@@ -1,0 +1,140 @@
+---
+title: "Vector Indexes"
+description: "Vector indexes powering semantic search in the Orbiter FalkorDB knowledge graph"
+---
+
+Every node in the Orbiter graph carries the base label **`Entity`**. Most node types store one or more `vecf32` embedding properties, enabling semantic similarity search via FalkorDB's built-in vector index API.
+
+---
+
+## How vector search works in FalkorDB
+
+FalkorDB uses **HNSW (Hierarchical Navigable Small World)** indexes under the hood. You don't create them with a DDL statement the way you would a btree index — instead, FalkorDB automatically maintains the vector index when you write `vecf32` properties to nodes.
+
+Queries go through the `db.idx.vector.queryNodes()` procedure:
+
+```cypher
+CALL db.idx.vector.queryNodes(
+  'Entity',              // label to search
+  'name_embedding',      // vecf32 property
+  3,                     // k — number of nearest neighbors
+  vecf32($embedding)     // query vector
+)
+YIELD node, score
+```
+
+- **`score`** is cosine distance — lower is better (0 = identical, 1 = orthogonal).
+- The procedure returns up to `k` nodes sorted by ascending score.
+- Filtering (e.g. by node type) happens **after** the vector search in a `WHERE` clause.
+
+---
+
+## Embedding properties by node type
+
+All embeddings are type `vecf32`. Dimension is determined by the embedding model used during ingestion.
+
+| Node Label(s) | Property | Purpose |
+|---|---|---|
+| `Entity:Person` | `name_embedding` | Semantic embedding of the person's profile |
+| `Entity:Company` | `name_embedding` | Semantic embedding |
+| `Entity:Startup` | `name_embedding` | Semantic embedding |
+| `Entity:School` | `name_embedding` | Semantic embedding |
+| `Entity:Country` | `name_embedding` | Semantic embedding |
+| `Entity:Region` | `name_embedding` | Semantic embedding |
+| `Entity:City` | `name_embedding` | Semantic embedding |
+| `Entity:Film_TV` | `name_embedding` | Semantic embedding |
+| `Entity:Film_TV_Award` | `name_embedding` | Semantic embedding |
+| `Entity:Certification` | `name_embedding` | Semantic embedding |
+| `Entity:Funding_Round` | `name_embedding` | Semantic embedding |
+| `Entity:DomainExpertise` | `name_embedding` | Semantic embedding |
+| `Entity:DomainExpertise` | `expertise_embedding` | Expertise-specific embedding |
+| `Entity:SubDomainExpertise` | `name_embedding` | Semantic embedding |
+| `Entity:SubDomainExpertise` | `expertise_embedding` | Expertise-specific embedding |
+
+<Note>
+  `DomainExpertise` and `SubDomainExpertise` carry **two** embedding properties — `name_embedding` for general name similarity and `expertise_embedding` for domain-specific matching. All other node types use only `name_embedding`.
+</Note>
+
+---
+
+## Live usage — expertise matching
+
+The primary vector search in production matches incoming expertise signals against existing `SubDomainExpertise` nodes. From the [expertise pipeline](/guides/cyphers/expertise):
+
+```cypher
+CALL db.idx.vector.queryNodes(
+  'Entity', 'expertise_embedding', 3, vecf32({{$var.embedding}})
+)
+YIELD node, score
+WHERE score < 0.45
+  AND labels(node) = 'SubDomainExpertise'
+RETURN node.uuid AS uuid, node.name AS name, score
+ORDER BY score ASC
+```
+
+**Key details:**
+
+- Searches across the `Entity` label (all node types), then filters to `SubDomainExpertise` in the `WHERE` clause.
+- Returns the 3 nearest neighbors with a cosine distance threshold of **< 0.45**.
+- The `score` is used downstream as the `match_score` property on the resulting `HAS_EXPERTISE` edge (see [edges → HAS_EXPERTISE](/guides/ontology/edges)).
+
+---
+
+## Common patterns
+
+### Deduplication via vector similarity
+
+Before creating a new node, query for existing nodes with similar embeddings. If the top result scores below a threshold, merge instead of creating a duplicate.
+
+```cypher
+CALL db.idx.vector.queryNodes('Entity', 'name_embedding', 1, vecf32($embedding))
+YIELD node, score
+WHERE score < 0.15
+  AND labels(node) = 'Person'
+RETURN node.uuid AS existing_uuid, score
+```
+
+### Multi-property search
+
+For node types with two embedding properties (e.g. `DomainExpertise`), choose the property based on intent:
+
+- **`name_embedding`** — match by name / label (e.g. "Machine Learning").
+- **`expertise_embedding`** — match by semantic meaning of the expertise area (e.g. an embedding derived from a description of skills, not just the label).
+
+### Skills and specialties matching
+
+Person `skills` and Company `specialties` arrays are matched against the existing `SubDomainExpertise` taxonomy via the same vector search pipeline. Each array item is embedded and searched against `expertise_embedding` — the resulting edges carry the original source text.
+
+- **Person skills** → `HAS_EXPERTISE` edge with `skill` property
+- **Company specialties** → `SPECIALIZES_IN` edge with `specialty` property
+
+Both edge types target the same `SubDomainExpertise` nodes, enabling cross-entity queries:
+
+```cypher
+// People whose expertise matches a company's specialties
+MATCH (c:Company {uuid: $company_uuid})-[:SPECIALIZES_IN]->(d:SubDomainExpertise)<-[:HAS_EXPERTISE]-(p:Person)
+RETURN p.name, d.name AS shared_domain
+```
+
+```cypher
+// Companies that specialize in the same domains as a person's skills
+MATCH (p:Person {uuid: $person_uuid})-[:HAS_EXPERTISE]->(d:SubDomainExpertise)<-[:SPECIALIZES_IN]-(c:Company)
+RETURN c.name, d.name AS shared_domain
+```
+
+See [edges → SPECIALIZES_IN](/guides/ontology/edges) and [edges → HAS_EXPERTISE](/guides/ontology/edges) for full property definitions.
+
+---
+
+## Distance metric
+
+FalkorDB vector indexes use **cosine distance** by default. Score interpretation:
+
+| Score Range | Meaning |
+|---|---|
+| `< 0.15` | Near-duplicate — likely the same entity |
+| `0.15 – 0.30` | Very similar — strong semantic match |
+| `0.30 – 0.45` | Related — used as the expertise matching threshold |
+| `> 0.45` | Weak or no match — typically filtered out |
+
+These thresholds are conventions used across the Orbiter pipelines, not FalkorDB defaults.

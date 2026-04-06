@@ -1,9 +1,9 @@
 ---
 title: "Expertise"
-description: "Cypher queries for DomainExpertise and SubDomainExpertise nodes and HAS_EXPERTISE edges"
+description: "Cypher queries for DomainExpertise and SubDomainExpertise nodes, HAS_EXPERTISE edges, SPECIALIZES_IN edges, and HAS_SUBDOMAIN taxonomy edges"
 ---
 
-All Cypher queries related to expertise — domain and sub-domain node creation, vector search for matching, HAS_EXPERTISE edge resolution, and HAS_SUBDOMAIN taxonomy edges.
+All Cypher queries related to expertise — domain and sub-domain node creation, vector search for matching, HAS_EXPERTISE edge resolution (person skills), SPECIALIZES_IN edge resolution (company specialties), and HAS_SUBDOMAIN taxonomy edges.
 
 ---
 
@@ -44,24 +44,34 @@ RETURN node.uuid AS uuid, node.name AS name,
 When an existing expertise node matches above the similarity threshold:
 
 ```cypher
-// Version v1
+// Version v3
 MATCH (p:Entity:Person {uuid: "{{$input.person_node_uuid}}"})
 MATCH (e:Entity {uuid: "{{$var.bestUuid}}"})
 MERGE (p)-[r:HAS_EXPERTISE]->(e)
 ON CREATE SET
-  r.confidence = "{{$var.item.confidence}}",
+  r.skill = "{{$var.cleanArea}}",
+  r.weight = {{$var.edgeWeight}},
+  r.confidence = {{$var.item.confidence}},
   r.evidence = "{{$var.cleanEvidence}}",
-  r.identified_as = "{{$var.cleanDomain}}",
+  r.identified_as = "{{$var.cleanArea}}",
+  r.signal_type = "{{$var.item.signal_type}}",
+  r.depth = "{{$var.item.depth}}",
+  r.recency = "{{$var.item.recency}}",
   r.match_score = {{$var.bestScore}},
   r.match_type = "matched"
 ON MATCH SET
+  r.skill = r.skill + " | " + "{{$var.cleanArea}}",
+  r.weight = CASE WHEN {{$var.edgeWeight}} < r.weight THEN {{$var.edgeWeight}} ELSE r.weight END,
   r.evidence = r.evidence + " | " + "{{$var.cleanEvidence}}",
-  r.identified_as = r.identified_as + " | " + "{{$var.cleanDomain}}",
-  r.confidence = CASE WHEN r.confidence = "high" OR "{{$var.item.confidence}}" = "high" THEN "high" ELSE r.confidence END,
+  r.identified_as = r.identified_as + " | " + "{{$var.cleanArea}}",
+  r.signal_type = r.signal_type + " | " + "{{$var.item.signal_type}}",
+  r.confidence = CASE WHEN {{$var.item.confidence}} > r.confidence THEN {{$var.item.confidence}} ELSE r.confidence END,
   r.match_score = CASE WHEN {{$var.bestScore}} < r.match_score THEN {{$var.bestScore}} ELSE r.match_score END
 RETURN p.uuid AS person_uuid, e.uuid AS expertise_uuid,
        e.name AS expertise_name
 ```
+
+Weight is computed before the cypher call: `edgeWeight = min(round(10 + (bestScore * 80)), 50)`. ON MATCH keeps the lower (stronger) weight.
 
 ### CREATE New SubDomainExpertise Node
 
@@ -86,20 +96,28 @@ RETURN s
 Connects person to the newly created SubDomainExpertise node:
 
 ```cypher
-// Version v1
+// Version v3
 MATCH (p:Entity:Person {uuid: "{{$input.person_node_uuid}}"})
 MATCH (e:Entity:SubDomainExpertise {uuid: "{{$var.newNodeUuid}}"})
 MERGE (p)-[r:HAS_EXPERTISE]->(e)
 ON CREATE SET
-  r.confidence = "{{$var.item.confidence}}",
+  r.skill = "{{$var.cleanArea}}",
+  r.weight = {{$var.edgeWeight}},
+  r.confidence = {{$var.item.confidence}},
   r.evidence = "{{$var.cleanEvidence}}",
-  r.identified_as = "{{$var.cleanDomain}}",
+  r.identified_as = "{{$var.cleanArea}}",
+  r.signal_type = "{{$var.item.signal_type}}",
+  r.depth = "{{$var.item.depth}}",
+  r.recency = "{{$var.item.recency}}",
   r.match_score = {{$var.safeScore}},
   r.match_type = "created"
 ON MATCH SET
+  r.skill = r.skill + " | " + "{{$var.cleanArea}}",
+  r.weight = CASE WHEN {{$var.edgeWeight}} < r.weight THEN {{$var.edgeWeight}} ELSE r.weight END,
   r.evidence = r.evidence + " | " + "{{$var.cleanEvidence}}",
-  r.identified_as = r.identified_as + " | " + "{{$var.cleanDomain}}",
-  r.confidence = CASE WHEN r.confidence = "high" OR "{{$var.item.confidence}}" = "high" THEN "high" ELSE r.confidence END,
+  r.identified_as = r.identified_as + " | " + "{{$var.cleanArea}}",
+  r.signal_type = r.signal_type + " | " + "{{$var.item.signal_type}}",
+  r.confidence = CASE WHEN {{$var.item.confidence}} > r.confidence THEN {{$var.item.confidence}} ELSE r.confidence END,
   r.match_score = CASE WHEN {{$var.safeScore}} < r.match_score THEN {{$var.safeScore}} ELSE r.match_score END
 RETURN p.uuid AS person_uuid, e.uuid AS expertise_uuid,
        e.name AS expertise_name
@@ -153,4 +171,100 @@ MATCH (d:Entity:DomainExpertise {uuid: "{{$var.parentDomain.node_uuid}}"})
 MATCH (s:Entity:SubDomainExpertise {uuid: "{{$var.subNodeUuid}}"})
 CREATE (d)-[:HAS_SUBDOMAIN]->(s)
 RETURN d.uuid AS domain_uuid, s.uuid AS sub_uuid
+```
+
+---
+
+## mvp/expertise/resolve-company-specialties (function #12746)
+
+Takes a company's specialties from the `speciality_join` table, embeds each specialty string, vector searches against existing SubDomainExpertise nodes, matches or creates new nodes, and connects the company via SPECIALIZES_IN edges. Called as Section 5.5 of `run-base-company-process` (#12699).
+
+### Delete Existing SPECIALIZES_IN Edges
+
+Clears all SPECIALIZES_IN edges for a company before re-resolving (idempotent refresh).
+
+```cypher
+// Version v1
+MATCH (c:Entity:Company {uuid: "{{$var.company.node_uuid}}"})-[r:SPECIALIZES_IN]->()
+DELETE r
+RETURN count(r) AS deleted_count
+```
+
+### Vector Search for Matching Expertise
+
+Same query as person expertise — searches against `expertise_embedding` index:
+
+```cypher
+// Version v1
+CALL db.idx.vector.queryNodes(
+  'Entity', 'expertise_embedding', 3, vecf32({{$var.embedding}})
+)
+YIELD node, score
+WITH node, score ORDER BY score ASC LIMIT 1
+RETURN node.uuid AS uuid, node.name AS name,
+       node.display_label AS label, score
+```
+
+### MERGE SPECIALIZES_IN Edge (Matched)
+
+When an existing SubDomainExpertise node matches above the similarity threshold:
+
+```cypher
+// Version v2
+MATCH (c:Entity:Company {uuid: "{{$var.company.node_uuid}}"})
+MATCH (e:Entity {uuid: "{{$var.bestUuid}}"})
+MERGE (c)-[r:SPECIALIZES_IN]->(e)
+ON CREATE SET
+  r.specialty = "{{$var.cleanSpecialty}}",
+  r.weight = {{$var.edgeWeight}},
+  r.match_score = {{$var.bestScore}},
+  r.match_type = "matched"
+ON MATCH SET
+  r.specialty = r.specialty + " | " + "{{$var.cleanSpecialty}}",
+  r.weight = CASE WHEN {{$var.edgeWeight}} < r.weight THEN {{$var.edgeWeight}} ELSE r.weight END,
+  r.match_score = CASE WHEN {{$var.bestScore}} < r.match_score THEN {{$var.bestScore}} ELSE r.match_score END
+RETURN c.uuid AS company_uuid, e.uuid AS expertise_uuid,
+       e.name AS expertise_name
+```
+
+Weight is computed before the cypher call: `edgeWeight = min(round(10 + (bestScore * 80)), 50)`. ON MATCH keeps the lower (stronger) weight.
+
+### CREATE New SubDomainExpertise Node (Company)
+
+When no existing node matches, creates a new SubDomainExpertise node with LLM-generated description. Also writes back to Xano `sub_domain_expertise` table.
+
+```cypher
+// Version v1
+CREATE (s:Entity:SubDomainExpertise {
+  uuid: randomUUID(),
+  name: "{{$var.cleanSpecialty}}",
+  description: "{{$var.cleanGenericDesc}}",
+  display_label: "SubDomainExpertise",
+  source: "company_specialty",
+  name_embedding: vecf32({{$var.nodeEmbedding}}),
+  expertise_embedding: vecf32({{$var.nodeEmbedding}})
+})
+RETURN s
+```
+
+### MERGE SPECIALIZES_IN Edge (New Node)
+
+Connects company to the newly created SubDomainExpertise node:
+
+```cypher
+// Version v2
+MATCH (c:Entity:Company {uuid: "{{$var.company.node_uuid}}"})
+MATCH (e:Entity:SubDomainExpertise {uuid: "{{$var.newNodeUuid}}"})
+MERGE (c)-[r:SPECIALIZES_IN]->(e)
+ON CREATE SET
+  r.specialty = "{{$var.cleanSpecialty}}",
+  r.weight = {{$var.edgeWeight}},
+  r.match_score = {{$var.safeScore}},
+  r.match_type = "created"
+ON MATCH SET
+  r.specialty = r.specialty + " | " + "{{$var.cleanSpecialty}}",
+  r.weight = CASE WHEN {{$var.edgeWeight}} < r.weight THEN {{$var.edgeWeight}} ELSE r.weight END,
+  r.match_score = CASE WHEN {{$var.safeScore}} < r.match_score THEN {{$var.safeScore}} ELSE r.match_score END
+RETURN c.uuid AS company_uuid, e.uuid AS expertise_uuid,
+       e.name AS expertise_name
 ```

@@ -1,0 +1,199 @@
+---
+title: 'Custom Skills'
+description: 'Orbiter.io custom skill files — in-house agent skills for our workflows, pipelines, and integrations.'
+---
+
+## Overview
+
+Custom Skills are [Claude agent skills](https://code.claude.com/docs/en/skills) authored in-house for Orbiter.io workflows and tools that don't have a high-quality third-party skill available. They encode our conventions, API surface, and guardrails so agents stay aligned with how we actually build and ship.
+
+Custom skills live in `~/.claude/skills/<skill-name>/SKILL.md` on each developer's machine. This page is the source of truth for what each skill does — update it when you add, rename, or retire a custom skill.
+
+---
+
+## check-models
+
+**Purpose:** Audit every LLM model used in the Orbiter enrichment pipelines against live Xano functions in workspace 3, then reconcile three different things on the Mintlify model documentation: configuration, pricing, and derived cost.
+
+**Location:** `~/.claude/skills/check-models/SKILL.md`
+
+**What it covers:**
+
+<Steps>
+  <Step title="Xano → per-pipeline model summaries (config)">
+    For every function in the skill's `model-registry.md`, fetches the live XanoScript from workspace 3 (`mcp__xano__getFunction`, batched in parallel groups of 5–8) and extracts `model`, `temperature`, `max_tokens`, and `timeout`. Resolves `$env.LLM_MODEL_*` variables (asking the user if the Xano tenant env API returns empty and caching for the run). Then diffs each value against the per-pipeline `model-summary.mdx` files under `guides/enrichment/**/`, including moving function rows between `## model/id` sections if a model was swapped, creating new model sections when needed, removing empty ones, and updating Mermaid diagram labels in lockstep.
+  </Step>
+  <Step title="Canonical model list from all-models-summary.mdx">
+    Reads `guides/enrichment/all-models-summary.mdx` and extracts every `## \`model/id\`` heading. This is the authoritative list of models the audit cares about — any model found in Xano that isn't listed here is reported as *new* and surfaced for the user to add before pricing runs.
+  </Step>
+  <Step title="OpenRouter → every Model Summary page (pricing)">
+    For each model in the canonical list, fetches `https://openrouter.ai/{model_id}` in parallel and extracts context window, input cost per 1M tokens, and output cost per 1M tokens. Updates the pricing table beneath that model's heading on both `all-models-summary.mdx` (keeping the cost comparison table sorted by input cost ascending) and every per-pipeline `model-summary.mdx` that has a section for the model.
+  </Step>
+  <Step title="Derived Cost/Call on per-pipeline pages only">
+    On every per-pipeline `model-summary.mdx` (never `all-models-summary.mdx`), walks every row of every function table. If both `Avg Input Tokens` and `Avg Output Tokens` are populated (non-TBD), recomputes `Cost/Call` using the formula `(avg_in / 1,000,000) × input_cost + (avg_out / 1,000,000) × output_cost`. Uses the **new** prices from the previous step, not the old ones. Rows where either average is still `TBD` are left untouched. Formatting: six significant digits below `$0.01`, four decimal places above.
+  </Step>
+  <Step title="Report, confirm, apply, verify">
+    Presents a single consolidated diff — config sync, pricing changes, cost recalcs, new models, stale models — and asks for a single confirmation before touching anything. After writes, re-reads every touched file to verify.
+  </Step>
+</Steps>
+
+**Triggers on:** `check models`, `update models`, `model audit`, `sync models`, `are my docs up to date`, `model check`, or after any Xano function model swap.
+
+**Guardrails:**
+- Never prices a model that isn't already in `all-models-summary.mdx` — surfaces it as *new* and waits for user decision.
+- Never recalculates `Cost/Call` on `all-models-summary.mdx`.
+- Never invents an OpenRouter price — if the page is inaccessible, warns and leaves the existing price in place.
+- Never auto-removes an orphaned model section — asks first.
+- Never guesses env var values.
+
+**Resource files:** `model-registry.md` — authoritative list of function IDs the audit covers, with their model sources (hardcoded vs env var) and the doc files that reference them. Updated whenever enrichment pipeline functions are added or removed.
+
+---
+
+## sync-system-prompts
+
+**Purpose:** Keep every LLM system prompt in Xano workspace 3 in lockstep with the Mintlify `llm-system-prompts.mdx` documentation. Xano is always the source of truth. **The user owns version numbers in Xano** — when editing a prompt, the developer bumps the `// vN` header themselves. The skill copies Xano → Mintlify verbatim (version header included) and only rewrites the Xano version as a **safety net** when drift is detected but the user forgot to bump.
+
+**Location:** `~/.claude/skills/sync-system-prompts/SKILL.md`
+
+**What it covers:**
+
+<Steps>
+  <Step title="Discover every $systemPrompt block in Xano">
+    Lists all functions in workspace 3 (paginated), filters to the enrichment-pipeline name prefixes (`mvp/imdb/`, `mvp/enrich/`, `mvp/about/`, `mvp/bios/`, `mvp/twitter/`, `mvp/school/`, `mvp/company/`, `mvp/link/`), and fetches XanoScript in parallel batches. For each function, finds every `util.template_engine { value = """..."""} as $systemPrompt` block via regex. Multiple blocks per function are supported and matched by order of appearance — function `#2537` has two (short bio and long bio) and they are handled independently.
+  </Step>
+  <Step title="Parse every Mintlify llm-system-prompts.mdx">
+    Reads the five per-pipeline files under `guides/enrichment/**/llm-system-prompts.mdx` (tolerant of missing files). For each `## N. Title` section, extracts the `**#NNNN**` function reference and the prompt body from the `\`\`\`text\` fenced block under `### System Prompt` (typically inside an `<Accordion>`).
+  </Step>
+  <Step title="Match and classify with version-line-stripped diff">
+    Groups Mintlify sections by function ID and pairs them with Xano blocks by `(function_id, order_within_function)`. **Strips the `// vN` version line from both sides before diffing** — the version is metadata, not content, which prevents a phantom-drift loop where a stale version header keeps re-triggering a bump. Classifies each pair as: **in-sync**, **drift**, **orphan** (Xano has it, Mintlify doesn't), or **stale doc section** (Mintlify has it, Xano doesn't).
+  </Step>
+  <Step title="Report before touching anything">
+    Shows a full summary: counts for each category, a drift table with current version → new version, an orphans table with the first 80 characters of each unhomed prompt, and a stale-sections table. Nothing is written until the user confirms.
+  </Step>
+  <Step title="Resolve orphans one at a time">
+    For each orphan, asks the user (via `AskUserQuestion`) which Mintlify file it belongs on, with the option to skip. Asks for a section title, deriving one from the function name if none is given. If the chosen file doesn't exist yet, offers to create it from the `person-pipeline/llm-system-prompts.mdx` template.
+  </Step>
+  <Step title="Apply: copy Xano → Mintlify verbatim, safety-net bump only if needed">
+    Default behavior is to copy Xano's body (version header included) into Mintlify unchanged. The skill **does not auto-bump versions** — the user is responsible for bumping `// vN` in Xano when they edit a prompt.
+
+    The **safety-net rule** fires only when drift is detected AND Xano's version is not ahead of Mintlify's (i.e. user edited the body but forgot to bump):
+
+    | Xano ver | Mintlify ver | Action on Xano |
+    |---|---|---|
+    | `vN` | `vM` where `M < N` | No bump — user already bumped; copy body to Mintlify. |
+    | `vN` | `vN` (equal) | **Safety-net bump** → rewrite Xano with `v{N+1}`. |
+    | `vN` | `vM` where `M > N` | **Safety-net bump** → Mintlify is ahead (shouldn't happen); rewrite Xano with `v{M+1}`; warn in report. |
+    | no version | `vM` or none | **Safety-net bump** → treat missing Xano version as `v1`, rewrite as `v{M+1}` (or `v2`). |
+    | `vN` | no version | No bump — Mintlify is just missing it; copy Xano body verbatim. |
+
+    **Critical correctness detail:** multiple drifted blocks inside the same Xano function are batched into a single `mcp__xano__updateFunction` call — writing them sequentially would invalidate byte offsets within the XanoScript. After writes, the final Xano body (either unchanged or freshly bumped) is the body written to Mintlify.
+
+    Every safety-net bump is surfaced loudly in the final report so the developer knows which prompts they edited without bumping.
+  </Step>
+  <Step title="Orphans get v1 + a new Mintlify section">
+    Prepends `// v1` to the Xano body (batched with other in-function edits) and appends a new numbered section to the chosen Mintlify file using a standard template with TODO placeholders for description, model, and curl example (model/temperature/etc. are owned by the `check-models` skill, not this one).
+  </Step>
+  <Step title="Stale sections, on confirmation">
+    For each stale Mintlify section (prompt removed from Xano), asks the user per-entry whether to delete. Offers a bulk "delete all" option when there are more than three. Never deletes without confirmation.
+  </Step>
+  <Step title="Verify">
+    Re-fetches each touched Xano function and re-reads each touched Mintlify file to confirm writes landed correctly. Reports final counts.
+  </Step>
+</Steps>
+
+**Triggers on:** `sync system prompts`, `update system prompts`, `system prompt audit`, `check system prompts`, `system prompt drift`, or after editing any `$systemPrompt` template in Xano.
+
+**Guardrails:**
+- Xano is always the source of truth — Mintlify never writes back to Xano body content.
+- **The user owns version numbers.** The skill does not auto-bump. It only rewrites the Xano version as a safety net when drift is detected and the user clearly forgot to bump (see table above).
+- Diff with the version line stripped so version metadata never creates phantom drift — version numbers are only compared separately to decide whether the safety-net bump applies.
+- `**#NNNN**` function reference is mandatory on every new Mintlify section (it's the cross-system join key).
+- Never touches models, temperature, max_tokens, or curl examples — those belong to `check-models`.
+- All in-function edits are batched into a single `updateFunction` call.
+- Preserves original XanoScript indentation when rewriting `value = """..."""` blocks.
+- Missing Mintlify files are tolerated unless explicitly chosen as a home.
+
+---
+
+## average-token-use
+
+<Note>
+  **Status: STUB — pending Arize AI MCP install.** The skill file exists and is discoverable, but Phase 2 (trace queries) is deliberately left as TODOs until the Arize MCP is wired up in `~/.claude/mcp.json`. Once the MCP is live, fill in the TODOs in the skill, flip the status to `ACTIVE`, and run a first dry run against one function.
+</Note>
+
+**Purpose:** Close the loop on cost accuracy. The `check-models` skill already recalculates `Cost/Call` from `Avg Input Tokens × input price + Avg Output Tokens × output price`, but only when both averages are populated. Today those columns are mostly `TBD` because nothing automatically measures real-world token usage. This skill pulls actual trace data from [Arize AI](https://arize.com), averages over a rolling window, and writes the numbers back into the per-pipeline `model-summary.mdx` files. After a run, `check-models` picks up the new averages and refreshes `Cost/Call` automatically.
+
+**Location:** `~/.claude/skills/average-token-use/SKILL.md`
+
+**Intended pipeline:**
+
+<Steps>
+  <Step title="Enumerate functions from llm-system-prompts pages">
+    Read all five `guides/enrichment/**/llm-system-prompts.mdx` files. For every `## N.` section, extract `function_id` (from `**#NNNN**`), `function_name`, `prompt_index` (1-based order within the function, same convention used by `sync-system-prompts`), section title, and file path. This produces the complete list of `(function_id, prompt_index)` pairs that need averages.
+  </Step>
+  <Step title="Query Arize AI traces per function (TODO once MCP is live)">
+    For each `(function_id, prompt_index)` pair, query the Arize MCP for trace data over the configured time window (proposed default: last 30 days). Extract per-span input and output token counts, filter to the rolling window, and compute the mean. Track sample size so rows below the reliability threshold (proposed: 50 calls) can be skipped.
+
+    **Open questions pending MCP install:** exact Arize tool names, Orbiter's project/space identifier, how traces are tagged with function identity (direct `function_id` attribute vs span name vs metadata key), exact token count field names, and — critically — whether multi-prompt functions like `#2537` (short bio + long bio) are distinguishable in traces or whether they aggregate together.
+  </Step>
+  <Step title="Map averages to model-summary.mdx rows">
+    Read all five per-pipeline `model-summary.mdx` files. For each function table row, look up the matching `(function_id, prompt_index)` average from the previous step. Single-prompt functions match by `function_id` alone. Multi-prompt functions require per-row matching — the exact rendering convention for multi-prompt rows on `model-summary.mdx` is a TODO to confirm.
+  </Step>
+  <Step title="Report before writing">
+    Show a diff table listing the time window, sample sizes, old vs new averages per row, and which rows were skipped (below-threshold sample size). Nothing is written until the user confirms.
+  </Step>
+  <Step title="Apply">
+    On confirmation, write the new values to the `Avg Input Tokens` and `Avg Output Tokens` columns (and `Updated` timestamp if the row has one). Only these columns — never `Cost/Call`, which belongs to `check-models`.
+  </Step>
+  <Step title="Handoff to check-models">
+    After writes, prompt: *"Averages updated on N rows. Run `check-models` now to refresh Cost/Call?"* If yes, hand off. The cost formula lives in `check-models` as the single source of truth and is deliberately not duplicated here.
+  </Step>
+</Steps>
+
+**Triggers on (once active):** `update token averages`, `refresh avg tokens`, `arize token sync`, `recompute averages`, or a scheduled cadence (weekly/monthly).
+
+**Guardrails:**
+- Never write an average when the sample size is below the reliability threshold — leave the row as `TBD` and report it. Tiny samples produce misleading `Cost/Call`.
+- Never recompute `Cost/Call` directly — that belongs to `check-models`.
+- Always show the diff and confirm before writing.
+- Preserve manual overrides — if a user has marked a row as manually locked, skip it and note in the report. (Convention TBD.)
+
+**Prerequisites to flip from STUB → ACTIVE:**
+
+1. Arize AI MCP installed, reachable from Claude Code, authenticated.
+2. One sample trace query captured end-to-end — tool call shape, field names, response payload.
+3. Decision on how multi-prompt functions are distinguished in traces.
+4. Minimum sample size + default time window agreed.
+5. Rounding convention agreed (proposed: nearest integer token count).
+6. Manual-lock convention agreed (how to mark a row this skill won't overwrite).
+7. First end-to-end dry run against one function with hand-verified baseline.
+
+---
+
+## knock
+
+**Purpose:** Guidance for working with [Knock](https://knock.app) — the customer engagement platform Orbiter.io uses for cross-channel notifications (email, in-app, push, SMS, Slack, chat). No official Knock agent skill exists upstream; this one is authored from their CLI, Management API, and [`@knocklabs/agent-toolkit`](https://github.com/knocklabs/agent-toolkit) documentation.
+
+**Location:** `~/.claude/skills/knock/SKILL.md`
+
+**What it covers:**
+
+- **Core concepts:** workflows (the primary unit of notification-as-code, identified by `key`), environments (`development → staging → production`), channels (configured providers), recipients/users, and tenants (multi-tenant scoping for preferences and branding).
+- **Token types and when to use each:** `pk_*` publishable keys (client-side, identify account only), `sk_*` secret keys (server-side API calls, trigger workflows, upsert users), and `kst_*` service tokens (CLI, Management API, and the agent-toolkit — account-wide scope). Includes the `~/.config/knock/config.json` pattern so service tokens don't live in shell history.
+- **Knock CLI commands:** `workflow pull / push / validate / run` for working with workflows as code, and `commit` + `commit promote` for the environment promotion flow. The skill enforces the one-way flow — edits land in `development`, are committed to become promotable, then promoted upward toward production. You never push directly to production.
+- **Workflow-as-code directory layout:** how a pulled workflow directory is structured on disk (`workflow.json`, per-channel step directories with their templates and subjects) and what each file means.
+- **`@knocklabs/agent-toolkit` integration:**
+  - As an **MCP server** for Claude Code, Cursor, and Windsurf via `npx -y @knocklabs/agent-toolkit -p local-mcp --service-token kst_...`, with `--tools` and `--workflows` flags to scope what the agent can do.
+  - As a **Vercel AI SDK** tool set via `createKnockToolkit({ serviceToken, permissions })`, with explicit permission scoping (read/run/write/manage per resource type) as the key safety primitive.
+  - Also covers OpenAI SDK and Langchain integration.
+- **Triggering a workflow from server code** via `@knocklabs/node`, including how `data` becomes template context (keep payloads small and stable because Knock persists them for retries).
+- **Debugging checklist:** the most common footguns — wrong-environment "workflow not found" errors, missing `data` keys causing template failures, permission-scope write errors in the toolkit, no-op promotes from uncommitted changes, and duplicate sends from batch/throttle misconfiguration.
+- **Orbiter.io conventions section** — currently stubbed placeholders for workflow key naming, environment list, secret storage, and CI promotion strategy. Fill in as house style is locked down so the agent stops guessing.
+
+**Triggers on:** any mention of Knock, `knock.app`, `kst_*` / `sk_*` / `pk_*` tokens, Knock workflows/channels/environments, the Knock CLI, or the agent-toolkit.
+
+**Guardrails:**
+- Always start agent-toolkit permissions at read-only and widen deliberately — never hand an agent blanket `manage` on production.
+- Never commit `sk_*` or `kst_*` tokens.
+- Never push directly to `production` — always flow dev → staging → production via `commit promote`.

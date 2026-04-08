@@ -1,0 +1,165 @@
+---
+title: "grant.expired"
+description: "Nylas grant.expired webhook — marks expired grants and notifies the frontend"
+---
+
+<Note>
+**API Endpoint:** `POST /nylas/grant/expired` — [API Reference](/api-reference/nylas/nylas-grant-expired)
+</Note>
+
+## nylas/grant/expired — API #853
+
+Triggered by the Nylas `grant.expired` webhook when a user's OAuth grant expires. Validates the webhook signature using HMAC-SHA256, then delegates to `nylas-expired-grant` (#397) to mark the grant as expired and sends a real-time notification to the frontend via the `grant_expired` channel.
+
+```text
+nylas/grant/expired — API #853
+```
+
+<Accordion title="XanoScript — click to expand">
+````xanoscript
+// Nylas sends expired grants created to this endpoint
+query "nylas/grant/expired" verb=POST {
+  api_group = "Nylas"
+
+  input {
+    text challenge? filters=trim
+  }
+
+  stack {
+    // Check if the endpoint has a challenge field
+    conditional {
+      if ($input.challenge != null) {
+        util.set_header {
+          value = "Content-Type: text/html; charset=UTF-8"
+          duplicates = "replace"
+        }
+
+        return {
+          value = $input.challenge|escape
+        }
+      }
+    }
+
+    util.get_raw_input {
+      encoding = "none"
+      exclude_middleware = false
+    } as $raw_body
+
+    // Check data source from client id from nylas
+    conditional {
+      if ($raw_body.data.application_id == $env.nylas_client_id) {
+        db.set_datasource {
+          value = "staging"
+        }
+      }
+
+      else {
+        db.set_datasource {
+          value = "live"
+        }
+      }
+    }
+
+    function.run "mvp/nylas/get-nylas-keys" as $keys
+    var $hash {
+      value = $raw_body
+        |hmac_sha256:$keys.nylas_webhook_grant_expired_secret:false
+    }
+
+    // If no hash then it means its not Nylas
+    conditional {
+      if ($hash != $env.$http_headers["X-Nylas-Signature"]) {
+        return {
+          value = "signature failed"
+        }
+      }
+    }
+
+    util.post_process {
+      stack {
+        util.get_raw_input {
+          encoding = "json"
+          exclude_middleware = false
+        } as $body
+
+        var $grantId {
+          value = $body|get:"data.object.grant_id":null
+        }
+
+        function.run "nylas/nylas-expired-grant" {
+          input = {grant_id: $grantId}
+        } as $updateGrantsExpired
+
+        function.run "nylas/nylas-send-authenticated-realtime" {
+          input = {
+            message : "User has an expired grant"
+            grant_id: $grantId
+            channel : "grant_expired"
+          }
+        } as $realtime
+      }
+    }
+  }
+
+  response = $body
+  tags = ["nylas - webhook"]
+}
+````
+</Accordion>
+
+---
+
+## nylas-expired-grant — #397
+
+Called by the grant.expired API endpoint. Looks up the `nylas_grant` by grant_id, sets `grant_expired: true`, and marks the corresponding `master_email` record as having an expired grant.
+
+```text
+nylas/nylas-expired-grant — #397
+```
+
+<Accordion title="XanoScript — click to expand">
+````xanoscript
+// This is to update grants that are expired
+function "nylas/nylas-expired-grant" {
+  input {
+    text grant_id? filters=trim
+  }
+
+  stack {
+    db.get nylas_grant {
+      field_name = "grant_id"
+      field_value = $input.grant_id
+    } as $nylasGrant
+
+    // If nylas email exists
+    conditional {
+      if (($nylasGrant|is_empty) == false) {
+        db.edit nylas_grant {
+          field_name = "grant_id"
+          field_value = $input.grant_id
+          data = {updated_at: now, grant_expired: true}
+          output = ["id", "grant_id", "email_account", "grant_expired"]
+        } as $nylasGrant
+
+        db.edit master_email {
+          field_name = "email_address"
+          field_value = $nylasGrant|get:"email_account":null
+          data = {updated_at: now, nylas_grant_expired: true}
+        } as $masterEmail
+      }
+    }
+  }
+
+  response = $nylasGrant
+  tags = ["nylas - webhook", "nylas"]
+}
+````
+</Accordion>
+
+### Sub-functions called
+
+| Function | Description |
+|----------|-------------|
+| `get-nylas-keys` | Retrieves Nylas API credentials and webhook secrets |
+| `nylas-expired-grant` (#397) | Marks grant and master_email as expired |
+| `nylas-send-authenticated-realtime` | Sends real-time notification to frontend |

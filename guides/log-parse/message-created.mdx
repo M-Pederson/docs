@@ -1,0 +1,585 @@
+---
+title: "message.created"
+description: "Nylas message.created webhook — logs new emails and creates activity records"
+---
+
+<Note>
+**API Endpoint:** `POST /nylas/message/created` — [API Reference](/api-reference/nylas/nylas-message-created)
+</Note>
+
+## message-created — #180
+
+Triggered by the Nylas `message.created` webhook when a new email arrives. Filters out marketing emails by checking sender/recipient prefixes against a `marketing_prefix` table, logs the raw webhook payload to `log_webhook_nylas`, and hands off to `message-created-parse` (#1913) for activity creation.
+
+```text
+mvp/nylas-webhook/message-created — #180
+```
+
+<Accordion title="XanoScript — #180">
+````xanoscript
+// Used by message.created webhook
+function "mvp/nylas-webhook/message-created" {
+  input {
+    json body
+  }
+
+  stack {
+    // // TEMP - if datasource is NOT live then return and IF email account is not mark@orbiter.io RETURN
+
+    // TEMP FOR DEV
+    group {
+      stack {
+        conditional {
+          if ($env.$datasource != "live") {
+            return {
+              value = ""
+            }
+          }
+
+          elseif (($input.body|get:"data.object.grant_id":null) != "82d198e1-021a-49eb-8f9a-78b14b081f7e") {
+            return {
+              value = ""
+            }
+          }
+
+          else {
+            !return {
+              value = ""
+            }
+          }
+        }
+      }
+    }
+
+    db.add log_webhook_nylas {
+      data = {
+        created_at: "now"
+        grant_id  : $input.body|get:"data.result.object.grant_id":null
+        type      : "email"
+        webhook   : "message-created"
+        body      : $input.body
+      }
+    } as $log
+
+    var $activityAdded {
+      value = false
+    }
+
+    group {
+      stack {
+        var $toEmail {
+          value = $input.body
+            |get:"data.object.to.0.email":null
+        }
+
+        var $toPrefix {
+          value = $toEmail
+            |split:"@"
+            |first
+            |to_lower
+        }
+
+        var $fromEmail {
+          value = $input.body
+            |get:"data.object.from.0.email":null
+        }
+
+        var $fromPrefix {
+          value = $fromEmail
+            |split:"@"
+            |first
+            |to_lower
+        }
+
+        db.query marketing_prefix {
+          where = $db.marketing_prefix.prefix == $fromPrefix
+          return = {type: "exists"}
+        } as $hasMarketingPrefix
+
+        db.query marketing_prefix {
+          where = $db.marketing_prefix.prefix == $toPrefix
+          return = {type: "exists"}
+        } as $hasMarketingPrefixTo
+
+        conditional {
+          if ($hasMarketingPrefixTo || $hasMarketingPrefix) {
+            return {
+              value = "marketing email"
+            }
+          }
+        }
+      }
+    }
+
+    try_catch {
+      try {
+        function.run "mvp/activity/message-created-parse" {
+          input = {body: $input.body}
+        } as $activityAdded
+      }
+
+      catch {
+        db.edit log_webhook_nylas {
+          field_name = "id"
+          field_value = $log.id
+          data = {error: $error.message}
+        } as $log
+      }
+    }
+  }
+
+  response = {activity_added: $activityAdded}
+  tags = ["message.created webhook"]
+}
+````
+</Accordion>
+
+---
+
+## message-created-parse — #1913
+
+Called by `message-created` (#180) to process a new email. Determines the user's role in the conversation (sender, recipient, CC, or BCC), filters out drafts and spam/promotions/social folders, saves large attachments via `email-attachment-save`, creates activity records via `parse-from`, `parse-to`, or `parse-cc`, and — if AI is enabled on the grant — kicks off async LLM conversation cleaning (`llm_clean_messages`) and thread summarization (`email-llm-summary`).
+
+```text
+mvp/activity/message-created-parse — #1913
+```
+
+<Accordion title="XanoScript — #1913">
+````xanoscript
+// to be used by message.created webhook
+function "mvp/activity/message-created-parse" {
+  input {
+    json body
+  }
+
+  stack {
+    // Return the calendar event
+    group {
+      stack {
+        var $activityAdded {
+          value = false
+        }
+
+        var $result {
+          value = $input.body.data
+        }
+
+        // Return if the message is a calendar event
+        group {
+          stack {
+            // is the message a calendar event??
+            conditional {
+              if ($result.object|has:"attachments") {
+                array.has ($result.object.attachments) if ($this.content_type|icontains:"text/calendar") as $isCalendarEvent
+              }
+
+              else {
+                var $isCalendarEvent {
+                  value = false
+                }
+              }
+            }
+
+            // RETURN if message IS a calendar event
+            conditional {
+              if ($isCalendarEvent) {
+                return {
+                  value = {}
+                    |set:"activity_added":$activityAdded
+                }
+              }
+            }
+          }
+        }
+
+        db.get nylas_grant {
+          field_name = "grant_id"
+          field_value = $result.object.grant_id
+          output = ["id", "user_id", "grant_id", "email_account", "ai_enabled"]
+        } as $nylasGrant
+      }
+    }
+
+    // return if activity already exists
+    group {
+      stack {
+        db.query email_activity {
+          where = $db.email_activity.grant_id == $result.object.grant_id && $db.email_activity.message_id == $result.object.id
+          return = {type: "list"}
+        } as $has_activity
+
+        // Check if the activity already exists
+        conditional {
+          if (($has_activity|is_empty) == false) {
+            return {
+              value = {}
+                |set:"activity_added":$activityAdded
+            }
+          }
+        }
+      }
+    }
+
+    // set up variables
+    group {
+      stack {
+        var $folders {
+          value = $result.object.folders
+        }
+
+        var $from {
+          value = $result.object.from|first
+        }
+
+        // Create array variables
+        group {
+          stack {
+            var $to {
+              value = $result.object|get:"to":[]
+            }
+
+            var $cc {
+              value = $result.object|get:"cc":[]
+            }
+
+            var $bcc {
+              value = $result.object|get:"bcc":[]
+            }
+          }
+        }
+      }
+    }
+
+    // Checks if email activity is a draft.
+    group {
+      stack {
+        // End if email is part of Draft Folder.
+        array.has ($folders) if ($this == "DRAFT") as $isDraft
+
+        conditional {
+          if ($isDraft) {
+            return {
+              value = {}
+                |set:"activity_added":$activityAdded
+            }
+          }
+        }
+      }
+    }
+
+    // // log the email
+
+    // is email is sent FROM owner of account??
+    conditional {
+      if ($from.email == $nylasGrant.email_account) {
+        // email IS from owner of account
+        group {
+          stack {
+            function.run "mvp/activity/parse-from" {
+              input = {participants: $result, user_id: $nylasGrant.user_id}
+            }
+
+            // Parse attachments
+            conditional {
+              if (($result.object|get:"attachments":null) != null) {
+                foreach ($result.object.attachments) {
+                  each as $attachment {
+                    conditional {
+                      if (($attachment|get:"size":1) > ($env.parse_attachment_max_size_kb|multiply:1000)) {
+                        function.run "mvp/attachments/email-attachment-save" {
+                          input = {
+                            grant_id  : $nylasGrant.grant_id
+                            message_id: $result.object.id
+                            attachment: $attachment
+                            date      : $result.object.date
+                            thread_id : $result.object.thread_id
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+
+            conditional {
+              if ($nylasGrant.ai_enabled) {
+                function.run "clean-convo/llm_clean_messages" {
+                  runtime_mode = "async-shared"
+                  input = {
+                    body      : $result.object.body
+                    message_id: $result.object.id
+                    user_id   : $nylasGrant.user_id
+                  }
+                }
+
+                function.run "mvp/activity/email-llm-summary" {
+                  runtime_mode = "async-shared"
+                  input = {
+                    email_thread_id: $result.object.thread_id
+                    grant_id       : $result.object.grant_id
+                  }
+                }
+              }
+            }
+
+            var.update $activityAdded {
+              value = true
+            }
+
+            // // return after logging an email FROM the USER
+
+            return {
+              value = {}
+                |set:"activity_added":$activityAdded
+            }
+          }
+        }
+      }
+
+      else {
+        // email is NOT from owner of account
+        group {
+          stack {
+            array.has ($to) if ($this.email == $nylasGrant.email_account) as $isTo
+            conditional {
+              if ($isTo) {
+                // email is TO the USER
+                group {
+                  stack {
+                    // filter out MARKETING
+                    group {
+                      stack {
+                        array.filter ($folders) if ($this == "SPAM" || $this == "CATEGORY_PROMOTIONS" || $this == "CATEGORY_UPDATES" || $this == "SOCIAL" || $this == "CATEGORY_SOCIAL") as $hasCategories
+                        conditional {
+                          if ($hasCategories) {
+                            return {
+                              value = {}
+                                |set:"activity_added":$activityAdded
+                            }
+                          }
+                        }
+                      }
+                    }
+
+                    // save ATTACHMENTS
+                    group {
+                      stack {
+                        // Parse attachments
+                        conditional {
+                          if (($result.object|get:"attachments":null) != null) {
+                            foreach ($result.object.attachments) {
+                              each as $attachment {
+                                conditional {
+                                  if (($attachment|get:"size":1) > ($env.parse_attachment_max_size_kb|multiply:1000)) {
+                                    function.run "mvp/attachments/email-attachment-save" {
+                                      input = {
+                                        grant_id  : $nylasGrant.grant_id
+                                        message_id: $result.object.id
+                                        attachment: $attachment
+                                        date      : $result.object.date
+                                        thread_id : $result.object.thread_id
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+
+                    // email is TO grant_id account
+                    group {
+                      stack {
+                        function.run "mvp/activity/parse-to" {
+                          input = {participants: $result, user_id: $nylasGrant.user_id}
+                        }
+
+                        conditional {
+                          if ($nylasGrant.ai_enabled) {
+                            function.run "clean-convo/llm_clean_messages" {
+                              runtime_mode = "async-shared"
+                              input = {
+                                body      : $result.object.body
+                                message_id: $result.object.id
+                                user_id   : $nylasGrant.user_id
+                              }
+                            }
+
+                            function.run "mvp/activity/email-llm-summary" {
+                              runtime_mode = "async-shared"
+                              input = {
+                                email_thread_id: $result.object.thread_id
+                                grant_id       : $result.object.grant_id
+                              }
+                            }
+                          }
+                        }
+
+                        var.update $activityAdded {
+                          value = true
+                        }
+
+                        // // return after logging an email TO the USER
+
+                        return {
+                          value = {}
+                            |set:"activity_added":$activityAdded
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+
+              else {
+                array.has ($cc) if ($this.email == $nylasGrant.email_account) as $isCC
+                conditional {
+                  if ($isCC) {
+                    // USER is CC'd
+                    group {
+                      stack {
+                        foreach ($result.object.attachments) {
+                          each as $attachment {
+                            conditional {
+                              if (($attachment|get:"size":1) > ($env.parse_attachment_max_size_kb|multiply:1000)) {
+                                function.run "mvp/attachments/email-attachment-save" {
+                                  input = {
+                                    grant_id  : $nylasGrant.grant_id
+                                    message_id: $result.object.id
+                                    attachment: $attachment
+                                    date      : $result.object.date
+                                    thread_id : $result.object.thread_id
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+
+                        function.run "mvp/activity/parse-cc" {
+                          input = {participants: $result, user_id: $nylasGrant.user_id}
+                        }
+
+                        function.run "clean-convo/llm_clean_messages" {
+                          runtime_mode = "async-shared"
+                          input = {
+                            body      : $result.object.body
+                            message_id: $result.object.id
+                            user_id   : $nylasGrant.user_id
+                          }
+                        }
+
+                        function.run "mvp/activity/email-llm-summary" {
+                          runtime_mode = "async-shared"
+                          input = {
+                            email_thread_id: $result.object.thread_id
+                            grant_id       : $result.object.grant_id
+                          }
+                        }
+
+                        var.update $activityAdded {
+                          value = true
+                        }
+
+                        return {
+                          value = {}
+                            |set:"activity_added":$activityAdded
+                        }
+                      }
+                    }
+                  }
+
+                  else {
+                    array.has ($bcc) if ($this.email == $nylasGrant.email_account) as $isBCC
+                    conditional {
+                      if ($isBCC) {
+                        // USER is BCC'd
+                        group {
+                          stack {
+                            foreach ($result.object.attachments) {
+                              each as $attachment {
+                                conditional {
+                                  if (($attachment|get:"size":1) > ($env.parse_attachment_max_size_kb|multiply:1000)) {
+                                    function.run "mvp/attachments/email-attachment-save" {
+                                      input = {
+                                        grant_id  : $nylasGrant.grant_id
+                                        message_id: $result.object.id
+                                        attachment: $attachment
+                                        date      : $result.object.date
+                                        thread_id : $result.object.thread_id
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+
+                            function.run "mvp/activity/parse-cc" {
+                              input = {participants: $result, user_id: $nylasGrant.user_id}
+                            }
+
+                            function.run "clean-convo/llm_clean_messages" {
+                              runtime_mode = "async-shared"
+                              input = {
+                                body      : $result.object.body
+                                message_id: $result.object.id
+                                user_id   : $nylasGrant.user_id
+                              }
+                            }
+
+                            function.run "mvp/activity/email-llm-summary" {
+                              runtime_mode = "async-shared"
+                              input = {
+                                email_thread_id: $result.object.thread_id
+                                grant_id       : $result.object.grant_id
+                              }
+                            }
+
+                            var.update $activityAdded {
+                              value = true
+                            }
+
+                            return {
+                              value = {}
+                                |set:"activity_added":$activityAdded
+                            }
+                          }
+                        }
+                      }
+
+                      else {
+                        return {
+                          value = {}
+                            |set:"activity_added":$activityAdded
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  response = {activity_added: $activityAdded}
+  tags = ["message.created webhook"]
+}
+````
+</Accordion>
+
+### Sub-functions called
+
+| Function | Description |
+|----------|-------------|
+| `parse-from` | Creates email activity when user is the sender |
+| `parse-to` | Creates email activity when user is the recipient |
+| `parse-cc` | Creates email activity when user is CC'd or BCC'd |
+| `email-attachment-save` | Saves attachments above the size threshold |
+| `llm_clean_messages` | (async) LLM-powered conversation thread cleaning |
+| `email-llm-summary` | (async) LLM-generated email thread summary |

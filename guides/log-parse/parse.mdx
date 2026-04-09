@@ -3,18 +3,38 @@ title: "Parse Functions"
 description: "Email activity parsing functions — parse-from, parse-to, and parse-cc"
 ---
 
-Called by `message-created-parse` (#1913) to create email activity records based on the user's role in the conversation.
+Called by `message-created-parse` (#1913) to create email activity records based on the user's role in the conversation. Each function follows the same core pattern: extract participant arrays, calculate participant count, iterate through each participant list, resolve identity, create or get-add person, log activity, increment counters, and set primary email.
 
 ## parse-from — #2126
 
-Parses and logs an email activity when the email is sent FROM the user's account. Iterates through every TO, CC, and BCC participant on the outbound message and, for each one, resolves or creates the contact's identity (`check-identity-email`, `get-add/master-person`), copies them into the user's address book (`copy-to-my-person`), writes an `email_activity` record with `activity_type_id = 2`, increments `total_email_activity` on the `my_person` row, and sets the primary email. Marketing-flagged contacts are skipped entirely. Participant count is calculated once up front via `calculate_participant`.
+Processes outbound emails (sent FROM the user's account). Creates activity records for every recipient.
 
 ```text
 mvp/activity/parse-from — #2126
 ```
 
-<Accordion title="XanoScript — click to expand">
-````xanoscript
+### Step-by-step
+
+<Steps>
+  <Step title="Extract participant arrays">
+    Pulls `to`, `cc`, and `bcc` arrays from the webhook payload's `object` field.
+  </Step>
+  <Step title="Calculate participant count">
+    Calls `calculate_participant` to get total participant count across all arrays.
+  </Step>
+  <Step title="Process TO recipients (activity_type 2)">
+    For each TO recipient: resolves identity via `check-identity-email`, skips marketing emails, then either logs activity for an existing person or creates a new person via `name-format` + `master-person` get-add before logging. Creates `email_activity` with type 2 ("Email to [name]"), increments `total_email_activity` on `my_person`, and calls `set-primary-email_v2`.
+  </Step>
+  <Step title="Process CC recipients (activity_type 3)">
+    Same pattern as TO but with activity_type 3 ("[name] is cc'd"). Calls `set-primary-email_v2` async.
+  </Step>
+  <Step title="Process BCC recipients (activity_type 4)">
+    Same pattern as TO/CC but with activity_type 4 ("[name] is bcc'd"). Calls `set-primary-email_v2` async.
+  </Step>
+</Steps>
+
+<Accordion title="Full XanoScript — parse-from #2126">
+````text
 // parse & log email when it is sent FROM user's account
 function "mvp/activity/parse-from" {
   input {
@@ -23,36 +43,24 @@ function "mvp/activity/parse-from" {
   }
 
   stack {
-    // create array variables
-    group {
-      stack {
-        var $grantID {
-          value = $input.participants|get:"grant_id":null
-        }
-
-        var $created {
-          value = false
-        }
-
-        group {
-          stack {
-            // create TO array variable
-            var $to {
-              value = $input.participants.object|get:"to":[]
-            }
-
-            var $cc {
-              value = $input.participants.object|get:"cc":[]
-            }
-
-            var $bcc {
-              value = $input.participants.object|get:"bcc":[]
-            }
-          }
-        }
-      }
+    // ─── SETUP: extract participant arrays ───
+    var $grantID {
+      value = $input.participants|get:"grant_id":null
     }
 
+    var $to {
+      value = $input.participants.object|get:"to":[]
+    }
+
+    var $cc {
+      value = $input.participants.object|get:"cc":[]
+    }
+
+    var $bcc {
+      value = $input.participants.object|get:"bcc":[]
+    }
+
+    // ─── SETUP: calculate participant count ───
     function.run "mvp/activity/calculate_participant" {
       input = {
         to  : $to
@@ -62,30 +70,27 @@ function "mvp/activity/parse-from" {
       }
     } as $participant_count
 
-    // process TO
+    // ═══════════════════════════════════════
+    // PROCESS TO PARTICIPANTS (activity_type 2)
+    // ═══════════════════════════════════════
     foreach ($to) {
       each as $toItem {
-        // LOG activity
         group {
           stack {
             function.run "mvp/identity/check-identity-email" {
               input = {email_address: $toItem.email, user_id: $input.user_id}
             } as $identityemail
 
-            // SKIP IF MARKETING!!
-            group {
-              stack {
-                conditional {
-                  if ($identityemail|get:"marketing":null) {
-                    continue
-                  }
-                }
+            // skip marketing emails
+            conditional {
+              if ($identityemail|get:"marketing":null) {
+                continue
               }
             }
 
             conditional {
+              // ── existing person: log activity ──
               if ($identityemail.master_person_id != null) {
-                // If email belongs to a master person
                 group {
                   stack {
                     function.run "mvp/my/copy-to-my-person" {
@@ -122,7 +127,7 @@ function "mvp/activity/parse-from" {
                       }
                     } as $activity
 
-                    // get current total_email_activity before edit
+                    // increment total_email_activity
                     db.get my_person {
                       field_name = "id"
                       field_value = $copyToMy.my_person_id
@@ -148,44 +153,36 @@ function "mvp/activity/parse-from" {
                 }
               }
 
+              // ── new person: create identity then log ──
               else {
-                // If email record doesn't exist
                 group {
                   stack {
-                    group {
-                      stack {
-                        function.run "mvp/format/name-format" {
-                          input = {full_name: $toItem.name ?: "Anonymous"}
-                        } as $nameFormat
+                    function.run "mvp/format/name-format" {
+                      input = {full_name: $toItem.name ?: "Anonymous"}
+                    } as $nameFormat
 
-                        function.run "mvp/get-add/master-person" {
-                          input = {
-                            first_name    : $nameFormat.first_name
-                            last_name     : $nameFormat.last_name
-                            links         : []
-                            phone_numbers : []
-                            email         : []|push:($toItem.email|to_lower)
-                            company_name  : null
-                            title         : null
-                            data_source_id: 47
-                            user_id       : $input.user_id
-                            full_name     : $nameFormat.full_name
-                            queue         : false
-                            non_aync      : false
-                          }
-                        } as $getIdentity
-
-                        db.get master_person {
-                          field_name = "id"
-                          field_value = $getIdentity.master_person_id
-                        } as $masterPerson
-
-                        db.get master_person {
-                          field_name = "id"
-                          field_value = $getIdentity.master_person_id
-                        } as $masterPerson
+                    function.run "mvp/get-add/master-person" {
+                      input = {
+                        first_name    : $nameFormat.first_name
+                        last_name     : $nameFormat.last_name
+                        links         : []
+                        phone_numbers : []
+                        email         : []|push:($toItem.email|to_lower)
+                        company_name  : null
+                        title         : null
+                        data_source_id: 47
+                        user_id       : $input.user_id
+                        full_name     : $nameFormat.full_name
+                        queue         : false
+                        non_aync      : false
                       }
-                    }
+                    } as $getIdentity
+
+                    db.get master_person {
+                      field_name = "id"
+                      field_value = $getIdentity.master_person_id
+                      output = ["id", "name"]
+                    } as $masterPerson
 
                     function.run "mvp/my/copy-to-my-person" {
                       input = {
@@ -195,58 +192,54 @@ function "mvp/activity/parse-from" {
                       }
                     } as $copyToMy
 
-                    group {
-                      stack {
-                        db.get master_email {
-                          field_name = "email_address"
-                          field_value = $toItem.email
-                          output = ["id"]
-                        } as $masterEmail
+                    db.get master_email {
+                      field_name = "email_address"
+                      field_value = $toItem.email
+                      output = ["id"]
+                    } as $masterEmail
 
-                        db.add email_activity {
-                          data = {
-                            created_at        : "now"
-                            user_id           : $input.user_id
-                            my_person_id      : $copyToMy|get:"my_person_id":null
-                            activity_type_id  : 2
-                            card_descriptor   : "Email to"|concat:$masterPerson.name:" "
-                            activity_timestamp: $input.participants.object.date|multiply:1000
-                            subject           : $input.participants.object.subject
-                            grant_id          : $input.participants.object.grant_id
-                            thread_id         : $input.participants.object.thread_id
-                            message_id        : $input.participants.object.id
-                            snippet           : $input.participants|get:"object.snippet":null
-                            unread            : $input.participants.object.unread
-                            interlocutor_email: $identityemail.master_email_id
-                            participant_count : $participant_count
-                            data_source_id    : 14
-                            temp_email_body   : $input.participants.object.body
-                          }
-                        } as $activity
-
-                        // get current total_email_activity before edit
-                        db.get my_person {
-                          field_name = "id"
-                          field_value = $copyToMy|get:"my_person_id":null
-                          output = ["total_email_activity"]
-                        } as $currentMyPerson
-
-                        db.edit my_person {
-                          field_name = "id"
-                          field_value = $copyToMy|get:"my_person_id":null
-                          data = {
-                            updated_at                     : now
-                            last_email_activity_id         : $activity.id
-                            last_calendar_event_activity_id: null
-                            last_activity_at               : $input.participants.object.date|multiply:1000
-                            total_email_activity           : ($currentMyPerson|get:"total_email_activity":0)|add:1
-                          }
-                        }
-
-                        function.run "mvp/email/set-primary-email_v2" {
-                          input = {email_address: $toItem.email, user_id: $input.user_id}
-                        }
+                    db.add email_activity {
+                      data = {
+                        created_at        : "now"
+                        user_id           : $input.user_id
+                        my_person_id      : $copyToMy|get:"my_person_id":null
+                        activity_type_id  : 2
+                        card_descriptor   : "Email to"|concat:$masterPerson.name:" "
+                        activity_timestamp: $input.participants.object.date|multiply:1000
+                        subject           : $input.participants.object.subject
+                        grant_id          : $input.participants.object.grant_id
+                        thread_id         : $input.participants.object.thread_id
+                        message_id        : $input.participants.object.id
+                        snippet           : $input.participants|get:"object.snippet":null
+                        unread            : $input.participants.object.unread
+                        interlocutor_email: $masterEmail.id
+                        participant_count : $participant_count
+                        data_source_id    : 14
+                        temp_email_body   : $input.participants|get:"object.body":null
                       }
+                    } as $activity
+
+                    // increment total_email_activity
+                    db.get my_person {
+                      field_name = "id"
+                      field_value = $copyToMy|get:"my_person_id":null
+                      output = ["total_email_activity"]
+                    } as $currentMyPerson
+
+                    db.edit my_person {
+                      field_name = "id"
+                      field_value = $copyToMy|get:"my_person_id":null
+                      data = {
+                        updated_at                     : now
+                        last_email_activity_id         : $activity.id
+                        last_calendar_event_activity_id: null
+                        last_activity_at               : $input.participants.object.date|multiply:1000
+                        total_email_activity           : ($currentMyPerson|get:"total_email_activity":0)|add:1
+                      }
+                    }
+
+                    function.run "mvp/email/set-primary-email_v2" {
+                      input = {email_address: $toItem.email, user_id: $input.user_id}
                     }
                   }
                 }
@@ -257,30 +250,27 @@ function "mvp/activity/parse-from" {
       }
     }
 
-    // process Cc
+    // ═══════════════════════════════════════
+    // PROCESS CC PARTICIPANTS (activity_type 3)
+    // ═══════════════════════════════════════
     foreach ($cc) {
       each as $ccItem {
-        // LOG activity
         group {
           stack {
             function.run "mvp/identity/check-identity-email" {
               input = {email_address: $ccItem.email, user_id: $input.user_id}
             } as $identityemail
 
-            // SKIP IF MARKETING!!
-            group {
-              stack {
-                conditional {
-                  if ($identityemail|get:"marketing":null) {
-                    continue
-                  }
-                }
+            // skip marketing emails
+            conditional {
+              if ($identityemail|get:"marketing":null) {
+                continue
               }
             }
 
             conditional {
+              // ── existing person: log activity ──
               if ($identityemail.master_person_id != null) {
-                // If email belongs to a master person
                 group {
                   stack {
                     function.run "mvp/my/copy-to-my-person" {
@@ -302,8 +292,8 @@ function "mvp/activity/parse-from" {
                         created_at        : "now"
                         user_id           : $input.user_id
                         my_person_id      : $copyToMy|get:"my_person_id":null
-                        activity_type_id  : 2
-                        card_descriptor   : $masterPerson.name|concat:"is cc'd":""
+                        activity_type_id  : 3
+                        card_descriptor   : $masterPerson.name|concat:"is cc'd":" "
                         activity_timestamp: $input.participants.object.date|multiply:1000
                         subject           : $input.participants.object.subject
                         grant_id          : $input.participants.object.grant_id
@@ -317,7 +307,7 @@ function "mvp/activity/parse-from" {
                       }
                     } as $activity
 
-                    // get current total_email_activity before edit
+                    // increment total_email_activity
                     db.get my_person {
                       field_name = "id"
                       field_value = $copyToMy|get:"my_person_id":null
@@ -344,55 +334,58 @@ function "mvp/activity/parse-from" {
                 }
               }
 
+              // ── new person: create identity then log ──
               else {
                 group {
                   stack {
-                    group {
-                      stack {
-                        function.run "mvp/format/name-format" {
-                          input = {full_name: $ccItem.name ?: "Anonymous"}
-                        } as $nameFormat
+                    function.run "mvp/format/name-format" {
+                      input = {full_name: $ccItem.name ?: "Anonymous"}
+                    } as $nameFormat
 
-                        function.run "mvp/get-add/master-person" {
-                          input = {
-                            first_name    : $nameFormat.first_name
-                            last_name     : $nameFormat.last_name
-                            links         : []
-                            phone_numbers : []
-                            email         : []|push:($ccItem.email|to_lower)
-                            company_name  : null
-                            title         : null
-                            data_source_id: 47
-                            user_id       : $input.user_id
-                            full_name     : $nameFormat.full_name
-                            queue         : false
-                            non_aync      : false
-                          }
-                        } as $getIdentity
+                    function.run "mvp/get-add/master-person" {
+                      input = {
+                        first_name    : $nameFormat.first_name
+                        last_name     : $nameFormat.last_name
+                        links         : []
+                        phone_numbers : []
+                        email         : []|push:($ccItem.email|to_lower)
+                        company_name  : null
+                        title         : null
+                        data_source_id: 47
+                        user_id       : $input.user_id
+                        full_name     : $nameFormat.full_name
+                        queue         : false
+                        non_aync      : false
                       }
-                    }
+                    } as $getIdentity
 
                     function.run "mvp/my/copy-to-my-person" {
                       input = {
                         master_person_id: $getIdentity.master_person_id
                         user_id         : $input.user_id
-                        email_address   : ""
+                        email_address   : $ccItem.email
                       }
                     } as $copyToMy
+
+                    db.get master_person {
+                      field_name = "id"
+                      field_value = $getIdentity.master_person_id
+                      output = ["id", "name"]
+                    } as $masterPerson
 
                     db.get master_email {
                       field_name = "email_address"
                       field_value = $ccItem.email
                       output = ["id"]
-                    } as $master_email
+                    } as $masterEmail
 
                     db.add email_activity {
                       data = {
                         created_at        : "now"
                         user_id           : $input.user_id
                         my_person_id      : $copyToMy|get:"my_person_id":null
-                        activity_type_id  : 2
-                        card_descriptor   : $copyToMy.full_name|concat:"is cc'd":" "
+                        activity_type_id  : 3
+                        card_descriptor   : $masterPerson.name|concat:"is cc'd":" "
                         activity_timestamp: $input.participants.object.date|multiply:1000
                         subject           : $input.participants.object.subject
                         grant_id          : $input.participants.object.grant_id
@@ -400,13 +393,13 @@ function "mvp/activity/parse-from" {
                         message_id        : $input.participants.object.id
                         snippet           : $input.participants|get:"object.snippet":null
                         unread            : $input.participants.object.unread
-                        interlocutor_email: $master_email.id
+                        interlocutor_email: $masterEmail.id
                         participant_count : $participant_count
                         data_source_id    : 14
                       }
                     } as $activity
 
-                    // get current total_email_activity before edit
+                    // increment total_email_activity
                     db.get my_person {
                       field_name = "id"
                       field_value = $copyToMy|get:"my_person_id":null
@@ -438,30 +431,27 @@ function "mvp/activity/parse-from" {
       }
     }
 
-    // process Bcc
+    // ═══════════════════════════════════════
+    // PROCESS BCC PARTICIPANTS (activity_type 4)
+    // ═══════════════════════════════════════
     foreach ($bcc) {
       each as $bccItem {
-        // LOG activity
         group {
           stack {
             function.run "mvp/identity/check-identity-email" {
               input = {email_address: $bccItem.email, user_id: $input.user_id}
             } as $identityemail
 
-            // SKIP IF MARKETING!!
-            group {
-              stack {
-                conditional {
-                  if ($identityemail|get:"marketing":null) {
-                    continue
-                  }
-                }
+            // skip marketing emails
+            conditional {
+              if ($identityemail|get:"marketing":null) {
+                continue
               }
             }
 
             conditional {
+              // ── existing person: log activity ──
               if ($identityemail.master_person_id != null) {
-                // If email belongs to a master person
                 group {
                   stack {
                     function.run "mvp/my/copy-to-my-person" {
@@ -483,7 +473,7 @@ function "mvp/activity/parse-from" {
                         created_at        : "now"
                         user_id           : $input.user_id
                         my_person_id      : $copyToMy|get:"my_person_id":null
-                        activity_type_id  : 2
+                        activity_type_id  : 4
                         card_descriptor   : $masterPerson.name|concat:"is bcc'd":" "
                         activity_timestamp: $input.participants.object.date|multiply:1000
                         subject           : $input.participants.object.subject
@@ -498,7 +488,7 @@ function "mvp/activity/parse-from" {
                       }
                     } as $activity
 
-                    // get current total_email_activity before edit
+                    // increment total_email_activity
                     db.get my_person {
                       field_name = "id"
                       field_value = $copyToMy|get:"my_person_id":null
@@ -525,56 +515,58 @@ function "mvp/activity/parse-from" {
                 }
               }
 
+              // ── new person: create identity then log ──
               else {
-                // If email doesn't exist
                 group {
                   stack {
-                    group {
-                      stack {
-                        function.run "mvp/format/name-format" {
-                          input = {full_name: $bccItem.name ?: "Anonymous"}
-                        } as $nameFormat
+                    function.run "mvp/format/name-format" {
+                      input = {full_name: $bccItem.name ?: "Anonymous"}
+                    } as $nameFormat
 
-                        function.run "mvp/get-add/master-person" {
-                          input = {
-                            first_name    : $nameFormat.first_name
-                            last_name     : $nameFormat.last_name
-                            links         : []
-                            phone_numbers : []
-                            email         : []|push:($bccItem.email|to_lower)
-                            company_name  : null
-                            title         : null
-                            data_source_id: 47
-                            user_id       : $input.user_id
-                            full_name     : $nameFormat.full_name
-                            queue         : false
-                            non_aync      : false
-                          }
-                        } as $getIdentity
+                    function.run "mvp/get-add/master-person" {
+                      input = {
+                        first_name    : $nameFormat.first_name
+                        last_name     : $nameFormat.last_name
+                        links         : []
+                        phone_numbers : []
+                        email         : []|push:($bccItem.email|to_lower)
+                        company_name  : null
+                        title         : null
+                        data_source_id: 47
+                        user_id       : $input.user_id
+                        full_name     : $nameFormat.full_name
+                        queue         : false
+                        non_aync      : false
                       }
-                    }
+                    } as $getIdentity
 
                     function.run "mvp/my/copy-to-my-person" {
                       input = {
                         master_person_id: $getIdentity.master_person_id
                         user_id         : $input.user_id
-                        email_address   : ""
+                        email_address   : $bccItem.email
                       }
                     } as $copyToMy
+
+                    db.get master_person {
+                      field_name = "id"
+                      field_value = $getIdentity.master_person_id
+                      output = ["id", "name"]
+                    } as $masterPerson
 
                     db.get master_email {
                       field_name = "email_address"
                       field_value = $bccItem.email
                       output = ["id"]
-                    } as $master_email
+                    } as $masterEmail
 
                     db.add email_activity {
                       data = {
                         created_at        : "now"
                         user_id           : $input.user_id
                         my_person_id      : $copyToMy|get:"my_person_id":null
-                        activity_type_id  : 2
-                        card_descriptor   : $masterPerson.name|concat:"is bcc'd":""
+                        activity_type_id  : 4
+                        card_descriptor   : $masterPerson.name|concat:"is bcc'd":" "
                         activity_timestamp: $input.participants.object.date|multiply:1000
                         subject           : $input.participants.object.subject
                         grant_id          : $input.participants.object.grant_id
@@ -582,13 +574,13 @@ function "mvp/activity/parse-from" {
                         message_id        : $input.participants.object.id
                         snippet           : $input.participants|get:"object.snippet":null
                         unread            : $input.participants.object.unread
-                        interlocutor_email: $master_email.id
+                        interlocutor_email: $masterEmail.id
                         participant_count : $participant_count
                         data_source_id    : 14
                       }
                     } as $activity
 
-                    // get current total_email_activity before edit
+                    // increment total_email_activity
                     db.get my_person {
                       field_name = "id"
                       field_value = $copyToMy|get:"my_person_id":null
@@ -632,14 +624,37 @@ function "mvp/activity/parse-from" {
 
 ## parse-to — #2129
 
-Parses and logs an email activity when the email is sent TO the user's account. First resolves the sender (FROM) and logs an inbound `email_activity` with `activity_type_id = 1`. Then iterates through additional TO recipients (skipping the user's own grant email) and CC/BCC participants, logging outbound activity records (`activity_type_id = 2` for TO, `3` for CC, `4` for BCC). For unknown senders, it also triggers `email-signature-parse-process` asynchronously to extract contact details. Uses `check-identity-email-to` for identity resolution and a `$logActvity` flag to conditionally suppress duplicate activity logging when the sender was newly created.
+Processes inbound emails (sent TO the user's account). Creates activity records for the sender and all other recipients. Has a unique `$logActivity` flag that suppresses downstream activity logging when the sender is a brand-new person.
 
 ```text
 mvp/activity/parse-to — #2129
 ```
 
-<Accordion title="XanoScript — click to expand">
-````xanoscript
+### Step-by-step
+
+<Steps>
+  <Step title="Get grant info with user addon">
+    Fetches `nylas_grant` with a `user:user_id` addon to get the user's `master_person_id`.
+  </Step>
+  <Step title="Extract participant arrays + calculate count">
+    Pulls `to`, `cc`, `bcc` arrays and calls `calculate_participant`.
+  </Step>
+  <Step title="Process FROM sender (activity_type 1)">
+    Resolves the sender via `check-identity-email-to`. Three paths: (a) existing person with my_person — log activity directly, (b) brand-new person — create via get-add, log activity, parse email signature async, then set `$logActivity = false` to suppress further logging for this message, (c) marketing — skip.
+  </Step>
+  <Step title="Process TO recipients (activity_type 2)">
+    Skips the user's own email. Four paths: (a) existing person with my_person — log if `$logActivity` is true, (b) master_person exists but no my_person — copy-to-my then log, (c) brand-new person with logging enabled — create and log, (d) brand-new person with logging suppressed — just ensure person exists without creating activity.
+  </Step>
+  <Step title="Process CC recipients (activity_type 3)">
+    Same 4-path pattern as TO. Skips user's own email.
+  </Step>
+  <Step title="Process BCC recipients (activity_type 4)">
+    Same 4-path pattern as TO/CC. Skips user's own email.
+  </Step>
+</Steps>
+
+<Accordion title="Full XanoScript — parse-to #2129">
+````text
 // parse & log email when it is sent TO user's account
 function "mvp/activity/parse-to" {
   input {
@@ -648,6 +663,7 @@ function "mvp/activity/parse-to" {
   }
 
   stack {
+    // ─── SETUP: get grant info ───
     db.get nylas_grant {
       field_name = "grant_id"
       field_value = $input.participants.object.grant_id
@@ -661,32 +677,28 @@ function "mvp/activity/parse-to" {
       ]
     } as $nylasGrant
 
-    // set up variables
-    group {
-      stack {
-        var $grantID {
-          value = $input.participants|get:"grant_id":null
-        }
-
-        var $logActvity {
-          value = true
-        }
-
-        // create TO array variable
-        var $to {
-          value = $input.participants.object|get:"to":[]
-        }
-
-        var $cc {
-          value = $input.participants.object|get:"cc":[]
-        }
-
-        var $bcc {
-          value = $input.participants.object|get:"bcc":[]
-        }
-      }
+    // ─── SETUP: extract participant arrays ───
+    var $grantID {
+      value = $input.participants|get:"grant_id":null
     }
 
+    var $logActvity {
+      value = true
+    }
+
+    var $to {
+      value = $input.participants.object|get:"to":[]
+    }
+
+    var $cc {
+      value = $input.participants.object|get:"cc":[]
+    }
+
+    var $bcc {
+      value = $input.participants.object|get:"bcc":[]
+    }
+
+    // ─── SETUP: calculate participant count ───
     function.run "mvp/activity/calculate_participant" {
       input = {
         to  : $input.participants.object.to
@@ -696,182 +708,184 @@ function "mvp/activity/parse-to" {
       }
     } as $participant_count
 
-    // log who email is FROM
+    // ═══════════════════════════════════════
+    // PROCESS FROM — who sent the email (activity_type 1)
+    // ═══════════════════════════════════════
     group {
       stack {
-        group {
-          stack {
-            var $fromEmail {
-              value = $input.participants.object.from|first|get:"email":null
-            }
+        var $fromEmail {
+          value = $input.participants.object.from|first|get:"email":null
+        }
 
-            function.run "mvp/identity/check-identity-email-to" {
-              input = {email_address: $fromEmail, user_id: $input.user_id}
-            } as $identityEmail
+        function.run "mvp/identity/check-identity-email-to" {
+          input = {email_address: $fromEmail, user_id: $input.user_id}
+        } as $identityEmail
 
-            // SKIP IF MARKETING!!
+        // skip marketing emails
+        conditional {
+          if ($identityEmail|get:"marketing":null) {
+            continue
+          }
+        }
+
+        conditional {
+          // ── existing person with my_person: log activity ──
+          if ($identityEmail.my_person_id != null && $identityEmail.master_person_id != null) {
             group {
               stack {
-                conditional {
-                  if ($identityEmail|get:"marketing":null) {
-                    continue
+                db.get master_person {
+                  field_name = "id"
+                  field_value = $identityEmail.master_person_id
+                  output = ["id", "name"]
+                } as $masterPerson
+
+                db.add email_activity {
+                  data = {
+                    created_at        : "now"
+                    user_id           : $input.user_id
+                    my_person_id      : $identityEmail.my_person_id
+                    activity_type_id  : 1
+                    card_descriptor   : "Email from"|concat:$masterPerson.name:" "
+                    activity_timestamp: $input.participants.object.date|multiply:1000
+                    subject           : $input.participants.object.subject
+                    grant_id          : $input.participants.object.grant_id
+                    thread_id         : $input.participants.object.thread_id
+                    message_id        : $input.participants.object.id
+                    snippet           : $input.participants|get:"object.snippet":null
+                    unread            : $input.participants.object.unread
+                    interlocutor_email: $identityEmail.master_email_id
+                    participant_count : $participant_count
+                    data_source_id    : 14
+                  }
+                } as $activity
+
+                // increment total_email_activity
+                db.get my_person {
+                  field_name = "id"
+                  field_value = $identityEmail.my_person_id
+                  output = ["total_email_activity"]
+                } as $currentMyPerson
+
+                db.edit my_person {
+                  field_name = "id"
+                  field_value = $identityEmail.my_person_id
+                  data = {
+                    updated_at                     : now
+                    last_email_activity_id         : $activity.id
+                    last_calendar_event_activity_id: null
+                    last_activity_at               : $input.participants.object.date|multiply:1000
+                    total_email_activity           : ($currentMyPerson|get:"total_email_activity":0)|add:1
                   }
                 }
               }
             }
+          }
 
-            // user has this contact in my_person
-            conditional {
-              if ($identityEmail.my_person_id != null && $identityEmail.master_person_id != null) {
-                group {
-                  stack {
-                    db.get master_person {
-                      field_name = "id"
-                      field_value = $identityEmail.master_person_id
-                      output = ["id", "name"]
-                    } as $masterPerson
-
-                    db.add email_activity {
-                      data = {
-                        created_at        : "now"
-                        user_id           : $input.user_id
-                        my_person_id      : $identityEmail.my_person_id
-                        activity_type_id  : 1
-                        card_descriptor   : "Email from"|concat:$masterPerson.name:" "
-                        activity_timestamp: $input.participants.object.date|multiply:1000
-                        subject           : $input.participants.object.subject
-                        grant_id          : $input.participants.object.grant_id
-                        thread_id         : $input.participants.object.thread_id
-                        message_id        : $input.participants.object.id
-                        snippet           : $input.participants|get:"object.snippet":null
-                        unread            : $input.participants.object.unread
-                        interlocutor_email: $identityEmail.master_email_id
-                        participant_count : $participant_count
-                        data_source_id    : 14
-                      }
-                    } as $activity
-
-                    db.edit my_person {
-                      field_name = "id"
-                      field_value = $identityEmail.my_person_id
-                      data = {
-                        updated_at                     : now
-                        last_email_activity_id         : $activity.id
-                        last_calendar_event_activity_id: null
-                        last_activity_at               : $input.participants.object.date|multiply:1000
-                      }
-
-                      output = []
-                    }
+          // ── new person: create identity, log, then suppress further activity logging ──
+          elseif ($identityEmail.master_person_id == null) {
+            group {
+              stack {
+                function.run "mvp/format/name-format" {
+                  input = {
+                    full_name: $input.participants.object.from|first|get:"name":null
                   }
-                }
-              }
+                } as $nameFormat
 
-              elseif ($identityEmail.master_person_id == null) {
-                group {
-                  stack {
-                    function.run "mvp/format/name-format" {
-                      input = {
-                        full_name: $input.participants.object.from|first|get:"name":null
-                      }
-                    } as $nameFormat
+                function.run "mvp/get-add/master-person" {
+                  input = {
+                    first_name    : $nameFormat.first_name
+                    last_name     : $nameFormat.last_name
+                    links         : []
+                    phone_numbers : []
+                    email         : []|push:($fromEmail|to_lower)
+                    company_name  : null
+                    title         : null
+                    data_source_id: 47
+                    user_id       : $input.user_id
+                    full_name     : $nameFormat.full_name
+                    queue         : false
+                    non_aync      : false
+                  }
+                } as $getIdentity
 
-                    function.run "mvp/get-add/master-person" {
-                      input = {
-                        first_name    : $nameFormat.first_name
-                        last_name     : $nameFormat.last_name
-                        links         : []
-                        phone_numbers : []
-                        email         : []|push:($fromEmail|to_lower)
-                        company_name  : null
-                        title         : null
-                        data_source_id: 47
-                        user_id       : $input.user_id
-                        full_name     : $nameFormat.full_name
-                        queue         : false
-                        non_aync      : false
-                      }
-                    } as $getIdentity
+                function.run "mvp/my/copy-to-my-person" {
+                  input = {
+                    master_person_id: $getIdentity.master_person_id
+                    user_id         : $input.user_id
+                    email_address   : $fromEmail
+                  }
+                } as $copyToMy
 
-                    function.run "mvp/my/copy-to-my-person" {
-                      input = {
-                        master_person_id: $getIdentity.master_person_id
-                        user_id         : $input.user_id
-                        email_address   : $fromEmail
-                      }
-                    } as $copyToMy
+                db.get master_email {
+                  field_name = "email_address"
+                  field_value = $fromEmail
+                  output = ["id"]
+                } as $masterEmail
 
-                    group {
-                      stack {
-                        db.get master_email {
-                          field_name = "email_address"
-                          field_value = $fromEmail
-                          output = ["id"]
-                        } as $masterEmail
+                db.add email_activity {
+                  data = {
+                    created_at        : "now"
+                    user_id           : $input.user_id
+                    my_person_id      : $copyToMy|get:"my_person_id":null
+                    activity_type_id  : 1
+                    card_descriptor   : "Email from"|concat:$getIdentity.full_name:" "
+                    activity_timestamp: $input.participants.object.date|multiply:1000
+                    subject           : $input.participants.object.subject
+                    grant_id          : $input.participants.object.grant_id
+                    thread_id         : $input.participants.object.thread_id
+                    message_id        : $input.participants.object.id
+                    snippet           : $input.participants|get:"object.snippet":null
+                    unread            : $input.participants.object.unread
+                    interlocutor_email: $masterEmail.id
+                    participant_count : $participant_count
+                    data_source_id    : 14
+                    temp_email_body   : $input.participants|get:"object.body":null
+                  }
+                } as $activity
 
-                        db.add email_activity {
-                          data = {
-                            created_at        : "now"
-                            user_id           : $input.user_id
-                            my_person_id      : $copyToMy|get:"my_person_id":null
-                            activity_type_id  : 2
-                            card_descriptor   : "Email from"|concat:$getIdentity.full_name:" "
-                            activity_timestamp: $input.participants.object.date|multiply:1000
-                            subject           : $input.participants.object.subject
-                            grant_id          : $input.participants.object.grant_id
-                            thread_id         : $input.participants.object.thread_id
-                            message_id        : $input.participants.object.id
-                            snippet           : $input.participants|get:"object.snippet":null
-                            unread            : $input.participants.object.unread
-                            interlocutor_email: $masterEmail.id
-                            participant_count : $participant_count
-                            data_source_id    : 14
-                            temp_email_body   : $input.participants.object.body
-                          }
-                        } as $activity
+                // increment total_email_activity
+                db.get my_person {
+                  field_name = "id"
+                  field_value = $copyToMy|get:"my_person_id":null
+                  output = ["total_email_activity"]
+                } as $currentMyPerson
 
-                        db.edit my_person {
-                          field_name = "id"
-                          field_value = $copyToMy|get:"my_person_id":null
-                          data = {
-                            updated_at                     : now
-                            last_email_activity_id         : $activity.id
-                            last_calendar_event_activity_id: null
-                            last_activity_at               : $input.participants.object.date|multiply:1000
-                          }
-
-                          output = []
-                        }
-
-                        function.run "mvp/email/set-primary-email_v2" {
-                          input = {email_address: $fromEmail, user_id: $input.user_id}
-                        }
-
-                        // parse signature
-                        group {
-                          stack {
-                            function.run "mvp/signature/email-signature-parse-process" {
-                              runtime_mode = "async-shared"
-                              input = {email_address: $fromEmail, grant_id: $grantID}
-                            }
-                          }
-                        }
-                      }
-                    }
+                db.edit my_person {
+                  field_name = "id"
+                  field_value = $copyToMy|get:"my_person_id":null
+                  data = {
+                    updated_at                     : now
+                    last_email_activity_id         : $activity.id
+                    last_calendar_event_activity_id: null
+                    last_activity_at               : $input.participants.object.date|multiply:1000
+                    total_email_activity           : ($currentMyPerson|get:"total_email_activity":0)|add:1
                   }
                 }
 
-                var.update $logActvity {
-                  value = false
+                function.run "mvp/email/set-primary-email_v2" {
+                  input = {email_address: $fromEmail, user_id: $input.user_id}
+                }
+
+                // parse signature async
+                function.run "mvp/signature/email-signature-parse-process" {
+                  runtime_mode = "async-shared"
+                  input = {email_address: $fromEmail, grant_id: $grantID}
                 }
               }
+            }
+
+            // suppress activity logging for TO/CC/BCC when sender is new
+            var.update $logActvity {
+              value = false
             }
           }
         }
       }
     }
 
-    // log who email is TO
+    // ═══════════════════════════════════════
+    // PROCESS TO — other recipients (activity_type 2)
+    // ═══════════════════════════════════════
     foreach ($to) {
       each as $toItem {
         conditional {
@@ -880,27 +894,21 @@ function "mvp/activity/parse-to" {
           }
 
           else {
-            // there is ANOTHER "To:"(s) on email ogther than User
-
             group {
               stack {
                 function.run "mvp/identity/check-identity-email-to" {
                   input = {email_address: $toItem.email, user_id: $input.user_id}
                 } as $identityEmail
 
-                // SKIP IF MARKETING!!
-                group {
-                  stack {
-                    conditional {
-                      if ($identityEmail|get:"marketing":null) {
-                        continue
-                      }
-                    }
+                // skip marketing emails
+                conditional {
+                  if ($identityEmail|get:"marketing":null) {
+                    continue
                   }
                 }
 
-                // user has this contact in my_person
                 conditional {
+                  // ── existing person with my_person: log activity ──
                   if ($identityEmail.my_person_id != null && $identityEmail.master_person_id != null && $logActvity) {
                     group {
                       stack {
@@ -930,6 +938,13 @@ function "mvp/activity/parse-to" {
                           }
                         } as $activity
 
+                        // increment total_email_activity
+                        db.get my_person {
+                          field_name = "id"
+                          field_value = $identityEmail.my_person_id
+                          output = ["total_email_activity"]
+                        } as $currentMyPerson
+
                         db.edit my_person {
                           field_name = "id"
                           field_value = $identityEmail.my_person_id
@@ -938,14 +953,14 @@ function "mvp/activity/parse-to" {
                             last_email_activity_id         : $activity.id
                             last_calendar_event_activity_id: null
                             last_activity_at               : $input.participants.object.date|multiply:1000
+                            total_email_activity           : ($currentMyPerson|get:"total_email_activity":0)|add:1
                           }
-
-                          output = []
                         }
                       }
                     }
                   }
 
+                  // ── master person exists but no my_person yet: copy and log ──
                   elseif ($identityEmail.master_person_id != null && $identityEmail.my_person_id == null && $logActvity) {
                     db.get master_person {
                       field_name = "id"
@@ -981,6 +996,13 @@ function "mvp/activity/parse-to" {
                       }
                     } as $activity
 
+                    // increment total_email_activity
+                    db.get my_person {
+                      field_name = "id"
+                      field_value = $copyToMyFrom.my_person_id
+                      output = ["total_email_activity"]
+                    } as $currentMyPerson
+
                     db.edit my_person {
                       field_name = "id"
                       field_value = $copyToMyFrom.my_person_id
@@ -989,12 +1011,12 @@ function "mvp/activity/parse-to" {
                         last_email_activity_id         : $activity.id
                         last_calendar_event_activity_id: null
                         last_activity_at               : $input.participants.object.date|multiply:1000
+                        total_email_activity           : ($currentMyPerson|get:"total_email_activity":0)|add:1
                       }
-
-                      output = []
                     }
                   }
 
+                  // ── completely new person: create identity and log ──
                   elseif ($identityEmail.master_person_id == null) {
                     group {
                       stack {
@@ -1030,6 +1052,7 @@ function "mvp/activity/parse-to" {
                         db.get master_person {
                           field_name = "id"
                           field_value = $getIdentity.master_person_id
+                          output = ["id", "name"]
                         } as $masterPerson
 
                         db.add email_activity {
@@ -1052,16 +1075,12 @@ function "mvp/activity/parse-to" {
                           }
                         } as $activity
 
-                        // parse signature
-                        group {
-                          stack {
-                            db.get person_enrich_data {
-                              field_name = "id"
-                              field_value = $masterPerson.id
-                              output = ["email_signature"]
-                            } as $personEnrichData
-                          }
-                        }
+                        // increment total_email_activity
+                        db.get my_person {
+                          field_name = "id"
+                          field_value = $copyToMy.my_person_id
+                          output = ["total_email_activity"]
+                        } as $currentMyPerson
 
                         db.edit my_person {
                           field_name = "id"
@@ -1071,9 +1090,8 @@ function "mvp/activity/parse-to" {
                             last_email_activity_id         : $activity.id
                             last_calendar_event_activity_id: null
                             last_activity_at               : $input.participants.object.date|multiply:1000
+                            total_email_activity           : ($currentMyPerson|get:"total_email_activity":0)|add:1
                           }
-
-                          output = []
                         }
                       }
                     }
@@ -1086,7 +1104,9 @@ function "mvp/activity/parse-to" {
       }
     }
 
-    // log CCs on email
+    // ═══════════════════════════════════════
+    // PROCESS CC PARTICIPANTS (activity_type 3)
+    // ═══════════════════════════════════════
     foreach ($cc) {
       each as $ccItem {
         conditional {
@@ -1101,19 +1121,15 @@ function "mvp/activity/parse-to" {
                   input = {email_address: $ccItem.email, user_id: $input.user_id}
                 } as $identityEmail
 
-                // SKIP IF MARKETING!!
-                group {
-                  stack {
-                    conditional {
-                      if ($identityEmail|get:"marketing":null) {
-                        continue
-                      }
-                    }
+                // skip marketing emails
+                conditional {
+                  if ($identityEmail|get:"marketing":null) {
+                    continue
                   }
                 }
 
-                // user has this contact in my_person
                 conditional {
+                  // ── existing person with my_person: log activity ──
                   if ($identityEmail.my_person_id != null && $identityEmail.master_person_id != null && $logActvity) {
                     db.get master_person {
                       field_name = "id"
@@ -1142,6 +1158,13 @@ function "mvp/activity/parse-to" {
                       }
                     } as $activity
 
+                    // increment total_email_activity
+                    db.get my_person {
+                      field_name = "id"
+                      field_value = $identityEmail.my_person_id
+                      output = ["total_email_activity"]
+                    } as $currentMyPerson
+
                     db.edit my_person {
                       field_name = "id"
                       field_value = $identityEmail.my_person_id
@@ -1150,16 +1173,17 @@ function "mvp/activity/parse-to" {
                         last_email_activity_id         : $activity.id
                         last_calendar_event_activity_id: null
                         last_activity_at               : $input.participants.object.date|multiply:1000
+                        total_email_activity           : ($currentMyPerson|get:"total_email_activity":0)|add:1
                       }
-
-                      output = []
                     }
                   }
 
+                  // ── master person exists but no my_person yet: copy and log ──
                   elseif ($identityEmail.master_person_id != null && $identityEmail.my_person_id == null && $logActvity) {
                     db.get master_person {
                       field_name = "id"
                       field_value = $identityEmail.master_person_id
+                      output = ["id", "name"]
                     } as $masterPerson
 
                     function.run "mvp/my/copy-to-my-person" {
@@ -1190,6 +1214,13 @@ function "mvp/activity/parse-to" {
                       }
                     } as $activity
 
+                    // increment total_email_activity
+                    db.get my_person {
+                      field_name = "id"
+                      field_value = $copyToMyFrom.my_person_id
+                      output = ["total_email_activity"]
+                    } as $currentMyPerson
+
                     db.edit my_person {
                       field_name = "id"
                       field_value = $copyToMyFrom.my_person_id
@@ -1198,99 +1229,99 @@ function "mvp/activity/parse-to" {
                         last_email_activity_id         : $activity.id
                         last_calendar_event_activity_id: null
                         last_activity_at               : $input.participants.object.date|multiply:1000
+                        total_email_activity           : ($currentMyPerson|get:"total_email_activity":0)|add:1
                       }
-
-                      output = []
                     }
                   }
 
+                  // ── completely new person + logging enabled: create and log ──
                   elseif ($identityEmail.master_person_id == null && $logActvity) {
                     group {
                       stack {
-                        group {
-                          stack {
-                            group {
-                              stack {
-                                function.run "mvp/format/name-format" {
-                                  input = {full_name: $ccItem.name ?: "Anonymous"}
-                                } as $nameFormat
+                        function.run "mvp/format/name-format" {
+                          input = {full_name: $ccItem.name ?: "Anonymous"}
+                        } as $nameFormat
 
-                                function.run "mvp/get-add/master-person" {
-                                  input = {
-                                    first_name    : $nameFormat.first_name
-                                    last_name     : $nameFormat.last_name
-                                    links         : []
-                                    phone_numbers : []
-                                    email         : []|push:($ccItem.email|to_lower)
-                                    company_name  : null
-                                    title         : null
-                                    data_source_id: 47
-                                    user_id       : $input.user_id
-                                    full_name     : $nameFormat.full_name
-                                    queue         : false
-                                    non_aync      : false
-                                  }
-                                } as $getIdentity
-                              }
-                            }
+                        function.run "mvp/get-add/master-person" {
+                          input = {
+                            first_name    : $nameFormat.first_name
+                            last_name     : $nameFormat.last_name
+                            links         : []
+                            phone_numbers : []
+                            email         : []|push:($ccItem.email|to_lower)
+                            company_name  : null
+                            title         : null
+                            data_source_id: 47
+                            user_id       : $input.user_id
+                            full_name     : $nameFormat.full_name
+                            queue         : false
+                            non_aync      : false
+                          }
+                        } as $getIdentity
 
-                            db.get master_person {
-                              field_name = "id"
-                              field_value = $getIdentity.master_person_id
-                            } as $masterPerson
+                        db.get master_person {
+                          field_name = "id"
+                          field_value = $getIdentity.master_person_id
+                          output = ["id", "name"]
+                        } as $masterPerson
 
-                            function.run "mvp/my/copy-to-my-person" {
-                              input = {
-                                master_person_id: $masterPerson.id
-                                user_id         : $input.user_id
-                                email_address   : ""
-                              }
-                            } as $copyToMyFrom
+                        function.run "mvp/my/copy-to-my-person" {
+                          input = {
+                            master_person_id: $masterPerson.id
+                            user_id         : $input.user_id
+                            email_address   : ""
+                          }
+                        } as $copyToMyFrom
 
-                            db.add email_activity {
-                              data = {
-                                created_at        : "now"
-                                user_id           : $input.user_id
-                                my_person_id      : $copyToMyFrom.my_person_id
-                                activity_type_id  : 3
-                                card_descriptor   : $masterPerson.name|concat:"is cc'd":" "
-                                activity_timestamp: $input.participants.object.date|multiply:1000
-                                subject           : $input.participants.object.subject
-                                grant_id          : $input.participants.object.grant_id
-                                thread_id         : $input.participants.object.thread_id
-                                message_id        : $input.participants.object.id
-                                snippet           : $input.participants|get:"object.snippet":null
-                                unread            : $input.participants.object.unread
-                                interlocutor_email: $identityEmail.master_email_id
-                                participant_count : $participant_count
-                                data_source_id    : 14
-                                temp_email_body   : $input.participants|get:"object.body":null
-                              }
-                            } as $activity
+                        db.add email_activity {
+                          data = {
+                            created_at        : "now"
+                            user_id           : $input.user_id
+                            my_person_id      : $copyToMyFrom.my_person_id
+                            activity_type_id  : 3
+                            card_descriptor   : $masterPerson.name|concat:"is cc'd":" "
+                            activity_timestamp: $input.participants.object.date|multiply:1000
+                            subject           : $input.participants.object.subject
+                            grant_id          : $input.participants.object.grant_id
+                            thread_id         : $input.participants.object.thread_id
+                            message_id        : $input.participants.object.id
+                            snippet           : $input.participants|get:"object.snippet":null
+                            unread            : $input.participants.object.unread
+                            interlocutor_email: $identityEmail.master_email_id
+                            participant_count : $participant_count
+                            data_source_id    : 14
+                            temp_email_body   : $input.participants|get:"object.body":null
+                          }
+                        } as $activity
 
-                            db.edit my_person {
-                              field_name = "id"
-                              field_value = $copyToMyFrom.my_person_id
-                              data = {
-                                updated_at                     : now
-                                last_email_activity_id         : $activity.id
-                                last_calendar_event_activity_id: null
-                                last_activity_at               : $input.participants.object.date|multiply:1000
-                              }
+                        // increment total_email_activity
+                        db.get my_person {
+                          field_name = "id"
+                          field_value = $copyToMyFrom.my_person_id
+                          output = ["total_email_activity"]
+                        } as $currentMyPerson
 
-                              output = []
-                            }
+                        db.edit my_person {
+                          field_name = "id"
+                          field_value = $copyToMyFrom.my_person_id
+                          data = {
+                            updated_at                     : now
+                            last_email_activity_id         : $activity.id
+                            last_calendar_event_activity_id: null
+                            last_activity_at               : $input.participants.object.date|multiply:1000
+                            total_email_activity           : ($currentMyPerson|get:"total_email_activity":0)|add:1
                           }
                         }
                       }
                     }
                   }
 
+                  // ── new person but logging suppressed: just ensure person exists ──
                   elseif ($identityEmail.master_person_id == null && $logActvity == false) {
                     group {
                       stack {
                         function.run "mvp/format/name-format" {
-                          input = {full_name: $toItem.name ?: "Anonymous"}
+                          input = {full_name: $ccItem.name ?: "Anonymous"}
                         } as $nameFormat
 
                         function.run "mvp/get-add/master-person" {
@@ -1320,7 +1351,9 @@ function "mvp/activity/parse-to" {
       }
     }
 
-    // log BCC's on emails
+    // ═══════════════════════════════════════
+    // PROCESS BCC PARTICIPANTS (activity_type 4)
+    // ═══════════════════════════════════════
     foreach ($bcc) {
       each as $bccItem {
         conditional {
@@ -1335,19 +1368,15 @@ function "mvp/activity/parse-to" {
                   input = {email_address: $bccItem.email, user_id: $input.user_id}
                 } as $identityEmail
 
-                // SKIP IF MARKETING!!
-                group {
-                  stack {
-                    conditional {
-                      if ($identityEmail|get:"marketing":null) {
-                        continue
-                      }
-                    }
+                // skip marketing emails
+                conditional {
+                  if ($identityEmail|get:"marketing":null) {
+                    continue
                   }
                 }
 
-                // user has this contact in my_person
                 conditional {
+                  // ── existing person with my_person: log activity ──
                   if ($identityEmail.my_person_id != null && $identityEmail.master_person_id != null && $logActvity) {
                     db.get master_person {
                       field_name = "id"
@@ -1375,6 +1404,13 @@ function "mvp/activity/parse-to" {
                       }
                     } as $activity
 
+                    // increment total_email_activity
+                    db.get my_person {
+                      field_name = "id"
+                      field_value = $identityEmail.my_person_id
+                      output = ["total_email_activity"]
+                    } as $currentMyPerson
+
                     db.edit my_person {
                       field_name = "id"
                       field_value = $identityEmail.my_person_id
@@ -1383,17 +1419,17 @@ function "mvp/activity/parse-to" {
                         last_email_activity_id         : $activity.id
                         last_calendar_event_activity_id: null
                         last_activity_at               : $input.participants.object.date|multiply:1000
+                        total_email_activity           : ($currentMyPerson|get:"total_email_activity":0)|add:1
                       }
-
-                      output = []
                     }
                   }
 
+                  // ── master person exists but no my_person yet: copy and log ──
                   elseif ($identityEmail.master_person_id != null && $identityEmail.my_person_id == null && $logActvity) {
                     db.get master_person {
                       field_name = "id"
                       field_value = $identityEmail.master_person_id
-                      output = ["id", "name", "email_signature_parsed"]
+                      output = ["id", "name"]
                     } as $masterPerson
 
                     function.run "mvp/my/copy-to-my-person" {
@@ -1425,6 +1461,13 @@ function "mvp/activity/parse-to" {
                       }
                     } as $activity
 
+                    // increment total_email_activity
+                    db.get my_person {
+                      field_name = "id"
+                      field_value = $copyToMyFrom.my_person_id
+                      output = ["total_email_activity"]
+                    } as $currentMyPerson
+
                     db.edit my_person {
                       field_name = "id"
                       field_value = $copyToMyFrom.my_person_id
@@ -1433,12 +1476,12 @@ function "mvp/activity/parse-to" {
                         last_email_activity_id         : $activity.id
                         last_calendar_event_activity_id: null
                         last_activity_at               : $input.participants.object.date|multiply:1000
+                        total_email_activity           : ($currentMyPerson|get:"total_email_activity":0)|add:1
                       }
-
-                      output = []
                     }
                   }
 
+                  // ── completely new person + logging enabled: create and log ──
                   elseif ($identityEmail.master_person_id == null && $logActvity) {
                     group {
                       stack {
@@ -1462,57 +1505,64 @@ function "mvp/activity/parse-to" {
                             non_aync      : false
                           }
                         } as $getIdentity
+
+                        db.get master_person {
+                          field_name = "id"
+                          field_value = $getIdentity.master_person_id
+                          output = ["id", "name"]
+                        } as $masterPerson
+
+                        function.run "mvp/my/copy-to-my-person" {
+                          input = {
+                            master_person_id: $masterPerson.id
+                            user_id         : $input.user_id
+                            email_address   : ""
+                          }
+                        } as $copyToMyFrom
+
+                        db.add email_activity {
+                          data = {
+                            created_at        : "now"
+                            user_id           : $input.user_id
+                            my_person_id      : $copyToMyFrom.my_person_id
+                            activity_type_id  : 4
+                            card_descriptor   : $masterPerson.name|concat:"is bcc'd":" "
+                            activity_timestamp: $input.participants.object.date|multiply:1000
+                            subject           : $input.participants.object.subject
+                            grant_id          : $input.participants.object.grant_id
+                            thread_id         : $input.participants.object.thread_id
+                            message_id        : $input.participants.object.id
+                            snippet           : $input.participants|get:"object.snippet":null
+                            unread            : $input.participants.object.unread
+                            interlocutor_email: $identityEmail.master_email_id
+                            participant_count : $participant_count
+                            data_source_id    : 14
+                          }
+                        } as $activity
+
+                        // increment total_email_activity
+                        db.get my_person {
+                          field_name = "id"
+                          field_value = $copyToMyFrom.my_person_id
+                          output = ["total_email_activity"]
+                        } as $currentMyPerson
+
+                        db.edit my_person {
+                          field_name = "id"
+                          field_value = $copyToMyFrom.my_person_id
+                          data = {
+                            updated_at                     : now
+                            last_email_activity_id         : $activity.id
+                            last_calendar_event_activity_id: null
+                            last_activity_at               : $input.participants.object.date|multiply:1000
+                            total_email_activity           : ($currentMyPerson|get:"total_email_activity":0)|add:1
+                          }
+                        }
                       }
-                    }
-
-                    db.get master_person {
-                      field_name = "id"
-                      field_value = $getIdentity.master_person_id
-                      output = ["id", "name", "email_signature_parsed"]
-                    } as $masterPerson
-
-                    function.run "mvp/my/copy-to-my-person" {
-                      input = {
-                        master_person_id: $masterPerson.id
-                        user_id         : $input.user_id
-                        email_address   : ""
-                      }
-                    } as $copyToMyFrom
-
-                    db.add email_activity {
-                      data = {
-                        created_at        : "now"
-                        user_id           : $input.user_id
-                        my_person_id      : $copyToMyFrom.my_person_id
-                        activity_type_id  : 4
-                        card_descriptor   : $masterPerson.name|concat:"is bcc'd":" "
-                        activity_timestamp: $input.participants.object.date|multiply:1000
-                        subject           : $input.participants.object.subject
-                        grant_id          : $input.participants.object.grant_id
-                        thread_id         : $input.participants.object.thread_id
-                        message_id        : $input.participants.object.id
-                        snippet           : $input.participants|get:"object.snippet":null
-                        unread            : $input.participants.object.unread
-                        interlocutor_email: $identityEmail.master_email_id
-                        participant_count : $participant_count
-                        data_source_id    : 14
-                      }
-                    } as $activity
-
-                    db.edit my_person {
-                      field_name = "id"
-                      field_value = $copyToMyFrom.my_person_id
-                      data = {
-                        updated_at                     : now
-                        last_email_activity_id         : $activity.id
-                        last_calendar_event_activity_id: null
-                        last_activity_at               : $input.participants.object.date|multiply:1000
-                      }
-
-                      output = []
                     }
                   }
 
+                  // ── new person but logging suppressed: just ensure person exists ──
                   elseif ($identityEmail.master_person_id == null && $logActvity == false) {
                     group {
                       stack {
@@ -1558,14 +1608,37 @@ function "mvp/activity/parse-to" {
 
 ## parse-cc — #2132
 
-Parses and logs an email activity when the user's account is CC'd or BCC'd on the message. Looks up the Nylas grant to identify the user's own email account, then processes all four participant lists -- TO, FROM, CC, and BCC -- skipping the user's own address in each loop. For TO and CC participants it writes `activity_type_id = 2` (sent) or `3` (cc'd); for FROM it writes `activity_type_id = 1` (received); for BCC it writes `activity_type_id = 4`. Each participant is resolved or created via `check-identity-email` and `get-add/master-person`, copied into the user's address book, and triggers an async `email-signature-parse-process` call. Marketing-flagged contacts are skipped.
+Processes emails where the user is CC'd or BCC'd. Creates activity records across all four participant lists (TO, FROM, CC, BCC) from the CC perspective.
 
 ```text
 mvp/activity/parse-cc — #2132
 ```
 
-<Accordion title="XanoScript — click to expand">
-````xanoscript
+### Step-by-step
+
+<Steps>
+  <Step title="Get grant info">
+    Fetches `nylas_grant` to identify the user's email account.
+  </Step>
+  <Step title="Extract all four participant arrays + calculate count">
+    Pulls `to`, `from`, `cc`, and `bcc` arrays and calls `calculate_participant`.
+  </Step>
+  <Step title="Process TO participants (activity_type 2)">
+    Skips the user's own email. For each recipient: resolves identity, skips marketing, then either logs for existing person (and triggers async signature parsing) or creates new person via get-add before logging.
+  </Step>
+  <Step title="Process FROM participants (activity_type 1)">
+    Skips the user's own email. Same pattern — creates "Email from [name]" activities. Triggers async signature parsing for all senders.
+  </Step>
+  <Step title="Process CC participants (activity_type 3)">
+    Skips the user's own email. Creates "[name] is cc'd" activities with same resolve/create pattern.
+  </Step>
+  <Step title="Process BCC participants (activity_type 4)">
+    Skips the user's own email. Creates "[name] is bcc'd" activities with same pattern.
+  </Step>
+</Steps>
+
+<Accordion title="Full XanoScript — parse-cc #2132">
+````text
 // parse & log email when user's account is CC'd
 function "mvp/activity/parse-cc" {
   input {
@@ -1574,55 +1647,42 @@ function "mvp/activity/parse-cc" {
   }
 
   stack {
+    // ─── SETUP: get grant info ───
     db.get nylas_grant {
       field_name = "grant_id"
       field_value = $input.participants.object.grant_id
       output = ["id", "user_id", "grant_id", "email_account", "ai_enabled"]
-      addon = [
-        {
-          name  : "user:user_id"
-          output: ["id", "user_login_name"]
-          input : {user_id: $input.user_id}
-          as    : "user"
-        }
-      ]
     } as $nylasGrant
 
-    // set up variables
-    group {
-      stack {
-        var $grantID {
-          value = $input.participants|get:"grant_id":null
-        }
-
-        var $to {
-          value = $input.participants.object|get:"to":[]
-        }
-
-        var $from {
-          value = $input.participants.object|get:"from":[]
-        }
-
-        var $cc {
-          value = $input.participants.object|get:"cc":[]
-        }
-
-        var $bcc {
-          value = $input.participants.object|get:"bcc":[]
-        }
-      }
+    // ─── SETUP: extract participant arrays ───
+    var $grantID {
+      value = $input.participants|get:"grant_id":null
     }
 
+    var $to {
+      value = $input.participants.object|get:"to":[]
+    }
+
+    var $from {
+      value = $input.participants.object|get:"from":[]
+    }
+
+    var $cc {
+      value = $input.participants.object|get:"cc":[]
+    }
+
+    var $bcc {
+      value = $input.participants.object|get:"bcc":[]
+    }
+
+    // ─── SETUP: calculate participant count ───
     function.run "mvp/activity/calculate_participant" {
-      input = {
-        to  : $input.participants.object.to
-        from: $input.participants.object.from
-        cc  : $input.participants.object.cc ?: []
-        bcc : $input.participants.object.from ?: []
-      }
+      input = {to: $to, from: $from, cc: $cc, bcc: $bcc}
     } as $participant_count
 
-    // process TO
+    // ═══════════════════════════════════════
+    // PROCESS TO PARTICIPANTS (activity_type 2)
+    // ═══════════════════════════════════════
     foreach ($to) {
       each as $toItem {
         conditional {
@@ -1631,25 +1691,21 @@ function "mvp/activity/parse-cc" {
           }
 
           else {
-            // LOG activity
             group {
               stack {
                 function.run "mvp/identity/check-identity-email" {
                   input = {email_address: $toItem.email, user_id: $input.user_id}
                 } as $identityemail
 
-                // SKIP IF MARKETING!!
-                group {
-                  stack {
-                    conditional {
-                      if ($identityemail|get:"marketing":null) {
-                        continue
-                      }
-                    }
+                // skip marketing emails
+                conditional {
+                  if ($identityemail|get:"marketing":null) {
+                    continue
                   }
                 }
 
                 conditional {
+                  // ── existing person: log activity ──
                   if ($identityemail.master_person_id != null && $identityemail.my_person_id != null) {
                     group {
                       stack {
@@ -1663,7 +1719,7 @@ function "mvp/activity/parse-cc" {
                           data = {
                             created_at        : "now"
                             user_id           : $input.user_id
-                            my_person_id      : $identityemail|get:"my_person_id":null
+                            my_person_id      : $identityemail.my_person_id
                             activity_type_id  : 2
                             card_descriptor   : "Email to"|concat:$masterPerson.name:" "
                             activity_timestamp: $input.participants.object.date|multiply:1000
@@ -1679,7 +1735,7 @@ function "mvp/activity/parse-cc" {
                           }
                         } as $activity
 
-                        // get current total_email_activity before edit
+                        // increment total_email_activity
                         db.get my_person {
                           field_name = "id"
                           field_value = $identityemail.my_person_id
@@ -1690,14 +1746,15 @@ function "mvp/activity/parse-cc" {
                           field_name = "id"
                           field_value = $identityemail.my_person_id
                           data = {
-                            updated_at            : now
-                            last_email_activity_id: $activity.id
-                            last_activity_at      : $input.participants.object.date|multiply:1000
-                            total_email_activity  : ($currentMyPerson|get:"total_email_activity":0)|add:1
+                            updated_at                     : now
+                            last_email_activity_id         : $activity.id
+                            last_calendar_event_activity_id: null
+                            last_activity_at               : $input.participants.object.date|multiply:1000
+                            total_email_activity           : ($currentMyPerson|get:"total_email_activity":0)|add:1
                           }
                         }
 
-                        // parse signature
+                        // parse signature async (suppress errors)
                         !group {
                           stack {
                             function.run "mvp/signature/email-signature-parse-process" {
@@ -1710,6 +1767,7 @@ function "mvp/activity/parse-cc" {
                     }
                   }
 
+                  // ── new person: create identity then log ──
                   else {
                     group {
                       stack {
@@ -1742,6 +1800,12 @@ function "mvp/activity/parse-cc" {
                           }
                         } as $copyToMy
 
+                        db.get master_person {
+                          field_name = "id"
+                          field_value = $getIdentity.master_person_id
+                          output = ["id", "name"]
+                        } as $masterPerson
+
                         db.get master_email {
                           field_name = "email_address"
                           field_value = $toItem.email
@@ -1754,7 +1818,7 @@ function "mvp/activity/parse-cc" {
                             user_id           : $input.user_id
                             my_person_id      : $copyToMy.my_person_id
                             activity_type_id  : 2
-                            card_descriptor   : "Email to"|concat:$masterPerson.name:""
+                            card_descriptor   : "Email to"|concat:$masterPerson.name:" "
                             activity_timestamp: $input.participants.object.date|multiply:1000
                             subject           : $input.participants.object.subject
                             grant_id          : $input.participants.object.grant_id
@@ -1762,14 +1826,14 @@ function "mvp/activity/parse-cc" {
                             message_id        : $input.participants.object.id
                             snippet           : $input.participants|get:"object.snippet":null
                             unread            : $input.participants.object.unread
-                            interlocutor_email: $identityemail.master_email_id
+                            interlocutor_email: $masterEmail.id
                             participant_count : $participant_count
                             data_source_id    : 14
-                            temp_email_body   : $input.participants.data.object.body
+                            temp_email_body   : $input.participants|get:"object.body":null
                           }
                         } as $activity
 
-                        // get current total_email_activity before edit
+                        // increment total_email_activity
                         db.get my_person {
                           field_name = "id"
                           field_value = $copyToMy.my_person_id
@@ -1780,21 +1844,18 @@ function "mvp/activity/parse-cc" {
                           field_name = "id"
                           field_value = $copyToMy.my_person_id
                           data = {
-                            updated_at            : now
-                            total_email_activity  : ($currentMyPerson|get:"total_email_activity":0)|add:1
-                            last_email_activity_id: $activity.id
-                            last_activity_at      : $input.participants.object.date|multiply:1000
+                            updated_at                     : now
+                            last_email_activity_id         : $activity.id
+                            last_calendar_event_activity_id: null
+                            last_activity_at               : $input.participants.object.date|multiply:1000
+                            total_email_activity           : ($currentMyPerson|get:"total_email_activity":0)|add:1
                           }
                         }
 
-                        // parse signature
-                        group {
-                          stack {
-                            function.run "mvp/signature/email-signature-parse-process" {
-                              runtime_mode = "async-shared"
-                              input = {email_address: $toItem.email, grant_id: $grantID}
-                            }
-                          }
+                        // parse signature async
+                        function.run "mvp/signature/email-signature-parse-process" {
+                          runtime_mode = "async-shared"
+                          input = {email_address: $toItem.email, grant_id: $grantID}
                         }
                       }
                     }
@@ -1807,7 +1868,9 @@ function "mvp/activity/parse-cc" {
       }
     }
 
-    // process FROM
+    // ═══════════════════════════════════════
+    // PROCESS FROM PARTICIPANTS (activity_type 1)
+    // ═══════════════════════════════════════
     foreach ($from) {
       each as $fromItem {
         conditional {
@@ -1816,25 +1879,21 @@ function "mvp/activity/parse-cc" {
           }
 
           else {
-            // LOG activity
             group {
               stack {
                 function.run "mvp/identity/check-identity-email" {
                   input = {email_address: $fromItem.email, user_id: $input.user_id}
                 } as $identityemail
 
-                // SKIP IF MARKETING!!
-                group {
-                  stack {
-                    conditional {
-                      if ($identityemail|get:"marketing":null) {
-                        continue
-                      }
-                    }
+                // skip marketing emails
+                conditional {
+                  if ($identityemail|get:"marketing":null) {
+                    continue
                   }
                 }
 
                 conditional {
+                  // ── existing person: log activity ──
                   if ($identityemail.master_person_id != null && $identityemail.my_person_id != null) {
                     group {
                       stack {
@@ -1864,7 +1923,7 @@ function "mvp/activity/parse-cc" {
                           }
                         } as $activity
 
-                        // get current total_email_activity before edit
+                        // increment total_email_activity
                         db.get my_person {
                           field_name = "id"
                           field_value = $identityemail.my_person_id
@@ -1875,31 +1934,29 @@ function "mvp/activity/parse-cc" {
                           field_name = "id"
                           field_value = $identityemail.my_person_id
                           data = {
-                            updated_at            : now
-                            last_email_activity_id: $activity.id
-                            last_activity_at      : $input.participants.object.date|multiply:1000
-                            total_email_activity  : ($currentMyPerson|get:"total_email_activity":0)|add:1
+                            updated_at                     : now
+                            last_email_activity_id         : $activity.id
+                            last_calendar_event_activity_id: null
+                            last_activity_at               : $input.participants.object.date|multiply:1000
+                            total_email_activity           : ($currentMyPerson|get:"total_email_activity":0)|add:1
                           }
                         }
 
-                        // parse signature
-                        group {
-                          stack {
-                            function.run "mvp/signature/email-signature-parse-process" {
-                              runtime_mode = "async-shared"
-                              input = {email_address: $fromItem.email, grant_id: $grantID}
-                            }
-                          }
+                        // parse signature async
+                        function.run "mvp/signature/email-signature-parse-process" {
+                          runtime_mode = "async-shared"
+                          input = {email_address: $fromItem.email, grant_id: $grantID}
                         }
                       }
                     }
                   }
 
+                  // ── new person: create identity then log ──
                   else {
                     group {
                       stack {
                         function.run "mvp/format/name-format" {
-                          input = {full_name: $var.fromItem.name ?: "Anonymous"}
+                          input = {full_name: $fromItem|get:"name":"Anonymous"}
                         } as $nameFormat
 
                         function.run "mvp/get-add/master-person" {
@@ -1927,6 +1984,12 @@ function "mvp/activity/parse-cc" {
                           }
                         } as $copyToMy
 
+                        db.get master_person {
+                          field_name = "id"
+                          field_value = $getIdentity.master_person_id
+                          output = ["id", "name"]
+                        } as $masterPerson
+
                         db.get master_email {
                           field_name = "email_address"
                           field_value = $fromItem.email
@@ -1938,8 +2001,8 @@ function "mvp/activity/parse-cc" {
                             created_at        : "now"
                             user_id           : $input.user_id
                             my_person_id      : $copyToMy.my_person_id
-                            activity_type_id  : 2
-                            card_descriptor   : "Email to"|concat:$masterPerson.name:" "
+                            activity_type_id  : 1
+                            card_descriptor   : "Email from"|concat:$masterPerson.name:" "
                             activity_timestamp: $input.participants.object.date|multiply:1000
                             subject           : $input.participants.object.subject
                             grant_id          : $input.participants.object.grant_id
@@ -1947,13 +2010,14 @@ function "mvp/activity/parse-cc" {
                             message_id        : $input.participants.object.id
                             snippet           : $input.participants|get:"object.snippet":null
                             unread            : $input.participants.object.unread
-                            interlocutor_email: $identityemail.master_email_id
+                            interlocutor_email: $masterEmail.id
                             participant_count : $participant_count
                             data_source_id    : 14
+                            temp_email_body   : $input.participants|get:"object.body":null
                           }
                         } as $activity
 
-                        // get current total_email_activity before edit
+                        // increment total_email_activity
                         db.get my_person {
                           field_name = "id"
                           field_value = $copyToMy.my_person_id
@@ -1964,21 +2028,18 @@ function "mvp/activity/parse-cc" {
                           field_name = "id"
                           field_value = $copyToMy.my_person_id
                           data = {
-                            updated_at            : now
-                            total_email_activity  : ($currentMyPerson|get:"total_email_activity":0)|add:1
-                            last_email_activity_id: $activity.id
-                            last_activity_at      : $input.participants.object.date|multiply:1000
+                            updated_at                     : now
+                            last_email_activity_id         : $activity.id
+                            last_calendar_event_activity_id: null
+                            last_activity_at               : $input.participants.object.date|multiply:1000
+                            total_email_activity           : ($currentMyPerson|get:"total_email_activity":0)|add:1
                           }
                         }
 
-                        // parse signature
-                        group {
-                          stack {
-                            function.run "mvp/signature/email-signature-parse-process" {
-                              runtime_mode = "async-shared"
-                              input = {email_address: $fromItem.email, grant_id: $grantID}
-                            }
-                          }
+                        // parse signature async
+                        function.run "mvp/signature/email-signature-parse-process" {
+                          runtime_mode = "async-shared"
+                          input = {email_address: $fromItem.email, grant_id: $grantID}
                         }
                       }
                     }
@@ -1991,7 +2052,9 @@ function "mvp/activity/parse-cc" {
       }
     }
 
-    // process CC
+    // ═══════════════════════════════════════
+    // PROCESS CC PARTICIPANTS (activity_type 3)
+    // ═══════════════════════════════════════
     foreach ($cc) {
       each as $ccItem {
         conditional {
@@ -2000,25 +2063,21 @@ function "mvp/activity/parse-cc" {
           }
 
           else {
-            // LOG activity
             group {
               stack {
                 function.run "mvp/identity/check-identity-email" {
                   input = {email_address: $ccItem.email, user_id: $input.user_id}
                 } as $identityemail
 
-                // SKIP IF MARKETING!!
-                group {
-                  stack {
-                    conditional {
-                      if ($identityemail|get:"marketing":null) {
-                        continue
-                      }
-                    }
+                // skip marketing emails
+                conditional {
+                  if ($identityemail|get:"marketing":null) {
+                    continue
                   }
                 }
 
                 conditional {
+                  // ── existing person: log activity ──
                   if ($identityemail.master_person_id != null && $identityemail.my_person_id != null) {
                     group {
                       stack {
@@ -2048,7 +2107,7 @@ function "mvp/activity/parse-cc" {
                           }
                         } as $activity
 
-                        // get current total_email_activity before edit
+                        // increment total_email_activity
                         db.get my_person {
                           field_name = "id"
                           field_value = $identityemail.my_person_id
@@ -2059,26 +2118,24 @@ function "mvp/activity/parse-cc" {
                           field_name = "id"
                           field_value = $identityemail.my_person_id
                           data = {
-                            updated_at            : now
-                            total_email_activity  : ($currentMyPerson|get:"total_email_activity":0)|add:1
-                            last_email_activity_id: $activity.id
-                            last_activity_at      : $input.participants.object.date|multiply:1000
+                            updated_at                     : now
+                            last_email_activity_id         : $activity.id
+                            last_calendar_event_activity_id: null
+                            last_activity_at               : $input.participants.object.date|multiply:1000
+                            total_email_activity           : ($currentMyPerson|get:"total_email_activity":0)|add:1
                           }
                         }
 
-                        // parse signature
-                        group {
-                          stack {
-                            function.run "mvp/signature/email-signature-parse-process" {
-                              runtime_mode = "async-shared"
-                              input = {email_address: $ccItem.email, grant_id: $grantID}
-                            }
-                          }
+                        // parse signature async
+                        function.run "mvp/signature/email-signature-parse-process" {
+                          runtime_mode = "async-shared"
+                          input = {email_address: $ccItem.email, grant_id: $grantID}
                         }
                       }
                     }
                   }
 
+                  // ── new person: create identity then log ──
                   else {
                     group {
                       stack {
@@ -2111,6 +2168,12 @@ function "mvp/activity/parse-cc" {
                           }
                         } as $copyToMy
 
+                        db.get master_person {
+                          field_name = "id"
+                          field_value = $getIdentity.master_person_id
+                          output = ["id", "name"]
+                        } as $masterPerson
+
                         db.get master_email {
                           field_name = "email_address"
                           field_value = $ccItem.email
@@ -2122,8 +2185,8 @@ function "mvp/activity/parse-cc" {
                             created_at        : "now"
                             user_id           : $input.user_id
                             my_person_id      : $copyToMy.my_person_id
-                            activity_type_id  : 2
-                            card_descriptor   : "Email to"|concat:$masterPerson.name:""
+                            activity_type_id  : 3
+                            card_descriptor   : $masterPerson.name|concat:"is cc'd":" "
                             activity_timestamp: $input.participants.object.date|multiply:1000
                             subject           : $input.participants.object.subject
                             grant_id          : $input.participants.object.grant_id
@@ -2131,13 +2194,14 @@ function "mvp/activity/parse-cc" {
                             message_id        : $input.participants.object.id
                             snippet           : $input.participants|get:"object.snippet":null
                             unread            : $input.participants.object.unread
-                            interlocutor_email: $identityemail.master_email_id
+                            interlocutor_email: $masterEmail.id
                             participant_count : $participant_count
                             data_source_id    : 14
+                            temp_email_body   : $input.participants|get:"object.body":null
                           }
                         } as $activity
 
-                        // get current total_email_activity before edit
+                        // increment total_email_activity
                         db.get my_person {
                           field_name = "id"
                           field_value = $copyToMy.my_person_id
@@ -2148,21 +2212,18 @@ function "mvp/activity/parse-cc" {
                           field_name = "id"
                           field_value = $copyToMy.my_person_id
                           data = {
-                            updated_at            : now
-                            total_email_activity  : ($currentMyPerson|get:"total_email_activity":0)|add:1
-                            last_email_activity_id: $activity.id
-                            last_activity_at      : $input.participants.object.date|multiply:1000
+                            updated_at                     : now
+                            last_email_activity_id         : $activity.id
+                            last_calendar_event_activity_id: null
+                            last_activity_at               : $input.participants.object.date|multiply:1000
+                            total_email_activity           : ($currentMyPerson|get:"total_email_activity":0)|add:1
                           }
                         }
 
-                        // parse signature
-                        group {
-                          stack {
-                            function.run "mvp/signature/email-signature-parse-process" {
-                              runtime_mode = "async-shared"
-                              input = {email_address: $ccItem.email, grant_id: $grantID}
-                            }
-                          }
+                        // parse signature async
+                        function.run "mvp/signature/email-signature-parse-process" {
+                          runtime_mode = "async-shared"
+                          input = {email_address: $ccItem.email, grant_id: $grantID}
                         }
                       }
                     }
@@ -2175,7 +2236,9 @@ function "mvp/activity/parse-cc" {
       }
     }
 
-    // process BCC
+    // ═══════════════════════════════════════
+    // PROCESS BCC PARTICIPANTS (activity_type 4)
+    // ═══════════════════════════════════════
     foreach ($bcc) {
       each as $bccItem {
         conditional {
@@ -2184,25 +2247,21 @@ function "mvp/activity/parse-cc" {
           }
 
           else {
-            // LOG activity
             group {
               stack {
                 function.run "mvp/identity/check-identity-email" {
                   input = {email_address: $bccItem.email, user_id: $input.user_id}
                 } as $identityemail
 
-                // SKIP IF MARKETING!!
-                group {
-                  stack {
-                    conditional {
-                      if ($identityemail|get:"marketing":null) {
-                        continue
-                      }
-                    }
+                // skip marketing emails
+                conditional {
+                  if ($identityemail|get:"marketing":null) {
+                    continue
                   }
                 }
 
                 conditional {
+                  // ── existing person: log activity ──
                   if ($identityemail.master_person_id != null && $identityemail.my_person_id != null) {
                     group {
                       stack {
@@ -2232,7 +2291,7 @@ function "mvp/activity/parse-cc" {
                           }
                         } as $activity
 
-                        // get current total_email_activity before edit
+                        // increment total_email_activity
                         db.get my_person {
                           field_name = "id"
                           field_value = $identityemail.my_person_id
@@ -2243,26 +2302,24 @@ function "mvp/activity/parse-cc" {
                           field_name = "id"
                           field_value = $identityemail.my_person_id
                           data = {
-                            updated_at            : now
-                            total_email_activity  : ($currentMyPerson|get:"total_email_activity":0)|add:1
-                            last_email_activity_id: $activity.id
-                            last_activity_at      : $input.participants.object.date|multiply:1000
+                            updated_at                     : now
+                            last_email_activity_id         : $activity.id
+                            last_calendar_event_activity_id: null
+                            last_activity_at               : $input.participants.object.date|multiply:1000
+                            total_email_activity           : ($currentMyPerson|get:"total_email_activity":0)|add:1
                           }
                         }
 
-                        // parse signature
-                        group {
-                          stack {
-                            function.run "mvp/signature/email-signature-parse-process" {
-                              runtime_mode = "async-shared"
-                              input = {email_address: $bccItem.email, grant_id: $grantID}
-                            }
-                          }
+                        // parse signature async
+                        function.run "mvp/signature/email-signature-parse-process" {
+                          runtime_mode = "async-shared"
+                          input = {email_address: $bccItem.email, grant_id: $grantID}
                         }
                       }
                     }
                   }
 
+                  // ── new person: create identity then log ──
                   else {
                     group {
                       stack {
@@ -2295,6 +2352,12 @@ function "mvp/activity/parse-cc" {
                           }
                         } as $copyToMy
 
+                        db.get master_person {
+                          field_name = "id"
+                          field_value = $getIdentity.master_person_id
+                          output = ["id", "name"]
+                        } as $masterPerson
+
                         db.get master_email {
                           field_name = "email_address"
                           field_value = $bccItem.email
@@ -2315,14 +2378,14 @@ function "mvp/activity/parse-cc" {
                             message_id        : $input.participants.object.id
                             snippet           : $input.participants|get:"object.snippet":null
                             unread            : $input.participants.object.unread
-                            interlocutor_email: $identityemail.master_email_id
+                            interlocutor_email: $masterEmail.id
                             participant_count : $participant_count
                             data_source_id    : 14
-                            temp_email_body   : $input.participants.data.object.body
+                            temp_email_body   : $input.participants|get:"object.body":null
                           }
                         } as $activity
 
-                        // get current total_email_activity before edit
+                        // increment total_email_activity
                         db.get my_person {
                           field_name = "id"
                           field_value = $copyToMy.my_person_id
@@ -2333,21 +2396,18 @@ function "mvp/activity/parse-cc" {
                           field_name = "id"
                           field_value = $copyToMy.my_person_id
                           data = {
-                            updated_at            : now
-                            total_email_activity  : ($currentMyPerson|get:"total_email_activity":0)|add:1
-                            last_email_activity_id: $activity.id
-                            last_activity_at      : $input.participants.object.date|multiply:1000
+                            updated_at                     : now
+                            last_email_activity_id         : $activity.id
+                            last_calendar_event_activity_id: null
+                            last_activity_at               : $input.participants.object.date|multiply:1000
+                            total_email_activity           : ($currentMyPerson|get:"total_email_activity":0)|add:1
                           }
                         }
 
-                        // parse signature
-                        group {
-                          stack {
-                            function.run "mvp/signature/email-signature-parse-process" {
-                              runtime_mode = "async-shared"
-                              input = {email_address: $bccItem.email, grant_id: $grantID}
-                            }
-                          }
+                        // parse signature async
+                        function.run "mvp/signature/email-signature-parse-process" {
+                          runtime_mode = "async-shared"
+                          input = {email_address: $bccItem.email, grant_id: $grantID}
                         }
                       }
                     }
@@ -2366,3 +2426,18 @@ function "mvp/activity/parse-cc" {
 }
 ````
 </Accordion>
+
+---
+
+### Shared sub-functions
+
+| Function | Description |
+|----------|-------------|
+| `calculate_participant` | Counts total participants across to/from/cc/bcc arrays |
+| `check-identity-email` | Resolves an email address to master_person_id and my_person_id |
+| `check-identity-email-to` | Variant used by parse-to — also returns my_person_id directly |
+| `copy-to-my-person` | Copies master_person to user's my_person table |
+| `name-format` | Parses a full name into first/middle/last/suffix |
+| `master-person` (get-add) | Gets or creates a master_person record |
+| `set-primary-email_v2` | Sets primary email for a person (often async) |
+| `email-signature-parse-process` | (async) Parses email signatures for contact enrichment |

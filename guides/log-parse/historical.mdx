@@ -3,16 +3,18 @@ title: 'Historical Log & Parse'
 description: 'How the email history parse and account import pipelines discover contacts from sent/received emails and calendar events, process AI summaries, and populate the email_account_import table.'
 ---
 
-When a user connects an email account, Orbiter runs two pipelines:
+When a user connects an email account, Orbiter runs three pipelines:
 
 1. **Account Import** — scans sent threads and calendar events to discover new contacts and populate the `email_account_import` table.
-2. **History Parse** — scans sent and received threads, creates activity records, cleans message bodies, and generates AI summaries.
+2. **Add People from Import** — processes `email_account_import` records in batches, creating master person records and extracting email signatures.
+3. **History Parse** — scans sent and received threads, creates activity records, cleans message bodies, and generates AI summaries.
 
 | Function | ID | Role |
 |----------|----|------|
-| `mvp/activity/nylas-history-parse` | #189 | Master orchestrator — parses threads, creates activities, runs AI |
 | `mvp/import/email-account` | #4638 | Contact import — discovers emails from threads + calendar events |
+| `mvp/import/add-people-from-email-account` | #10517 | People processor — creates master persons + extracts signatures from import records |
 | `mvp/activity/add-email-account-record` | #12539 | Gatekeeper — validates and inserts a single import record |
+| `mvp/activity/nylas-history-parse` | #189 | Master orchestrator — parses threads, creates activities, runs AI |
 
 ---
 
@@ -213,6 +215,76 @@ The top-level orchestrator. Called once per Nylas grant to import all discoverab
 
 ---
 
+## add-people-from-email-account — #10517
+
+```text
+mvp/import/add-people-from-email-account — #10517
+```
+
+Processes `email_account_import` records in batches of 100. For each record, creates or finds a `master_person`, extracts an email signature via LLM, and enriches the person record if a signature is found. Processed records are deleted from the import table.
+
+### Input
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `user_id` | int | The user whose import records to process |
+
+### Step-by-Step Flow
+
+<Steps>
+  <Step title="Count unprocessed records">
+    Queries `email_account_import` for records matching `user_id`, `processing = false`, and `last_30_days = true`. Returns a count used to calculate how many 100-record batches to run.
+  </Step>
+
+  <Step title="Calculate batch count">
+    Divides the count by 100 and rounds up via a JavaScript lambda (`Math.ceil`) to determine the number of loop iterations.
+  </Step>
+
+  <Step title="Batch loop — fetch page 1">
+    For each batch, queries `email_account_import` with the same filters (`user_id`, `processing = false`, `last_30_days = true`), always requesting page 1 with 100 results per page. Page 1 is always correct because processed records are deleted after each iteration.
+  </Step>
+
+  <Step title="Per record — mark as processing">
+    Sets `processing: true` on the `email_account_import` record to prevent concurrent pickup by another run.
+  </Step>
+
+  <Step title="Per record — create master person">
+    Calls **`mvp/get-add/master-person`** with the email address, display name, and user ID. This either finds an existing `master_person` or creates a new one, returning the `master_person_id`.
+  </Step>
+
+  <Step title="Per record — extract email signature">
+    Calls **`mvp/signature/email-signature-email-import`** with the email address and `grant_id`. Returns signature data including a `signature_found` flag.
+  </Step>
+
+  <Step title="Per record — store signature on import record">
+    Updates the `email_account_import` row with the extracted `email_signature` JSON.
+  </Step>
+
+  <Step title="Per record — enrich person (if signature found)">
+    If `signature_found` is truthy:
+    1. Updates `person_enrich_data` for this `master_person_id` with the signature and current timestamp.
+    2. Calls **`mvp/signature/email-signature-process-only`** to parse the signature into structured fields (phone, title, company, etc.).
+  </Step>
+
+  <Step title="Per record — delete import record">
+    Removes the processed row from `email_account_import`. This keeps the table clean and ensures page-1 pagination stays correct.
+  </Step>
+
+  <Step title="Error handling">
+    Each record is wrapped in a try/catch. On failure, the error is logged to `add_people_crashes` with the email address, and the import record is deleted to prevent zombie rows (stuck with `processing = true`).
+  </Step>
+</Steps>
+
+### Dependencies
+
+| Function Called | Purpose |
+|----------------|---------|
+| `mvp/get-add/master-person` | Creates or finds a master person record from an email address |
+| `mvp/signature/email-signature-email-import` | Extracts email signature from recent messages via LLM |
+| `mvp/signature/email-signature-process-only` | Parses a raw signature into structured person fields |
+
+---
+
 ## add-email-account-record — #12539
 
 ```text
@@ -289,23 +361,10 @@ The single-record gatekeeper. Decides whether an email address should be importe
 
 ## Full Pipeline Diagram
 
-Shows how all three functions connect within the overall historical parse and import flow.
+Shows how all four functions connect within the overall historical parse and import flow.
 
 ```mermaid
 graph TD
-    subgraph "#189 nylas-history-parse"
-        HP_START["Start"] --> HP_LOCK["Lock grant"]
-        HP_LOCK --> HP_SENT["Fetch sent threads (paginated)"]
-        HP_SENT --> HP_SENT_PROC["nylas-parse-sent_threads"]
-        HP_SENT_PROC --> HP_RECV["Fetch received threads (per contact)"]
-        HP_RECV --> HP_RECV_PROC["nylas-parse-received_threads"]
-        HP_RECV_PROC --> HP_MARK["Mark parsed + totals"]
-        HP_MARK --> HP_ACTIVITY["update-all-last-activity"]
-        HP_ACTIVITY --> HP_CLEAN["Clean messages via LLM (30d)"]
-        HP_CLEAN --> HP_SUMMARY["AI thread summaries (30d)"]
-        HP_SUMMARY --> HP_UNLOCK["Unlock grant"]
-    end
-
     subgraph "#4638 import/email-account"
         IM_START["Start"] --> IM_PREFIX["Load marketing_prefix"]
         IM_PREFIX --> IM_GRANT["Resolve nylas_grant"]
@@ -331,5 +390,31 @@ graph TD
         GK_MKTG -->|Yes| GK_MKTG_SKIP["Return 'marketing'"]
         GK_MKTG -->|No| GK_INSERT["INSERT → email_account_import"]
         GK_INSERT --> GK_ADDED["Return 'added'"]
+    end
+
+    subgraph "#10517 add-people-from-email-account"
+        AP_START["Start"] --> AP_COUNT["Count unprocessed records"]
+        AP_COUNT --> AP_BATCH["Batch loop: page 1, 100/batch"]
+        AP_BATCH --> AP_PROC["Mark processing = true"]
+        AP_PROC --> AP_MASTER["get-add/master-person"]
+        AP_MASTER --> AP_SIG["email-signature-email-import"]
+        AP_SIG --> AP_CHECK{Signature found?}
+        AP_CHECK -->|Yes| AP_ENRICH["Enrich person + process signature"]
+        AP_CHECK -->|No| AP_DEL["Delete import record"]
+        AP_ENRICH --> AP_DEL
+        AP_DEL -->|"on error"| AP_CRASH["Log to add_people_crashes"]
+    end
+
+    subgraph "#189 nylas-history-parse"
+        HP_START["Start"] --> HP_LOCK["Lock grant"]
+        HP_LOCK --> HP_SENT["Fetch sent threads (paginated)"]
+        HP_SENT --> HP_SENT_PROC["nylas-parse-sent_threads"]
+        HP_SENT_PROC --> HP_RECV["Fetch received threads (per contact)"]
+        HP_RECV --> HP_RECV_PROC["nylas-parse-received_threads"]
+        HP_RECV_PROC --> HP_MARK["Mark parsed + totals"]
+        HP_MARK --> HP_ACTIVITY["update-all-last-activity"]
+        HP_ACTIVITY --> HP_CLEAN["Clean messages via LLM (30d)"]
+        HP_CLEAN --> HP_SUMMARY["AI thread summaries (30d)"]
+        HP_SUMMARY --> HP_UNLOCK["Unlock grant"]
     end
 ```

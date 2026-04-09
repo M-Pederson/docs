@@ -9,7 +9,7 @@ description: "Nylas event.created webhook — logs calendar events and creates a
 
 ## calendar-webhook-parse-event — #2477
 
-Triggered by the Nylas `event.created` webhook when a new calendar event is received. Logs the raw event payload to `log_webhook_nylas`, resolves the Nylas grant and calendar, handles recurring events by fetching or creating `master_event` records via the Nylas API, creates the `event` record, then iterates through all participants — resolving each to a `master_person` (creating one from the email address if needed), copying to `my_person`, and logging a `calendar_event_activity` with appropriate type (organizer vs. participant). Kicks off async primary email resolution for each participant.
+Triggered by the Nylas `event.created` webhook when a new calendar event is received. Logs the raw event payload to `log_webhook_nylas`, validates the grant and calendar exist (early return if not), handles recurring events by fetching or creating `master_event` records via the Nylas API (with null-safe conferencing and all-day event support), creates the `event` record, then iterates through participants — determining role (organizer type 5 vs. participant type 6) up front, resolving each to a `master_person` (creating one from the email address if needed), copying to `my_person`, and logging a `calendar_event_activity`. Organizer timestamp falls back to `created_at` when `updated_at` is null. Participants are iterated directly without duplicating the organizer. Kicks off async primary email resolution for each participant.
 
 ```text
 mvp/nylas-webhook/calendar-webhook-parse-event — #2477
@@ -34,7 +34,7 @@ function "mvp/nylas-webhook/calendar-webhook-parse-event" {
       }
     } as $log
 
-    // TEMP FOR DEV
+    // DEV GATE — only executes on live datasource
     group {
       stack {
         conditional {
@@ -65,18 +65,35 @@ function "mvp/nylas-webhook/calendar-webhook-parse-event" {
           field_value = $input.grant_id
         } as $nylas_grant
 
+        // Guard — grant must exist
+        conditional {
+          if ($nylas_grant == null) {
+            return {
+              value = "Grant not found for grant_id"
+            }
+          }
+        }
+
         db.get calendar {
           field_name = "external_id"
           field_value = $input.event.calendar_id
-          output = ["id"]
+          output = ["id", "external_id"]
         } as $calendar
+
+        // Calendar must exist (checked before event exists query)
+        conditional {
+          if ($calendar == null) {
+            return {
+              value = "Calendar does not exist"
+            }
+          }
+        }
 
         db.query event {
           where = $db.event.external_id == $input.event.id && $db.event.calendar_id == $calendar.id
           return = {type: "exists"}
         } as $hasEvent
 
-        // If event exists
         conditional {
           if ($hasEvent) {
             return {
@@ -85,16 +102,7 @@ function "mvp/nylas-webhook/calendar-webhook-parse-event" {
           }
         }
 
-        // If calendar doenst exist or active is false
-        conditional {
-          if ($calendar == null) {
-            return {
-              value = "Calendar either doenst exist or is inactive"
-            }
-          }
-        }
-
-        // is master event
+        // Handle master event (recurring)
         conditional {
           if ($input.event|has:"master_event_id") {
             db.get master_event {
@@ -117,17 +125,18 @@ function "mvp/nylas-webhook/calendar-webhook-parse-event" {
                     |push:"Content-Type: application/json"
                 } as $nylas_master_event_response
 
+                // Null-safe conferencing + all-day event handling
                 db.add master_event {
                   data = {
                     created_at : "now"
                     external_id: $nylas_master_event_response.response.result.data.id
                     calendar_id: $calendar.id
-                    recurrence : $nylas_master_event_response.response.result.data.recurrence[0]
+                    recurrence : $nylas_master_event_response.response.result.data.recurrence[0] ?: null
                     title      : $nylas_master_event_response.response.result.data.title
-                    start      : $nylas_master_event_response.response.result.data.when.start_time|multiply:1000
-                    end        : $nylas_master_event_response.response.result.data.when.end_time|multiply:1000
-                    provider   : $nylas_master_event_response.response.result.data.conferencing.provider
-                    url        : $nylas_master_event_response.response.result.data.conferencing.details.url
+                    start      : $nylas_master_event_response.response.result.data.when.start_time ? ($nylas_master_event_response.response.result.data.when.start_time|multiply:1000) : $nylas_master_event_response.response.result.data.when.start_date
+                    end        : $nylas_master_event_response.response.result.data.when.end_time ? ($nylas_master_event_response.response.result.data.when.end_time|multiply:1000) : $nylas_master_event_response.response.result.data.when.end_date
+                    provider   : $nylas_master_event_response.response.result.data.conferencing.provider ?: null
+                    url        : $nylas_master_event_response.response.result.data.conferencing.details.url ?: null
                   }
 
                   output = ["id"]
@@ -147,7 +156,7 @@ function "mvp/nylas-webhook/calendar-webhook-parse-event" {
           value = $input.event.participants|count
         }
 
-        // create the EVENT record
+        // Create the EVENT record
         db.add event {
           data = {
             created_at     : "now"
@@ -171,214 +180,29 @@ function "mvp/nylas-webhook/calendar-webhook-parse-event" {
           value = 21
         }
 
-        var $event {
-          value = $input.event
-            |!set:"participants":($input.event.participants|push:$input.event.organizer)
+        // Guard organizer existence before accessing email
+        var $organizer_email {
+          value = ($input.event|has:"organizer") ? ($input.event.organizer.email|to_lower) : null
         }
 
-        var $eventTime {
-          value = $event_db.start
-        }
-
-        foreach ($event.participants) {
+        // Iterate participants directly — no organizer push (avoids duplicates)
+        // Role variables set up front, then single identity/activity flow
+        foreach ($input.event.participants) {
           each as $participant {
+            // Determine role: organizer (type 5) vs participant (type 6)
             conditional {
-              if ($participant.email == $input.event.organizer.email) {
+              if ($organizer_email != null && ($participant.email|to_lower) == $organizer_email) {
                 var $participantType {
                   value = 5
                 }
 
-                function.run "mvp/identity/check-identity-email" {
-                  input = {
-                    email_address: $participant.email
-                    user_id      : $nylas_grant.user_id
-                  }
-                } as $identityEmail
+                var $cardDescriptor {
+                  value = "You scheduled a meeting"
+                }
 
-                // Check If master person exists
-                conditional {
-                  if ($identityEmail.master_person_id != null) {
-                    // If master person exists
-                    group {
-                      stack {
-                        db.get master_person {
-                          field_name = "id"
-                          field_value = $identityEmail.master_person_id
-                          output = ["id", "name"]
-                        } as $masterPerson
-
-                        function.run "mvp/my/copy-to-my-person" {
-                          input = {
-                            master_person_id: $masterPerson.id
-                            user_id         : $nylas_grant.user_id
-                            email_address   : ""
-                          }
-                        } as $copyToMy
-
-                        var $activityTimestamp {
-                          value = $input.event
-                            |get:"updated_at":null
-                            |to_int
-                            |multiply:1000
-                        }
-
-                        db.add calendar_event_activity {
-                          data = {
-                            created_at        : "now"
-                            user_id           : $nylas_grant.user_id
-                            my_person_id      : $copyToMy.my_person_id
-                            activity_type_id  : $participantType
-                            subject           : $input.event|get:"title":null
-                            card_descriptor   : "You scheduled a meeting"
-                            activity_timestamp: $activityTimestamp
-                            grant_id          : $input.event|get:"grant_id":null
-                            event_id          : $event_db.id
-                            interlocutor_email: $identityEmail.master_email_id
-                            participant_count : $participant_count
-                            data_source_id    : $dataSourceId
-                          }
-                        } as $activity
-
-                        db.edit my_person {
-                          field_name = "id"
-                          field_value = $copyToMy.my_person_id
-                          data = {
-                            updated_at                     : now
-                            last_email_activity_id         : null
-                            last_calendar_event_activity_id: $activity.id
-                            last_activity_at               : $activity.activity_timestamp
-                          }
-
-                          output = ["id"]
-                        } as $myPerson
-
-                        function.run "mvp/email/set-primary-email_v2" {
-                          runtime_mode = "async-shared"
-                          input = {
-                            email_address: $participant.email
-                            user_id      : $nylas_grant.user_id
-                          }
-                        }
-                      }
-                    }
-                  }
-
-                  else {
-                    // If master person doesn't exist
-                    group {
-                      stack {
-                        var $tempName {
-                          value = $participant.email
-                            |split:"@"
-                            |first
-                            |replace:".":"  "
-                            |capitalize
-                        }
-
-                        group {
-                          stack {
-                            function.run "mvp/format/name-format" {
-                              input = {full_name: $tempName}
-                            } as $nameFormat
-
-                            function.run "mvp/get-add/master-person" {
-                              input = {
-                                first_name    : $nameFormat.first_name
-                                last_name     : $nameFormat.last_name
-                                links         : []
-                                phone_numbers : []
-                                email         : []|push:($participant.email|to_lower)
-                                company_name  : null
-                                title         : null
-                                data_source_id: $dataSourceId
-                                user_id       : $nylas_grant.user_id
-                                full_name     : $nameFormat.full_name
-                                queue         : false
-                              }
-                            } as $getIdentity
-                          }
-                        }
-
-                        db.get master_person {
-                          field_name = "id"
-                          field_value = $getIdentity.master_person_id
-                          output = [
-                            "id"
-                            "name"
-                            "first_name"
-                            "middle_name"
-                            "last_name"
-                            "suffix"
-                            "nickname"
-                            "birthdate"
-                            "status_orbiter"
-                            "email_signature_parsed"
-                          ]
-                        } as $masterPerson
-
-                        function.run "mvp/my/copy-to-my-person" {
-                          input = {
-                            master_person_id: $masterPerson.id
-                            user_id         : $nylas_grant.user_id
-                            email_address   : ""
-                          }
-                        } as $copyToMy
-
-                        group {
-                          stack {
-                            db.get master_email {
-                              field_name = "email_address"
-                              field_value = $participant.email
-                              output = ["id"]
-                            } as $masterEmail
-
-                            var $activityTimestamp {
-                              value = $input.event
-                                |get:"updated_at":null
-                                |to_int
-                                |multiply:1000
-                            }
-
-                            db.add calendar_event_activity {
-                              data = {
-                                created_at        : "now"
-                                user_id           : $nylas_grant.user_id
-                                my_person_id      : $copyToMy.my_person_id
-                                activity_type_id  : $participantType
-                                subject           : $input.event|get:"title":null
-                                card_descriptor   : "Meeting participant"
-                                activity_timestamp: $activityTimestamp
-                                grant_id          : $input.event|get:"grant_id":null
-                                event_id          : $event_db.id
-                                interlocutor_email: $masterEmail.id
-                                participant_count : $participant_count
-                                data_source_id    : $dataSourceId
-                              }
-                            } as $activity
-
-                            db.edit my_person {
-                              field_name = "id"
-                              field_value = $copyToMy.my_person_id
-                              data = {
-                                updated_at                     : now
-                                last_email_activity_id         : null
-                                last_calendar_event_activity_id: $activity.id
-                                last_activity_at               : $activity.activity_timestamp
-                              }
-                            }
-
-                            function.run "mvp/email/set-primary-email_v2" {
-                              runtime_mode = "async-shared"
-                              input = {
-                                email_address: $participant.email
-                                user_id      : $nylas_grant.user_id
-                              }
-                            }
-                          }
-                        }
-                      }
-                    }
-                  }
+                // Fall back to created_at when updated_at is null
+                var $activityTimestamp {
+                  value = ($input.event|get:"updated_at":null) ? ($input.event.updated_at|to_int|multiply:1000) : ($input.event.created_at|to_int|multiply:1000)
                 }
               }
 
@@ -387,35 +211,151 @@ function "mvp/nylas-webhook/calendar-webhook-parse-event" {
                   value = 6
                 }
 
-                function.run "mvp/identity/check-identity-email" {
-                  input = {
-                    email_address: $participant.email
-                    user_id      : $nylas_grant.user_id
-                  }
-                } as $identityEmail
+                var $cardDescriptor {
+                  value = "Participant in a scheduled meeting"
+                }
 
-                conditional {
-                  if ($identityEmail.master_person_id != null) {
-                    // If master person exists
+                var $activityTimestamp {
+                  value = $input.event.created_at|to_int|multiply:1000
+                }
+              }
+            }
+
+            function.run "mvp/identity/check-identity-email" {
+              input = {
+                email_address: $participant.email
+                user_id      : $nylas_grant.user_id
+              }
+            } as $identityEmail
+
+            conditional {
+              if ($identityEmail.master_person_id != null) {
+                // Existing master person
+                group {
+                  stack {
+                    db.get master_person {
+                      field_name = "id"
+                      field_value = $identityEmail.master_person_id
+                      output = ["id", "name"]
+                    } as $masterPerson
+
+                    function.run "mvp/my/copy-to-my-person" {
+                      input = {
+                        master_person_id: $masterPerson.id
+                        user_id         : $nylas_grant.user_id
+                        email_address   : ""
+                      }
+                    } as $copyToMy
+
+                    db.add calendar_event_activity {
+                      data = {
+                        created_at        : "now"
+                        user_id           : $nylas_grant.user_id
+                        my_person_id      : $copyToMy.my_person_id
+                        activity_type_id  : $participantType
+                        subject           : $input.event|get:"title":null
+                        card_descriptor   : $cardDescriptor
+                        activity_timestamp: $activityTimestamp
+                        grant_id          : $input.event|get:"grant_id":null
+                        event_id          : $event_db.id
+                        interlocutor_email: $identityEmail.master_email_id
+                        participant_count : $participant_count
+                        data_source_id    : $dataSourceId
+                      }
+                    } as $activity
+
+                    db.edit my_person {
+                      field_name = "id"
+                      field_value = $copyToMy.my_person_id
+                      data = {
+                        updated_at                     : now
+                        last_email_activity_id         : null
+                        last_calendar_event_activity_id: $activity.id
+                        last_activity_at               : $activityTimestamp
+                      }
+
+                      output = ["id"]
+                    } as $myPerson
+
+                    function.run "mvp/email/set-primary-email_v2" {
+                      runtime_mode = "async-shared"
+                      input = {
+                        email_address: $participant.email
+                        user_id      : $nylas_grant.user_id
+                      }
+                    }
+                  }
+                }
+              }
+
+              else {
+                // New master person — create identity + person
+                group {
+                  stack {
+                    var $tempName {
+                      value = $participant.email
+                        |split:"@"
+                        |first
+                        |replace:".":" "
+                        |capitalize
+                    }
+
                     group {
                       stack {
-                        db.get master_person {
-                          field_name = "id"
-                          field_value = $identityEmail.master_person_id
-                          output = ["id", "name"]
-                        } as $masterPerson
+                        function.run "mvp/format/name-format" {
+                          input = {full_name: $tempName}
+                        } as $nameFormat
 
-                        function.run "mvp/my/copy-to-my-person" {
+                        function.run "mvp/get-add/master-person" {
                           input = {
-                            master_person_id: $masterPerson.id
-                            user_id         : $nylas_grant.user_id
-                            email_address   : ""
+                            first_name    : $nameFormat.first_name
+                            last_name     : $nameFormat.last_name
+                            links         : []
+                            phone_numbers : []
+                            email         : []|push:($participant.email|to_lower)
+                            company_name  : null
+                            title         : null
+                            data_source_id: $dataSourceId
+                            user_id       : $nylas_grant.user_id
+                            full_name     : $nameFormat.full_name
+                            queue         : false
                           }
-                        } as $copyToMy
+                        } as $getIdentity
+                      }
+                    }
 
-                        var $activityTimestamp {
-                          value = $input.event.created_at|to_int|multiply:1000
-                        }
+                    db.get master_person {
+                      field_name = "id"
+                      field_value = $getIdentity.master_person_id
+                      output = [
+                        "id"
+                        "name"
+                        "first_name"
+                        "middle_name"
+                        "last_name"
+                        "suffix"
+                        "nickname"
+                        "birthdate"
+                        "status_orbiter"
+                        "email_signature_parsed"
+                      ]
+                    } as $masterPerson
+
+                    function.run "mvp/my/copy-to-my-person" {
+                      input = {
+                        master_person_id: $masterPerson.id
+                        user_id         : $nylas_grant.user_id
+                        email_address   : ""
+                      }
+                    } as $copyToMy
+
+                    group {
+                      stack {
+                        db.get master_email {
+                          field_name = "email_address"
+                          field_value = $participant.email
+                          output = ["id"]
+                        } as $masterEmail
 
                         db.add calendar_event_activity {
                           data = {
@@ -424,11 +364,11 @@ function "mvp/nylas-webhook/calendar-webhook-parse-event" {
                             my_person_id      : $copyToMy.my_person_id
                             activity_type_id  : $participantType
                             subject           : $input.event|get:"title":null
-                            card_descriptor   : "Participant in a scheduled meeting"
+                            card_descriptor   : $cardDescriptor
                             activity_timestamp: $activityTimestamp
                             grant_id          : $input.event|get:"grant_id":null
                             event_id          : $event_db.id
-                            interlocutor_email: $identityEmail.master_email_id
+                            interlocutor_email: $masterEmail.id
                             participant_count : $participant_count
                             data_source_id    : $dataSourceId
                           }
@@ -443,128 +383,13 @@ function "mvp/nylas-webhook/calendar-webhook-parse-event" {
                             last_calendar_event_activity_id: $activity.id
                             last_activity_at               : $activityTimestamp
                           }
-
-                          output = ["id"]
-                        } as $myPerson
+                        }
 
                         function.run "mvp/email/set-primary-email_v2" {
                           runtime_mode = "async-shared"
                           input = {
                             email_address: $participant.email
                             user_id      : $nylas_grant.user_id
-                          }
-                        }
-                      }
-                    }
-                  }
-
-                  else {
-                    group {
-                      stack {
-                        var $tempName {
-                          value = $participant.email
-                            |split:"@"
-                            |first
-                            |replace:".":"  "
-                            |capitalize
-                        }
-
-                        group {
-                          stack {
-                            function.run "mvp/format/name-format" {
-                              input = {full_name: $tempName}
-                            } as $nameFormat
-
-                            function.run "mvp/get-add/master-person" {
-                              input = {
-                                first_name    : $nameFormat.first_name
-                                last_name     : $nameFormat.last_name
-                                links         : []
-                                phone_numbers : []
-                                email         : []|push:($participant.email|to_lower)
-                                company_name  : null
-                                title         : null
-                                data_source_id: $dataSourceId
-                                user_id       : $nylas_grant.user_id
-                                full_name     : $nameFormat.full_name
-                                queue         : false
-                              }
-                            } as $getIdentity
-                          }
-                        }
-
-                        db.get master_person {
-                          field_name = "id"
-                          field_value = $getIdentity.master_person_id
-                          output = [
-                            "id"
-                            "name"
-                            "first_name"
-                            "middle_name"
-                            "last_name"
-                            "suffix"
-                            "nickname"
-                            "birthdate"
-                            "status_orbiter"
-                            "email_signature_parsed"
-                          ]
-                        } as $masterPerson
-
-                        function.run "mvp/my/copy-to-my-person" {
-                          input = {
-                            master_person_id: $masterPerson.id
-                            user_id         : $nylas_grant.user_id
-                            email_address   : ""
-                          }
-                        } as $copyToMy
-
-                        group {
-                          stack {
-                            db.get master_email {
-                              field_name = "email_address"
-                              field_value = $participant.email
-                              output = ["id"]
-                            } as $masterEmail
-
-                            var $activityTimestamp {
-                              value = $input.event.created_at|to_int|multiply:1000
-                            }
-
-                            db.add calendar_event_activity {
-                              data = {
-                                created_at        : "now"
-                                user_id           : $nylas_grant.user_id
-                                my_person_id      : $copyToMy.my_person_id
-                                activity_type_id  : $participantType
-                                subject           : $input.event|get:"title":null
-                                card_descriptor   : "Meeting participant in a scheudled meeting"
-                                activity_timestamp: $activityTimestamp
-                                grant_id          : $input.event|get:"grant_id":null
-                                event_id          : $event_db.id
-                                interlocutor_email: $masterEmail.id
-                                participant_count : $participant_count
-                                data_source_id    : $dataSourceId
-                              }
-                            } as $activity
-
-                            db.edit my_person {
-                              field_name = "id"
-                              field_value = $copyToMy.my_person_id
-                              data = {
-                                updated_at                     : now
-                                last_email_activity_id         : null
-                                last_calendar_event_activity_id: $activity.id
-                                last_activity_at               : $activityTimestamp
-                              }
-                            }
-
-                            function.run "mvp/email/set-primary-email_v2" {
-                              runtime_mode = "async-shared"
-                              input = {
-                                email_address: $participant.email
-                                user_id      : $nylas_grant.user_id
-                              }
-                            }
                           }
                         }
                       }

@@ -1,0 +1,282 @@
+---
+title: "Xano Touchpoints"
+description: "Every Xano function that needs to be updated, replaced, or triggered when Known ships — audited against the live Xano workspace"
+---
+
+This page catalogs every existing Xano function that interacts with the FalkorDB graph and maps each one to its impact on Known. Known is primarily greenfield — most Known functions are new — but a handful of existing functions either **create edges Known reads from** (upstream dependencies) or **create edges Known unifies with** (like the `MENTOR` edge discovered during scenario stress tests).
+
+**Nothing in this page has been changed in Xano yet.** This is the reference for a future implementation pass.
+
+**Workspace:** `OrbiterV2` (workspace_id: 3)
+
+---
+
+## Categories
+
+Each existing Xano function falls into one of four categories:
+
+<CardGroup cols={2}>
+  <Card title="🔴 Direct cypher update" icon="pen-to-square">
+    The function contains an embedded cypher template that writes to an edge Known has redesigned. The cypher needs to be replaced with the Known-aware version.
+  </Card>
+  <Card title="🟡 Trigger hook needed" icon="bolt">
+    The function writes to an edge Known reads from (upstream). No cypher changes needed, but Known's lifecycle crons need to be triggered when this function runs.
+  </Card>
+  <Card title="⚪ Legacy / deprecated" icon="trash-can">
+    The function is part of an older surface that Known replaces entirely. Mark as deprecated and route callers to Known's new functions. Do not update the cypher — it's going away.
+  </Card>
+  <Card title="🟢 No changes" icon="circle-check">
+    The function writes to edges or nodes that Known does not touch (film/TV, expertise, locations, funding rounds, etc.). No action required.
+  </Card>
+</CardGroup>
+
+---
+
+## 🔴 Direct cypher updates
+
+### `mvp/yc/process-yc-people` (#12700)
+
+**Current behavior:** Creates `MENTOR` edges from YC partners to batch founders during company enrichment. Uses a v1 cypher template with `description`, `company_uuid`, `company_name` properties only. No lifecycle tracking, no weight, no source/formality/domain.
+
+**Required change:** Replace the embedded cypher template with the [v2 MENTOR cypher](/guides/known/schema-design/edges#v2-cypher-unified-known-aware-ingest). The v2 version adds `valid_from`, `valid_to`, `source`, `formality`, `domain`, `weight`, `created_by`, `created_at`, `invalidation_reason`, `invalidated_by` fields with YC-appropriate defaults. Backward-compatible.
+
+**Prerequisite:** The [v1 → v2 MENTOR migration](/guides/known/schema-design/edges#migration-v1-v2) must be run first to backfill all existing YC-created `MENTOR` edges with v2 fields. Otherwise the upgraded function will produce inconsistent data where new edges have v2 fields but existing edges don't.
+
+**Impact:** Medium. One function, one embedded template, backward-compatible.
+
+**Related documentation:**
+- [Schema Design → MENTOR](/guides/known/schema-design/edges#mentor-directed-coaching-relationship)
+- [Ontology → MENTOR](/guides/ontology/edges#mentor)
+
+---
+
+## 🟡 Trigger hooks needed (no cypher changes)
+
+These functions write to edges Known reads from. Known's lifecycle and cache-refresh crons need to be triggered when these functions run, but the functions themselves don't change.
+
+### `mvp/edges/create-work-edges` (#2800)
+
+**Current behavior:** Creates `FOUNDED`, `WORKS_AT`, `BOARD_MEMBER_OF`, `ADVISOR_TO`, `INVESTED_IN (Person)`, and `MEMBER_OF` edges for a master_person based on their work history.
+
+**Known dependency:** `PROFESSIONAL_TIE` in Known is inferred from `WORKS_AT` overlap between two persons at the same company. When this function creates, updates, or invalidates a `WORKS_AT` edge, Known needs to:
+
+1. Fire [`professional_tie_maintainer`](/guides/known/scope/lifecycle#known-lifecycle-professional-tie-maintainer-trigger) to re-evaluate all `PROFESSIONAL_TIE` edges involving the affected person
+2. Fire [`cache/invalidate_on_upstream_change`](/guides/known/scope/cache#known-cache-invalidate-on-upstream-change) to mark dependent `shared_context_cache.employments` entries stale
+
+**Implementation approach:** Add trigger calls at the end of `create-work-edges` (after cyphers are executed). Alternatively, use a deferred queue — mark affected KNOWS edges as "needs recompute" in a Xano table, and let the nightly cron pick them up.
+
+**No cypher changes required in this function.** The existing cyphers that create `WORKS_AT` etc. are unchanged.
+
+### `mvp/edges/create-education-edges` (#1898)
+
+**Current behavior:** Creates `ATTENDED`, `ATTENDED_TOGETHER`, `STUDIED_UNDER` edges for a master_person's education history.
+
+**Known dependency:** `shared_context_cache.educations` on KNOWS reads from `ATTENDED` edges and computes overlap between two persons. When this function creates or updates an `ATTENDED` edge, Known needs to fire `cache/invalidate_on_upstream_change` for all KNOWS edges touching the affected person.
+
+**Implementation approach:** Same as `create-work-edges` — append trigger calls at end.
+
+**No cypher changes required.**
+
+### `mvp/node/update-person-node` (#2758)
+
+**Current behavior:** Syncs `master_person` properties + embedding to the FalkorDB `Person` node. Derives graph labels (e.g. `Angel`) from `is_angel` bool on `master_person`.
+
+**Known dependency:** Known adds new properties to the `Person` node: `deceased_at`, `merged_into`, `deleted_at`, `tombstone`. When these fields change on `master_person`, the graph node must be synced.
+
+**Required change:** Extend the cypher in this function to also set the new Known-specific properties when they're non-null:
+
+```cypher
+SET p.deceased_at = $deceased_at,
+    p.merged_into = $merged_into,
+    p.deleted_at  = $deleted_at,
+    p.tombstone   = $tombstone
+```
+
+**Additionally:** when `deceased_at` is first set on a person, fire the [`deceased_freezer`](/guides/known/scope/lifecycle#known-lifecycle-deceased-freezer-trigger) cron to cascade death handling across all KNOWS edges touching this person.
+
+**Impact:** Low. One SET clause addition, one trigger fire on deceased_at set.
+
+### `mvp/funding/add-all-fundable-deals` (#12703) and `mvp/funding/add-fundable-deal-node` (#12701)
+
+**Current behavior:** Creates funding round nodes and `INVESTED_IN (Funding)`, `LEAD_INVESTED_IN`, `FOLLOW_ON_INVESTED_IN`, `RAISED`, `INVESTMENT_PARTNER_IN`, `INVESTMENT_PARTNER_AT` edges from fundable deals.
+
+**Known dependency:** Known's `PROFESSIONAL_TIE(relationship_role='investor_founder')` is inferred from the combination of investment relationships and founder relationships at the same company. Specifically: if person A has `INVESTED_IN` at company X, and person B has `FOUNDED` at company X, they should have a `PROFESSIONAL_TIE(investor_founder)`.
+
+**Required change:** Same trigger pattern as `create-work-edges` — fire `professional_tie_maintainer` and `cache/invalidate_on_upstream_change` when funding edges are created or updated. The existing cyphers in these functions are unchanged.
+
+**Impact:** Low. Trigger hook only.
+
+### `mvp/expertise/resolve-person-expertise` (#12668) and `mvp/expertise/resolve-company-specialties` (#12746)
+
+**Current behavior:** Create `HAS_EXPERTISE` and `SPECIALIZES_IN` edges via vector-matching + MERGE.
+
+**Known dependency:** None currently. Known does not use expertise/specialty edges in its scoring or facet derivation. If a future version of Known wants to use "shared expertise domain" as a bonding signal, these functions would gain a trigger hook.
+
+**Required change:** None for the initial Known build.
+
+### Nylas webhook pipeline (log-parse functions)
+
+**Current behavior:** `message.created`, `event.created`, `event.updated`, `parse-from`, `parse-to`, `parse-cc` handlers ingest email and calendar activity into Xano tables.
+
+**Known dependency:** Known's [ingest functions](/guides/known/scope/ingest) (`email_direct`, `calendar_meeting`, `sms_chat`) read from these activity tables to extract evidence rows and create/update `KNOWS` edges.
+
+**Required change:** At the end of each Nylas handler, call the appropriate Known ingest function with the new activity data. This is an **append operation**, not a cypher replacement — the existing Nylas handlers remain as the data source, and Known's ingest becomes a downstream consumer.
+
+**Impact:** Medium. Multiple handlers, all append-only changes. See [scope/ingest](/guides/known/scope/ingest) for the full pattern.
+
+### `mvp/imdb/add-imdb-to-master-person` (#10509) and related IMDB functions
+
+**Current behavior:** Enrich a master_person with IMDB data, create film/TV nodes and credits.
+
+**Known dependency:** None. Known does not currently model film/TV relationships. IMDB collaborators are not represented in Known's facet model.
+
+**Required change:** None.
+
+### `mvp/node/sync-domain-expertise-nodes` (#12663)
+
+**Current behavior:** Syncs `domain_expertise` and `sub_domain_expertise` table rows to FalkorDB nodes.
+
+**Known dependency:** None.
+
+**Required change:** None.
+
+---
+
+## ⚪ Legacy / deprecated surfaces that Known replaces
+
+These functions are **deprecated** and should NOT have their cyphers updated. Known provides the replacement path; existing callers should be migrated to the Known equivalents, and these functions can be removed once migration is complete.
+
+### `mvp/merge/master-merge` (#12736) — deprecated
+
+**Current behavior:** Was a placeholder for merging `master_person` records that share an exact identifier. Marked as deprecated — not in active use.
+
+**Known replacement:** [Identity Merge](/guides/known/scope/identity-merge) — `known/merge/execute_merge` and the full merge algorithm. Known's merge is **greenfield**, not an extension of this function. Do NOT treat `master-merge` as an implementation target.
+
+### `mvp/merge/detect-suspects` (#12709) — uses deprecated flow
+
+**Current behavior:** Detects suspected duplicate contacts using embedding similarity + LLM, writes to the `merge_suspect` table, and calls the deprecated `master-merge` function for deterministic exact-match cases.
+
+**Known replacement:** Known's [identity resolution trigger surface](/guides/known/scope/identity-merge#merge-trigger). The detect-suspects logic (embedding-based candidate detection) could be preserved or rewritten, but the downstream call to `master-merge` must be replaced with `known/merge/execute_merge` from Known.
+
+**Decision needed:** keep `detect-suspects` as the identity resolver (feeding candidates into Known's merge) OR replace it entirely with a new Known-aware identity resolver. Deferred to implementation time.
+
+### `merge/person` (#2269) — tagged "master merge"
+
+**Current behavior:** Older merge/person function.
+
+**Known replacement:** Same as above — fully superseded by `known/merge/execute_merge`. Deprecate once Known is live.
+
+### `merge/mp-merge` (#159) — tagged "refactored" + "depreciated" (sic)
+
+**Current behavior:** Already marked as deprecated in the Xano tags. Legacy hard-merge function.
+
+**Known replacement:** `known/merge/execute_merge`. Safe to remove after Known is live.
+
+### `mvp/archive/merge-founders-v2` (#4630)
+
+**Current behavior:** Archive function for merging founder records. Path includes `/archive/`, indicating it's already archived.
+
+**Known replacement:** None needed — the archive path is a signal this is already end-of-life.
+
+### `mvp/dupe/merge-company-nodes` (#10505)
+
+**Current behavior:** Deduplicates company nodes in the graph.
+
+**Known scope:** **Out of scope** for Known's initial build. Known only merges `Person` nodes. Company deduplication remains the responsibility of this existing function (not deprecated, not updated — just unrelated to Known).
+
+**Note:** If a future version of Known wants to handle company identity merges, the patterns from `known/merge/execute_merge` (audit log, tombstone, reparent edges) would transfer. Deferred.
+
+---
+
+## 🟢 Functions that don't need any changes
+
+These are out of Known's scope. They write to edges/nodes Known does not touch.
+
+| Function | ID | Writes | Notes |
+|---|---|---|---|
+| `mvp/edges/add-imdb-credit-edges` | #10514 | `WORKED_ON`, `HAS_AWARD`, `WON_AWARD`, `NOMINATED_FOR` (film/TV) | Film/TV domain, unrelated to Known |
+| `mvp/edge/add-node-edge-imdb-award` | #2334 | IMDB award edges | Film/TV domain |
+| `mvp/imdb/add-imdb-credits` | #12632 | IMDB credits → film/TV edges | Film/TV domain |
+| `mvp/imdb/add-award-records-from-person` | #12633 | Film/TV awards | Film/TV domain |
+| `mvp/imdb/add-title-imdb` | #10507 | Film/TV title nodes | Film/TV domain |
+| `mvp/imdb/add-title-imdb-restricted` | #10515 | Film/TV title nodes | Film/TV domain |
+| `mvp/imdb/create-master-person-from-imdb` | #10506 | Person nodes from IMDB | Node creation only |
+| `mvp/node/add-person-node` | #2601 | Creates `Person` node | Primitive Known reuses as-is |
+| `mvp/node/add-company-node` | #2602 | Creates `Company` node | Primitive, unchanged |
+| `mvp/node/add-film-tv-node` | #2320 | Creates `FilmTV` node | Film/TV domain |
+| `mvp/node/add-all-country-nodes` | #12583 | Creates `Country` nodes | Location, unrelated |
+| `mvp/node/update-country-node` | #2533 | Updates `Country` node | Location, unrelated |
+| `mvp/node/update-node-region` | #2532 | Updates `Region` node | Location, unrelated |
+| `mvp/node/update-city-node` | #2531 | Updates `City` node | Location, unrelated |
+| `mvp/node/primary-location-nodes-edges_v2` | #4690 | `LOCATED_IN`, `IN_REGION`, `IN_COUNTRY` edges | Location, no Known interaction |
+| `mvp/node/location-nodes-edges-company` | #4528 | Company location edges | Location, no Known interaction |
+| `mvp/node/update-company-node` | #4659 | Syncs `Company` properties | No Known-specific additions |
+| `mvp/expertise/backfill-person-expertise` | #12745 | Migration task for `HAS_EXPERTISE` | Pattern reference for Known backfill, not affected |
+| `mvp/expertise/llm-identify-person-expertise` | #12666 | LLM classifier → calls resolve-person-expertise | Unrelated domain |
+| `mvp/funding/fundable-lookup` | #12698 | Read-only lookup | No graph writes |
+| `mvp/funding/_upsert-person` | #12692 | Upserts `fundable_people` table | Xano table, not graph |
+| `mvp/funding/_upsert-org` | #12691 | Upserts `fundable_organizations` table | Xano table, not graph |
+| `mvp/funding/_bq-execute` | #12690 | BigQuery helper | No graph writes |
+| `mvp/funding/get-add-fundable-records` | #12689 | Fetches + upserts | Xano table, not graph |
+| `mvp/falkor/send-cypher` | #2815 | Shared cypher executor | Core infrastructure, unchanged |
+| `mvp/falkor/send-cypher-with-embeddings` | #12566 | Cypher executor with embeddings | Core infrastructure, unchanged |
+| `mvp/falkor/send-cypher-with-params` | #4670 | Parameterized cypher executor | Core infrastructure, unchanged |
+| `mvp/falkor/send-cypher-with-uuids` | #12679 | Cypher executor with uuid list | Core infrastructure, unchanged |
+| `mvp/falkor/send-cypher-with-paths` | #12680 | Cypher executor with paths | Core infrastructure, unchanged |
+| `mvp/query/text-to-cypher` | #4612 | NL → cypher translator | Read-only query layer |
+| `mvp/falkor/text-to-cypher` | #4492 | NL → cypher translator | Read-only query layer |
+
+---
+
+## Summary
+
+### Count by category
+
+| Category | Count |
+|---|---|
+| 🔴 Direct cypher update | **1** (`mvp/yc/process-yc-people`) |
+| 🟡 Trigger hook needed | **5** functions / ~1 pattern addition per function |
+| ⚪ Legacy / deprecated | **5** functions — replaced entirely by Known's merge algorithm |
+| 🟢 No changes | **30+** functions — unrelated or primitive infrastructure |
+| 🆕 Net-new Known functions to create | **~45** (all of [scope](/guides/known/scope) — helpers, staging, ingest, counts, cache, intros, households, scoring, lifecycle, llm, queries, identity-merge) |
+
+### What needs to happen in order
+
+**Phase 0 — migration prerequisite (run ONCE, before any Xano changes):**
+1. **`known/migrations/backfill_mentor_v2`** — new one-time function. Runs the v1 → v2 MENTOR backfill cypher from [Schema Design → MENTOR → Migration](/guides/known/schema-design/edges#migration-v1-v2) against production. Must complete before the next step.
+
+**Phase 1 — existing function update:**
+2. **Update `mvp/yc/process-yc-people` (#12700)** — replace the embedded cypher template with the v2 version.
+
+**Phase 2 — build Known's core (per [scope build order](/guides/known/scope#build-order-priority)):**
+3. All Phase 1–6 functions from the main build order. No existing Xano functions are changed in this phase — everything is net-new.
+
+**Phase 3 — trigger hooks on upstream functions:**
+4. **`mvp/edges/create-work-edges`** — append trigger calls to fire `professional_tie_maintainer` + `cache/invalidate_on_upstream_change`.
+5. **`mvp/edges/create-education-edges`** — append trigger call for `cache/invalidate_on_upstream_change`.
+6. **`mvp/node/update-person-node`** — extend SET clause to sync new Known Person properties; fire `deceased_freezer` when `deceased_at` is first set.
+7. **`mvp/funding/add-all-fundable-deals`** — append trigger calls for investor-founder PROFESSIONAL_TIE inference.
+8. **Nylas webhook handlers** (`message-created`, `event-created`, `parse-*`) — append calls to Known's ingest functions at the end of each handler.
+
+**Phase 4 — deprecate legacy merge surfaces:**
+9. Mark `mvp/merge/master-merge` (#12736), `merge/person` (#2269), `merge/mp-merge` (#159), `mvp/archive/merge-founders-v2` (#4630) as deprecated in their descriptions.
+10. Decide the future of `mvp/merge/detect-suspects` (#12709) — either rewire to call Known's `execute_merge`, or replace entirely with a new Known-aware identity resolver. **Pending decision.**
+
+**Phase 5 — remove deprecated functions** (after all callers migrate to Known):
+11. Remove the legacy merge functions from Xano once no production code calls them.
+
+---
+
+## Pending decisions
+
+- **Identity resolver surface:** keep `detect-suspects` as-is (with rewired downstream) vs build a new Known-aware identity resolver from scratch. The candidate-detection logic (embedding + LLM) is reusable; the merge execution path definitely needs to change.
+- **Deferral window for legacy merge removal:** how long after Known ships do the deprecated merge functions stay in Xano? Recommend 30 days of no calls before removal.
+- **Company merge scope:** `mvp/dupe/merge-company-nodes` is out of scope for Known's initial build, but should Known's merge algorithm eventually extend to cover Company nodes? If so, when?
+
+---
+
+## How this list was built
+
+This audit was conducted by searching Xano workspace 3 (`OrbiterV2`) on 2026-04-10 for functions containing graph-writing patterns, grouped by prefix (`mvp/edges/*`, `mvp/node/*`, `mvp/yc/*`, `mvp/funding/*`, `mvp/merge/*`, `mvp/expertise/*`, `mvp/imdb/*`) and by keyword searches for `cypher`, `MERGE`, and graph-specific terms. Each candidate was then cross-referenced against Known's schema (see [Schema Design → Edge Types](/guides/known/schema-design/edges)) to determine the impact category.
+
+**The audit is a point-in-time snapshot.** If new graph-writing functions are added to Xano after 2026-04-10, this page must be re-audited. A periodic (monthly?) sync process is recommended once Known is in production — the `known-touchpoints-audit` could itself be a scheduled task that diffs the Xano function list against this doc.

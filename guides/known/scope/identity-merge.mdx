@@ -1,0 +1,299 @@
+---
+title: "Identity Merge"
+description: "Functions and merge algorithm for consolidating two Person nodes that represent the same human"
+---
+
+When Orbiter's identity resolution pipeline determines that two `Person` nodes represent the same human, the Known graph must merge them. This is one of the highest-risk operations in the model — it touches every edge, every facet, and every derived field. A naive implementation would silently double-count interactions, leave orphaned Introduction nodes, or produce contradictory facet states.
+
+This page specifies the full merge algorithm and the functions that implement it.
+
+## Design principles
+
+1. **Always re-compute derived fields from raw logs.** Do not sum or combine derived fields across merged edges. Counts, scores, reciprocity, and shared context cache are all recomputed from scratch against the unified `person_id`.
+2. **Lower `uuid` wins canonical.** When merging `A` into `B`, the older person (lower uuid) is canonical. The absorbed person is soft-deleted as a tombstone.
+3. **Merges are auditable.** Every merge creates a [`MergeEvent`](/guides/known/schema-design/nodes#mergeevent) node recording what was absorbed, by whom, with what confidence, and any conflicts encountered.
+4. **Hard conflicts block the merge.** If two merged pairs have contradictory declared facets (e.g. one has declared BONDED, the other has declared ESTRANGED), the merge aborts with a conflict log for human or LLM review. Soft conflicts (inferred vs inferred) are resolved automatically per the rules below.
+5. **Tombstone, don't delete.** The absorbed Person node is soft-deleted with a `merged_into` pointer, so external systems with cached uuids can resolve to the canonical.
+
+---
+
+## Merge trigger
+
+Merges are **never automatic from ingest paths**. They are only triggered by:
+
+1. An explicit call from the identity resolution pipeline (with confidence ≥ configured threshold, typically 0.9+)
+2. A manual user action ("these are the same person")
+3. An LLM review pass that matches two candidates and promotes to merge
+
+Routine ingest NEVER merges. Two separate Person nodes with similar names will coexist until the identity resolution pipeline explicitly matches them.
+
+---
+
+## The merge algorithm
+
+### `known/merge/execute_merge`
+
+Top-level function. Orchestrates the full merge. Runs in a transaction where possible.
+
+**Inputs:** `absorbed_person_id`, `canonical_person_id`, `initiated_by`, `confidence`, `rationale`
+**Outputs:** `{merge_event_uuid, affected_edges_count, affected_introductions_count, conflicts: []}`
+
+**Pre-flight checks:**
+- Both persons exist and are not tombstoned
+- `absorbed_person_id ≠ canonical_person_id`
+- `canonical_person_id < absorbed_person_id` (lower uuid wins; swap and re-call if reversed)
+- If either has `deceased_at` set and the other has `last_direct_interaction_at` later than that date → abort with conflict `'deceased_conflict'`
+
+The function then walks through the steps below in order.
+
+---
+
+### Step 1 — Enumerate edges touching the absorbed person
+
+```cypher
+MATCH (absorbed:Person {uuid: $absorbed_id})-[e]-(other)
+RETURN e, type(e), other
+```
+
+Split results into two buckets:
+- **Duplicates** — edges where the same edge type exists between the canonical person and the same `other` node
+- **Unique** — edges where no equivalent exists on the canonical side
+
+### Step 2 — Merge duplicate `KNOWS` edges
+
+For each pair where both `(canonical)-[:KNOWS]-(other)` and `(absorbed)-[:KNOWS]-(other)` exist:
+
+`known/merge/merge_knows_pair(canonical_uuid, absorbed_knows_uuid, canonical_knows_uuid, other_uuid)`
+
+1. **Append evidence.** Concatenate `absorbed.evidence` into `canonical.evidence`. Deduplicate by `(source, evidence_occurred_at)` — if the same source fired at the same time on both edges, keep one copy.
+2. **Re-derive temporal fields** from the combined evidence array: `known_since`, `first_evidence_at`, `last_evidence_at`, `first_direct_interaction_at`, `last_direct_interaction_at`. Use [`derive_known_since`](/guides/known/scope/helpers#known-helpers-derive-known-since).
+3. **Re-trigger interaction count computation from raw logs.** Do NOT sum the count fields from the two edges. Call [`update_all_counts`](/guides/known/scope/counts#known-counts-update-all-counts) with the canonical person id. This re-scans the raw logs with the unified identity and produces accurate counts.
+4. **Re-compute shared context cache.** Call [`compute_shared_context`](/guides/known/scope/cache#known-cache-compute-shared-context) with the canonical pair.
+5. **Re-compute scoring.** Call [`recompute_all`](/guides/known/scope/scoring#known-scoring-recompute-all-cron) — strength score, reciprocity, decay, weight, peak watermarks. The peak is taken as the max across both pre-merge peaks.
+6. **Delete the absorbed KNOWS edge.** Hard delete. Its content has been absorbed.
+
+### Step 3 — Re-point unique edges from absorbed to canonical
+
+For each edge from `absorbed` where no equivalent exists on `canonical`:
+
+`known/merge/reparent_edge(edge_uuid, from_person_id, to_person_id)`
+
+Re-pointing an edge endpoint is **not a simple field update** in FalkorDB. Because the graph engine stores edges with a direction (even for undirected conventions), and because canonical ordering requires the lower uuid to be the source, re-pointing may require **delete + recreate**:
+
+1. Snapshot the edge's properties (`uuid`, `type`, all fields).
+2. Determine the new canonical pair: `(to_person_id, other_id)` canonicalized as `(min, max)`.
+3. Delete the old edge.
+4. Recreate the edge in the new canonical order with the same properties, including the original `uuid` and `valid_from`.
+5. If the edge type carries asymmetric role fields (`role_a_to_b`, `role_b_to_a`), and the re-canonicalization flipped the pair order, swap the role fields accordingly.
+
+**This step is the most error-prone in the merge.** Careful testing is required to ensure edge uuids are preserved and facet properties are not lost.
+
+### Step 4 — Merge duplicate facets
+
+For each non-KNOWS facet type that exists on both sides (`BONDED`, `PROFESSIONAL_TIE`, `KINSHIP`, `ROMANTIC`, `ESTRANGED`, `MENTORSHIP`):
+
+`known/merge/merge_facet_pair(facet_type, canonical_pair_facet_uuid, absorbed_pair_facet_uuid)`
+
+**Resolution rules (in priority order):**
+
+1. **Declared conflicts abort the merge.** If both facets have `source='declared'` and they encode contradictory state (e.g. declared BONDED on one side, declared ESTRANGED on the other), set a `conflicts: ['declared_contradiction']` entry on the `MergeEvent` and **abort the merge entirely**. No partial merges.
+2. **Declared beats inferred.** If one is declared and the other is inferred, keep the declared facet and delete the inferred one.
+3. **Most recently valid beats older.** Among inferred facets, keep the one with the most recent `valid_from`.
+4. **More evidence beats less.** For facets with an `evidence` array (like `ESTRANGED`), tie-break by array length.
+5. **Higher peak beats lower.** For facets with `peak_strength_during_bond` or similar fields, keep the higher peak when merging.
+
+For each non-duplicate facet (exists on absorbed only, not canonical), re-point via `reparent_edge` per Step 3.
+
+### Step 5 — Re-point Introduction nodes
+
+```cypher
+MATCH (intro:Introduction)-[:CONNECTS]->(absorbed:Person {uuid: $absorbed_id})
+RETURN intro, intro.resulting_knows_uuid
+```
+
+For each Introduction node pointing at the absorbed person:
+
+1. If a `CONNECTS` edge from the same Introduction to the canonical person **already exists**, just delete the absorbed-side `CONNECTS` edge.
+2. If not, re-point the `CONNECTS` edge to the canonical person.
+
+**Update `resulting_knows_uuid` references.** If the Introduction's `resulting_knows_uuid` field points at a KNOWS edge that was deleted in Step 2 (because it was a duplicate that got absorbed), update the field to the surviving canonical KNOWS uuid:
+
+```cypher
+MATCH (intro:Introduction)
+WHERE intro.resulting_knows_uuid = $deleted_knows_uuid
+SET intro.resulting_knows_uuid = $canonical_knows_uuid
+```
+
+The `Introduction.resulting_knows_uuid` index (see [Schema Design — indexes](/guides/known/schema-design#indexes)) makes this bulk update efficient.
+
+### Step 6 — Re-point `MADE_INTRODUCTION` edges
+
+If the absorbed person was an introducer (not just a participant), re-point those edges too:
+
+```cypher
+MATCH (absorbed:Person {uuid: $absorbed_id})-[m:MADE_INTRODUCTION]->(intro:Introduction)
+// Re-point to canonical
+```
+
+Same pattern as Step 5 — check for duplicates, delete or re-point accordingly. `MADE_INTRODUCTION` is directed, so canonicalization rules don't apply.
+
+### Step 7 — Merge `Household` residencies
+
+For each `(absorbed)-[:RESIDED_AT]->(household)` edge:
+
+1. If `(canonical)-[:RESIDED_AT]->(household)` exists with overlapping time windows, this is a **conflict** — the same person should not have two residency edges to the same household. Merge the edges: take the earliest `move_in` and the latest `move_out` (or null if either is null).
+2. If no conflict, re-point the edge to canonical per Step 3.
+
+### Step 8 — Merge `staging_evidence` rows
+
+```sql
+-- Re-point canonicalized rows
+UPDATE staging_evidence
+SET person_a_id = CASE WHEN person_a_id = $absorbed THEN LEAST($canonical, other_in_row) ELSE person_a_id END,
+    person_b_id = CASE WHEN person_b_id = $absorbed THEN GREATEST($canonical, other_in_row) ELSE person_b_id END
+WHERE person_a_id = $absorbed OR person_b_id = $absorbed;
+
+-- Deduplicate rows that now collide with existing canonical-side rows
+DELETE FROM staging_evidence
+WHERE id IN (
+  SELECT id FROM staging_evidence
+  GROUP BY person_a_id, person_b_id, source, evidence_occurred_at
+  HAVING COUNT(*) > 1
+  -- keep the earliest row
+);
+```
+
+### Step 9 — Merge `Person` node properties
+
+`known/merge/merge_person_properties(canonical_id, absorbed_id)`
+
+1. For each field on `absorbed`, if the field is null on `canonical`, copy it over.
+2. If both have values that differ, log to `MergeEvent.conflicts`. Use the canonical's value unless specifically overridden (e.g. `deceased_at` — use the earliest non-null value across the two).
+3. `name_embedding` is recomputed, not merged — call the embedding pipeline with the unified identity.
+
+### Step 10 — Create the `MergeEvent` audit record
+
+```cypher
+CREATE (merge:Entity:MergeEvent {
+  uuid: randomUUID(),
+  absorbed_person_id: $absorbed_id,
+  canonical_person_id: $canonical_id,
+  merged_at: datetime(),
+  initiated_by: $initiated_by,
+  confidence: $confidence,
+  rationale: $rationale,
+  affected_edges_count: $count,
+  affected_introductions_count: $intro_count,
+  conflicts: $conflicts_json
+})
+CREATE (merge)-[:ABSORBED]->(absorbed_tombstone:Person {uuid: $absorbed_id})
+CREATE (merge)-[:CANONICAL_NOW]->(canonical:Person {uuid: $canonical_id})
+```
+
+See [Schema Design — MergeEvent](/guides/known/schema-design/nodes#mergeevent) for the full node shape.
+
+### Step 11 — Tombstone the absorbed person
+
+**Soft delete, not hard delete.** The absorbed Person node is kept with tombstone fields so that external systems caching the old uuid can still resolve:
+
+```cypher
+MATCH (absorbed:Person {uuid: $absorbed_id})
+SET absorbed.merged_into = $canonical_id,
+    absorbed.deleted_at = datetime(),
+    absorbed.tombstone = true
+```
+
+Queries for active persons filter `WHERE NOT p.tombstone`. Queries for historical uuids can follow `merged_into` to find the current canonical.
+
+### Step 12 — Trigger downstream recomputation
+
+After the merge settles, trigger these as follow-ups (not inline, to keep the merge transaction bounded):
+
+- `cache/refresh_shared_context` for all canonical KNOWS edges that were touched
+- `scoring/recompute_all` for the same set
+- `lifecycle/bonded_creator` and `lifecycle/bonded_invalidator` — score changes may cross thresholds
+- LLM sentiment pass if any ESTRANGED facet's severity was modified
+
+---
+
+## Conflict handling
+
+### Declared contradiction (abort)
+
+If two merged pairs have **declared** facets that contradict each other, the merge is aborted. Example:
+
+- Canonical has `ESTRANGED(source='declared', reason='cofounder_split')` with person X
+- Absorbed has `BONDED(source='declared', bond_type=['cofounder'])` with person X
+
+These cannot both be true for the same pair. The merge logs:
+
+```json
+{
+  "type": "declared_contradiction",
+  "canonical_facet": {"type": "ESTRANGED", "uuid": "..."},
+  "absorbed_facet": {"type": "BONDED", "uuid": "..."},
+  "same_other_person_id": "..."
+}
+```
+
+A human or LLM must resolve the contradiction (by explicitly invalidating one of the declared facets) before re-running the merge.
+
+### Deceased conflict
+
+If only one of the two persons has `deceased_at` set, and the other has `last_direct_interaction_at` **after** that date, the merge is aborted with `conflicts: ['deceased_conflict']`. This suggests the identity resolver was wrong about the match — a deceased person cannot have recent interactions.
+
+### Inferred conflicts (auto-resolve)
+
+Inferred-vs-inferred facet conflicts are resolved per the rules in Step 4. No manual intervention needed. These are logged to the `MergeEvent.conflicts` array for audit but do not block the merge.
+
+---
+
+## Supporting functions
+
+### `known/merge/preflight_check`
+
+Validates the merge is safe to execute. Returns the list of would-be conflicts without mutating anything. Called before `execute_merge` to preview outcomes.
+
+### `known/merge/reparent_edge`
+
+Re-points a single edge from one Person to another, handling canonicalization and role-field swaps. Used by `execute_merge` internally. Not a public entry point.
+
+### `known/merge/merge_knows_pair`
+
+Merges two duplicate `KNOWS` edges. Handles the evidence dedup, count recompute, cache recompute, and scoring recompute. Deletes the absorbed edge.
+
+### `known/merge/merge_facet_pair`
+
+Merges two duplicate facets of the same type on the same pair. Applies resolution rules. Returns either `'kept_canonical'`, `'kept_absorbed'`, `'conflict_aborted'`, or `'merged'` depending on the outcome.
+
+### `known/merge/redirect_person_uuid` (query helper)
+
+Given a person uuid, returns the canonical uuid if the input was tombstoned (via `merged_into` chain), or the input if it's already canonical. Exposed to the frontend and other Orbiter services so stale uuids resolve correctly.
+
+**Inputs:** `person_uuid`
+**Outputs:** `canonical_person_uuid`
+
+### `known/merge/get_merge_history`
+
+Given a canonical person uuid, returns all `MergeEvent` nodes where this person was the canonical or absorbed target. Used for audit/debugging.
+
+**Inputs:** `person_uuid`
+**Outputs:** array of `MergeEvent` records with timestamps and rationale
+
+---
+
+## Cadence and operational notes
+
+- **Merges are not scheduled.** There is no cron for merging. Merges are always on-demand, triggered by the identity resolver or a manual action.
+- **Merges run in the foreground** with a bounded transaction. They should complete within seconds for a typical pair; identity resolution for someone with thousands of KNOWS edges may take longer.
+- **Merges are NOT reversible.** The tombstone preserves external uuid resolution but does not allow "undoing" the merge. If a merge was wrong, the correct action is to re-split the canonical into two Person nodes manually — essentially the inverse algorithm — which is out of scope for the initial implementation.
+- **Merges touch every layer.** The merge function depends on helpers, ingest, counts, cache, scoring, lifecycle crons, and query helpers. It is the most cross-cutting function in Known and should be the last thing implemented (Phase 7, after all other phases are operational).
+
+---
+
+## Known limitations
+
+- **Auto-detection of merge candidates is not Known's responsibility.** The identity resolution pipeline lives outside Known — Known only implements the mechanism once a merge is requested.
+- **Batch merges are not supported.** Each merge is one pair at a time. If the identity resolver finds 5 duplicates of the same person, it must call `execute_merge` 4 times in sequence.
+- **Merge conflicts during other merges.** If two merge operations are in flight simultaneously and touch overlapping persons, the second merge should detect the in-flight state and abort with `conflicts: ['concurrent_merge']`. Needs a distributed lock or optimistic concurrency control.
+- **Merge does not trigger re-evaluation of identity resolution for other persons.** After merging `A → B`, it's possible that more persons now match `B` that didn't match `A` individually. The identity resolver must re-run to detect these cascades.

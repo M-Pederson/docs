@@ -3,27 +3,31 @@ title: "Node Types"
 description: "Node types in the Known relationship graph — Person (extended), Introduction, and Household"
 ---
 
-**3 node types** across 2 logical groups.
+**4 node types** across 3 logical groups.
 
-Known reuses `Person` from the existing ontology and introduces two new node types (`Introduction` and `Household`) for cases that are genuinely N-ary or can't be represented as edges in FalkorDB. Everything else stays as edges — see [Edge Types](/guides/known/schema-design/edges).
+Known reuses `Person` from the existing ontology and introduces three new node types (`Introduction`, `Household`, `MergeEvent`) for cases that are genuinely N-ary, can't be represented as edges in FalkorDB, or require an audit record. Everything else stays as edges — see [Edge Types](/guides/known/schema-design/edges).
 
 ## Summary
 
 | Node type | Labels | Purpose |
 |---|---|---|
-| [`Person` (extended)](#person-extended) | `Entity:Person` | Reused from existing ontology. Known adds the `deceased_at` property for freeze logic. |
+| [`Person` (extended)](#person-extended) | `Entity:Person` | Reused from existing ontology. Known adds `deceased_at` for freeze logic, plus `merged_into` / `deleted_at` / `tombstone` for identity merge. |
 | [`Introduction`](#introduction) | `Entity:Introduction` | First-class node representing "X introduced Y to Z." Carries introducer, participants, and resulting KNOWS reference. Promoted to a node because FalkorDB can't link edges to edges and introductions are N-ary. |
 | [`Household`](#household) | `Entity:Household` | Shared living space with multiple residents and overlap windows. Promoted to a node because cohabitation is N-ary and is a first-class closeness signal. |
+| [`MergeEvent`](#mergeevent) | `Entity:MergeEvent` | Audit record for an [identity merge](/guides/known/scope/identity-merge). Records which person absorbed which, by whom, with what confidence, and any conflicts encountered. |
 
 ---
 
 ## Person (extended)
 
-Known adds one new optional property to the existing `Person` node for freeze logic. All other Person properties come from the [existing ontology](/guides/ontology/nodes#person).
+Known adds several new optional properties to the existing `Person` node: one for freeze logic and three for identity merge tombstoning. All other Person properties come from the [existing ontology](/guides/ontology/nodes#person).
 
 | Property | Type | Description |
 |---|---|---|
-| `deceased_at` | string \| null | ISO 8601 timestamp. When set, all `KNOWS` edges touching this person freeze their `strength_score` with `score_frozen_reason='deceased'`. |
+| `deceased_at` | string \| null | ISO 8601 timestamp. When set, all `KNOWS` edges touching this person freeze their `strength_score` with `score_frozen_reason='deceased'`. See [Scoring model](/guides/known/documentation#scoring-model). |
+| `merged_into` | person uuid \| null | Tombstone pointer. Set when this person was absorbed by another during an [identity merge](/guides/known/scope/identity-merge). Queries can follow the chain to find the current canonical uuid. |
+| `deleted_at` | string \| null | Soft-delete timestamp, set when `merged_into` is set. |
+| `tombstone` | boolean | True if this person was absorbed in a merge. Active-person queries filter `WHERE NOT p.tombstone`. |
 
 All other relationship state is captured on edges and facets, not on the Person node.
 
@@ -139,3 +143,84 @@ CREATE (sarah)-[:RESIDED_AT {move_in: '2008-06-14', move_out: '2020-04-02', role
        (lily)-[:RESIDED_AT {move_in: '2012-08-09', move_out: '2020-04-02', role: 'child'}]->(home)
 ```
 </Accordion>
+
+---
+
+## MergeEvent
+
+An audit record capturing an identity merge operation. Created whenever Orbiter's identity resolver (or a user/LLM action) determines that two `Person` nodes represent the same human and consolidates them into one. See [Identity Merge scope](/guides/known/scope/identity-merge) for the full algorithm.
+
+**Labels:** `Entity:MergeEvent`
+
+| Property | Type | Description |
+|---|---|---|
+| `uuid` | string | Primary identifier |
+| `absorbed_person_id` | person uuid | The Person that was absorbed. Now tombstoned (`tombstone=true`, `merged_into=<canonical>`). |
+| `canonical_person_id` | person uuid | The surviving canonical Person. |
+| `merged_at` | timestamp | When the merge executed |
+| `initiated_by` | string | What triggered the merge: `identity_resolver_v1`, `user:<user_id>`, `llm_review_pass_v1`, etc. |
+| `confidence` | float (0.0–1.0) | How confident the trigger was that these are the same person |
+| `rationale` | string | Human-readable reason (e.g. "Matching email domain, 14 mutual connections, name tokens match after middle-initial normalization") |
+| `affected_edges_count` | integer | Number of edges touched (merged, re-pointed, or recreated) during the merge |
+| `affected_introductions_count` | integer | Number of `Introduction` nodes re-pointed |
+| `conflicts` | json \| null | Array of soft conflicts encountered (e.g. facet resolution rules applied). Null if no conflicts. |
+| `created_at` | timestamp | Same as `merged_at`; kept for consistency with other audit entities |
+
+### Edges from MergeEvent
+
+| Pattern | Meaning |
+|---|---|
+| `(MergeEvent)-[:ABSORBED]->(Person)` | Points at the tombstoned person that was absorbed |
+| `(MergeEvent)-[:CANONICAL_NOW]->(Person)` | Points at the surviving canonical person |
+
+Both edges use the original `uuid` of the Person — the `:ABSORBED` edge resolves to a tombstoned Person node (still in the graph, with `tombstone=true`), enabling historical audit.
+
+<Accordion title="Real example">
+```cypher
+// After a successful merge absorbing 'alice-dup-uuid' into 'alice-uuid'
+CREATE (merge:Entity:MergeEvent {
+  uuid: 'merge-abc-001',
+  absorbed_person_id: 'alice-dup-uuid',
+  canonical_person_id: 'alice-uuid',
+  merged_at: '2025-01-20T14:32:00Z',
+  initiated_by: 'identity_resolver_v1',
+  confidence: 0.94,
+  rationale: 'Same email domain (foocorp.com), 14 mutual connections, name tokens match after middle-initial normalization',
+  affected_edges_count: 2,
+  affected_introductions_count: 1,
+  conflicts: null,
+  created_at: '2025-01-20T14:32:00Z'
+})
+MATCH (absorbed:Person {uuid: 'alice-dup-uuid'}),
+      (canonical:Person {uuid: 'alice-uuid'})
+CREATE (merge)-[:ABSORBED]->(absorbed),
+       (merge)-[:CANONICAL_NOW]->(canonical)
+
+// Absorbed Person is also updated with tombstone fields:
+SET absorbed.merged_into = 'alice-uuid',
+    absorbed.deleted_at = '2025-01-20T14:32:00Z',
+    absorbed.tombstone = true
+```
+</Accordion>
+
+**Query patterns enabled:**
+
+```cypher
+// Resolve a potentially-stale person uuid to the current canonical
+MATCH (p:Person {uuid: $stale_uuid})
+RETURN COALESCE(p.merged_into, p.uuid) AS canonical_uuid
+
+// Get the full merge history for a person
+MATCH (p:Person {uuid: $person_uuid})
+OPTIONAL MATCH (merge:MergeEvent)-[:CANONICAL_NOW]->(p)
+OPTIONAL MATCH (merge)-[:ABSORBED]->(absorbed:Person)
+RETURN merge, absorbed
+ORDER BY merge.merged_at
+
+// Find all merges initiated by the identity resolver in a date range
+MATCH (merge:MergeEvent)
+WHERE merge.initiated_by STARTS WITH 'identity_resolver'
+  AND merge.merged_at >= $start_date
+  AND merge.merged_at < $end_date
+RETURN merge
+```

@@ -43,8 +43,55 @@ Top-level function. Orchestrates the full merge. Runs in a transaction where pos
 - `absorbed_person_id ≠ canonical_person_id`
 - `canonical_person_id < absorbed_person_id` (lower uuid wins; swap and re-call if reversed)
 - If either has `deceased_at` set and the other has `last_direct_interaction_at` later than that date → abort with conflict `'deceased_conflict'`
+- **Concurrent merge check:** If either person has `merge_in_progress_at IS NOT NULL`, abort with `conflicts: ['concurrent_merge']` (see [Concurrent merge handling](#concurrent-merge-handling) below)
+- **Acquire the merge lock:** Set `canonical.merge_in_progress_at = now()` and `canonical.merge_in_progress_by = <worker_id>` atomically. Also set the same on the absorbed person (so neither can be targeted by a concurrent merge). If the atomic set fails (another worker got there first), abort with `conflicts: ['concurrent_merge']`.
 
-The function then walks through the steps below in order.
+The function then walks through the steps below in order. On completion (success or any abort after the lock is acquired), the `merge_in_progress_at` and `merge_in_progress_by` fields are cleared on both persons in a `finally` block.
+
+## Concurrent merge handling
+
+If two merge operations are dispatched simultaneously against overlapping persons — e.g., two parallel identity resolver workers both discover the same duplicate pair at nearly the same time — the second one must detect the in-flight state and abort rather than corrupting the graph.
+
+Known uses **optimistic concurrency control** via two fields on the `Person` node:
+
+| Field | Description |
+|---|---|
+| `merge_in_progress_at` | ISO 8601 timestamp set when an `execute_merge` call starts against this person as the canonical target. Cleared when the merge completes (success or abort). |
+| `merge_in_progress_by` | Worker id or process id that holds the merge lock. |
+
+**Pre-flight logic:**
+
+```
+if canonical.merge_in_progress_at is not null OR absorbed.merge_in_progress_at is not null:
+  return {
+    aborted: true,
+    reason: 'concurrent_merge',
+    other_worker: <which field is set>,
+    retry_after_ms: 30000
+  }
+
+// Atomic compare-and-set to acquire lock
+set canonical.merge_in_progress_at = now()
+set canonical.merge_in_progress_by = worker_id
+set absorbed.merge_in_progress_at = now()
+set absorbed.merge_in_progress_by = worker_id
+```
+
+**Retry path:** The identity resolver should re-queue the aborted merge request with a back-off delay (30 seconds recommended). By the time the retry runs, the first merge should be complete.
+
+**Staleness protection:** If a merge crashes mid-execution and leaves `merge_in_progress_at` set indefinitely, a janitor cron (`known/merge/release_stale_locks`) clears any locks older than 10 minutes.
+
+```
+// known/merge/release_stale_locks (cron, hourly)
+MATCH (p:Person)
+WHERE p.merge_in_progress_at IS NOT NULL
+  AND p.merge_in_progress_at < datetime() - duration('PT10M')
+SET p.merge_in_progress_at = null,
+    p.merge_in_progress_by = null
+RETURN count(p) AS locks_released
+```
+
+Add this cron to [scope/lifecycle](/guides/known/scope/lifecycle) as `release_stale_merge_locks`.
 
 ---
 
@@ -146,13 +193,42 @@ For each `(absorbed)-[:RESIDED_AT]->(household)` edge:
 
 ### Step 8 — Merge `staging_evidence` rows
 
+Three sub-steps, in order:
+
+**8a. Re-point the canonicalized pair:**
+
 ```sql
--- Re-point canonicalized rows
+-- Re-point canonicalized rows to the canonical person
 UPDATE staging_evidence
 SET person_a_id = CASE WHEN person_a_id = $absorbed THEN LEAST($canonical, other_in_row) ELSE person_a_id END,
     person_b_id = CASE WHEN person_b_id = $absorbed THEN GREATEST($canonical, other_in_row) ELSE person_b_id END
 WHERE person_a_id = $absorbed OR person_b_id = $absorbed;
+```
 
+**8b. Eagerly absorb re-pointed rows where the canonical pair already has a KNOWS edge.**
+
+If the canonical person already has a `KNOWS` edge to the third party from the re-pointed row, the staging row should be **immediately consumed and appended to that KNOWS's evidence array**, not left in staging. This handles the common case where the absorbed person had weak-source evidence (e.g. `shared_employment_inferred`) that never cleared the floor on its own, but the canonical already has a full KNOWS to the same third party.
+
+```
+foreach staging_row in re-pointed rows:
+  canonical_pair = (staging_row.person_a_id, staging_row.person_b_id)
+  existing_knows = lookup_knows_edge(canonical_pair)
+
+  if existing_knows is not null:
+    # Append to the existing KNOWS's evidence array
+    # Bypasses the normal floor check — the floor was already cleared when KNOWS was created
+    append_evidence(existing_knows.uuid, staging_row)
+    delete_staging_row(staging_row.id)
+  else:
+    # Leave in staging for future ingest to re-evaluate against the floor
+    pass
+```
+
+This preserves evidence provenance (the previously-orphaned weak signals become provenance entries on the canonical's KNOWS) while keeping staging bounded.
+
+**8c. Deduplicate remaining staging rows:**
+
+```sql
 -- Deduplicate rows that now collide with existing canonical-side rows
 DELETE FROM staging_evidence
 WHERE id IN (
@@ -213,6 +289,38 @@ After the merge settles, trigger these as follow-ups (not inline, to keep the me
 - `scoring/recompute_all` for the same set
 - `lifecycle/bonded_creator` and `lifecycle/bonded_invalidator` — score changes may cross thresholds
 - LLM sentiment pass if any ESTRANGED facet's severity was modified
+
+### Step 12b — Enqueue canonical for cascade re-evaluation
+
+A single merge can reveal additional duplicates. Example: merging person 5002 into canonical 5001 brings in a rich set of new evidence (additional email addresses, phone numbers, LinkedIn profile data). Now that 5001 has richer profile data, the identity resolver may find **more** merge candidates that it didn't match on 5001 alone.
+
+To handle this cascade naturally without running into infinite loops:
+
+```
+# After the merge completes successfully:
+identity_resolver.enqueue_for_reevaluation(canonical_person_id)
+```
+
+The identity resolver receives the canonical person id in its input queue and re-runs its duplicate detection against the newly-merged state. If it finds new candidates, it triggers additional `execute_merge` calls. Each iteration absorbs at least one new person, so the cascade terminates naturally when the candidate pool is exhausted.
+
+**Why this isn't a runaway:** each cascade iteration strictly reduces the number of Person nodes in the graph. The pool of merge candidates is finite. Real-world cascades typically resolve within 2-3 iterations.
+
+**Implementation note:** the actual identity resolver lives outside Known. Known's responsibility is only to call `identity_resolver.enqueue_for_reevaluation(uuid)` at the end of `execute_merge`. The resolver decides when and how to process the queue.
+
+### Step 13 — Release the merge lock
+
+Clear the `merge_in_progress_at` and `merge_in_progress_by` fields on both persons. This **must** run in a `finally` block so the lock is released even if earlier steps abort.
+
+```
+try:
+  # Steps 1-12b above
+finally:
+  canonical.merge_in_progress_at = null
+  canonical.merge_in_progress_by = null
+  # absorbed is tombstoned so clearing its lock is mostly ceremonial, but do it anyway
+  absorbed.merge_in_progress_at = null
+  absorbed.merge_in_progress_by = null
+```
 
 ---
 
@@ -294,6 +402,6 @@ Given a canonical person uuid, returns all `MergeEvent` nodes where this person 
 ## Known limitations
 
 - **Auto-detection of merge candidates is not Known's responsibility.** The identity resolution pipeline lives outside Known — Known only implements the mechanism once a merge is requested.
-- **Batch merges are not supported.** Each merge is one pair at a time. If the identity resolver finds 5 duplicates of the same person, it must call `execute_merge` 4 times in sequence.
-- **Merge conflicts during other merges.** If two merge operations are in flight simultaneously and touch overlapping persons, the second merge should detect the in-flight state and abort with `conflicts: ['concurrent_merge']`. Needs a distributed lock or optimistic concurrency control.
-- **Merge does not trigger re-evaluation of identity resolution for other persons.** After merging `A → B`, it's possible that more persons now match `B` that didn't match `A` individually. The identity resolver must re-run to detect these cascades.
+- **Batch merges are not supported.** Each merge is one pair at a time. If the identity resolver finds 5 duplicates of the same person, it must call `execute_merge` 4 times in sequence. See [Scenario 11 — Multi-way identity merge](/guides/known/documentation) for the cascade pattern.
+- **Merge conflicts during other merges.** Handled via optimistic concurrency control. See [Concurrent merge handling](#concurrent-merge-handling) above.
+- **Cascade re-evaluation handled.** After a merge completes, the canonical is enqueued for identity-resolver re-evaluation (Step 12b) so that newly-revealed duplicates can be cascaded into additional merges.

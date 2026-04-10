@@ -42,12 +42,43 @@ Orbiter runs on **FalkorDB**, not Neo4j. FalkorDB is openCypher-compatible but *
 
 The cypher is embedded inside a `util.template_engine` block with Twig-style substitutions. Placeholders like `{{$var.ycPartnerUuid}}` correspond to Xano stack variables. See [Known → MENTOR edge spec](/guides/known/schema-design/edges#mentor-directed-coaching-relationship) for field definitions and design rationale.
 
-**Multi-founder branch:**
+The function ships **a single Twig-branched cypher block** that handles both the multi-founder and single-founder cases via `{% if founderCount > 1 %}`. The multi-founder branch creates a `contextFounded` entity (a shared "founded together" anchor) and points all founders at it; the single-founder branch creates a direct `FOUNDED` edge from the lone founder to the company. Both branches optionally fan out a `MENTOR` edge from the YC partner when `$var.ycPartnerUuid` is set.
 
 ```cypher
-// v2.6 MENTOR cypher — multi-founder branch (FalkorDB-compat: uses timestamp() not datetime())
+// v2.6 process-yc-people cypher — single block, Twig-branched on founderCount
 // Spec: guides/known/schema-design/edges#mentor-directed-coaching-relationship
 // MERGE key: (mentor, mentee, company_uuid, valid_from ISO string)
+{% set founderCount = $var.founderNodeUuids|length %}
+{% if founderCount > 1 %}
+OPTIONAL MATCH (oldCf:contextFounded)-[oldWf:WAS_FOUNDED]->(c:Company {uuid: "{{$var.masterCompany.node_uuid}}"})
+OPTIONAL MATCH (p:Person)-[oldR:FOUNDED]->(oldCf)
+DELETE oldR, oldWf, oldCf
+WITH count(*) AS deletedContext
+UNWIND {{$var.founderNodeUuids|json_encode}} AS founderUuid
+OPTIONAL MATCH (p:Person {uuid: founderUuid})-[r:FOUNDED]->(c:Company {uuid: "{{$var.masterCompany.node_uuid}}"})
+DELETE r
+WITH count(*) AS deleted
+CREATE (cf:Entity:contextFounded {
+  uuid: randomUUID(),
+  name: {{$var.masterCompany.company_name|json_encode}} + "_Founded",
+  description: {{$var.foundedContext|json_encode}},
+  name_embedding: vecf32({{$var.embeddingArray}}),
+  founded_year: {{$var.masterCompany.founded ?? 'null'}},
+  founders: "{% for founder in $var.completeFounders %}{{ founder.name }}{% if not loop.last %}, {% endif %}{% endfor %}"
+})
+WITH cf
+MATCH (c:Company {uuid: "{{$var.masterCompany.node_uuid}}"})
+CREATE (cf)-[wf:WAS_FOUNDED {weight: 0, uuid: randomUUID()}]->(c)
+WITH cf, c
+UNWIND [{% for founder in $var.completeFounders %}{name: {{founder.name|json_encode}}, title: {{founder.title|json_encode}}, node_uuid: "{{founder.node_uuid}}"}{% if not loop.last %},{% endif %}{% endfor %}] AS founder
+MATCH (p:Person {uuid: founder.node_uuid})
+CREATE (p)-[r:FOUNDED]->(cf)
+SET r.uuid = randomUUID(),
+    r.title = founder.title,
+    r.weight = 5,
+    r.start_year = {{$var.masterCompany.founded ?? 'null'}}
+WITH collect(p) AS founders, cf, c
+{% if $var.ycPartnerUuid is not empty %}
 MATCH (mentor:Person {uuid: "{{$var.ycPartnerUuid}}"})
 UNWIND founders AS founder
 MERGE (mentor)-[m:MENTOR {
@@ -55,67 +86,41 @@ MERGE (mentor)-[m:MENTOR {
   valid_from: "{{$var.masterCompany.founded ?? 1970}}-01-01T00:00:00Z"
 }]->(founder)
 ON CREATE SET
-  m.uuid                = randomUUID(),
-  m.description         = mentor.name + ' mentored ' + founder.name +
-                          ' as the Y Combinator partner for ' +
-                          {{$var.masterCompany.company_name|json_encode}} + '.',
-  m.company_name        = {{$var.masterCompany.company_name|json_encode}},
-  m.valid_to            = null,
-  m.source              = 'inferred',
-  m.formality           = 'formal',
-  m.domain              = 'accelerator',
-  m.created_by          = 'mvp/yc/process-yc-people',
-  m.created_at          = timestamp(),
-  m.invalidation_reason = null,
-  m.invalidated_by      = null,
-  m.weight              = 14
-ON MATCH SET
-  m.description  = mentor.name + ' mentored ' + founder.name +
-                   ' as the Y Combinator partner for ' +
-                   {{$var.masterCompany.company_name|json_encode}} + '.',
-  m.company_name = {{$var.masterCompany.company_name|json_encode}}
-
-WITH mentor, collect(founder) AS mentored_founders, cf, c
-RETURN cf.uuid AS context_founded_uuid,
-       c.company_name AS company,
-       [f IN mentored_founders | f.name] AS founders,
-       mentor.name AS yc_partner
-```
-
-**Single-founder branch:** Same pattern but bound to the single resolved founder `(p)`:
-
-```cypher
-// v2.6 MENTOR cypher — single-founder branch (FalkorDB-compat: uses timestamp() not datetime())
+  m.uuid = randomUUID(),
+  m.created_at = timestamp(),
+  m.weight = 14
+RETURN cf.uuid AS context_founded_uuid, c.company_name AS company, mentor.name AS yc_partner
+{% else %}
+RETURN cf.uuid AS context_founded_uuid, c.company_name AS company, null AS yc_partner
+{% endif %}
+{% else %}
+OPTIONAL MATCH (oldCf:contextFounded)-[oldWf:WAS_FOUNDED]->(c:Company {uuid: "{{$var.masterCompany.node_uuid}}"})
+OPTIONAL MATCH (p:Person)-[oldR:FOUNDED]->(oldCf)
+DELETE oldR, oldWf, oldCf
+WITH count(*) AS deleted
+UNWIND [{% for founder in $var.completeFounders %}{name: {{founder.name|json_encode}}, title: {{founder.title|json_encode}}, node_uuid: "{{founder.node_uuid}}"}{% if not loop.last %},{% endif %}{% endfor %}] AS founder
+MATCH (p:Person {uuid: founder.node_uuid})
+MATCH (c:Company {uuid: "{{$var.masterCompany.node_uuid}}"})
+MERGE (p)-[r:FOUNDED]->(c)
+SET r.title = founder.title,
+    r.weight = 5,
+    r.uuid = coalesce(r.uuid, randomUUID())
+WITH p, c, r
+{% if $var.ycPartnerUuid is not empty %}
 MATCH (mentor:Person {uuid: "{{$var.ycPartnerUuid}}"})
 MERGE (mentor)-[m:MENTOR {
   company_uuid: "{{$var.masterCompany.node_uuid}}",
   valid_from: "{{$var.masterCompany.founded ?? 1970}}-01-01T00:00:00Z"
 }]->(p)
 ON CREATE SET
-  m.uuid                = randomUUID(),
-  m.description         = mentor.name + ' mentored ' + p.name +
-                          ' as the Y Combinator partner for ' +
-                          {{$var.masterCompany.company_name|json_encode}} + '.',
-  m.company_name        = {{$var.masterCompany.company_name|json_encode}},
-  m.valid_to            = null,
-  m.source              = 'inferred',
-  m.formality           = 'formal',
-  m.domain              = 'accelerator',
-  m.created_by          = 'mvp/yc/process-yc-people',
-  m.created_at          = timestamp(),
-  m.invalidation_reason = null,
-  m.invalidated_by      = null,
-  m.weight              = 14
-ON MATCH SET
-  m.description  = mentor.name + ' mentored ' + p.name +
-                   ' as the Y Combinator partner for ' +
-                   {{$var.masterCompany.company_name|json_encode}} + '.',
-  m.company_name = {{$var.masterCompany.company_name|json_encode}}
-
-RETURN p.name AS founder,
-       c.company_name AS company,
-       r.uuid AS founded_edge_uuid,
-       mentor.name AS yc_partner
+  m.uuid = randomUUID(),
+  m.created_at = timestamp(),
+  m.weight = 14
+RETURN p.name AS founder, c.company_name AS company, r.uuid AS founded_edge_uuid, mentor.name AS yc_partner
+{% else %}
+RETURN p.name AS founder, c.company_name AS company, r.uuid AS founded_edge_uuid, null AS yc_partner
+{% endif %}
+{% endif %}
 ```
 
 **Design notes:**

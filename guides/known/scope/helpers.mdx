@@ -16,13 +16,13 @@ Phase 1 foundation helpers — tracked as functions are built in Xano workspace 
 | Function | Xano ID | Status |
 |---|---|---|
 | [`canonicalize_pair`](#known-helpers-canonicalize-pair) | **#12767** | ✅ Built |
-| [`create_knows_edge`](#known-helpers-create-knows-edge) | — | ⏳ Pending |
+| [`compute_confidence`](#known-helpers-compute-confidence) | **#12768** | ✅ Built |
+| [`check_evidence_floor`](#known-helpers-check-evidence-floor) | **#12769** | ✅ Built |
+| [`derive_known_since`](#known-helpers-derive-known-since) | **#12770** | ✅ Built |
+| [`create_facet`](#known-helpers-create-facet) | **#12771** | ✅ Built |
+| [`invalidate_facet`](#known-helpers-invalidate-facet) | **#12772** | ✅ Built |
 | [`append_evidence`](#known-helpers-append-evidence) | — | ⏳ Pending |
-| [`compute_confidence`](#known-helpers-compute-confidence) | — | ⏳ Pending |
-| [`check_evidence_floor`](#known-helpers-check-evidence-floor) | — | ⏳ Pending |
-| [`derive_known_since`](#known-helpers-derive-known-since) | — | ⏳ Pending |
-| [`create_facet`](#known-helpers-create-facet) | — | ⏳ Pending |
-| [`invalidate_facet`](#known-helpers-invalidate-facet) | — | ⏳ Pending |
+| [`create_knows_edge`](#known-helpers-create-knows-edge) | — | ⏳ Pending |
 
 ---
 
@@ -53,6 +53,10 @@ Takes two person UUIDs and returns them in canonical order (lower first, by lexi
 
 ## `known/helpers/create_knows_edge`
 
+<Note>
+**Build status:** ⏳ Pending. The biggest Phase 1 helper — depends on `canonicalize_pair`, `compute_confidence`, `check_evidence_floor`, `derive_known_since`, and `mvp/falkor/send-cypher`. Will also initialize the `historical_edge` flag and freeze state when either endpoint has `deceased_at` set (see [retrospective freeze](#retrospective-freeze-check-on-creation) below).
+</Note>
+
 Creates a new `KNOWS` edge with the canonical pair order enforced. The only entry point for `KNOWS` creation — no callers should do raw Cypher `CREATE (a)-[:KNOWS]->(b)`.
 
 **Inputs:** `person_a_id`, `person_b_id`, `evidence_rows`, `origin_context`, `origin_entity_id`, `origin_detail`
@@ -77,30 +81,115 @@ This handles the **deceased-at-ingest** case (e.g., creating a KNOWS between two
 
 ## `known/helpers/append_evidence`
 
-Appends new evidence to an existing `KNOWS.evidence` array and recomputes derived fields.
+<Note>
+**Build status:** ⏳ Next to build. Depends on `compute_confidence`, `derive_known_since`, and the send-cypher infrastructure.
+</Note>
 
-**Inputs:** `knows_edge_uuid`, `evidence_row`
-**Outputs:** updated `KNOWS` edge
-**Recomputes on every call:**
-- `confidence` (sum of weights, capped at 1.0)
-- `known_since`, `first_evidence_at`, `last_evidence_at`
+Appends new evidence to an existing `KNOWS.evidence` array and recomputes all derived fields. This is the primary update path for an existing KNOWS edge — every evidence ingest either creates a new KNOWS (via `create_knows_edge`) or appends to an existing one (via this function).
+
+**Inputs:**
+- `knows_edge_uuid` (text) — uuid of the target KNOWS edge
+- `evidence_row` (json) — single evidence row to append (not an array)
+
+**Outputs:**
+```json
+{
+  "success": true,
+  "knows_edge_uuid": "...",
+  "recomputed": {
+    "confidence": 0.75,
+    "known_since": 2019,
+    "first_evidence_at": "2019-05-22T00:00:00Z",
+    "last_evidence_at": "2024-08-21T00:00:00Z",
+    "first_direct_interaction_at": null,
+    "last_direct_interaction_at": null,
+    "connected_platforms": ["linkedin"],
+    "total_social_connections": 1
+  }
+}
+```
+
+**Algorithm:**
+
+1. Read the existing KNOWS edge's `evidence` array from FalkorDB
+2. Append the new `evidence_row` to the array (in memory)
+3. Call `compute_confidence` with the new array
+4. Call `derive_known_since` with the new array
+5. Compute `connected_platforms` as the set of platform names from rows whose source is a social platform (`linkedin_connection` → `linkedin`, `twitter_follow` → `twitter`, `instagram_follow` → `instagram`)
+6. Compute `total_social_connections` = length of `connected_platforms`
+7. Write all recomputed fields back to the KNOWS edge in a single cypher SET clause
+
+**Critical:** Every derived-from-evidence field must be recomputed on every append. Implementation enumerates the list explicitly — a silent "forgot to recompute X" bug here would let derived fields drift from evidence over time.
+
+**Fields recomputed on every call:**
+- `confidence`
+- `known_since`
+- `first_evidence_at`, `last_evidence_at`
 - `first_direct_interaction_at`, `last_direct_interaction_at`
 - `connected_platforms`, `total_social_connections`
+- `evidence` (the array itself, with the new row appended)
 
-**Critical:** Every derived-from-evidence field must be recomputed on every append. Implementation should enumerate the list explicitly — a silent "forgot to recompute X" bug here would let derived fields drift from evidence over time.
+**Fields NOT recomputed by this function:**
+- `strength_score`, `weight`, `closeness_tier` — these are scoring-cron concerns, computed separately
+- Interaction counts (`total_email_*`, etc.) — these are count-cron concerns, computed from raw logs
+- `shared_context_cache` — computed by the cache cron from shared employment/education/etc.
+- Peak watermarks — updated only by scoring cron
+
+**Edge cases:**
+- **KNOWS edge not found** → throws `inputerror` with message `"KNOWS edge not found"`
+- **Evidence row missing required fields (weight, source, evidence_occurred_at)** → bubbled up from `compute_confidence` / `derive_known_since` as `inputerror`
+
+**Called by:** every ingest function in `known/ingest/*` when adding evidence to an existing pair
+
+**Calls:** `compute_confidence`, `derive_known_since`, `mvp/falkor/send-cypher`
 
 ## `known/helpers/compute_confidence`
 
-Computes `confidence = min(1.0, sum(weights))` from an evidence array. Pure function.
+<Note>
+**Build status:** ✅ Built in Xano as function **#12768** on 2026-04-10.
+</Note>
+
+Computes `confidence = min(1.0, sum(weights))` from an evidence array. Pure function — no graph access, no side effects.
+
+**Inputs:** `evidence_rows` (json — array of evidence row objects)
+**Outputs:** `{ confidence: float }`
+
+**Evidence row shape** (each element of the array):
+```json
+{
+  "source": "email_direct",
+  "weight": 0.5,
+  "first_seen_at": "2024-03-15T10:42:00Z",
+  "evidence_occurred_at": "2023-11-20T00:00:00Z",
+  "raw_metadata": {}
+}
+```
+
+Only the `weight` field is used by this function. Other fields are preserved on the KNOWS edge but do not influence confidence.
+
+**Edge cases:**
+- **Empty array** → `confidence = 0.0`. Valid input (e.g. before any evidence has been ingested for a pending pair). Not an error.
+- **Missing `weight` field on a row** → throws `inputerror` with message `"Evidence row missing required weight field"`. Well-formed evidence rows MUST have weight.
+- **Negative weight** → throws `inputerror` with message `"Evidence weight must be non-negative"`. Strong sources are 0.5 and weak sources are 0.25; negative values indicate a caller bug.
+- **Sum exceeds 1.0** → capped at 1.0 by `min`. Not an error. This is the whole point of the cap.
+- **Non-array input** → Xano's `json` type validation should catch most cases; if it reaches the function the iteration fails gracefully with an error.
+
+**Called by:**
+- [`create_knows_edge`](#known-helpers-create-knows-edge) — initial confidence at creation
+- [`append_evidence`](#known-helpers-append-evidence) — recomputes confidence after appending
 
 **Inputs:** `evidence_rows[]`
 **Outputs:** `confidence: float`
 
 ## `known/helpers/check_evidence_floor`
 
-Evaluates an evidence array against the floor rule: `(strong_count ≥ 1) OR (weak_count ≥ 2)`.
+<Note>
+**Build status:** ✅ Built in Xano as function **#12769** on 2026-04-10. Calls `compute_confidence` (#12768) internally.
+</Note>
 
-**Inputs:** `evidence_rows[]`
+Evaluates an evidence array against the floor rule: `(strong_count ≥ 1) OR (weak_count ≥ 2)`. Pure function — no graph access, no side effects.
+
+**Inputs:** `evidence_rows` (json — array of evidence row objects)
 **Outputs:**
 ```json
 {
@@ -111,11 +200,34 @@ Evaluates an evidence array against the floor rule: `(strong_count ≥ 1) OR (we
 }
 ```
 
+**Strong / weak classification.** The function classifies each row by its `source` field against a hardcoded list that mirrors the canonical enum in [Schema Design → Evidence sources](/guides/known/schema-design/edges#evidence-sources). Rows with unknown source values are treated as weak (conservative default) and logged for investigation.
+
+**Strong sources** (alone sufficient to clear the floor):
+- `crm_contact`, `phone_contact`, `email_direct`, `calendar_meeting`, `manual_user_add`, `sms_chat`
+
+**Weak sources** (require ≥2 to clear the floor):
+- `linkedin_connection`, `twitter_follow`, `instagram_follow`, `shared_event_attendance`, `shared_employment_inferred`, `mutual_friend_mention`, `press_co_mention`
+
+**Floor rule:** `passes_floor = (strong_count >= 1) OR (weak_count >= 2)`
+
+**Edge cases:**
+- **Empty array** → `{ passes_floor: false, strong_count: 0, weak_count: 0, total_confidence: 0 }`. Valid, not an error.
+- **Row missing `source` field** → throws `inputerror`. Well-formed evidence rows MUST have a source identifier.
+- **Unknown source value** → counted as weak with a debug log entry. This lets ingest pipelines add new source types without immediately breaking the floor check; the source definition list in this function should be updated in a follow-up PR.
+
+**Called by:** the ingest pipelines (`known/ingest/*`) and [`create_knows_edge`](#known-helpers-create-knows-edge) to determine whether a new pair has enough evidence to enter the graph.
+
+**Calls:** `compute_confidence` internally to populate the `total_confidence` field.
+
 ## `known/helpers/derive_known_since`
+
+<Note>
+**Build status:** ✅ Built in Xano as function **#12770** on 2026-04-10.
+</Note>
 
 Derives temporal fields from an evidence array. Key rule: temporal derivations use `evidence_occurred_at`, not `first_seen_at`. This is what enables retroactive backdating when LinkedIn tells us "they connected in 2019" even though Orbiter only saw the evidence in 2024.
 
-**Inputs:** `evidence_rows[]`
+**Inputs:** `evidence_rows` (json — array of evidence row objects)
 **Outputs:**
 ```json
 {
@@ -127,16 +239,121 @@ Derives temporal fields from an evidence array. Key rule: temporal derivations u
 }
 ```
 
+**Direct interaction sources** (used to populate `first_direct_interaction_at` / `last_direct_interaction_at`):
+- `email_direct`, `calendar_meeting`, `sms_chat`
+
+Other strong sources (`phone_contact`, `crm_contact`, `manual_user_add`) are acknowledgment sources — they prove a person knows of another but are not themselves direct communication events. They do not populate the `*_direct_interaction_at` fields.
+
+**Field derivations:**
+- `known_since` = year component of `min(evidence_occurred_at)` across all rows (integer year)
+- `first_evidence_at` = `min(evidence_occurred_at)` across all rows (ISO timestamp)
+- `last_evidence_at` = `max(evidence_occurred_at)` across all rows
+- `first_direct_interaction_at` = `min(evidence_occurred_at)` across rows where `source` is in the direct interaction list; null if no direct interaction evidence exists
+- `last_direct_interaction_at` = `max(evidence_occurred_at)` across rows where `source` is in the direct interaction list; null if none
+
+**Edge cases:**
+- **Empty array** → all fields null except `known_since` which is also null. Valid input, not an error.
+- **Row missing `evidence_occurred_at`** → throws `inputerror`. Every evidence row MUST have this field.
+- **Evidence with timestamps in the future** → not rejected; included as-is. If a bug sends future timestamps, they'll show up on the edge and can be cleaned up downstream.
+
+**Called by:**
+- [`create_knows_edge`](#known-helpers-create-knows-edge) — computes initial temporal fields
+- [`append_evidence`](#known-helpers-append-evidence) — recomputes after new evidence is appended
+
+**Pure function** — no graph access, no side effects.
+
 ## `known/helpers/create_facet`
 
-Generic facet creation. Enforces canonical pair order, sets `valid_from`, `source`, `created_by`, `created_at`.
+<Note>
+**Build status:** ✅ Built in Xano as function **#12771** on 2026-04-10. First graph-writing helper — sends cypher to FalkorDB via `mvp/falkor/send-cypher` (#2815).
+</Note>
 
-**Inputs:** `facet_type`, `person_a_id`, `person_b_id`, `source`, `properties`
-**Outputs:** `facet_uuid`
+Generic facet creation. Enforces canonical pair order, sets `valid_from`, `source`, `created_by`, `created_at`, and any facet-specific `properties`. Creates the edge in FalkorDB and returns its uuid.
+
+**Inputs:**
+- `facet_type` (text) — one of `BONDED`, `PROFESSIONAL_TIE`, `KINSHIP`, `ROMANTIC`, `ESTRANGED`, `MENTOR`
+- `person_a_id` (text) — uuid of the first person (will be canonicalized)
+- `person_b_id` (text) — uuid of the second person (will be canonicalized)
+- `source` (text) — `inferred` or `declared`
+- `properties` (json) — facet-specific additional properties (e.g. `bond_type` for BONDED, `relation` + `role_a_to_b` + `role_b_to_a` for KINSHIP)
+- `created_by` (text) — cron name, user id, or LLM identifier (e.g. `scoring_cron_v3`, `user:sarah`)
+- `valid_from` (text) — ISO 8601 timestamp; defaults to `now()` if null
+
+**Outputs:** `{ facet_uuid: text }`
+
+**Guards:**
+- `facet_type` must be one of the allowed values; throws `inputerror` otherwise
+- `source` must be `inferred` or `declared`; throws `inputerror` otherwise
+- Delegates self-pair check to `canonicalize_pair` (which throws `inputerror` for identical uuids)
+- For `MENTOR` (directed), canonicalization is NOT applied — `person_a_id` is the mentor, `person_b_id` is the mentee, and the edge is created with that exact direction
+
+**Canonicalization:**
+- For all facet types EXCEPT `MENTOR`, the pair is canonicalized via `canonicalize_pair` so `lower_id` becomes the source of the edge
+- For `MENTOR`, the direction is preserved as provided (mentor → mentee)
+
+**Cypher (templated):**
+```cypher
+MATCH (a:Person {uuid: $source_uuid}), (b:Person {uuid: $target_uuid})
+CREATE (a)-[f:FACET_TYPE {
+  uuid: randomUUID(),
+  valid_from: $valid_from,
+  valid_to: null,
+  source: $source,
+  created_by: $created_by,
+  created_at: datetime()
+  // + spread properties
+}]->(b)
+RETURN f.uuid AS facet_uuid
+```
+
+The `FACET_TYPE` placeholder is substituted with the validated `facet_type` input value. Properties are spread into the `CREATE` clause after the base fields.
+
+**Does NOT:**
+- Check for an existing valid facet of the same type on the same pair — that's the caller's responsibility (e.g. `bonded_creator` cron checks before calling). This helper is the low-level primitive.
+- Set `weight` — that's done by `compute_weight` on the next scoring pass
+- Fire any lifecycle cascades (e.g. does not invalidate a BONDED when creating an ESTRANGED)
+
+**Called by:** `bonded_creator`, `estrangement_detector`, `professional_tie_maintainer`, user/LLM declared-facet creation paths
+
+**Calls:** `canonicalize_pair`, `mvp/falkor/send-cypher`
 
 ## `known/helpers/invalidate_facet`
 
+<Note>
+**Build status:** ✅ Built in Xano as function **#12772** on 2026-04-10.
+</Note>
+
 Sets `valid_to`, `invalidation_reason`, `invalidated_by` on an existing facet. **Never deletes.** Invalidation preserves history.
 
-**Inputs:** `facet_uuid`, `invalidation_reason`, `invalidated_by`, `invalidated_at`
-**Outputs:** updated facet
+**Inputs:**
+- `facet_uuid` (text) — the uuid of the facet edge to invalidate
+- `facet_type` (text) — one of `BONDED`, `PROFESSIONAL_TIE`, `KINSHIP`, `ROMANTIC`, `ESTRANGED`, `MENTOR` (needed to construct the MATCH clause since FalkorDB edge-label lookups require the type)
+- `invalidation_reason` (text) — one of the enum values from [Invalidation reasons](/guides/known/schema-design#invalidation-reasons)
+- `invalidated_by` (text) — cron name, user id, or LLM identifier
+- `valid_to` (text, optional) — ISO 8601 timestamp; defaults to `now()` if null
+
+**Outputs:** `{ success: bool, facet_uuid: text }`
+
+**Guards:**
+- `facet_type` must be one of the allowed values
+- `invalidation_reason` must be one of the enum values; throws `inputerror` otherwise
+- If the facet is already invalidated (`valid_to IS NOT NULL`), the function is a no-op and returns `success: true` with a debug log
+
+**Cypher:**
+```cypher
+MATCH ()-[f:FACET_TYPE {uuid: $facet_uuid}]->()
+WHERE f.valid_to IS NULL
+SET f.valid_to            = $valid_to,
+    f.invalidation_reason = $invalidation_reason,
+    f.invalidated_by      = $invalidated_by
+RETURN f.uuid AS facet_uuid
+```
+
+**Does NOT:**
+- Delete the edge — invalidation preserves history
+- Fire any cascades (e.g. does not create ESTRANGED when invalidating BONDED). Cascades are the caller's responsibility (typically the lifecycle crons).
+- Check uniqueness — if two rows with the same uuid exist (shouldn't happen), both get updated
+
+**Called by:** every lifecycle cron, identity merge facet resolution, user-declared invalidation paths
+
+**Calls:** `mvp/falkor/send-cypher`

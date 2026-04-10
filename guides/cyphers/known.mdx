@@ -1,0 +1,475 @@
+---
+title: "Known"
+description: "All FalkorDB Cypher queries for the Known relationship model — production, planned, and illustrative"
+---
+
+All Cypher queries related to the **Known relationship model**. Known is Orbiter's human-relationships layer ([design docs](/guides/known)), being rolled out on a **fresh graph** — no v1 → v2 migration cypher exists because there's no legacy data to migrate.
+
+This page consolidates every cypher fragment Known uses or will use. Per Orbiter convention, all cypher lives in `guides/cyphers/*`; the Known sub-pages are pure documentation with links back here.
+
+## Status legend
+
+- 🟢 **Live** — the cypher is embedded in a Xano function running in production right now
+- 🟡 **Built not live** — the cypher is embedded in a Xano function that exists but hasn't been triggered end-to-end
+- 🔵 **Planned** — specification cypher for a function not yet built
+- ⚪ **Illustrative** — example cypher for documentation / query pattern reference; not embedded in any function
+
+---
+
+## Production cypher
+
+### MENTOR v2 ingest — `mvp/yc/process-yc-people` (#12700) 🟢
+
+**Function:** `mvp/yc/process-yc-people` (#12700)
+**Version:** v2.1 (published 2026-04-10 18:22 UTC)
+**Purpose:** Create `MENTOR` edges from YC partners to batch founders during company enrichment.
+
+The cypher is embedded inside a `util.template_engine` block with Twig-style substitutions. Placeholders like `{{$var.ycPartnerUuid}}` correspond to Xano stack variables. See [Known → MENTOR edge spec](/guides/known/schema-design/edges#mentor-directed-coaching-relationship) for field definitions and design rationale.
+
+**Multi-founder branch:**
+
+```cypher
+// v2.1 MENTOR cypher — multi-founder branch
+// Spec: guides/known/schema-design/edges#mentor-directed-coaching-relationship
+// MERGE key: (mentor, mentee, company_uuid, valid_from ISO string)
+MATCH (mentor:Person {uuid: "{{$var.ycPartnerUuid}}"})
+UNWIND founders AS founder
+MERGE (mentor)-[m:MENTOR {
+  company_uuid: "{{$var.masterCompany.node_uuid}}",
+  valid_from: "{{$var.masterCompany.founded ?? 1970}}-01-01T00:00:00Z"
+}]->(founder)
+ON CREATE SET
+  m.uuid                = randomUUID(),
+  m.description         = mentor.name + ' mentored ' + founder.name +
+                          ' as the Y Combinator partner for ' +
+                          {{$var.masterCompany.company_name|json_encode}} + '.',
+  m.company_name        = {{$var.masterCompany.company_name|json_encode}},
+  m.valid_to            = null,
+  m.source              = 'inferred',
+  m.formality           = 'formal',
+  m.domain              = 'accelerator',
+  m.created_by          = 'mvp/yc/process-yc-people',
+  m.created_at          = datetime(),
+  m.invalidation_reason = null,
+  m.invalidated_by      = null,
+  m.weight              = 14
+ON MATCH SET
+  m.description  = mentor.name + ' mentored ' + founder.name +
+                   ' as the Y Combinator partner for ' +
+                   {{$var.masterCompany.company_name|json_encode}} + '.',
+  m.company_name = {{$var.masterCompany.company_name|json_encode}}
+
+WITH mentor, collect(founder) AS mentored_founders, cf, c
+RETURN cf.uuid AS context_founded_uuid,
+       c.company_name AS company,
+       [f IN mentored_founders | f.name] AS founders,
+       mentor.name AS yc_partner
+```
+
+**Single-founder branch:** Same pattern but bound to the single resolved founder `(p)`:
+
+```cypher
+// v2.1 MENTOR cypher — single-founder branch
+MATCH (mentor:Person {uuid: "{{$var.ycPartnerUuid}}"})
+MERGE (mentor)-[m:MENTOR {
+  company_uuid: "{{$var.masterCompany.node_uuid}}",
+  valid_from: "{{$var.masterCompany.founded ?? 1970}}-01-01T00:00:00Z"
+}]->(p)
+ON CREATE SET
+  m.uuid                = randomUUID(),
+  m.description         = mentor.name + ' mentored ' + p.name +
+                          ' as the Y Combinator partner for ' +
+                          {{$var.masterCompany.company_name|json_encode}} + '.',
+  m.company_name        = {{$var.masterCompany.company_name|json_encode}},
+  m.valid_to            = null,
+  m.source              = 'inferred',
+  m.formality           = 'formal',
+  m.domain              = 'accelerator',
+  m.created_by          = 'mvp/yc/process-yc-people',
+  m.created_at          = datetime(),
+  m.invalidation_reason = null,
+  m.invalidated_by      = null,
+  m.weight              = 14
+ON MATCH SET
+  m.description  = mentor.name + ' mentored ' + p.name +
+                   ' as the Y Combinator partner for ' +
+                   {{$var.masterCompany.company_name|json_encode}} + '.',
+  m.company_name = {{$var.masterCompany.company_name|json_encode}}
+
+RETURN p.name AS founder,
+       c.company_name AS company,
+       r.uuid AS founded_edge_uuid,
+       mentor.name AS yc_partner
+```
+
+**Design notes:**
+- `valid_from` is a **plain ISO string**, not `datetime()`. Safer for MERGE-key matching and consistent with how Orbiter's existing ontology stores date-like fields. See [v2 → v2.1 changelog](/guides/known/scope/xano-touchpoints#mvp-yc-process-yc-people-12700) for why.
+- Uses Twig's `??` operator for defensive null handling on `founded` year. Falls back to `1970` if null.
+- `ON MATCH SET` only touches mutable display fields — lifecycle state is immutable after creation.
+- Initial `weight` is 14 (midpoint of formal + inferred range 10–18); the scoring cron refines it on the next pass.
+- All 15 v2 fields are set on create; 4 v1 fields are preserved from the original YC ingest (`uuid`, `description`, `company_uuid`, `company_name`).
+
+---
+
+## Planned cypher (specifications for functions not yet built)
+
+### Helper: `create_facet` generic cypher template 🔵
+
+**Function:** `known/helpers/create_facet` — see [spec](/guides/known/scope/helpers#known-helpers-create-facet).
+
+Generic facet creation. The `facet_type` placeholder is substituted with a validated value from the input (BONDED, PROFESSIONAL_TIE, KINSHIP, ROMANTIC, ESTRANGED, or MENTOR). Properties are spread into the `CREATE` clause after the base fields.
+
+```cypher
+-- Template — FACET_TYPE substituted by the function from input
+MATCH (a:Person {uuid: $source_uuid}),
+      (b:Person {uuid: $target_uuid})
+CREATE (a)-[f:FACET_TYPE {
+  uuid: randomUUID(),
+  valid_from: $valid_from,
+  valid_to: null,
+  source: $source,
+  created_by: $created_by,
+  created_at: datetime()
+  // + spread properties
+}]->(b)
+RETURN f.uuid AS facet_uuid
+```
+
+### Helper: `invalidate_facet` generic cypher template 🔵
+
+**Function:** `known/helpers/invalidate_facet` — see [spec](/guides/known/scope/helpers#known-helpers-invalidate-facet).
+
+History-preserving invalidation. Never deletes. The `facet_type` placeholder is substituted from input.
+
+```cypher
+MATCH ()-[f:FACET_TYPE {uuid: $facet_uuid}]->()
+WHERE f.valid_to IS NULL
+SET f.valid_to            = $valid_to,
+    f.invalidation_reason = $invalidation_reason,
+    f.invalidated_by      = $invalidated_by
+RETURN f.uuid AS facet_uuid
+```
+
+### Lifecycle: `release_stale_merge_locks` janitor 🔵
+
+**Function:** `known/lifecycle/release_stale_merge_locks` — see [spec](/guides/known/scope/lifecycle#known-lifecycle-release-stale-merge-locks-cron).
+
+Clears `merge_in_progress_at` locks on `Person` nodes that have been held for longer than 10 minutes. Runs hourly.
+
+```cypher
+MATCH (p:Person)
+WHERE p.merge_in_progress_at IS NOT NULL
+  AND p.merge_in_progress_at < datetime() - duration('PT10M')
+SET p.merge_in_progress_at = null,
+    p.merge_in_progress_by = null
+RETURN count(p) AS locks_released
+```
+
+### Identity merge: enumerate edges on absorbed person 🔵
+
+**Algorithm step:** Step 1 of [`execute_merge`](/guides/known/scope/identity-merge).
+
+```cypher
+MATCH (absorbed:Person {uuid: $absorbed_id})-[e]-(other)
+RETURN e, type(e), other
+```
+
+Split results into two buckets in application code: duplicates (where the same edge type exists between the canonical person and the same `other` node) and unique (no equivalent on the canonical side).
+
+### Identity merge: bulk-update Introduction.resulting_knows_uuid 🔵
+
+**Algorithm step:** Step 5 of [`execute_merge`](/guides/known/scope/identity-merge). When a KNOWS edge is absorbed, any Introduction nodes that referenced it by `resulting_knows_uuid` must be re-pointed at the surviving canonical KNOWS.
+
+```cypher
+MATCH (intro:Introduction)
+WHERE intro.resulting_knows_uuid = $deleted_knows_uuid
+SET intro.resulting_knows_uuid = $canonical_knows_uuid
+```
+
+### Identity merge: re-point Introduction CONNECTS edges 🔵
+
+**Algorithm step:** Step 5 of [`execute_merge`](/guides/known/scope/identity-merge). Find all Introduction nodes pointing at the absorbed person, then re-point to the canonical in application code.
+
+```cypher
+MATCH (intro:Introduction)-[:CONNECTS]->(absorbed:Person {uuid: $absorbed_id})
+RETURN intro, intro.resulting_knows_uuid
+```
+
+### Identity merge: re-point MADE_INTRODUCTION edges 🔵
+
+**Algorithm step:** Step 6 of [`execute_merge`](/guides/known/scope/identity-merge).
+
+```cypher
+MATCH (absorbed:Person {uuid: $absorbed_id})-[m:MADE_INTRODUCTION]->(intro:Introduction)
+// Application code then decides: delete (if canonical already has MADE_INTRODUCTION
+// to the same Introduction) or re-point to canonical.
+```
+
+### Identity merge: MergeEvent creation 🔵
+
+**Algorithm step:** Step 10 of [`execute_merge`](/guides/known/scope/identity-merge). Creates the audit record capturing the merge operation.
+
+```cypher
+CREATE (merge:Entity:MergeEvent {
+  uuid: randomUUID(),
+  absorbed_person_id: $absorbed_id,
+  canonical_person_id: $canonical_id,
+  merged_at: datetime(),
+  initiated_by: $initiated_by,
+  confidence: $confidence,
+  rationale: $rationale,
+  affected_edges_count: $count,
+  affected_introductions_count: $intro_count,
+  conflicts: $conflicts_json
+})
+CREATE (merge)-[:ABSORBED]->(absorbed_tombstone:Person {uuid: $absorbed_id})
+CREATE (merge)-[:CANONICAL_NOW]->(canonical:Person {uuid: $canonical_id})
+```
+
+### Identity merge: tombstone absorbed Person 🔵
+
+**Algorithm step:** Step 11 of [`execute_merge`](/guides/known/scope/identity-merge). Soft delete — never hard delete.
+
+```cypher
+MATCH (absorbed:Person {uuid: $absorbed_id})
+SET absorbed.merged_into = $canonical_id,
+    absorbed.deleted_at = datetime(),
+    absorbed.tombstone = true
+```
+
+### Identity merge: `update-person-node` extension for Known properties 🔵
+
+**Function:** `mvp/node/update-person-node` (#2758) — [scope](/guides/known/scope/xano-touchpoints#mvp-node-update-person-node-2758).
+
+The existing function needs its SET clause extended to also sync the new Known-specific Person properties when they're non-null:
+
+```cypher
+SET p.deceased_at = $deceased_at,
+    p.merged_into = $merged_into,
+    p.deleted_at  = $deleted_at,
+    p.tombstone   = $tombstone
+```
+
+---
+
+## Illustrative example cypher (node creation patterns)
+
+These are **example** cypher fragments showing what a new node + relationships would look like in the graph. Used in the [node type documentation](/guides/known/schema-design/nodes) to illustrate the expected shape. Not embedded in any function.
+
+### Introduction node + MADE_INTRODUCTION + CONNECTS edges ⚪
+
+Example: Patricia introduced Alice to Bob over email in 2019.
+
+```cypher
+CREATE (intro:Entity:Introduction {
+  uuid: 'intro-abc-123',
+  introduced_at: '2019-05-22T14:30:00Z',
+  context: 'warm intro via email cc',
+  introduction_medium: 'email',
+  source: 'inferred',
+  confidence: 0.85,
+  resulting_knows_uuid: 'knows-xyz-789',
+  created_by: 'email_parser_cron',
+  created_at: '2024-03-15T10:00:00Z'
+})
+MATCH (patricia:Person {uuid: 'patricia-uuid'}),
+      (alice:Person {uuid: 'alice-uuid'}),
+      (bob:Person {uuid: 'bob-uuid'})
+CREATE (patricia)-[:MADE_INTRODUCTION]->(intro),
+       (intro)-[:CONNECTS]->(alice),
+       (intro)-[:CONNECTS]->(bob)
+```
+
+### Household node + RESIDED_AT edges ⚪
+
+Example: Sarah and David's marital household, 2008–2020, with their two daughters.
+
+```cypher
+CREATE (home:Entity:Household {
+  uuid: 'household-001',
+  address_hash: 'sha256:abc...',
+  household_type: 'family',
+  start: '2008-06-14T00:00:00Z',
+  end: '2020-04-02T00:00:00Z',
+  source: 'inferred',
+  created_at: '2024-01-01T00:00:00Z'
+})
+MATCH (sarah:Person {uuid: 'sarah-uuid'}),
+      (david:Person {uuid: 'david-uuid'}),
+      (emma:Person {uuid: 'emma-uuid'}),
+      (lily:Person {uuid: 'lily-uuid'})
+CREATE (sarah)-[:RESIDED_AT {move_in: '2008-06-14', move_out: '2020-04-02', role: 'partner'}]->(home),
+       (david)-[:RESIDED_AT {move_in: '2008-06-14', move_out: '2020-04-02', role: 'partner'}]->(home),
+       (emma)-[:RESIDED_AT {move_in: '2010-03-22', move_out: '2020-04-02', role: 'child'}]->(home),
+       (lily)-[:RESIDED_AT {move_in: '2012-08-09', move_out: '2020-04-02', role: 'child'}]->(home)
+```
+
+### MergeEvent example ⚪
+
+Example: after a successful merge absorbing `alice-dup-uuid` into `alice-uuid`.
+
+```cypher
+CREATE (merge:Entity:MergeEvent {
+  uuid: 'merge-abc-001',
+  absorbed_person_id: 'alice-dup-uuid',
+  canonical_person_id: 'alice-uuid',
+  merged_at: '2025-01-20T14:32:00Z',
+  initiated_by: 'identity_resolver_v1',
+  confidence: 0.94,
+  rationale: 'Same email domain (foocorp.com), 14 mutual connections, name tokens match after middle-initial normalization',
+  affected_edges_count: 2,
+  affected_introductions_count: 1,
+  conflicts: null,
+  created_at: '2025-01-20T14:32:00Z'
+})
+MATCH (absorbed:Person {uuid: 'alice-dup-uuid'}),
+      (canonical:Person {uuid: 'alice-uuid'})
+CREATE (merge)-[:ABSORBED]->(absorbed),
+       (merge)-[:CANONICAL_NOW]->(canonical)
+
+// Absorbed Person also updated with tombstone fields:
+SET absorbed.merged_into = 'alice-uuid',
+    absorbed.deleted_at = '2025-01-20T14:32:00Z',
+    absorbed.tombstone = true
+```
+
+---
+
+## Query helper cypher (read-only)
+
+These are read-only Cypher queries that will be wrapped by Known's query helper functions. See [Query helpers spec](/guides/known/scope/queries).
+
+### Resolve a stale (possibly tombstoned) person uuid to canonical ⚪
+
+```cypher
+MATCH (p:Person {uuid: $stale_uuid})
+RETURN COALESCE(p.merged_into, p.uuid) AS canonical_uuid
+```
+
+### Get full merge history for a canonical Person ⚪
+
+Used by [`get_merge_history_for_canonical`](/guides/known/scope/queries#known-query-get-merge-history-for-canonical).
+
+```cypher
+MATCH (merge:MergeEvent)-[:CANONICAL_NOW]->(p:Person {uuid: $person_uuid})
+OPTIONAL MATCH (merge)-[:ABSORBED]->(absorbed:Person)
+RETURN merge, absorbed
+ORDER BY merge.merged_at DESC
+```
+
+### Get merge count for a canonical Person ⚪
+
+Used by [`get_merge_count_for_canonical`](/guides/known/scope/queries#known-query-get-merge-count-for-canonical).
+
+```cypher
+MATCH (merge:MergeEvent)-[:CANONICAL_NOW]->(p:Person {uuid: $person_uuid})
+RETURN count(merge) AS merge_count
+```
+
+### Find merges initiated by a specific resolver in a date range ⚪
+
+```cypher
+MATCH (merge:MergeEvent)
+WHERE merge.initiated_by STARTS WITH 'identity_resolver'
+  AND merge.merged_at >= $start_date
+  AND merge.merged_at < $end_date
+RETURN merge
+```
+
+---
+
+## Query patterns (documentation examples)
+
+These are illustrative Cypher queries shown in the [Known documentation](/guides/known/documentation#query-patterns) to demonstrate the shape of common queries. Not backed by any specific function — they're reference material for implementers.
+
+### Everyone Alice currently knows (live) ⚪
+
+```cypher
+MATCH (a:Person {uuid: $alice_uuid})-[k:KNOWS]-(b:Person)
+WHERE k.valid_to IS NULL
+RETURN b, k.strength_score, k.closeness_tier
+ORDER BY k.strength_score DESC
+```
+
+### Everyone Alice has ever been close to (including past) ⚪
+
+```cypher
+MATCH (a:Person {uuid: $alice_uuid})-[b:BONDED]-(other:Person)
+RETURN other, b.bond_type, b.valid_from, b.valid_to, b.peak_strength_during_bond
+ORDER BY b.valid_from DESC
+```
+
+### Alice's currently-estranged relationships ⚪
+
+```cypher
+MATCH (a:Person {uuid: $alice_uuid})-[e:ESTRANGED]-(other:Person)
+WHERE e.valid_to IS NULL
+RETURN other, e.reason, e.severity, e.valid_from
+```
+
+### Has Alice ever been married? (including past) ⚪
+
+```cypher
+MATCH (a:Person {uuid: $alice_uuid})-[r:ROMANTIC]-(partner:Person)
+WHERE r.type = 'married'
+RETURN partner, r.valid_from, r.valid_to, r.invalidation_reason
+```
+
+### Alice's co-parents (shared KINSHIP parent-target) ⚪
+
+```cypher
+MATCH (a:Person {uuid: $alice_uuid})-[:KINSHIP {relation: 'parent'}]->(child:Person)
+MATCH (other:Person)-[:KINSHIP {relation: 'parent'}]->(child)
+WHERE other.uuid <> $alice_uuid
+RETURN DISTINCT other
+```
+
+### Alice's in-law history (including former in-laws) ⚪
+
+```cypher
+MATCH (a:Person {uuid: $alice_uuid})-[k:KINSHIP {relation: 'in_law'}]-(other:Person)
+RETURN other, k.valid_from, k.valid_to, k.invalidation_reason
+```
+
+### Who introduced Alice to her closest current contacts ⚪
+
+```cypher
+MATCH (a:Person {uuid: $alice_uuid})-[k:KNOWS]-(other:Person)
+WHERE k.valid_to IS NULL AND k.strength_score > 70
+MATCH (introducer:Person)-[:MADE_INTRODUCTION]->(intro:Introduction)-[:CONNECTS]->(a)
+MATCH (intro)-[:CONNECTS]->(other)
+RETURN introducer.uuid, introducer.name, count(DISTINCT intro) AS introductions
+ORDER BY introductions DESC
+```
+
+### Everyone Alice has ever lived with (with overlap windows) ⚪
+
+```cypher
+MATCH (a:Person {uuid: $alice_uuid})-[r1:RESIDED_AT]->(home:Household)
+MATCH (other:Person)-[r2:RESIDED_AT]->(home)
+WHERE other.uuid <> $alice_uuid
+  AND r1.move_in < COALESCE(r2.move_out, datetime())
+  AND r2.move_in < COALESCE(r1.move_out, datetime())
+RETURN other, home.household_type,
+       GREATEST(r1.move_in, r2.move_in) AS overlap_start,
+       LEAST(COALESCE(r1.move_out, datetime()), COALESCE(r2.move_out, datetime())) AS overlap_end
+```
+
+### Who are the super-connectors in Alice's network ⚪
+
+```cypher
+MATCH (introducer:Person)-[:MADE_INTRODUCTION]->(intro:Introduction)-[:CONNECTS]->(a:Person {uuid: $alice_uuid})
+MATCH (intro)-[:CONNECTS]->(other:Person)
+WHERE other.uuid <> $alice_uuid
+RETURN introducer, count(DISTINCT other) AS people_introduced
+ORDER BY people_introduced DESC
+LIMIT 10
+```
+
+---
+
+## Notes
+
+- **No v1 → v2 MENTOR migration cypher exists.** Known is deploying on a fresh graph. There are no v1 MENTOR edges to backfill. The v2.1 cypher at the top of this page is the first and only MENTOR cypher Known produces.
+- **Helper function templates** (`create_facet`, `invalidate_facet`) are specifications — the functions themselves are built in Xano (#12771, #12772) and produce cypher matching these templates at runtime via `util.template_engine`.
+- **Illustrative examples** appear in the Known sub-pages for pedagogical purposes but they're all sourced from this page. If a cypher in a Known sub-page ever drifts from this page, **this page is the source of truth**.

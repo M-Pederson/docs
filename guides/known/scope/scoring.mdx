@@ -1,0 +1,151 @@
+---
+title: "Scoring"
+description: "Functions that compute strength score, reciprocity, decay, peak watermarks, and freeze logic on KNOWS edges"
+---
+
+The scoring layer turns raw interaction counts, evidence, and shared context into a single `strength_score` per `KNOWS` edge, plus derived fields (`closeness_tier`, `recency_score`, `channel_diversity`), reciprocity scores, peak watermarks, and freeze state for deceased relationships.
+
+See [Documentation — Scoring model](/guides/known/documentation#scoring-model) for the formula and concepts.
+
+---
+
+## `known/scoring/compute_strength_score`
+
+Computes the live `strength_score` from counts, shared context, reciprocity, recency, and applies the presence floor.
+
+**Inputs:** `knows_edge_uuid`
+**Outputs:**
+```json
+{
+  "strength_score": 78.4,
+  "closeness_tier": "close",
+  "recency_score": 0.72,
+  "channel_diversity": 4,
+  "decay_half_life_days": 365
+}
+```
+
+**Formula:** see [Documentation — Scoring model](/guides/known/documentation#scoring-model)
+
+**Presence floor:** If the edge has strong "acknowledgment" evidence (`phone_contact`, `crm_contact`, `manual_user_add`) but no direct interaction, the score is floored at 8. This ensures "acknowledged but never interacted" relationships score low but nonzero.
+
+## `known/scoring/compute_reciprocity`
+
+Computes `observed_reciprocity` (raw counts as-is) and `adjusted_reciprocity` (weighted by `evidence_coverage`).
+
+**Inputs:** `knows_edge_uuid`
+**Outputs:**
+```json
+{
+  "observed_reciprocity": 0.04,
+  "adjusted_reciprocity": null
+}
+```
+
+When only one person's data sources are imported, `adjusted_reciprocity` returns `null`. The scoring formula treats null as 0.5 (neutral) — avoiding false "one-sided relationship" conclusions for data-incomplete edges.
+
+## `known/scoring/compute_decay_half_life`
+
+Determines the decay half-life for recency scoring based on the dominant currently-valid facet.
+
+**Inputs:** `knows_edge_uuid`
+**Outputs:** `decay_half_life_days: int`
+
+**Half-life by dominant facet:**
+
+| Dominant facet | Half-life |
+|---|---|
+| `KINSHIP` | 3650 days (10 years) |
+| `ROMANTIC(is_current)` | 730 days (2 years) |
+| `BONDED(friendship | cofounder)` | 1095 days (3 years) |
+| `PROFESSIONAL_TIE` only | 365 days (1 year) |
+| `KNOWS` only (no facets) | 180 days (6 months) |
+
+## `known/scoring/compute_weight`
+
+Computes the `weight` field for an edge given its current state. Writes the result to the edge. Lower weight = higher importance, matching the existing Orbiter ontology convention.
+
+**Inputs:** `edge_uuid`, `edge_type`, `strength_score`, edge-specific metadata (e.g. `bond_type`, `relationship_role`, `relation`, `source`, `formality`, `type`)
+**Outputs:** `weight: float`
+
+**Formula:**
+```
+weight = floor + (ceiling - floor) * (1 - strength_score / 100)
+```
+
+The `floor` and `ceiling` come from the per-type ranges declared in [Schema Design → Weight model](/guides/known/schema-design#weight-model). For edges with sub-type modulation (BONDED by source, PROFESSIONAL_TIE by role, KINSHIP by relation, ROMANTIC by type, MENTORSHIP by formality), the function picks the right range based on the edge's attributes.
+
+**Structural edges** (`MADE_INTRODUCTION`, `CONNECTS`) use the floor directly — they have no `strength_score`.
+
+**ESTRANGED penalty for KNOWS:** When computing weight for a `KNOWS` edge, the function checks for a currently-valid `ESTRANGED` facet on the same pair. If present, the penalty `ESTRANGED.severity * 5` is added to the final weight:
+```
+if ESTRANGED(pair).valid_to IS NULL:
+    weight += ESTRANGED.severity * 5
+```
+
+**Invalidated edges** are not updated — their `weight` field is frozen at whatever value it had at invalidation time, and they are excluded from default weight queries by the `valid_to IS NULL` filter.
+
+## `known/scoring/update_peak_watermarks`
+
+Checks if the current `strength_score` exceeds `peak_strength_score` and updates the peak fields if so. **Peak fields only ever increase.** This preserves the "used to be close" signal through estrangement without needing to freeze the live score.
+
+**Inputs:** `knows_edge_uuid`
+**Outputs:** updated peak fields (if any)
+
+## `known/scoring/apply_freeze_if_deceased`
+
+Checks if either person has `deceased_at` set. If so:
+- Sets `score_frozen_at = max(person_a.deceased_at, person_b.deceased_at)`
+- Sets `score_frozen_reason = 'deceased'`
+- Skips further score updates on this edge
+
+**Estrangement does not trigger freeze.** Only death does. Peak watermarks handle the historical signal for estrangement; live score decays normally.
+
+**Inputs:** `knows_edge_uuid`
+**Outputs:** `{frozen: bool, reason: string | null}`
+
+## `known/scoring/recompute_all` (cron)
+
+Orchestrates the full scoring pass for a `KNOWS` edge or batch. Sequence:
+
+<Steps>
+  <Step title="Freeze check">
+    Call `apply_freeze_if_deceased`. If frozen, skip the rest.
+  </Step>
+  <Step title="Counts">
+    Ensure counts are fresh (depend on [count crons](/guides/known/scope/counts)).
+  </Step>
+  <Step title="Shared context">
+    Ensure `shared_context_cache` is fresh (depend on [cache cron](/guides/known/scope/cache)).
+  </Step>
+  <Step title="Reciprocity">
+    Call `compute_reciprocity`.
+  </Step>
+  <Step title="Decay half-life">
+    Call `compute_decay_half_life`.
+  </Step>
+  <Step title="Strength score">
+    Call `compute_strength_score`.
+  </Step>
+  <Step title="Weight (KNOWS and all currently-valid facets)">
+    Call `compute_weight` for the KNOWS edge and for every currently-valid facet on the same pair. Each facet's weight is derived from its own range plus the shared `strength_score`. KNOWS weight includes the ESTRANGED penalty when applicable.
+  </Step>
+  <Step title="Peak watermarks">
+    Call `update_peak_watermarks`.
+  </Step>
+  <Step title="Stamp timestamp">
+    Set `last_score_computed_at = now()`.
+  </Step>
+</Steps>
+
+**Cadence:** Nightly
+**Depends on:** Counts updated, shared context cache refreshed
+
+---
+
+## Implementation notes
+
+- **Differential recompute.** The cron processes only edges whose `last_score_computed_at` is older than N hours. Full scans are avoided.
+- **Batch mode.** Supports processing multiple edges in one pass for efficiency.
+- **Score precision.** Scores are stored as floats with 1 decimal place of precision. Tier assignment uses `>` comparisons at tier boundaries, not `>=`, to avoid off-by-one edge-case flapping.
+- **Tuning weights.** The formula coefficients (w1 through w7) are not yet committed — see [open questions](/guides/known/scope#open-implementation-questions).

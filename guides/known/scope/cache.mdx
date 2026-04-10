@@ -1,0 +1,69 @@
+---
+title: "Shared Context Cache"
+description: "Functions that compute and refresh the cached shared-context derivation on KNOWS edges"
+---
+
+`shared_context_cache` is a cached derivation on every `KNOWS` edge that captures the structural overlap between two persons — shared employments, educations, events, children, households, ventures. It's populated by traversing each person's existing graph edges (`WORKS_AT`, `STUDIED_AT`, `ATTENDED_EVENT`, `KINSHIP`, `RESIDED_AT`) and computing the intersection.
+
+## Why cached, not derived on every read?
+
+At Orbiter's scale, computing shared context at query time would require a graph traversal per KNOWS edge read. Caching it on the edge itself makes reads one-hop and keeps the scoring cron simple. The upstream edges remain the source of truth; the cache is refreshed on a nightly cron plus via upstream-change triggers.
+
+---
+
+## `known/cache/compute_shared_context`
+
+Traverses both persons' `WORKS_AT`, `STUDIED_AT`, `ATTENDED_EVENT`, `KINSHIP`, and `RESIDED_AT` edges and computes the intersection. Returns the `shared_context_cache` structure.
+
+**Inputs:** `knows_edge_uuid`
+**Outputs:** `shared_context_cache` object
+**Shape:**
+```json
+{
+  "employments": [{"company_id": "...", "overlap_start": "...", "overlap_end": "...", "overlap_days": 2647}],
+  "educations":  [{"school_id":  "...", "overlap_start": "...", "overlap_end": "...", "overlap_days": 0}],
+  "events":      [{"event_id":   "...", "date": "..."}],
+  "children":    [{"person_id":  "...", "shared_since": "...", "biological_both": true}],
+  "households":  [{"household_uuid": "...", "overlap_start": "...", "overlap_end": "...", "overlap_days": 4309}],
+  "ventures":    [{"venture_id": "...", "role": "co-founder"}],
+  "computed_at": "2026-04-10T00:00:00Z"
+}
+```
+
+The `households` array references `Household` node uuids (not inline address data). See [Household functions](/guides/known/scope/households) for how those nodes are maintained.
+
+## `known/cache/refresh_shared_context` (cron)
+
+Recomputes `shared_context_cache` on every `KNOWS` edge whose `last_cache_computed_at` is older than the cron interval. Stamps `last_cache_computed_at` after each refresh.
+
+**Cadence:** Nightly
+**Depends on:** Count crons finished (so the cache computation sees current data if the scoring cron runs next)
+
+## `known/cache/invalidate_on_upstream_change`
+
+Trigger function. When any of the following upstream edges are created, updated, or invalidated, this function enqueues the affected `KNOWS` edges for **priority** cache refresh (rather than waiting for the nightly pass):
+
+- `Person -[:WORKS_AT]-> Company`
+- `Person -[:STUDIED_AT]-> School`
+- `Person -[:ATTENDED_EVENT]-> Event`
+- `Person -[:KINSHIP]- Person`
+- `Person -[:RESIDED_AT]-> Household`
+
+This keeps cache staleness bounded without scanning the whole graph. For example: when a user's `WORKS_AT` at FooCorp is updated with a new end date, the trigger enqueues every `KNOWS` edge this user has that touches FooCorp for priority refresh.
+
+**Inputs:** `person_uuid`, `upstream_edge_type`, `affected_entity_uuid`
+**Outputs:** count of KNOWS edges enqueued
+
+---
+
+## Why `compute_cohabitation_overlap` lives here
+
+The `households` field in `shared_context_cache` is populated by calling `known/households/compute_cohabitation_overlap` (see [Households](/guides/known/scope/households)). That function finds all `Household` nodes both persons have `RESIDED_AT` edges to, computes the overlap of their per-person windows, and returns the array suitable for the cache. Same pattern applies to shared employments (via `WORKS_AT` overlap) and shared educations (via `STUDIED_AT` overlap) — each has its own overlap-computation helper within `compute_shared_context`.
+
+---
+
+## Implementation notes
+
+- **Cache is eventually consistent.** A brief window where the cache is stale relative to upstream edges is acceptable. The trigger function bounds this to the next scoring pass.
+- **Cache is overwritten, not patched.** On refresh, the entire `shared_context_cache` object is replaced. Incremental updates would add complexity without meaningful speedup.
+- **Nightly recompute is a full scan by `last_cache_computed_at`.** Differential — only edges with cache older than N hours.

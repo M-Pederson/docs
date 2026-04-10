@@ -1,0 +1,499 @@
+---
+title: "Documentation"
+description: "How the Known model works — concepts, evidence, scoring, lifecycle rules, and worked examples from real scenarios"
+---
+
+This is the conceptual guide to the Known relationship model. For the field-by-field schema reference, see [Schema Design](/guides/known/schema-design). For what needs to be built, see [Scope](/guides/known/scope).
+
+## Why compositional facets
+
+The Known model represents a relationship between two people as a stack of facet edges rather than a single "relationship" edge with a flat set of fields. This is the single most important design decision in Known — everything else follows from it.
+
+A flat model forces you to collapse multi-dimensional history into one row. A pair of ex-co-founders who fell out are either "friends" or "estranged" — you have to pick. You lose the ability to say "they were best friends and co-founders for 7 years, then had a falling out in 2022 over strategic direction, and as of last month are tentatively back in touch." A flat model turns history into a single latest-state snapshot.
+
+A compositional model stacks facets:
+
+```
+(Alice)-[:KNOWS]-(Bob)                                 // the envelope — always present
+(Alice)-[:PROFESSIONAL_TIE {valid_to: 2022-06-30}]-(Bob)  // ended
+(Alice)-[:BONDED {valid_to: 2022-06-30}]-(Bob)            // ended
+(Alice)-[:ESTRANGED {valid_from: 2022-06-30}]-(Bob)       // currently valid
+```
+
+Each facet carries its own `valid_from` and `valid_to`. A facet is never mutated on state change — it is invalidated (via `valid_to`) and a new facet is created for the new state. Historical queries work naturally:
+
+- "Were they ever close?" → yes, the invalidated BONDED row is still there
+- "Is the relationship currently strained?" → yes, ESTRANGED is valid
+- "When did they work together?" → PROFESSIONAL_TIE's `valid_from`/`valid_to` window
+
+Facets also stack by type, not just by time. A married couple with kids has simultaneously:
+- `ROMANTIC(type='married')`
+- `KINSHIP(via their shared children — actually two edges to each child)`
+- `BONDED` (derived from closeness signal)
+
+The schema captures what's true, all of it, without collapsing.
+
+---
+
+## The KNOWS envelope
+
+`KNOWS` is the baseline edge between two people. It exists whenever Orbiter has enough evidence that they know each other. Every facet overlay assumes a `KNOWS` edge already exists between the same pair.
+
+`KNOWS` carries:
+
+- **Evidence** — the raw log of why we believe they know each other
+- **Interaction counts** — rolling windows and lifetime totals per modality
+- **Shared context cache** — cached derivation of shared employment, education, events, children, households
+- **Scoring** — strength score, closeness tier, reciprocity, recency, peak watermarks
+- **Evidence coverage** — which data sources are imported for each person
+
+Facets like `BONDED`, `ESTRANGED`, `ROMANTIC`, `KINSHIP`, `PROFESSIONAL_TIE`, `MENTORSHIP` overlay on top of `KNOWS`. They carry the state of one specific dimension of the relationship and can be created, invalidated, and recreated independently.
+
+---
+
+## Evidence model
+
+A `KNOWS` edge is created only when the accumulated evidence clears a floor. Evidence comes from many sources, each tiered as **strong** or **weak**.
+
+### Source tiers
+
+**Strong sources (weight 0.5)** — alone sufficient to create a `KNOWS` edge:
+
+- `email_direct` — a two-way email exchange
+- `calendar_meeting` — both on the same calendar event
+- `sms_chat` — direct messaging
+- `phone_contact` — the user has them in phone contacts
+- `crm_contact` — the user tracks them in their CRM
+- `manual_user_add` — the user explicitly stated "I know this person"
+
+**Weak sources (weight 0.25)** — require at least one additional source (strong or weak) to clear the floor:
+
+- `linkedin_connection` — LinkedIn connection
+- `twitter_follow`, `instagram_follow` — public follows
+- `shared_event_attendance` — both at the same conference
+- `shared_employment_inferred` — overlapped at a company
+- `mutual_friend_mention`, `press_co_mention` — third-party mentions
+
+### Floor rule
+
+```
+create_knows = (strong_count ≥ 1) OR (weak_count ≥ 2)
+```
+
+A single LinkedIn connection is **not** enough to create a `KNOWS`. It needs to be paired with at least one other source. A single phone contact is enough. A single two-way email exchange is enough.
+
+### Staging table for latent evidence
+
+When weak evidence arrives that does not clear the floor, it is stored in a `staging_evidence` Xano table. When more evidence for the same pair arrives later, the cron combines staged rows with the new evidence, re-evaluates against the floor, and — if the floor is cleared — creates the `KNOWS` edge with the full combined evidence history. The staged rows are then deleted.
+
+**Every evidence ingest pipeline MUST check staging for the same pair before creating or updating a `KNOWS` edge**, even when the new evidence alone would clear the floor. Otherwise staged weak evidence gets orphaned. This is a hard rule in the cron spec.
+
+Staged evidence expires after 730 days if no matching second signal ever arrives.
+
+### Confidence
+
+Each `KNOWS` edge has a `confidence` field computed as `min(1.0, sum(weights))`:
+
+- 1 phone contact = 0.5
+- 1 phone contact + 1 LinkedIn = 0.75
+- 1 email exchange + 1 phone contact + 1 LinkedIn + 1 shared employment (inferred) = 1.0 (capped)
+
+High-confidence edges have multiple independent sources confirming the same relationship. Low-confidence edges may be real but should be treated cautiously in scoring.
+
+### Two timestamps on every evidence row
+
+Every evidence row carries two timestamps:
+
+- `first_seen_at` — when Orbiter ingested the evidence (system time)
+- `evidence_occurred_at` — when the real-world event the evidence represents actually happened (domain time)
+
+For a LinkedIn connection synced in 2024 that was actually made in 2019, `first_seen_at = 2024-xx-xx` and `evidence_occurred_at = 2019-xx-xx`. The `known_since` and `first_evidence_at` fields on the KNOWS edge are derived from `min(evidence_occurred_at)` across all evidence — so the relationship is correctly backdated to 2019 even though Orbiter only found out about it in 2024.
+
+---
+
+## Scoring model
+
+Every `KNOWS` edge has a `strength_score` (0–100) and derived `closeness_tier`.
+
+### Formula
+
+```
+raw = w1 · log(total_interactions)
+    + w2 · channel_diversity
+    + w3 · duration_years
+    + w4 · log(mutual_connections)
+    + w5 · shared_experience_bonus       // shared employment/school/event/children/household
+    + w6 · adjusted_reciprocity_signal
+    - w7 · estrangement_penalty
+
+score = max(presence_floor, raw · recency_multiplier)
+```
+
+### Presence floor
+
+Any `KNOWS` edge with strong "acknowledgment" evidence (`phone_contact`, `crm_contact`, `manual_user_add`) gets a minimum `strength_score` of 8. This ensures that "acknowledged but never interacted" relationships score low but nonzero, which is semantically correct — if Sarah has Marcus in her phone and is connected to him on LinkedIn, she knows him. The score should reflect that even without any direct interaction counts.
+
+Direct interaction evidence (`email_direct`, `calendar_meeting`, `sms_chat`) uses normal computation without the floor.
+
+### Closeness tiers
+
+Derived from `strength_score`:
+
+| Tier | Score range |
+|---|---|
+| `acquaintance` | 0–20 |
+| `contact` | 20–45 |
+| `friend` | 45–65 |
+| `close` | 65–85 |
+| `inner_circle` | 85+ |
+
+### Reciprocity (with asymmetric evidence)
+
+Orbiter often has evidence from only one side of a relationship — the user imports their own Gmail, but the other person's mailbox is not imported. Raw interaction counts are asymmetric not because the relationship is one-sided, but because the data is.
+
+Known addresses this with **two reciprocity fields**:
+
+- `observed_reciprocity` — raw counts as-is. Useful for debugging.
+- `adjusted_reciprocity` — weighted by each person's evidence coverage. Used for scoring.
+
+If only Alice's mailbox is imported and Bob's is not, `adjusted_reciprocity = null`. The scoring cron falls back to 0.5 (neutral) when null. This avoids falsely penalizing relationships as "one-sided" when the asymmetry is a data artifact.
+
+The `evidence_coverage` field on every `KNOWS` edge records which sources are imported for each person:
+
+```json
+"evidence_coverage": {
+  "person_a": {"email": "full", "calendar": "full", "chat": "none", "phone": "full"},
+  "person_b": {"email": "none", "calendar": "none", "chat": "none", "phone": "none"}
+}
+```
+
+### Decay rates
+
+Every `KNOWS` edge has a `decay_half_life_days` field that determines how fast the recency score fades. The half-life varies by the dominant currently-valid facet:
+
+| Dominant facet | Half-life (days) |
+|---|---|
+| `KINSHIP` | 3650 (10 years) |
+| `ROMANTIC(is_current=true)` | 730 (2 years) |
+| `BONDED(bond_type includes 'friendship' | 'cofounder')` | 1095 (3 years) |
+| `PROFESSIONAL_TIE` only | 365 (1 year) |
+| `KNOWS` only (no facets) | 180 (6 months) |
+
+When `ESTRANGED` is valid, decay proceeds normally using the above — it is NOT frozen. The peak watermarks preserve the historical high instead.
+
+### Peak watermarks
+
+Every `KNOWS` edge carries three peak fields that only ever increase:
+
+- `peak_strength_score` — highest score ever reached
+- `peak_strength_reached_at` — when
+- `peak_closeness_tier` — tier at the peak
+
+These preserve the "used to be close" signal through estrangement. Ten years after a co-founder fallout, the live `strength_score` might be 12 (decayed to "contact" tier), but `peak_strength_score` stays at 94 ("inner_circle"). Historical queries use the peak; current queries use the live score.
+
+### Score freeze (deceased only)
+
+When a `Person.deceased_at` is set, all `KNOWS` edges touching that person freeze their `strength_score`:
+
+- `score_frozen_at` is set to the deceased timestamp
+- `score_frozen_reason = 'deceased'`
+- The live score stops updating
+- Interaction counts also stop updating (no new interactions will ever arrive)
+
+Estrangement does NOT freeze the score. Peak watermarks handle the historical signal; the live score reflects current reality (they're not talking).
+
+---
+
+## Facet lifecycle rules
+
+Each facet has specific creation, invalidation, and interaction rules.
+
+### BONDED
+
+**Inferred creation** (by scoring cron):
+- `strength_score > 70` AND
+- `shared_context_cache` has real overlap (shared employment, school, children, household, OR sustained direct interaction over years)
+
+**Inferred invalidation**:
+- `strength_score < 55` (hysteresis — the 15-point gap prevents flapping)
+- OR `ESTRANGED` facet is created (cascade invalidation with `invalidation_reason='superseded'`)
+
+**Declared creation/invalidation**: user or LLM action. Cron never touches declared rows.
+
+**bond_type derivation** (for inferred): see [Schema Design — BONDED](/guides/known/schema-design#bonded-closeness-overlay).
+
+### ESTRANGED
+
+**Inferred creation** (strict 3-signal bar — all three required):
+1. Interaction dropoff ≥90% month-over-month in direct interaction modalities
+2. Shared context terminus within ±60 days (employment ended, marriage ended, cohabitation ended)
+3. At least one negative external signal (press article with split/ouster/lawsuit language, divorce filing from public records, sustained negative LLM sentiment in recent interactions)
+
+Fewer than 3 signals → no ESTRANGED. A dormant relationship with no negative signal stays at `status=dormant` (derived from silence alone).
+
+**Inferred invalidation** (reconciliation detection):
+- ≥3 direct interactions within rolling 90-day window AND
+- Across ≥2 distinct modalities (e.g. email + IRL, not just 3 emails) AND
+- LLM sentiment pass on recent interactions returns neutral-or-positive
+
+**Declared creation/invalidation**: user or LLM action. Cron never touches declared rows.
+
+**Cascade effect on BONDED**: when an inferred `ESTRANGED` is created, any valid inferred `BONDED` on the same pair is invalidated at the same timestamp. Declared `BONDED` is not touched.
+
+### ROMANTIC
+
+**Creation**: declared (user action) OR inferred from high-confidence signals (cohabitation + exclusive interaction pattern, public relationship declaration, marriage record).
+
+**Invalidation** with specific reasons:
+- `divorce` — legal marriage ended
+- `breakup` — dating/engaged relationship ended
+- `death` — one party deceased
+- `data_correction` — was wrong
+
+**Not invalidated**: by estrangement alone. An estranged married couple is still married (ROMANTIC stays valid) until a divorce/separation event. The ESTRANGED facet is a separate overlay.
+
+### KINSHIP
+
+**Creation**: declared (user builds family tree) or inferred from public records / profile data.
+
+**Invalidation**: only `data_correction` or `deceased`. Family relationships do not end via life events — a parent is always a parent, a sibling is always a sibling.
+
+**Exception: in-laws.** When a `ROMANTIC(type='married')` facet is invalidated with `invalidation_reason='divorce'`, the cron auto-invalidates any `KINSHIP(relation='in_law')` facets whose `via_chain` includes the divorcing pair. The invalidation reason is `divorce_severed_in_law`. Grandparent/grandchild kinships that don't run through the severed marriage are untouched.
+
+### PROFESSIONAL_TIE
+
+**Creation**: inferred from overlapping `WORKS_AT` edges at the same company. Time window is the overlap of the two employment windows.
+
+**Invalidation**: when the overlap ends (one person's `WORKS_AT.valid_to` is set). `invalidation_reason='ended'`.
+
+### MENTORSHIP
+
+**Directed** — stored with the arrow pointing mentor → mentee. The only directed facet in the Known model.
+
+**Creation**: declared (user action) or inferred from sustained asymmetric interaction patterns + domain context. Conservative inference bar.
+
+### Introductions (node, not facet)
+
+Introductions are not a facet. They are represented as [`Introduction` nodes](/guides/known/schema-design#introduction) with edges to the introducer (`MADE_INTRODUCTION`) and the participants (`CONNECTS`). This is because FalkorDB cannot represent an edge that points at another edge — and an introduction conceptually needs to reference the resulting `KNOWS`.
+
+**Creation**: declared (user explicitly marks "Patricia introduced me to Bob") or inferred from email patterns (cc warm introductions, "thanks for the intro" replies, etc.) via the intro parsing pipeline.
+
+**Effect on `KNOWS`**: when an Introduction node is created for two persons, the resulting `KNOWS` edge (if created as a result) stores the primary introducer's uuid in its `introduced_by` property as a denormalized fast-access field.
+
+**Invalidation**: Introductions are historical facts. They do not get invalidated on falling-out or drift. If an introduction is determined to be incorrect (data quality issue), the Introduction node is deleted with the cleanup cron.
+
+### Households (node, not facet)
+
+Shared cohabitation is represented via [`Household` nodes](/guides/known/schema-design#household) connected to residents via `RESIDED_AT` edges. A household can have any number of residents with overlapping or staggered residency windows.
+
+**Creation**: declared (user tags shared address), inferred from address data in contacts/imports, or inferred from calendar/email address patterns.
+
+**Effect on `KNOWS` scoring**: when two people have `RESIDED_AT` edges to the same `Household` with overlapping windows, the `shared_context_cache.households` array on their `KNOWS` edge is populated with a reference and overlap days. This contributes to the `shared_experience_bonus` in strength scoring.
+
+**Invalidation**: when all residents have moved out, the Household's `end` field is set to the last move-out date. The node is preserved as history (residents who were ever part of this household remain linked via their `RESIDED_AT` edges).
+
+---
+
+## Worked examples
+
+These walk through real state transitions using the Known schema.
+
+### Example 1: Co-founder falling out
+
+**Narrative:** Alice and Bob meet at YC W15 in 2015. Co-found FooCorp together. Build the company for 7 years. Fall out over Series B strategy in 2022. Silence for years. Tentative coffee meeting in 2026.
+
+**T0 — 2015-04 (founding):**
+- Evidence: LinkedIn + shared employment inferred + email exchange (from Alice's imported Gmail)
+- `KNOWS` created with confidence 1.0
+- `PROFESSIONAL_TIE(role='co_founder')` created
+- `origin_context='event'`, `origin_detail='YC W15 batch'`
+
+**T1 — 2018 (BONDED threshold crossed):**
+- `strength_score` crosses 70
+- Scoring cron creates `BONDED(source='inferred', bond_type=['cofounder'])`
+
+**T2 — 2022-06 (fallout):**
+- Bob's `WORKS_AT.valid_to` set to 2022-06-30
+- `PROFESSIONAL_TIE.valid_to` set to 2022-06-30 with `invalidation_reason='ended'`
+- Three signals present: interaction dropoff 96% MoM + employment ended + TechCrunch article with "strategy split" language
+- Scoring cron creates `ESTRANGED(source='inferred', reason='cofounder_split', severity=3, confidence=0.72)`
+- Inferred `BONDED` is invalidated at the same timestamp with `invalidation_reason='superseded'`
+- `KNOWS.peak_strength_score` holds at 94 (the peak reached in 2018)
+- Live `strength_score` continues to decay normally — no freeze
+
+**T3 — 2024-01 (18 months of silence):**
+- `total_email_last_365d = 0`
+- Live `strength_score` has decayed to ~45 (still dropping)
+- `peak_strength_score` still 94
+- ESTRANGED still valid
+
+**T4 — 2026-01 (coffee meeting, tentative):**
+- 1 IRL meeting + 1 email
+- Does not meet reconciliation bar (need ≥3 interactions + sentiment check)
+- ESTRANGED stays valid
+- Live score ticks up slightly from new interaction but is still well below BONDED threshold
+
+**Eventual reconciliation (hypothetical T5 — 2026-06):**
+- 6 interactions across 3 modalities in 90 days, LLM sentiment neutral
+- Cron invalidates ESTRANGED with `invalidation_reason='reconciliation'`
+- Live score climbs back up with normal scoring
+- If score eventually crosses 70 again, a NEW `BONDED` row is created (valid_from=T5), leaving the old invalidated BONDED in place as history
+
+**Final graph state** (after reconciliation): two BONDED rows with a gap between them, one ESTRANGED row invalidated by reconciliation, the full ROMANTIC / PROFESSIONAL_TIE history preserved, and the live score reflecting the current state of the rebuilt relationship.
+
+### Example 2: Divorce with co-parenting
+
+**Narrative:** Sarah and David marry in 2008, have two children in 2010 and 2012, divorce in 2020, remain in functional but cold co-parenting contact.
+
+**T0 — 2008-06 (marriage):**
+- `KNOWS` + `ROMANTIC(type='married')` created
+- `Household` node created with `household_type='family'`, `start='2008-06-14'`
+- Sarah and David both get `RESIDED_AT {move_in: 2008-06-14, role: 'partner'}` edges to the new Household
+
+**T1 — 2010 + 2012 (children born):**
+- `KINSHIP(parent→child, biological=true)` from each parent to each child
+- `KINSHIP(mother_in_law)` from Sarah to David's mother Patricia, with `via_chain=[{person_id: David, relationship: 'spouse'}]`
+- `ROMANTIC.produced_children = 2`
+- Emma and Lily each get `RESIDED_AT {move_in: <birth_date>, role: 'child'}` edges to the Household
+
+**T2 — 2015 (BONDED inferred):**
+- `strength_score > 70`
+- `BONDED(source='inferred', bond_type=['spouse', 'co_parent'])` created
+- `'co_parent'` is derived because both Sarah and David have `KINSHIP(parent)` to the same children
+
+**T3 — 2020-04 (divorce finalized):**
+- `ROMANTIC.valid_to = 2020-04-02`, `invalidation_reason='divorce'`
+- Cron auto-invalidates `KINSHIP(in_law)` Sarah↔Patricia with `invalidation_reason='divorce_severed_in_law'`
+- `KINSHIP(parent)` edges to the children are untouched
+- `KINSHIP(grandparent)` Patricia↔Emma/Lily is untouched (does not run through the severed marriage)
+- David's `RESIDED_AT.move_out = 2020-04-02`. Sarah, Emma, and Lily remain at the Household with `move_out = null`. The Household node itself stays active (`end = null`) because three residents are still there.
+
+**Does ESTRANGED get created?** Checking the 3-signal bar:
+1. ❌ Interaction dropoff — no, they still communicate heavily for co-parenting
+2. ✅ Shared context terminus — ROMANTIC ended
+3. ✅ Negative external signal — divorce record
+
+Only 2 of 3. **ESTRANGED is NOT created.** This is correct — a functional co-parenting relationship after divorce is not estrangement.
+
+**T4 — 2021-2023 (cold co-parenting):**
+- Interaction continues (custody scheduling, school events)
+- LLM sentiment pass: neutral to slightly cold
+- `strength_score` drifts down from peak (94) to ~40
+- When it crosses below 55 (hysteresis threshold), inferred `BONDED` is invalidated with `invalidation_reason='ended'`
+
+**T5 — 2023-08 (Sarah starts dating Michael):**
+- Completely new `KNOWS` edge between Sarah and Michael
+- New `ROMANTIC(type='dating')` facet
+- Sarah's `ROMANTIC` history now has TWO rows: one invalidated (David), one valid (Michael)
+- No conflict — uniqueness is per pair, not per person
+
+**T6 — 2025-09 (Sarah and Michael move in together):**
+- A new `Household` node created with `household_type='couple'`, `start='2025-09-10'`
+- Sarah gets a new `RESIDED_AT` edge to the new household with `move_in='2025-09-10'`
+- Michael also gets `RESIDED_AT {move_in: '2025-09-10', role: 'partner'}`
+- Sarah's prior Household (the marital home she shares with Emma and Lily) is untouched — she may still have `move_out = null` there, or the cron may set her `move_out = '2025-09-10'` if she's genuinely left that household. Depends on whether the kids are still living there and whether she maintains presence. This is a per-case nuance worth logging in `source='inferred'` vs requiring declared input.
+- `ROMANTIC(type='domestic_partner')` facet between Sarah and Michael updated with the household reference in `shared_context_cache.households`
+
+### Example 3: LinkedIn → phone-import retroactive backdating
+
+**Narrative:** Sarah and Marcus meet briefly at a conference in 2019, connect on LinkedIn that week, and exchange contact info. They never communicate directly after. Orbiter's evidence arrives in fragments over the following years.
+
+**T0 — 2024-03 (LinkedIn sync):**
+- Single evidence row arrives: `linkedin_connection`, weight 0.25, `evidence_occurred_at=2019-05-22`
+- Below floor (1 weak source)
+- Staged in `staging_evidence` table
+- No `KNOWS` edge yet
+
+**T1 — 2024-08 (Sarah imports phone contacts):**
+- New evidence: `phone_contact`, weight 0.5, `evidence_occurred_at=2024-08-21`
+- Cron checks `staging_evidence` for the same pair — finds the LinkedIn row
+- Combined evidence now has 1 strong + 1 weak = 0.75 confidence, clears floor
+- `KNOWS` edge created with both evidence rows in the array
+- Staged row deleted
+- `known_since = 2019` (derived from the LinkedIn evidence's `evidence_occurred_at`, not the phone contact's)
+- `first_direct_interaction_at = null` (neither source is "direct interaction" in the scoring sense)
+- `strength_score = 8` (presence floor from phone_contact, since there's no direct interaction evidence)
+- `closeness_tier = 'acquaintance'`
+
+**The same scenario with arrival order reversed** (phone contact first, LinkedIn later) produces an equivalent final state for all semantic fields. Only `valid_from` and evidence `first_seen_at` timestamps differ — because they correctly record when Orbiter learned about the relationship, not when the relationship actually began. The schema is order-independent for all domain-level fields.
+
+---
+
+## Query patterns
+
+A few common query shapes enabled by the compositional facet model.
+
+**"Everyone Alice currently knows" (live):**
+```cypher
+MATCH (a:Person {uuid: $alice_uuid})-[k:KNOWS]-(b:Person)
+WHERE k.valid_to IS NULL
+RETURN b, k.strength_score, k.closeness_tier
+ORDER BY k.strength_score DESC
+```
+
+**"Everyone Alice has ever been close to, including the past":**
+```cypher
+MATCH (a:Person {uuid: $alice_uuid})-[b:BONDED]-(other:Person)
+RETURN other, b.bond_type, b.valid_from, b.valid_to, b.peak_strength_during_bond
+ORDER BY b.valid_from DESC
+```
+
+**"Alice's currently-estranged relationships":**
+```cypher
+MATCH (a:Person {uuid: $alice_uuid})-[e:ESTRANGED]-(other:Person)
+WHERE e.valid_to IS NULL
+RETURN other, e.reason, e.severity, e.valid_from
+```
+
+**"Has Alice ever been married?" (including past):**
+```cypher
+MATCH (a:Person {uuid: $alice_uuid})-[r:ROMANTIC]-(partner:Person)
+WHERE r.type = 'married'
+RETURN partner, r.valid_from, r.valid_to, r.invalidation_reason
+```
+
+**"Alice's co-parents" (people who share KINSHIP parent-target with her):**
+```cypher
+MATCH (a:Person {uuid: $alice_uuid})-[:KINSHIP {relation: 'parent'}]->(child:Person)
+MATCH (other:Person)-[:KINSHIP {relation: 'parent'}]->(child)
+WHERE other.uuid <> $alice_uuid
+RETURN DISTINCT other
+```
+
+**"Relationships Alice had with her in-laws, including former ones":**
+```cypher
+MATCH (a:Person {uuid: $alice_uuid})-[k:KINSHIP {relation: 'in_law'}]-(other:Person)
+RETURN other, k.valid_from, k.valid_to, k.invalidation_reason
+```
+
+**"Who introduced Alice to her closest current contacts":**
+```cypher
+MATCH (a:Person {uuid: $alice_uuid})-[k:KNOWS]-(other:Person)
+WHERE k.valid_to IS NULL AND k.strength_score > 70
+MATCH (introducer:Person)-[:MADE_INTRODUCTION]->(intro:Introduction)-[:CONNECTS]->(a)
+MATCH (intro)-[:CONNECTS]->(other)
+RETURN introducer.uuid, introducer.name, count(DISTINCT intro) AS introductions
+ORDER BY introductions DESC
+```
+
+**"All people who have ever lived with Alice, with overlap windows":**
+```cypher
+MATCH (a:Person {uuid: $alice_uuid})-[r1:RESIDED_AT]->(home:Household)
+MATCH (other:Person)-[r2:RESIDED_AT]->(home)
+WHERE other.uuid <> $alice_uuid
+  AND r1.move_in < COALESCE(r2.move_out, datetime())
+  AND r2.move_in < COALESCE(r1.move_out, datetime())
+RETURN other, home.household_type,
+       GREATEST(r1.move_in, r2.move_in) AS overlap_start,
+       LEAST(COALESCE(r1.move_out, datetime()), COALESCE(r2.move_out, datetime())) AS overlap_end
+```
+
+**"Who are the super-connectors in Alice's network" (people who introduced many of her contacts):**
+```cypher
+MATCH (introducer:Person)-[:MADE_INTRODUCTION]->(intro:Introduction)-[:CONNECTS]->(a:Person {uuid: $alice_uuid})
+MATCH (intro)-[:CONNECTS]->(other:Person)
+WHERE other.uuid <> $alice_uuid
+RETURN introducer, count(DISTINCT other) AS people_introduced
+ORDER BY people_introduced DESC
+LIMIT 10
+```

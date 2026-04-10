@@ -1,0 +1,87 @@
+---
+title: "LLM Review Passes"
+description: "LLM-backed functions that add qualitative judgment to the graph — sentiment, classification, and review"
+---
+
+LLM-backed functions that run periodically or on-demand to add qualitative judgment to the graph where deterministic rules aren't enough. These add cost and latency, so they should be used carefully — prefer rule-based signals when they suffice, and batch/budget LLM calls.
+
+---
+
+## `known/llm/sentiment_pass`
+
+Given a set of recent interactions between two people (emails, messages, meeting transcripts if available), returns a sentiment score in `[-1, 1]` plus a rationale. Used by estrangement detection and reconciliation detection to distinguish "hostile sustained contact" from "friendly reconnection."
+
+**Inputs:** `knows_edge_uuid`, `time_window_days`
+**Outputs:**
+```json
+{
+  "sentiment": -0.4,
+  "confidence": 0.82,
+  "rationale": "Tone has shifted to terse, transactional. Several apologies and defensiveness in the last 5 exchanges.",
+  "interactions_reviewed": 12,
+  "model_used": "claude-opus-4-6",
+  "computed_at": "2026-04-10T00:00:00Z"
+}
+```
+
+**Cadence:** Nightly, batched. Only run on edges flagged by upstream signals (recent context terminus, ESTRANGED active, reconciliation candidate).
+
+## `known/llm/relationship_classifier`
+
+Given a `KNOWS` edge's full context (evidence, facets, interaction history, shared context), proposes a `bond_type` array and optionally flags candidates for declared relationship facets (e.g. "this looks like it might actually be a mentorship, consider creating MENTORSHIP").
+
+**Inputs:** `knows_edge_uuid`
+**Outputs:**
+```json
+{
+  "proposed_bond_types": ["friendship", "mentor_mentee"],
+  "proposed_facets": [
+    {"type": "MENTORSHIP", "confidence": 0.75, "rationale": "..."}
+  ],
+  "confidence": 0.78
+}
+```
+
+Used as a fallback by the `bonded_creator` cron when deterministic rules don't produce a `bond_type` (e.g. no spouse, no co-parent, no co-founder signals, but the edge clearly crosses the BONDED threshold).
+
+**Cadence:** On-demand, triggered by `bonded_creator` for ambiguous cases.
+
+## `known/llm/estrangement_reviewer`
+
+Given an inferred `ESTRANGED` facet, reviews the evidence and rationale. Can:
+- **Promote to declared** (`source='declared'`) if the LLM finds high-confidence supporting evidence — locks the facet from further cron invalidation
+- **Invalidate as false positive** if the LLM finds contradicting signals — sets `valid_to` with `invalidation_reason='data_correction'`
+- **Leave as inferred** — no change
+
+**Inputs:** `estranged_facet_uuid`
+**Outputs:** `{action: 'promote' | 'invalidate' | 'no_change', rationale: string}`
+
+**Cadence:** Weekly, batch over recently-created inferred ESTRANGED facets. Low priority.
+
+## `known/llm/reconciliation_reviewer`
+
+Mirror of the above for reconciliation events. Given a recent ESTRANGED invalidation (with `invalidation_reason='reconciliation'`), reviews the recent interactions that triggered the auto-reconciliation and confirms or rejects.
+
+**Inputs:** `invalidated_estranged_facet_uuid`
+**Outputs:** `{action: 'confirm' | 'reject' | 'no_change', rationale: string}`
+
+If rejected, the cron re-creates the ESTRANGED facet with a new `valid_from`.
+
+**Cadence:** Weekly, batch.
+
+---
+
+## Cost and budget notes
+
+LLM passes are expensive compared to rule-based evaluation. Design guidelines:
+
+- **Sentiment pass is the hot path.** Triggered by estrangement detection and reconciliation detection. Should be batched and cached — don't re-run sentiment on the same window twice in the same week.
+- **Classifier and reviewers are low-volume.** Only run when deterministic rules are ambiguous or when a lifecycle transition already happened and needs verification.
+- **Don't run LLM passes on edges with no recent activity.** A dormant edge doesn't need sentiment analysis.
+- **Cache rationales.** The text rationale from sentiment_pass is useful for auditability — store it, don't regenerate on queries.
+
+---
+
+## Model selection
+
+Model selection for these passes is deferred to implementation time. Candidates include Claude Sonnet/Opus, GPT-4, or local models for sentiment (where cost matters and quality floor is lower than classification). See [Orbiter's enrichment model conventions](/guides/enrichment/person-pipeline/model-summary) for the broader model-selection pattern used across Orbiter enrichment pipelines.

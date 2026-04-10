@@ -1,0 +1,96 @@
+---
+title: "Helper Functions"
+description: "Foundation helper functions — the write-path primitives every other Known function depends on"
+---
+
+These are the foundation functions. They must exist before any ingest, scoring, or lifecycle code can run. Every write to the Known graph goes through one of these helpers — no direct Cypher `CREATE` from callers.
+
+## Design principle
+
+No caller writes raw Cypher against Known edges. All creates, updates, and invalidations flow through these helpers so that canonicalization, temporal rules, and derived-field recomputation are enforced in exactly one place.
+
+---
+
+## `known/helpers/canonicalize_pair`
+
+Takes two person UUIDs and returns them in canonical order (lower first). Every write path uses this before any `CREATE` or `MERGE`.
+
+**Inputs:** `person_a_id`, `person_b_id`
+**Outputs:** `{lower_id, higher_id}`
+
+## `known/helpers/create_knows_edge`
+
+Creates a new `KNOWS` edge with the canonical pair order enforced. The only entry point for `KNOWS` creation — no callers should do raw Cypher `CREATE (a)-[:KNOWS]->(b)`.
+
+**Inputs:** `person_a_id`, `person_b_id`, `evidence_rows`, `origin_context`, `origin_entity_id`, `origin_detail`
+**Outputs:** `knows_edge_uuid`
+**Side effects:**
+- Runs initial `shared_context_cache` computation
+- Sets initial `strength_score` (may hit the presence floor if no direct interaction evidence)
+- Derives `known_since`, `first_evidence_at`, etc. from the evidence array
+
+## `known/helpers/append_evidence`
+
+Appends new evidence to an existing `KNOWS.evidence` array and recomputes derived fields.
+
+**Inputs:** `knows_edge_uuid`, `evidence_row`
+**Outputs:** updated `KNOWS` edge
+**Recomputes on every call:**
+- `confidence` (sum of weights, capped at 1.0)
+- `known_since`, `first_evidence_at`, `last_evidence_at`
+- `first_direct_interaction_at`, `last_direct_interaction_at`
+- `connected_platforms`, `total_social_connections`
+
+**Critical:** Every derived-from-evidence field must be recomputed on every append. Implementation should enumerate the list explicitly — a silent "forgot to recompute X" bug here would let derived fields drift from evidence over time.
+
+## `known/helpers/compute_confidence`
+
+Computes `confidence = min(1.0, sum(weights))` from an evidence array. Pure function.
+
+**Inputs:** `evidence_rows[]`
+**Outputs:** `confidence: float`
+
+## `known/helpers/check_evidence_floor`
+
+Evaluates an evidence array against the floor rule: `(strong_count ≥ 1) OR (weak_count ≥ 2)`.
+
+**Inputs:** `evidence_rows[]`
+**Outputs:**
+```json
+{
+  "passes_floor": true,
+  "strong_count": 1,
+  "weak_count": 1,
+  "total_confidence": 0.75
+}
+```
+
+## `known/helpers/derive_known_since`
+
+Derives temporal fields from an evidence array. Key rule: temporal derivations use `evidence_occurred_at`, not `first_seen_at`. This is what enables retroactive backdating when LinkedIn tells us "they connected in 2019" even though Orbiter only saw the evidence in 2024.
+
+**Inputs:** `evidence_rows[]`
+**Outputs:**
+```json
+{
+  "known_since": 2019,
+  "first_evidence_at": "2019-05-22T00:00:00Z",
+  "last_evidence_at": "2024-08-21T00:00:00Z",
+  "first_direct_interaction_at": null,
+  "last_direct_interaction_at": null
+}
+```
+
+## `known/helpers/create_facet`
+
+Generic facet creation. Enforces canonical pair order, sets `valid_from`, `source`, `created_by`, `created_at`.
+
+**Inputs:** `facet_type`, `person_a_id`, `person_b_id`, `source`, `properties`
+**Outputs:** `facet_uuid`
+
+## `known/helpers/invalidate_facet`
+
+Sets `valid_to`, `invalidation_reason`, `invalidated_by` on an existing facet. **Never deletes.** Invalidation preserves history.
+
+**Inputs:** `facet_uuid`, `invalidation_reason`, `invalidated_by`, `invalidated_at`
+**Outputs:** updated facet

@@ -1,0 +1,410 @@
+---
+title: "Edge Types"
+description: "Every edge type in the Known relationship graph — KNOWS envelope and the facet overlays (BONDED, PROFESSIONAL_TIE, KINSHIP, ROMANTIC, ESTRANGED, MENTORSHIP)"
+---
+
+**10 edge types** across 4 logical groups.
+
+Known is primarily an edge-based model. Every facet between two persons is a direct Cypher edge, canonicalized (lower `uuid` first for undirected facets). The exceptions — introductions and households — are [node types](/guides/known/schema-design/nodes) for reasons documented on that page.
+
+## Summary
+
+### Relationship facets (Person ↔ Person)
+
+| Edge type | Direction | Weight range | Purpose |
+|---|---|---|---|
+| [`KNOWS`](#knows-the-envelope-edge) | Undirected | 25–60 | Envelope edge. Interaction counts, evidence, scoring, shared context cache. |
+| [`PROFESSIONAL_TIE`](#professional-tie-work-relationship-overlay) | Undirected | 5–35 (3 tiers by role) | Work relationship scoped to a company — co-founder, manager/report, peer, board, etc. |
+| [`BONDED`](#bonded-closeness-overlay) | Undirected | 7–25 (by source) | Close tie overlay. Declared (7–18) or inferred (10–25). |
+| [`KINSHIP`](#kinship-family-overlay) | Undirected | 3–25 (2 tiers) | Family relationships. Immediate (3–10) or extended (10–25). |
+| [`ROMANTIC`](#romantic-romantic-relationship-overlay) | Undirected | 4–20 (2 tiers) | Romantic relationships. Committed (4–10) or dating (10–20). |
+| [`ESTRANGED`](#estranged-negative-valence-overlay) | Undirected | — (penalty on KNOWS) | Negative-valence overlay. Adds `severity × 5` penalty to the KNOWS weight. |
+| [`MENTORSHIP`](#mentorship-directed-coaching-relationship) | **Directed** | 10–25 (by formality) | The only directed facet. Mentor → mentee. |
+
+### Structural edges (for Introduction and Household nodes)
+
+| Edge type | Direction | Weight range | Purpose |
+|---|---|---|---|
+| `MADE_INTRODUCTION` | Directed | 25–40 | `(Introducer:Person)-[:MADE_INTRODUCTION]->(Introduction)`. Who made the introduction. |
+| `CONNECTS` | Directed | 30–45 | `(Introduction)-[:CONNECTS]->(Person)`. Each person who was introduced. |
+| `RESIDED_AT` | Directed | 8–35 (by current/past) | `(Person)-[:RESIDED_AT]->(Household)`. Residency window with move-in/move-out per person. |
+
+Full details for each edge type follow below, grouped by facet vs structural.
+
+## Weight convention
+
+Every weighted edge carries a `weight` field (float) with the convention **lower = more important**. Weight ranges are declared per edge type (floor/ceiling) and the specific value per instance is computed from `strength_score` by the scoring cron:
+
+```
+weight = floor + (ceiling - floor) * (1 - strength_score / 100)
+```
+
+The full weight table is in [Schema Design → Weight model](/guides/known/schema-design#weight-model). Each edge section below repeats its own range for reference.
+
+---
+
+## `KNOWS` — the envelope edge
+
+The baseline edge representing "these two people know each other." Carries interaction counts, evidence, confidence, scoring, and cached shared context. Every other facet is an overlay on top of an existing `KNOWS`.
+
+| | |
+|---|---|
+| **Pattern** | `(Person)-[:KNOWS]->(Person)` (canonicalized, lower id first) |
+| **Directionality** | Undirected (canonicalized) |
+| **Cardinality** | At most one valid `KNOWS` per pair at any given time |
+| **Created when** | Evidence floor is met (see [Evidence model](/guides/known/documentation#evidence-model)) |
+| **Weight range** | Baseline **25–60**, derived from `strength_score`. Plus `ESTRANGED` penalty (`severity × 5`) when an ESTRANGED facet is currently valid on the same pair. |
+
+### Identity & lifecycle
+
+| Property | Type | Description |
+|---|---|---|
+| `uuid` | string | Edge identifier |
+| `valid_from` | timestamp | When Orbiter first recorded this relationship as valid |
+| `valid_to` | timestamp \| null | Only set if the edge is invalidated (data cleanup). Not set for normal lifecycle events — those live on facets. |
+
+### Evidence & provenance
+
+| Property | Type | Description |
+|---|---|---|
+| `confidence` | float (0.0–1.0) | Sum of evidence weights, capped at 1.0 |
+| `evidence` | array\<object\> | Append-only log of every evidence row (see [Evidence row shape](#evidence-row-shape) below) |
+| `introduced_by` | person uuid \| null | Who introduced them (if known) |
+| `origin_context` | enum | How they first met: `work`, `school`, `event`, `intro`, `family`, `neighborhood`, `online`, `unknown` |
+| `origin_entity_id` | uuid \| null | FK to the Company/School/Event node for origin |
+| `origin_detail` | string | Freeform description (e.g. "YC W15 batch") |
+
+### Temporal (derived from evidence + interactions)
+
+| Property | Type | Description |
+|---|---|---|
+| `known_since` | integer | Year, derived from `min(evidence.evidence_occurred_at)` |
+| `first_evidence_at` | timestamp | Earliest `evidence_occurred_at` across all evidence |
+| `first_direct_interaction_at` | timestamp \| null | Earliest direct interaction (email, meeting, SMS, calendar) |
+| `last_evidence_at` | timestamp | Latest `evidence_occurred_at` |
+| `last_direct_interaction_at` | timestamp \| null | Latest direct interaction |
+
+### Interaction counts (cron-populated)
+
+Each modality has four count fields: lifetime, last 30 days, last 90 days, last 365 days.
+
+| Property | Type | Description |
+|---|---|---|
+| `total_email_lifetime` | integer | All-time email exchanges |
+| `total_email_last_30d` | integer | Rolling 30-day window |
+| `total_email_last_90d` | integer | Rolling 90-day window |
+| `total_email_last_365d` | integer | Rolling 365-day window |
+| `total_remote_meetings_lifetime` + 3 windows | integer | Video calls, etc. |
+| `total_irl_meetings_lifetime` + 3 windows | integer | In-person |
+| `total_phone_calls_lifetime` + 3 windows | integer | Voice calls |
+| `total_chat_messages_lifetime` + 3 windows | integer | SMS/Slack/iMessage |
+| `total_shared_calendar_events_lifetime` + 3 windows | integer | Shared calendar events |
+| `total_social_interactions_lifetime` + 3 windows | integer | Likes/comments/replies |
+| `total_interactions_lifetime` | integer | Sum across all modalities (derived) |
+
+### Social graph signals
+
+| Property | Type | Description |
+|---|---|---|
+| `total_social_connections` | integer | Number of platforms they're connected on |
+| `connected_platforms` | array\<string\> | e.g. `['linkedin','twitter']` |
+| `mutual_connections_count` | integer | Shared 2nd-degree connections |
+| `shared_group_memberships` | array\<string\> | Slack/Discord/boards/clubs |
+
+### Cached shared context
+
+Populated by a cron that traverses each person's `WORKS_AT`, `STUDIED_AT`, `ATTENDED_EVENT`, `KINSHIP`, and `RESIDED_AT` edges and intersects.
+
+```json
+"shared_context_cache": {
+  "employments": [{"company_id": "...", "overlap_start": "2015-04-01", "overlap_end": "2022-06-30", "overlap_days": 2647}],
+  "educations":  [{"school_id":  "...", "overlap_start": "...", "overlap_end": "...", "overlap_days": 0}],
+  "events":      [{"event_id":   "...", "date": "2015-03-15"}],
+  "children":    [{"person_id":  "...", "shared_since": "2010-03-22", "biological_both": true}],
+  "households":  [{"household_uuid": "...", "overlap_start": "2008-06-14", "overlap_end": "2020-04-02", "overlap_days": 4309}],
+  "ventures":    [{"venture_id": "...", "role": "co-founder"}],
+  "computed_at": "2026-04-10T00:00:00Z"
+}
+```
+
+The `households` array references `Household` nodes by uuid rather than storing address data inline. The overlap window is computed from the two persons' `RESIDED_AT` edges to the same `Household`.
+
+### Scoring
+
+| Property | Type | Description |
+|---|---|---|
+| `strength_score` | float (0–100) | Live score, updated each cron pass |
+| `closeness_tier` | enum | `acquaintance` \| `contact` \| `friend` \| `close` \| `inner_circle` |
+| `weight` | float | Computed from `strength_score` within the KNOWS weight range (baseline 25–60, or narrower if a dominant facet overrides). See [Weight model](/guides/known/schema-design#weight-model). Includes ESTRANGED penalty when applicable. |
+| `peak_strength_score` | float (0–100) | Historical high water mark; never decreases |
+| `peak_strength_reached_at` | timestamp | When the peak was reached |
+| `peak_closeness_tier` | enum | Tier at the peak |
+| `observed_reciprocity` | float (0–1) \| null | Raw counts as-is |
+| `adjusted_reciprocity` | float (0–1) \| null | Weighted by evidence coverage |
+| `channel_diversity` | integer | Count of modalities with nonzero interactions |
+| `recency_score` | float (0–1) | Decay function applied to `last_direct_interaction_at` |
+| `decay_half_life_days` | integer | Varies by dominant facet (see [Decay rates](/guides/known/documentation#decay-rates)) |
+| `a_to_b_weight` | float (0–1) | Directional weight from a→b (not the ranking weight above — this is a separate reciprocity field) |
+| `b_to_a_weight` | float (0–1) | Directional weight from b→a |
+
+### Freeze state (only set for deceased relationships)
+
+| Property | Type | Description |
+|---|---|---|
+| `score_frozen_at` | timestamp \| null | When the score was frozen |
+| `score_frozen_reason` | enum \| null | Currently only `deceased`. Other reasons (e.g. `manual_pause`) may be added. |
+
+Estrangement does NOT freeze the score. Peak watermarks preserve the "used to be close" signal while the live score decays normally.
+
+### Evidence coverage
+
+Records which data sources are imported for each person. Used to compute `adjusted_reciprocity` and to distinguish "one-sided relationship" from "incomplete data."
+
+```json
+"evidence_coverage": {
+  "person_a": {"email": "full", "calendar": "full", "chat": "full", "phone": "full"},
+  "person_b": {"email": "none", "calendar": "none", "chat": "none", "phone": "none"}
+}
+```
+
+Values: `full`, `partial`, `none`.
+
+### Cron bookkeeping
+
+| Property | Type | Description |
+|---|---|---|
+| `last_counts_updated_at` | timestamp | Last interaction count refresh |
+| `last_score_computed_at` | timestamp | Last strength score recompute |
+| `last_cache_computed_at` | timestamp | Last `shared_context_cache` refresh |
+
+### Evidence row shape
+
+Every entry in the `evidence` array has this shape:
+
+```json
+{
+  "source": "linkedin_connection",
+  "first_seen_at": "2024-03-15T10:42:00Z",
+  "evidence_occurred_at": "2019-05-22T00:00:00Z",
+  "weight": 0.25,
+  "raw_metadata": {"linkedin_connection_id": "xyz"}
+}
+```
+
+- `first_seen_at` — when Orbiter ingested the evidence (system time)
+- `evidence_occurred_at` — when the real-world event occurred (domain time). Used for `known_since` derivation.
+- `weight` — contribution to confidence. See [Evidence sources](#evidence-sources) below.
+- `raw_metadata` — source-specific payload for debugging / auditing.
+
+### Evidence sources
+
+Every source is tiered as **strong** or **weak**. Strong sources alone are sufficient to create a `KNOWS` edge. Weak sources require at least one additional source (strong or weak) to clear the floor.
+
+**Strong sources (weight 0.5):**
+
+| Source | Description |
+|---|---|
+| `crm_contact` | User explicitly tracked this person in their CRM |
+| `phone_contact` | User has them in phone contacts |
+| `email_direct` | Two-way email exchange (not newsletter) |
+| `calendar_meeting` | Both on a calendar event together |
+| `manual_user_add` | User explicitly stated "I know this person" |
+| `sms_chat` | Direct messaging history |
+
+**Weak sources (weight 0.25):**
+
+| Source | Description |
+|---|---|
+| `linkedin_connection` | LinkedIn connection |
+| `twitter_follow` | Public follow (mutual or one-directional) |
+| `instagram_follow` | Public follow |
+| `shared_event_attendance` | Both at same conference/event |
+| `shared_employment_inferred` | Overlapped at a company — may not have known each other |
+| `mutual_friend_mention` | Third-party mention in content |
+| `press_co_mention` | Named in the same article |
+
+**Floor rule:** `create_knows = (strong_count ≥ 1) OR (weak_count ≥ 2)`
+
+**Confidence calculation:** `confidence = min(1.0, sum(weights))`
+
+---
+
+## `PROFESSIONAL_TIE` — work relationship overlay
+
+| | |
+|---|---|
+| **Pattern** | `(Person)-[:PROFESSIONAL_TIE]->(Person)` (canonicalized) |
+| **Directionality** | Undirected with asymmetric roles |
+| **Cardinality** | Multiple allowed per pair if spanning different companies or different time windows |
+| **Created when** | Shared employment detected (overlap in `WORKS_AT` edges at the same company) |
+| **Weight range** | Tiered by role. Tier 1 (`co_founder`, `manager_report`): **5–12**. Tier 2 (`board_member`, `investor_founder`, `advisor`): **12–22**. Tier 3 (`peer`, `client_vendor`): **20–35**. |
+
+| Property | Type | Description |
+|---|---|---|
+| `uuid` | string | Edge identifier |
+| `valid_from` | timestamp | Overlap start |
+| `valid_to` | timestamp \| null | Overlap end |
+| `source` | enum | `inferred` \| `declared` |
+| `relationship_role` | enum | `peer`, `manager_report`, `co_founder`, `client_vendor`, `investor_founder`, `board_member`, `advisor` |
+| `role_a_to_b` | string | Specific role of a toward b (e.g. `manager`, `co-founder`, `client`) |
+| `role_b_to_a` | string | Specific role of b toward a (e.g. `report`, `co-founder`, `vendor`) |
+| `company_id` | uuid | The company this tie is scoped to |
+| `created_by` | string | Cron name, user id, or LLM identifier |
+| `created_at` | timestamp | When the row was created |
+| `invalidation_reason` | enum \| null | Set when `valid_to` is set. See [Invalidation reasons](/guides/known/schema-design#invalidation-reasons). |
+| `invalidated_by` | string \| null | |
+
+---
+
+## `BONDED` — closeness overlay
+
+| | |
+|---|---|
+| **Pattern** | `(Person)-[:BONDED]->(Person)` (canonicalized) |
+| **Directionality** | Undirected |
+| **Cardinality** | At most one valid per pair at a time |
+| **Created when** | Inferred: `strength_score > 70` AND `shared_context_cache` has real overlap. Declared: user/LLM action. |
+| **Invalidated when** | Inferred: `strength_score < 55` (hysteresis prevents flapping) OR an ESTRANGED facet is created. Declared: only by user/LLM action. |
+| **Weight range** | Modulated by `source`. Declared: **7–18**. Inferred: **10–25**. `bond_type` does not modulate weight. |
+
+| Property | Type | Description |
+|---|---|---|
+| `uuid` | string | Edge identifier |
+| `valid_from` | timestamp | |
+| `valid_to` | timestamp \| null | |
+| `source` | enum | `inferred` \| `declared` |
+| `bond_type` | array\<enum\> | Array of bond categories: `friendship`, `romantic`, `spouse`, `familial`, `cofounder`, `mentor_mentee`, `co_parent` |
+| `confidence` | float | Derived for inferred; 1.0 for declared |
+| `peak_strength_during_bond` | float | Max `strength_score` observed while this bond was valid |
+| `created_by` | string | |
+| `created_at` | timestamp | |
+| `invalidation_reason` | enum \| null | |
+| `invalidated_by` | string \| null | |
+
+**Hysteresis rule (cron logic):** Inferred BONDED is created when `strength_score > 70`. It is only invalidated when `strength_score < 55`. The 15-point gap prevents thrashing near the threshold.
+
+**Derivation of `bond_type` (inferred only):** Derived from currently-valid facets on the same pair at creation time:
+- `ROMANTIC(type='married')` present → include `'spouse'`
+- `ROMANTIC(type='dating' | 'domestic_partner')` present → include `'romantic'`
+- `KINSHIP` present → include `'familial'`
+- `PROFESSIONAL_TIE(relationship_role='co_founder')` present → include `'cofounder'`
+- Both persons have `KINSHIP(relation='parent')` to the same third person → include `'co_parent'`
+- `MENTORSHIP` present → include `'mentor_mentee'`
+- Otherwise → `'friendship'`
+
+---
+
+## `KINSHIP` — family overlay
+
+| | |
+|---|---|
+| **Pattern** | `(Person)-[:KINSHIP]->(Person)` (canonicalized) |
+| **Directionality** | Undirected with asymmetric roles |
+| **Cardinality** | Multiple allowed for different relation types |
+| **Weight range** | Tiered by `relation`. Tier 1 immediate family (`parent`, `child`, `spouse_kinship`, `sibling`, plus `step_*` / `adoptive_*` variants): **3–10**. Tier 2 extended family (`grandparent`, `grandchild`, `in_law`, `aunt_uncle`, `niece_nephew`, `cousin`): **10–25**. |
+
+| Property | Type | Description |
+|---|---|---|
+| `uuid` | string | Edge identifier |
+| `valid_from` | timestamp | |
+| `valid_to` | timestamp \| null | |
+| `relation` | enum | `parent`, `child`, `sibling`, `spouse_kinship`, `in_law`, `grandparent`, `grandchild`, `aunt_uncle`, `niece_nephew`, `cousin`, `step_*`, `adoptive_*` |
+| `role_a_to_b` | string | e.g. `parent` |
+| `role_b_to_a` | string | e.g. `child` |
+| `biological` | boolean | |
+| `via_chain` | array\<object\> \| null | Frozen historical chain for indirect relations (e.g. in-laws). `[{person_id, relationship}]` captured at creation time. Never updated if intermediate persons change state. |
+| `source` | enum | `inferred` \| `declared` |
+| `created_by` | string | |
+| `created_at` | timestamp | |
+| `invalidation_reason` | enum \| null | |
+| `invalidated_by` | string \| null | |
+
+**In-law handling on divorce:** When a `ROMANTIC(type='married')` facet is invalidated with `invalidation_reason='divorce'`, the cron auto-invalidates any `KINSHIP(relation='in_law')` facets whose `via_chain` includes the divorcing pair. The invalidation reason is `'divorce_severed_in_law'`. The underlying grandparent/grandchild kinships (which do not run via the now-severed marriage) are untouched.
+
+---
+
+## `ROMANTIC` — romantic relationship overlay
+
+| | |
+|---|---|
+| **Pattern** | `(Person)-[:ROMANTIC]->(Person)` (canonicalized) |
+| **Directionality** | Undirected |
+| **Cardinality** | At most one valid per pair at a time. Multiple rows allowed across time (breakup → get back together creates a second row). A single person can have multiple valid ROMANTIC facets to different partners (polyamory). |
+| **Weight range** | Tiered by `type`. Tier 1 committed (`married`, `engaged`, `domestic_partner`, `separated`): **4–10**. Tier 2 uncommitted (`dating`): **10–20**. |
+
+| Property | Type | Description |
+|---|---|---|
+| `uuid` | string | Edge identifier |
+| `valid_from` | timestamp | |
+| `valid_to` | timestamp \| null | |
+| `type` | enum | `dating`, `engaged`, `married`, `domestic_partner`, `separated` |
+| `is_current` | boolean | Convenience flag; must match `valid_to IS NULL` |
+| `started_dating` | timestamp \| null | Original dating start (may predate `valid_from` for marriages) |
+| `produced_children` | integer | Count of shared children |
+| `source` | enum | `inferred` \| `declared` |
+| `created_by` | string | |
+| `created_at` | timestamp | |
+| `invalidation_reason` | enum \| null | `divorce`, `breakup`, `death`, `data_correction` |
+| `invalidated_by` | string \| null | |
+
+---
+
+## `ESTRANGED` — negative-valence overlay
+
+| | |
+|---|---|
+| **Pattern** | `(Person)-[:ESTRANGED]->(Person)` (canonicalized) |
+| **Directionality** | Undirected |
+| **Cardinality** | At most one valid per pair at a time |
+| **Created when** | Inferred: ALL THREE of (interaction dropoff ≥90% MoM) + (shared context terminus within ±60d) + (negative external signal). Declared: user/LLM action. |
+| **Invalidated when** | Inferred: ≥3 interactions within rolling 90d across ≥2 modalities AND LLM sentiment neutral-or-positive. Declared: only by user/LLM action. |
+| **Weight** | **No own weight field.** When valid, adds a penalty of `severity × 5` (range +5 to +25) to the `KNOWS` edge of the same pair. Severity 1 = mild drift; severity 5 = active hostility. |
+
+| Property | Type | Description |
+|---|---|---|
+| `uuid` | string | Edge identifier |
+| `valid_from` | timestamp | |
+| `valid_to` | timestamp \| null | |
+| `source` | enum | `inferred` \| `declared` |
+| `reason` | enum | `divorce`, `cofounder_split`, `legal`, `falling_out`, `drift`, `unknown` |
+| `severity` | integer (1–5) | 1 = drifted apart; 5 = active hostility/litigation |
+| `confidence` | float | Derived for inferred; 1.0 for declared |
+| `evidence` | array | The specific signals that triggered creation |
+| `created_by` | string | |
+| `created_at` | timestamp | |
+| `invalidation_reason` | enum \| null | `reconciliation`, `data_correction`, `deceased` |
+| `invalidated_by` | string \| null | |
+
+**Effect on `BONDED`:** When an inferred ESTRANGED is created, any valid inferred `BONDED` facet on the same pair must be invalidated at the same timestamp, with `invalidation_reason='superseded'`. Declared BONDED is untouched (requires declared action to invalidate).
+
+**Effect on `strength_score`:** None. The score continues to decay normally. The `peak_strength_score` field captures historical high. This is distinct from the deceased case, which uses hard freeze.
+
+---
+
+## `MENTORSHIP` — directed coaching relationship
+
+| | |
+|---|---|
+| **Pattern** | `(Mentor:Person)-[:MENTORSHIP]->(Mentee:Person)` |
+| **Directionality** | **Directed** (not canonicalized) |
+| **Cardinality** | At most one valid per (mentor, mentee) pair |
+| **Weight range** | Tiered by `formality`. Formal: **10–18**. Informal: **15–25**. |
+
+| Property | Type | Description |
+|---|---|---|
+| `uuid` | string | |
+| `valid_from` | timestamp | |
+| `valid_to` | timestamp \| null | |
+| `domain` | string | What the mentorship is about |
+| `formality` | enum | `formal`, `informal` |
+| `source` | enum | |
+| `created_by` | string | |
+| `invalidation_reason` | enum \| null | |
+
+---
+
+## Introductions are nodes, not edges
+
+There is no `INTRODUCED` edge type. Introductions are represented as [`Introduction` nodes](/guides/known/schema-design/nodes#introduction) connected to the introducer via `MADE_INTRODUCTION` and to the participants via `CONNECTS`. This was a deliberate design choice: FalkorDB does not support edges pointing at other edges (so an `(Introducer)-[:INTRODUCED]->(knows_edge)` pattern is impossible), and introductions are naturally N-ary.
+
+See [Node types → Introduction](/guides/known/schema-design/nodes#introduction) for the full shape.

@@ -1,0 +1,185 @@
+---
+title: "Schema Design"
+description: "Canonical schema reference for the Known relationship graph — conventions, nodes, edges, indexes, and constraints"
+---
+
+This is the canonical schema reference for the Known relationship model. The model lives in FalkorDB alongside the existing Orbiter ontology and reuses the `Person` node from `guides/ontology/nodes`. Everything below the `Person` node — the KNOWS envelope, the facet overlays, the staging table, and the scoring derivations — is new and specific to Known.
+
+Node types and edge types each have their own sub-page. Conventions, indexes, constraints, and open questions live here on the landing page.
+
+## Sub-pages
+
+<CardGroup cols={2}>
+  <Card title="Node Types" icon="circle-nodes" href="/guides/known/schema-design/nodes">
+    Person (extended), Introduction, and Household. The three node types in the Known model, with properties, edge patterns, and real examples.
+  </Card>
+  <Card title="Edge Types" icon="arrows-left-right" href="/guides/known/schema-design/edges">
+    KNOWS envelope plus all facet overlays — BONDED, PROFESSIONAL_TIE, KINSHIP, ROMANTIC, ESTRANGED, MENTORSHIP. Full field lists for every edge type.
+  </Card>
+</CardGroup>
+
+---
+
+## Conventions
+
+- **Temporal fields:** Every facet edge carries `valid_from` and `valid_to`. `valid_to IS NULL` means currently valid. This matches the existing graph ontology.
+- **Canonicalization:** Undirected facet edges are stored with the lower person `uuid` (or `id`) as the source. The application layer MUST enforce this before any `CREATE` or `MERGE`. A helper like `createKnowsEdge(a_id, b_id, props)` should wrap every write.
+- **Directionality:** All facets except `MENTORSHIP` are undirected-modeled-as-canonicalized-directed. `MENTORSHIP` is the only directed facet (mentor → mentee). Introductions are not facets at all — they are first-class [`Introduction` nodes](/guides/known/schema-design/nodes#introduction).
+- **Mixed-mode graph model:** Known is primarily edge-based (facets between two persons), with two surgical node-based exceptions: `Introduction` (genuinely N-ary, carries its own metadata, can't work as an edge) and `Household` (genuinely N-ary, shared living space with multiple residents). Everything else stays as direct person-to-person edges for query performance.
+- **Asymmetric roles in symmetric facets:** Facets that are mutual but carry asymmetric roles (KINSHIP parent/child, PROFESSIONAL_TIE manager/report) use a pair of role fields: `role_a_to_b` and `role_b_to_a`. This is a required pattern — apply it to any symmetric facet with role asymmetry.
+- **Invalidation preserves history:** Facets are never deleted on state change. `valid_to` is set, and the row stays. New facets are created for new states.
+- **Source field on lifecycle facets:** `BONDED`, `ESTRANGED`, `PROFESSIONAL_TIE`, and other lifecycle overlays carry `source: 'inferred' | 'declared'`. Cron logic only touches `inferred` rows; declared rows are immutable except by user/LLM action.
+- **Weight convention:** Every weighted edge carries a `weight` field (float). **Lower weight = higher importance** — matches the existing Orbiter ontology convention. Weight is computed dynamically within a per-type range from the instance's `strength_score`. See [Weight model](#weight-model) below.
+
+---
+
+## Weight model
+
+Every weighted edge in the Known graph has a `weight` field that determines its priority in ranked queries. The convention matches the existing Orbiter ontology: **lower weight means higher importance**.
+
+### Hybrid strategy: per-type ranges, dynamic within
+
+Each edge type has a declared `weight_floor` and `weight_ceiling`. The per-instance value is computed by the scoring cron from `strength_score` using:
+
+```
+weight = floor + (ceiling - floor) * (1 - strength_score / 100)
+```
+
+Higher `strength_score` → lower weight → higher priority. For edges without a live `strength_score` (e.g. `Introduction` → `CONNECTS` structural edges), the floor is used.
+
+The cron writes `weight` to the edge on every pass. Queries like `MATCH (a)-[e]-(b) WHERE e.weight < 10` surface the most important edges first, and can predictably hit certain edge types because each type has a known range.
+
+### Committed weight ranges
+
+| Edge type | Floor | Ceiling | Notes |
+|---|---|---|---|
+| `KINSHIP` tier 1 (immediate family) | **3** | **10** | `parent`, `child`, `spouse_kinship`, `sibling`, and their `adoptive_*` / `step_*` variants |
+| `ROMANTIC` tier 1 (committed) | **4** | **10** | `married`, `engaged`, `domestic_partner`, `separated` |
+| `FOUNDED` (existing ontology) | **5** | **5** | Static, unchanged |
+| `PROFESSIONAL_TIE` tier 1 (inner work) | **5** | **12** | `co_founder`, `manager_report` |
+| `BONDED` (`source='declared'`) | **7** | **18** | User-declared close bonds — highest-trust |
+| `RESIDED_AT` (current, `move_out IS NULL`) | **8** | **15** | Currently sharing a household |
+| `BONDED` (`source='inferred'`) | **10** | **25** | Cron-inferred closeness |
+| `KINSHIP` tier 2 (extended family) | **10** | **25** | `grandparent`, `grandchild`, `in_law`, `aunt_uncle`, `niece_nephew`, `cousin` |
+| `MENTORSHIP` (`formality='formal'`) | **10** | **18** | |
+| `ROMANTIC` tier 2 (uncommitted) | **10** | **20** | `dating` |
+| `PROFESSIONAL_TIE` tier 2 (governance) | **12** | **22** | `board_member`, `investor_founder`, `advisor` |
+| `MENTORSHIP` (`formality='informal'`) | **15** | **25** | |
+| `PROFESSIONAL_TIE` tier 3 (outer work) | **20** | **35** | `peer`, `client_vendor` |
+| `RESIDED_AT` (past, `move_out IS NOT NULL`) | **20** | **35** | Historical cohabitation |
+| `KNOWS` (baseline, no facets) | **25** | **60** | Derived entirely from `strength_score` + presence floor |
+| `MADE_INTRODUCTION` | **25** | **40** | Structural edge from introducer to Introduction node |
+| `CONNECTS` (Introduction → Person) | **30** | **45** | Structural edge from Introduction to participants |
+
+### Dynamic modifiers
+
+**ESTRANGED penalty.** `ESTRANGED` does not have its own weight. Instead, when an `ESTRANGED` facet is currently valid on a pair, a penalty of `severity × 5` is added to the `KNOWS` edge weight for that pair. Severity ranges 1–5, so the penalty ranges +5 to +25. A mild drift (severity 2) barely affects ranking; active hostility (severity 5) drops the relationship well below baseline KNOWS.
+
+**Invalidated facets.** Facets with `valid_to IS NOT NULL` are **excluded from default weight queries**. The default query pattern filters `WHERE e.valid_to IS NULL`. Historical relationships can be queried explicitly by removing this filter, but they do not participate in ranked "most important relationships" queries.
+
+### How rankings interleave
+
+A concrete example — Sarah Okafor (from the [divorce scenario](/guides/known/documentation#example-2-divorce-with-co-parenting)) post-divorce with co-parenting:
+
+| Relationship | Edge | `strength_score` | Weight | Notes |
+|---|---|---|---|---|
+| Sarah → Emma (daughter) | `KINSHIP` tier 1 | — | **3** | Biological parent, highest priority |
+| Sarah → Lily (daughter) | `KINSHIP` tier 1 | — | **3** | |
+| Sarah → Michael (new partner, domestic partner) | `ROMANTIC` tier 1 | 72 | **5.68** | |
+| Sarah → Michael | `BONDED` (inferred) | 78 | **13.3** | |
+| Sarah → David (ex, still co-parent) | `KNOWS` (+ESTRANGED penalty sev 2) | 38 | **25 + 10 = 35** | Mild estrangement, penalty moves him down |
+| Sarah → David | `ROMANTIC(married)` | — | **—** | Invalidated (divorce), excluded from default queries |
+
+Query `MATCH (sarah)-[e]-(other) WHERE e.valid_to IS NULL AND e.weight < 15 RETURN other ORDER BY e.weight` surfaces her children and current partner. David is excluded because his weight is above the filter threshold — correct for "who matters most right now" queries.
+
+---
+
+## Supporting structures
+
+### `staging_evidence` table (Xano)
+
+Not an edge. A Xano table for holding weak evidence that hasn't yet cleared the KNOWS creation floor.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | integer | PK |
+| `person_a_id` | uuid | Canonicalized (lower id) |
+| `person_b_id` | uuid | |
+| `source` | enum | Evidence source name |
+| `weight` | float | Evidence weight |
+| `first_seen_at` | timestamp | When ingested |
+| `evidence_occurred_at` | timestamp | When the real-world event occurred |
+| `raw_metadata` | json | Source-specific payload |
+| `created_at` | timestamp | |
+
+**Lifecycle:**
+- **Insert** when evidence arrives but does not clear the floor (e.g. a lone LinkedIn connection).
+- **Consume + delete** when a subsequent evidence event for the same pair brings them over the floor. The staged rows are merged into the resulting `KNOWS.evidence` array and then removed from staging.
+- **Expire** after 730 days with no matching second signal (tunable cron parameter).
+
+**Critical rule:** Every evidence ingest pipeline MUST check `staging_evidence` for the same `(a, b)` pair before creating or updating a `KNOWS` edge, regardless of whether the new evidence alone clears the floor. Skipping the staging check on strong-source ingests would orphan previously-staged weak evidence.
+
+---
+
+## Invalidation reasons
+
+Every facet carries `invalidation_reason` when `valid_to` is set. Valid values:
+
+| Reason | Meaning |
+|---|---|
+| `ended` | Relationship naturally ended (e.g. score dropped, context expired) |
+| `superseded` | Invalidated because another facet took precedence (e.g. BONDED invalidated because ESTRANGED was created) |
+| `data_correction` | The facet was wrong — it should never have existed. Used for cleanup. |
+| `deceased` | One party died |
+| `reconciliation` | Only for ESTRANGED — the relationship recovered |
+| `divorce` | Only for ROMANTIC(type='married') |
+| `breakup` | Only for ROMANTIC(type='dating' \| 'engaged' \| 'domestic_partner') |
+| `divorce_severed_in_law` | Only for KINSHIP(relation='in_law') — the connecting marriage ended |
+
+Implementations should use the most specific reason available.
+
+---
+
+## Indexes
+
+| Label / Edge | Property | Type | Purpose |
+|---|---|---|---|
+| `Person` | `uuid` | unique | Primary lookup |
+| `Person` | `deceased_at` | range | Fast "who is deceased" queries for freeze logic |
+| `Introduction` | `uuid` | unique | Primary lookup |
+| `Introduction` | `resulting_knows_uuid` | range | Resolve introduction → KNOWS |
+| `Household` | `uuid` | unique | Primary lookup |
+| `Household` | `address_hash` | range | Find household by address |
+| `Household` | `end` | range | Find currently-active households (`end IS NULL`) |
+| `KNOWS` | `(person_a_id, person_b_id)` | composite unique | Canonical pair lookup |
+| `KNOWS` | `last_score_computed_at` | range | Differential scoring cron |
+| `KNOWS` | `last_counts_updated_at` | range | Differential counts cron |
+| `KNOWS` | `strength_score` | range | "Find high-strength edges" queries |
+| `BONDED` | `source` | range | Distinguish inferred vs declared on scan |
+| `ESTRANGED` | `source` | range | Same |
+| `ESTRANGED` | `valid_to` | range | "Find currently-valid estrangements" |
+| `PROFESSIONAL_TIE` | `company_id` | range | Company-scoped queries |
+| `KINSHIP` | `relation` | range | Filter by relationship type |
+| `ROMANTIC` | `is_current` | range | Fast "current partner" queries |
+| `RESIDED_AT` | `move_out` | range | Find currently-active residencies |
+
+FalkorDB gotcha: not-equal filters (`<>`) are not index-accelerated. Prefer positive predicates (e.g. filter by facet presence/absence rather than `status <> 'estranged'`).
+
+---
+
+## Constraints
+
+- **KNOWS uniqueness:** at most one `KNOWS` edge per canonicalized `(person_a_id, person_b_id)` pair at any time.
+- **Facet uniqueness:** the uniqueness key for lifecycle facets is `(a_id, b_id, facet_type, valid_at)`, NOT `(a_id, facet_type, valid_at)`. A person can have multiple valid `ROMANTIC` facets to different partners simultaneously; two people cannot have two valid `ROMANTIC` facets between them simultaneously.
+- **Canonicalization:** application layer MUST enforce `a_id < b_id` for undirected facets. No exceptions. Wrap all writes in helper functions.
+- **Evidence append-only:** the `KNOWS.evidence` array is never modified retroactively except to append new rows.
+- **`is_current` invariant:** `ROMANTIC.is_current = (valid_to IS NULL)`. Must be updated atomically with `valid_to`.
+
+---
+
+## Open schema questions (to resolve at implementation time)
+
+- **Evidence coverage granularity:** Should `evidence_coverage` distinguish "full" vs "partial" for calendars (e.g. imported one Google account but user has three)? Current model uses tri-state; may need finer resolution.
+- **Origin context for multi-context meetings:** Current rule is "earliest-in-time wins." Edge cases exist (e.g. met briefly at a conference, then seriously reconnected at work years later). May need manual override mechanism.
+- **Identity merge cascade:** When Orbiter realizes two `Person` nodes are the same human and merges them, what happens to their `KNOWS` edges to third parties? Not yet designed.
+- **Reciprocity on zero interaction:** Current formula returns `null` when no interaction exists. Scoring cron treats null as 0.5 (neutral). Confirm this is right for edges with acknowledgment-only evidence.

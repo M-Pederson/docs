@@ -1,0 +1,109 @@
+---
+title: "Facet Lifecycle"
+description: "Crons that create, invalidate, and maintain lifecycle facets (BONDED, ESTRANGED, PROFESSIONAL_TIE, KINSHIP, and deceased freeze)"
+---
+
+Facet lifecycle crons watch the scoring layer and upstream graph changes, then create or invalidate facets accordingly. These are the automated rules that turn signal patterns into state transitions.
+
+All inferred facet creation/invalidation goes through these crons. **Declared facets (user or LLM action) are never touched by these jobs.**
+
+See [Documentation — Facet lifecycle rules](/guides/known/documentation#facet-lifecycle-rules) for the underlying rules.
+
+---
+
+## `known/lifecycle/bonded_creator` (cron)
+
+Finds `KNOWS` edges where:
+- `strength_score > 70`, AND
+- `shared_context_cache` has real overlap (shared employment / school / children / household / ventures), AND
+- No currently-valid `BONDED` exists
+
+Creates inferred `BONDED` with a derived `bond_type` array.
+
+**`bond_type` derivation rules** (the array can contain multiple values):
+- Currently-valid `ROMANTIC(type='married')` → include `'spouse'`
+- Currently-valid `ROMANTIC(type='dating' | 'domestic_partner')` → include `'romantic'`
+- Currently-valid `KINSHIP` (direct) → include `'familial'`
+- Currently-valid `PROFESSIONAL_TIE(relationship_role='co_founder')` → include `'cofounder'`
+- Both persons have `KINSHIP(relation='parent')` to the same third person → include `'co_parent'`
+- Currently-valid `MENTORSHIP` → include `'mentor_mentee'`
+- Otherwise → `'friendship'`
+
+**Cadence:** Nightly
+**Depends on:** Scoring cron finished
+
+## `known/lifecycle/bonded_invalidator` (cron)
+
+Finds `KNOWS` edges with valid inferred `BONDED` where `strength_score < 55` (hysteresis — 15-point gap from the 70 creation threshold prevents flapping).
+
+Invalidates with `invalidation_reason='ended'`. Snapshots `peak_strength_during_bond` at invalidation time.
+
+**Cadence:** Nightly
+**Depends on:** Scoring cron finished
+
+## `known/lifecycle/estrangement_detector` (cron)
+
+Scans `KNOWS` edges for the 3-signal estrangement pattern. **All three signals required:**
+
+<Steps>
+  <Step title="Interaction dropoff">
+    `>=90%` month-over-month drop in direct interaction modalities (email, chat, calls, meetings).
+  </Step>
+  <Step title="Shared context terminus">
+    Within ±60 days of the dropoff, at least one of: `PROFESSIONAL_TIE.valid_to` set, `ROMANTIC.valid_to` set, `RESIDED_AT.move_out` set (end of cohabitation).
+  </Step>
+  <Step title="Negative external signal">
+    At least one of: press keyword classifier hit (split/ouster/lawsuit language), LLM sentiment pass returns negative on recent interactions, public records divorce/lawsuit detection.
+  </Step>
+</Steps>
+
+When all three are present, creates `ESTRANGED(source='inferred', reason=<derived>, severity=<1-5>, confidence=<0-1>)`. **Cascade-invalidates** any valid inferred `BONDED` on the same pair with `invalidation_reason='superseded'` at the same timestamp.
+
+**Cadence:** Nightly
+**Depends on:** Scoring cron finished, LLM sentiment pass finished
+
+## `known/lifecycle/reconciliation_detector` (cron)
+
+Scans edges with valid inferred `ESTRANGED`. For each, checks:
+
+1. ≥3 direct interactions within rolling 90-day window
+2. Across ≥2 distinct modalities (not just 3 emails)
+3. LLM sentiment pass on recent interactions returns neutral-or-positive
+
+If all three, invalidates the `ESTRANGED` with `invalidation_reason='reconciliation'`.
+
+**Important:** Only invalidates inferred `ESTRANGED`. Declared `ESTRANGED` requires declared reconciliation (user or LLM action).
+
+**Cadence:** Nightly
+**Depends on:** Scoring cron finished, LLM sentiment pass finished
+
+## `known/lifecycle/professional_tie_maintainer` (trigger)
+
+When any `WORKS_AT` edge's `valid_to` is updated, re-evaluate `PROFESSIONAL_TIE` edges that depend on the overlap. Invalidate those whose overlap has ended with `invalidation_reason='ended'`.
+
+**Cadence:** Trigger on `WORKS_AT` change
+
+## `known/lifecycle/kinship_in_law_cascader` (trigger)
+
+When a `ROMANTIC(type='married')` facet is invalidated with `invalidation_reason='divorce'`, find all `KINSHIP(relation='in_law')` facets whose `via_chain` includes the divorcing pair. Invalidate those with `invalidation_reason='divorce_severed_in_law'`.
+
+Does **not** touch `KINSHIP(relation='grandparent')` or `KINSHIP(relation='parent')` that don't run through the severed marriage — grandparent/grandchild bonds persist across the divorce.
+
+**Cadence:** Trigger on `ROMANTIC` invalidation with `invalidation_reason='divorce'`
+
+## `known/lifecycle/deceased_freezer` (trigger)
+
+When a `Person.deceased_at` is set, scan all `KNOWS` edges touching that person and set `score_frozen_at` + `score_frozen_reason='deceased'`. Further scoring passes skip frozen edges.
+
+Also sets `ROMANTIC.invalidation_reason='death'` on any currently-valid `ROMANTIC` facets touching the deceased person.
+
+**Cadence:** Trigger on `Person.deceased_at` set
+
+---
+
+## Key rules
+
+- **Declared facets are immutable to crons.** Every facet created by these crons has `source='inferred'`. Facets with `source='declared'` are only touched by user or LLM actions.
+- **Hysteresis everywhere.** BONDED uses 70/55 (create/invalidate). Estrangement uses 3-signal bar. Reconciliation uses sustained-interaction bar. These asymmetric thresholds prevent flapping.
+- **Invalidations preserve history.** Facets are never deleted. `valid_to` is set; the row remains for historical queries.
+- **Cascade on state changes.** Some state changes require cascade logic (estrangement cascades to BONDED, divorce cascades to in-law kinships, death cascades to romantic). These are encoded in the specific crons/triggers above.

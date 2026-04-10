@@ -1,0 +1,141 @@
+---
+title: "Node Types"
+description: "Node types in the Known relationship graph — Person (extended), Introduction, and Household"
+---
+
+**3 node types** across 2 logical groups.
+
+Known reuses `Person` from the existing ontology and introduces two new node types (`Introduction` and `Household`) for cases that are genuinely N-ary or can't be represented as edges in FalkorDB. Everything else stays as edges — see [Edge Types](/guides/known/schema-design/edges).
+
+## Summary
+
+| Node type | Labels | Purpose |
+|---|---|---|
+| [`Person` (extended)](#person-extended) | `Entity:Person` | Reused from existing ontology. Known adds the `deceased_at` property for freeze logic. |
+| [`Introduction`](#introduction) | `Entity:Introduction` | First-class node representing "X introduced Y to Z." Carries introducer, participants, and resulting KNOWS reference. Promoted to a node because FalkorDB can't link edges to edges and introductions are N-ary. |
+| [`Household`](#household) | `Entity:Household` | Shared living space with multiple residents and overlap windows. Promoted to a node because cohabitation is N-ary and is a first-class closeness signal. |
+
+---
+
+## Person (extended)
+
+Known adds one new optional property to the existing `Person` node for freeze logic. All other Person properties come from the [existing ontology](/guides/ontology/nodes#person).
+
+| Property | Type | Description |
+|---|---|---|
+| `deceased_at` | string \| null | ISO 8601 timestamp. When set, all `KNOWS` edges touching this person freeze their `strength_score` with `score_frozen_reason='deceased'`. |
+
+All other relationship state is captured on edges and facets, not on the Person node.
+
+---
+
+## Introduction
+
+A first-class node representing "person X introduced person Y to person Z." Promoted to a node (not an edge) because FalkorDB does not support edges pointing at other edges, and because an introduction is an N-ary concept — it has a distinct introducer plus multiple participants.
+
+**Labels:** `Entity:Introduction`
+
+| Property | Type | Description |
+|---|---|---|
+| `uuid` | string | Primary identifier |
+| `introduced_at` | timestamp | When the introduction happened (domain time) |
+| `context` | string | Freeform description — "over email cc", "at Alice's wedding", "warm intro via LinkedIn" |
+| `introduction_medium` | enum | `email`, `in_person`, `phone`, `chat`, `event`, `other` |
+| `source` | enum | `inferred` \| `declared` |
+| `confidence` | float (0.0–1.0) | Derived for inferred; 1.0 for declared |
+| `resulting_knows_uuid` | string \| null | UUID of the `KNOWS` edge that resulted from this introduction. Stored as a property reference since FalkorDB cannot link nodes to edges. |
+| `created_by` | string | Cron name, user id, or LLM identifier |
+| `created_at` | timestamp | |
+
+### Edges from Introduction
+
+| Pattern | Meaning |
+|---|---|
+| `(Introducer:Person)-[:MADE_INTRODUCTION]->(Introduction)` | The person who performed the introduction |
+| `(Introduction)-[:CONNECTS]->(Person)` | Each person who was introduced (usually two, but can be more for group introductions) |
+
+Queries like "who has introduced Alice to her closest contacts" traverse `MADE_INTRODUCTION` and `CONNECTS` edges. See [Query patterns in Documentation](/guides/known/documentation#query-patterns).
+
+<Accordion title="Real example">
+```cypher
+// Patricia introduced Alice to Bob over email in 2019
+CREATE (intro:Entity:Introduction {
+  uuid: 'intro-abc-123',
+  introduced_at: '2019-05-22T14:30:00Z',
+  context: 'warm intro via email cc',
+  introduction_medium: 'email',
+  source: 'inferred',
+  confidence: 0.85,
+  resulting_knows_uuid: 'knows-xyz-789',
+  created_by: 'email_parser_cron',
+  created_at: '2024-03-15T10:00:00Z'
+})
+MATCH (patricia:Person {uuid: 'patricia-uuid'}),
+      (alice:Person {uuid: 'alice-uuid'}),
+      (bob:Person {uuid: 'bob-uuid'})
+CREATE (patricia)-[:MADE_INTRODUCTION]->(intro),
+       (intro)-[:CONNECTS]->(alice),
+       (intro)-[:CONNECTS]->(bob)
+```
+</Accordion>
+
+**Note:** `KNOWS` also carries an `introduced_by: person_uuid` property as a denormalized fast-access field pointing to the primary introducer. The Introduction node is the canonical source for full introduction history; the property is a convenience for common queries.
+
+---
+
+## Household
+
+A first-class node representing a shared living space. Promoted to a node because a household is genuinely N-ary — any number of residents, potentially overlapping over time — and because shared cohabitation is a strong closeness signal worth querying directly.
+
+**Labels:** `Entity:Household`
+
+| Property | Type | Description |
+|---|---|---|
+| `uuid` | string | Primary identifier |
+| `address_hash` | string | Privacy-preserving hash of the physical address. Raw address is NOT stored on the node. |
+| `household_type` | enum | `family`, `couple`, `roommates`, `care_setting`, `parent_child`, `other` |
+| `start` | timestamp | When the household was formed (earliest known resident move-in) |
+| `end` | timestamp \| null | When the household dissolved (all residents moved out). Null = currently active. |
+| `source` | enum | `inferred` \| `declared` |
+| `created_at` | timestamp | |
+
+### Edges to Household
+
+| Pattern | Meaning |
+|---|---|
+| `(Person)-[:RESIDED_AT]->(Household)` | Someone lived in this household |
+
+The `RESIDED_AT` edge carries the per-person residency window:
+
+| Property | Type | Description |
+|---|---|---|
+| `uuid` | string | Edge identifier |
+| `move_in` | timestamp | When this person moved in |
+| `move_out` | timestamp \| null | When they moved out (null = currently resident) |
+| `role` | enum | `primary`, `partner`, `child`, `roommate`, `relative`, `other` |
+| `source` | enum | `inferred` \| `declared` |
+
+Shared cohabitation between two people is derived by finding a common `Household` both have `RESIDED_AT` edges to, then computing the overlap of their `move_in`/`move_out` windows. This derived signal flows into `KNOWS.shared_context_cache.households` as a reference.
+
+<Accordion title="Real example">
+```cypher
+// Sarah and David's marital household, 2008-2020
+CREATE (home:Entity:Household {
+  uuid: 'household-001',
+  address_hash: 'sha256:abc...',
+  household_type: 'family',
+  start: '2008-06-14T00:00:00Z',
+  end: '2020-04-02T00:00:00Z',
+  source: 'inferred',
+  created_at: '2024-01-01T00:00:00Z'
+})
+MATCH (sarah:Person {uuid: 'sarah-uuid'}),
+      (david:Person {uuid: 'david-uuid'}),
+      (emma:Person {uuid: 'emma-uuid'}),
+      (lily:Person {uuid: 'lily-uuid'})
+CREATE (sarah)-[:RESIDED_AT {move_in: '2008-06-14', move_out: '2020-04-02', role: 'partner'}]->(home),
+       (david)-[:RESIDED_AT {move_in: '2008-06-14', move_out: '2020-04-02', role: 'partner'}]->(home),
+       (emma)-[:RESIDED_AT {move_in: '2010-03-22', move_out: '2020-04-02', role: 'child'}]->(home),
+       (lily)-[:RESIDED_AT {move_in: '2012-08-09', move_out: '2020-04-02', role: 'child'}]->(home)
+```
+</Accordion>

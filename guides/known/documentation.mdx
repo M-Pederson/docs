@@ -47,7 +47,7 @@ The schema captures what's true, all of it, without collapsing.
 - **Scoring** — strength score, closeness tier, reciprocity, recency, peak watermarks
 - **Evidence coverage** — which data sources are imported for each person
 
-Facets like `BONDED`, `ESTRANGED`, `ROMANTIC`, `KINSHIP`, `PROFESSIONAL_TIE`, `MENTORSHIP` overlay on top of `KNOWS`. They carry the state of one specific dimension of the relationship and can be created, invalidated, and recreated independently.
+Facets like `BONDED`, `ESTRANGED`, `ROMANTIC`, `KINSHIP`, `PROFESSIONAL_TIE`, `MENTOR` overlay on top of `KNOWS`. They carry the state of one specific dimension of the relationship and can be created, invalidated, and recreated independently.
 
 ---
 
@@ -158,6 +158,8 @@ Known addresses this with **two reciprocity fields**:
 
 If only Alice's mailbox is imported and Bob's is not, `adjusted_reciprocity = null`. The scoring cron falls back to 0.5 (neutral) when null. This avoids falsely penalizing relationships as "one-sided" when the asymmetry is a data artifact.
 
+**Mentorship reciprocity baseline adjustment.** Some relationships are inherently asymmetric in healthy form — a formal mentorship has the mentor initiating most contact and the mentee responding. A 0.3 reciprocity (70% mentor-initiated, 30% mentee-initiated) is normal for a healthy mentorship, not a sign of a deteriorating relationship. When the scoring cron computes reciprocity for a pair that has a currently-valid `MENTOR` facet (in either direction), it **adjusts the expected baseline from 0.5 (neutral) to 0.3 (mentor-skewed)**. A reciprocity score of 0.3 on a mentorship edge is treated as "normal healthy asymmetry" by the strength scoring formula, rather than as one-sided.
+
 The `evidence_coverage` field on every `KNOWS` edge records which sources are imported for each person:
 
 ```json
@@ -249,22 +251,46 @@ Fewer than 3 signals → no ESTRANGED. A dormant relationship with no negative s
 - `breakup` — dating/engaged/domestic_partner relationship ended without marriage
 - `death` — one party deceased (set automatically by `deceased_freezer` cron)
 - `data_correction` — was wrong
+- `superseded` — the relationship was upgraded to a stronger type (e.g. dating → engaged → married), and a new ROMANTIC row replaced this one
+
+**Type upgrades create new rows.** When a relationship progresses (dating → engaged → married, or dating → domestic_partner), the existing ROMANTIC facet is invalidated with `invalidation_reason='superseded'` and a **new** ROMANTIC facet is created with the upgraded type. This preserves a clean historical chain. Each type row has its own `valid_from` / `valid_to` window.
 
 **Not invalidated**: by estrangement alone. An estranged married couple is still married (ROMANTIC stays valid) until a divorce/separation event. The ESTRANGED facet is a separate overlay.
 
 ### KINSHIP
 
-**Creation**: declared (user builds family tree) or inferred from public records / profile data.
+**Creation**: declared (user builds family tree) or inferred from public records / profile data. Several relation types are **auto-cascaded** from other graph state — see below.
 
-**In-law creation rule:** `KINSHIP(relation='in_law')` is created whenever a person has a currently-valid `ROMANTIC` facet of **any committed tier** — `married`, `engaged`, `domestic_partner`, or `separated`. Not restricted to marriage. Domestic partners' parents qualify as in-laws; their siblings qualify as in-laws; etc. This reflects real family structures where legal marriage is not the only committed relationship.
+**Relation sub-values:** The in-law value has been split into `parent_in_law`, `child_in_law`, and `sibling_in_law` for more specific queries. Step and adoptive variants exist for each of `parent`, `child`, and `sibling`. See [Schema Design → KINSHIP](/guides/known/schema-design/edges#kinship-family-overlay) for the full relation enum.
 
-**Invalidation**: only `data_correction` or (for in-laws) `divorce_severed_in_law`. Direct family relationships do not end via life events — a parent is always a parent, a sibling is always a sibling.
+**Auto-cascade rules on marriage / committed ROMANTIC:** When a `ROMANTIC` facet of any committed tier (`married`, `engaged`, `domestic_partner`, `separated`) is created between persons A and B:
 
-**In-law cascade on divorce (divorce-only):** When a `ROMANTIC(type='married')` facet is invalidated with `invalidation_reason='divorce'`, the cron auto-invalidates any `KINSHIP(relation='in_law')` facets whose `via_chain` includes the divorcing pair. The invalidation reason is `divorce_severed_in_law`. Grandparent/grandchild kinships that don't run through the severed marriage are untouched.
+1. **In-law KINSHIPs are auto-created:**
+   - A gets `parent_in_law` to each of B's parents (and vice versa)
+   - A gets `sibling_in_law` to each of B's siblings (and vice versa)
+   - A gets `child_in_law` to each of B's children from prior relationships (and vice versa)
+   - Each auto-created in-law has `via_chain = [{person_id: <bridging_spouse>, relationship: 'spouse' | 'domestic_partner' | ...}]`
 
-**The cascade does NOT fire on death.** When a spouse dies, in-law KINSHIPs stay valid. Rationale: divorce is an active decision to end the in-law structure; death is not. A widow(er) remains connected to her/his late spouse's family unless they declare otherwise. Manual invalidation is available via user/LLM action.
+2. **Step-parent / step-child KINSHIPs are auto-created:**
+   - If A has existing biological `parent` KINSHIPs to children from prior, B becomes `step_parent` to those children; they reciprocally become `step_child` to B. Same in the other direction.
+   - `via_chain` references the biological parent who is the bridge.
 
-**The cascade does NOT fire on breakup of a domestic partnership.** Only the legal marriage case triggers auto-cascade. Domestic partnership breakups leave in-law KINSHIPs valid; users can declare-invalidate if appropriate.
+3. **Step-sibling KINSHIPs are auto-created:**
+   - When both A and B have existing biological `parent` KINSHIPs to children from prior, those children become `step_sibling` to each other.
+   - `via_chain` lists both biological parents as multi-anchor entries.
+
+**Adoptive relations are never auto-created.** `adoptive_parent`, `adoptive_child`, and `adoptive_sibling` are only created via explicit declared action (user declaration or LLM review pass detecting a formal adoption record). Adoption creates a direct legal parent-child bond with `via_chain = null`.
+
+**Adoption can supersede step-relations.** If a step-parent formally adopts their step-child, the existing `step_parent` KINSHIP is invalidated with `invalidation_reason='superseded'` and a new `adoptive_parent` KINSHIP is created. The old row remains as history.
+
+**Invalidation rules:**
+- Direct biological relations (`parent`, `child`, `sibling`) are never invalidated except by `data_correction`. A parent is always a parent.
+- Extended relations (`grandparent`, `cousin`, etc.) are similarly stable.
+- **In-law KINSHIPs cascade-invalidate on divorce only.** When `ROMANTIC(type='married')` is invalidated with `invalidation_reason='divorce'`, all `parent_in_law` / `child_in_law` / `sibling_in_law` facets whose `via_chain` includes the divorcing pair are auto-invalidated with `invalidation_reason='divorce_severed_in_law'`.
+- **Step-relations (step_parent, step_child, step_sibling) also cascade-invalidate on divorce.** Same rule, but with `invalidation_reason='divorce_severed_step'`. Step-siblings' multi-anchor `via_chain` is checked for the divorcing pair.
+- **Adoptive KINSHIPs are NEVER cascade-invalidated** on any life event. Adoption is legally permanent. If the adoptive parent divorces the biological parent, the adoption stands.
+- **The cascade does NOT fire on death.** In-laws and step-relations stay valid when a partner dies. Rationale: divorce is an active decision to end the family structure; death is not. A widow(er) remains connected to her/his late spouse's family.
+- **The cascade does NOT fire on breakup of a non-marriage ROMANTIC.** Only `ROMANTIC(type='married')` with `invalidation_reason='divorce'` triggers auto-cascade. Domestic partnership breakups leave in-laws and step-relations valid; users can declare-invalidate if appropriate.
 
 ### Death handling (cross-facet cascade)
 
@@ -284,7 +310,7 @@ When `Person.deceased_at` is set, the `deceased_freezer` cron runs and cascades 
 
 **Invalidation**: when the overlap ends (one person's `WORKS_AT.valid_to` is set). `invalidation_reason='ended'`.
 
-### MENTORSHIP
+### MENTOR
 
 **Directed** — stored with the arrow pointing mentor → mentee. The only directed facet in the Known model.
 

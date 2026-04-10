@@ -26,7 +26,7 @@ Creates inferred `BONDED` with a derived `bond_type` array.
 - Currently-valid `KINSHIP` (direct) → include `'familial'`
 - Currently-valid `PROFESSIONAL_TIE(relationship_role='co_founder')` → include `'cofounder'`
 - Both persons have `KINSHIP(relation='parent')` to the same third person → include `'co_parent'`
-- Currently-valid `MENTORSHIP` → include `'mentor_mentee'`
+- Currently-valid `MENTOR` → include `'mentor_mentee'`
 - Otherwise → `'friendship'`
 
 **Cadence:** Nightly
@@ -83,17 +83,59 @@ When any `WORKS_AT` edge's `valid_to` is updated, re-evaluate `PROFESSIONAL_TIE`
 
 **Cadence:** Trigger on `WORKS_AT` change
 
-## `known/lifecycle/kinship_in_law_cascader` (trigger)
+## `known/lifecycle/kinship_divorce_cascader` (trigger)
 
-**Fires on divorce only.** When a `ROMANTIC(type='married')` facet is invalidated with `invalidation_reason='divorce'`, find all `KINSHIP(relation='in_law')` facets whose `via_chain` includes the divorcing pair. Invalidate those with `invalidation_reason='divorce_severed_in_law'`.
+**Renamed from `kinship_in_law_cascader`.** Now handles both in-law AND step-relation cascades on divorce.
 
-Does **not** touch `KINSHIP(relation='grandparent')` or `KINSHIP(relation='parent')` that don't run through the severed marriage — grandparent/grandchild bonds persist across the divorce.
+**Fires on divorce only.** When a `ROMANTIC(type='married')` facet is invalidated with `invalidation_reason='divorce'`, the cron executes three cascade passes in sequence:
 
-**Does NOT fire on death.** When `deceased_freezer` invalidates a ROMANTIC with `invalidation_reason='death'`, the in-law cascade is suppressed. In-law KINSHIPs stay valid through a partner's death. Rationale: divorce is an active decision to sever the in-law structure; death is not.
+<Steps>
+  <Step title="Invalidate in-law KINSHIPs">
+    Find all `KINSHIP(relation IN ['parent_in_law', 'child_in_law', 'sibling_in_law'])` facets whose `via_chain` includes the divorcing pair. Invalidate with `invalidation_reason='divorce_severed_in_law'`.
+  </Step>
+  <Step title="Invalidate step-parent / step-child KINSHIPs">
+    Find all `KINSHIP(relation IN ['step_parent', 'step_child'])` facets whose `via_chain` includes the divorcing pair. Invalidate with `invalidation_reason='divorce_severed_step'`.
+  </Step>
+  <Step title="Invalidate step-sibling KINSHIPs">
+    Find all `KINSHIP(relation='step_sibling')` facets whose multi-anchor `via_chain` includes **both** persons of the divorcing pair as anchors. Invalidate with `invalidation_reason='divorce_severed_step'`.
+  </Step>
+</Steps>
 
-**Does NOT fire on breakup of non-marriage ROMANTIC.** Only `invalidation_reason='divorce'` on `ROMANTIC(type='married')` triggers this cascade. Other invalidation reasons leave in-laws valid.
+**NEVER cascade-invalidates:**
+- Direct biological relations (`parent`, `child`, `sibling`) — always survive
+- Extended biological relations (`grandparent`, `grandchild`, `aunt_uncle`, `niece_nephew`, `cousin`) — always survive
+- Adoptive relations (`adoptive_parent`, `adoptive_child`, `adoptive_sibling`) — adoption is legally permanent and survives the adopter's divorce
+
+**Does NOT fire on death.** When `deceased_freezer` invalidates a ROMANTIC with `invalidation_reason='death'`, this cascader is suppressed. In-law and step KINSHIPs stay valid through a partner's death. Rationale: divorce is an active decision to sever the family structure; death is not.
+
+**Does NOT fire on breakup of non-marriage ROMANTIC.** Only `invalidation_reason='divorce'` on `ROMANTIC(type='married')` triggers this cascade. Domestic partnership breakups, dating breakups, and data corrections leave in-laws and step-relations valid. Users can declare-invalidate manually if appropriate.
 
 **Cadence:** Trigger on `ROMANTIC` invalidation where `type='married'` AND `invalidation_reason='divorce'`
+
+## `known/lifecycle/mentor_invalidator` (cron)
+
+Invalidates stale inferred `MENTOR` edges. Declared mentorships are never touched by this cron — only the user can end a declared mentorship.
+
+**Scans** all valid `MENTOR` edges where `source='inferred'` AND `valid_to IS NULL` AND `last_direct_interaction_at` on the underlying `KNOWS` edge is older than 180 days.
+
+**For each stale inferred MENTOR:**
+1. Set `valid_to = now()`
+2. Set `invalidation_reason = 'ended'`
+3. Set `invalidated_by = 'mentor_invalidator_cron'`
+
+The mentee or mentor may reconnect later, at which point a new inferred `MENTOR` row can be created by the LLM relationship classifier if the asymmetric interaction pattern re-emerges. The old invalidated row remains as history — producing a clean chain of "mentorship was active 2022–2024, resumed 2026" across multiple rows on the same pair.
+
+**Does NOT fire on:**
+- Declared mentorships (`source='declared'`) — only users can end these
+- YC-partner mentorships specifically scoped to a company (`company_uuid IS NOT NULL` AND `domain='accelerator'`) — the mentorship persists as a historical fact even if the partner stops actively coaching the founder. Reason: the YC partner relationship is a category of its own and "ended" isn't the right semantics.
+
+**Cadence:** Nightly
+**Depends on:** Counts updated first (so `last_direct_interaction_at` on the KNOWS edge is current)
+**Tunable parameters:**
+- `MENTOR_STALE_DAYS` = 180 (default)
+- Exclusion list of `domain` values (default: `['accelerator']`)
+
+**Interaction with the LLM relationship classifier:** After invalidation, if the LLM classifier later re-runs on the same pair and detects continued asymmetric interaction patterns, it can create a new inferred `MENTOR` row. The 180-day threshold is the floor — the classifier can still propose a new mentorship immediately if the signals return.
 
 ## `known/lifecycle/deceased_freezer` (trigger)
 
@@ -113,7 +155,7 @@ Runs when `Person.deceased_at` is set. Cascades death-handling across multiple f
     BONDED facets on the deceased person's pairs are **NOT** invalidated. They stay valid with the frozen score. Semantically, "the bond existed" remains true historically. Queries wanting "currently alive contacts" filter on `Person.deceased_at IS NULL`.
   </Step>
   <Step title="Leave KINSHIP in-laws valid">
-    In-law KINSHIPs whose via_chain includes the deceased person are **NOT** invalidated. The `kinship_in_law_cascader` trigger specifically checks for `invalidation_reason='divorce'` and is not fired by `'death'`.
+    In-law KINSHIPs whose via_chain includes the deceased person are **NOT** invalidated. The `kinship_divorce_cascader` trigger specifically checks for `invalidation_reason='divorce'` and is not fired by `'death'`.
   </Step>
   <Step title="Leave PROFESSIONAL_TIE valid (but frozen)">
     PROFESSIONAL_TIE facets are not invalidated either. The frozen score already reflects the lack of future interaction.
@@ -122,7 +164,7 @@ Runs when `Person.deceased_at` is set. Cascades death-handling across multiple f
 
 **Cadence:** Trigger on `Person.deceased_at` set
 
-**Ordering with `kinship_in_law_cascader`:** `deceased_freezer` MUST set `invalidation_reason='death'` on ROMANTIC facets. The `kinship_in_law_cascader` trigger must check the reason before firing — it only fires on `invalidation_reason='divorce'`, so the death case is naturally bypassed.
+**Ordering with `kinship_divorce_cascader`:** `deceased_freezer` MUST set `invalidation_reason='death'` on ROMANTIC facets. The `kinship_divorce_cascader` trigger must check the reason before firing — it only fires on `invalidation_reason='divorce'`, so the death case is naturally bypassed.
 
 ---
 

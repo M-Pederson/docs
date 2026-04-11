@@ -19,6 +19,29 @@ The three functions that touch the `:KNOWS` edge type in FalkorDB have all been 
 
 `known/ingest/_fanout_email_pairs` (**#12781**) and `known/ingest/email_direct` (**#12780**) are also built and wire email evidence through the four primitives above. Also built, also FalkorDB-clean.
 
+## KNOWS uniqueness enforcement
+
+`KNOWS` is declared as "at most one edge per canonicalized `(person_a_id, person_b_id)` pair at any time" in [schema-design → Constraints](/guides/known/schema-design#constraints). FalkorDB does **not** support unique constraints on relationships, so this invariant is enforced at the application layer in three layers of defence:
+
+<Steps>
+  <Step title="Canonicalization at the application layer">
+    Every ingest path calls `canonicalize_pair` (**#12767**) before any graph write. The lower-id person becomes `person_a_id`, the higher-id person becomes `person_b_id`. This eliminates the `(a, b)` vs `(b, a)` race — two concurrent writes for the same pair of humans will land on the same canonical direction every time.
+  </Step>
+  <Step title="Directed MERGE on the canonical pair">
+    `create_knows_edge` (#12778) uses `MERGE (a)-[k:KNOWS]->(b)` — **directed**, from the canonical low-id to the canonical high-id. Directed MERGE is used because FalkorDB does not support undirected MERGE; at read time, `lookup_knows` and every query pattern treat `KNOWS` as undirected via `-[k:KNOWS]-` (no arrow). On repeat writes for an existing pair, the `ON MATCH` branch runs and updates `evidence`, `confidence`, `known_since`, and `last_evidence_at` — it never creates a duplicate.
+  </Step>
+  <Step title="Dedupe cron as safety net">
+    `MERGE` is atomic within a single cypher query but does **not** guarantee serializable uniqueness across concurrent queries in FalkorDB. Two racing `create_knows_edge` calls can both evaluate the pattern, both see nothing, and both proceed to create. The race window is the cypher execution time (single-digit milliseconds) — narrow but real. As a safety net, [`known/lifecycle/dedupe_knows_edges`](/guides/known/scope/lifecycle#known-lifecycle-dedupe-knows-edges-cron) runs nightly and collapses any pair with more than one live `KNOWS` edge into the oldest surviving row, absorbing the duplicates' evidence arrays via `append_evidence`.
+  </Step>
+</Steps>
+
+**Why not a Xano mutex table?** A per-pair lock table would close the race window completely at the cost of slowing every write — a table INSERT + DELETE around every ingest call. Given Known's current concurrency profile (sequential ingest crons on a fresh graph, not high-volume live webhooks), the MERGE + dedupe-cron combination is the right tradeoff. If we start seeing duplicates in the cron's daily scan, the mutex table is a clean upgrade path.
+
+**What callers MUST do:**
+- Call `canonicalize_pair` before `create_knows_edge`. Do not pass raw uuids.
+- Treat `{knows_uuid: null}` from `create_knows_edge` as a soft-skip — it means one or both Person nodes were missing from the graph when the MATCH ran. Log and move on.
+- Never emit raw `CREATE (a)-[:KNOWS]->(b)` cypher. The three primitives in the table above are the only write path.
+
 ## Shared ingest pattern
 
 Every ingest function does these six steps, in order:

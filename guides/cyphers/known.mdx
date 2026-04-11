@@ -173,6 +173,50 @@ SET f.valid_to            = $valid_to,
 RETURN f.uuid AS facet_uuid
 ```
 
+### Lifecycle: `dedupe_knows_edges` safety-net cron 🔵
+
+**Function:** `known/lifecycle/dedupe_knows_edges` — see [spec](/guides/known/scope/lifecycle#known-lifecycle-dedupe-knows-edges-cron).
+
+Nightly safety net for the narrow concurrent-write race window that `create_knows_edge`'s `MERGE` cannot close. FalkorDB does not support unique constraints on relationships, and `MERGE` is atomic within a single query but not serializable across concurrent queries. Two racing writes for the same canonicalized pair can both create. This cron finds any canonical pair with more than one currently-valid `KNOWS` edge and collapses them into the oldest survivor, absorbing the duplicates' evidence arrays via `append_evidence`.
+
+The cron is structured as three Cypher steps executed in sequence from application code — the detection pass, the re-point pass, and the delete pass. Evidence merging happens between steps 1 and 2 in application code via repeated `append_evidence` calls against the survivor.
+
+**Step 1 — Detect duplicate pairs.** Grouped by canonical `(person_a_id, person_b_id)`, find every set with `count > 1`.
+
+```cypher
+-- FalkorDB-compat: no datetime(), no duration(). Sort by k.created_at (integer ms).
+MATCH (a:Person)-[k:KNOWS]->(b:Person)
+WHERE k.valid_to IS NULL
+WITH k.person_a_id AS a_id, k.person_b_id AS b_id,
+     collect({uuid: k.uuid, created_at: k.created_at, evidence: k.evidence}) AS edges
+WHERE size(edges) > 1
+RETURN a_id, b_id, edges
+ORDER BY a_id, b_id
+```
+
+Application code then picks the survivor (`min(edges, key=created_at)`), parses every other row's `evidence` JSON, and calls `append_evidence` on the survivor once per evidence row that isn't already present.
+
+**Step 2 — Re-point Introduction.resulting_knows_uuid.** For every absorbed duplicate uuid, re-point any Introduction nodes that referenced it. Uses the `Introduction.resulting_knows_uuid` index (see [All Indexes](/guides/ontology/all-indexes#introduction-1-new)).
+
+```cypher
+MATCH (i:Introduction)
+WHERE i.resulting_knows_uuid = $duplicate_uuid
+SET i.resulting_knows_uuid = $survivor_uuid
+```
+
+**Step 3 — Hard-delete the duplicates.** The one place in Known where hard delete on a `KNOWS` edge is allowed — these are race-created literal duplicates, not historically-meaningful state transitions, so invalidation-via-`valid_to` would be semantically wrong.
+
+```cypher
+MATCH ()-[k:KNOWS {uuid: $duplicate_uuid}]-()
+DELETE k
+```
+
+**Safety:**
+- Survivor selection is deterministic (oldest `created_at`).
+- Evidence merge is additive via `append_evidence` — no rows lost.
+- Idempotent: re-running on a clean graph is a no-op (step 1 returns zero duplicate pairs).
+- On any group with `count > 5`, the cron pages on-call — that's pathological, not a normal race.
+
 ### Lifecycle: `release_stale_merge_locks` janitor 🔵
 
 **Function:** `known/lifecycle/release_stale_merge_locks` — see [spec](/guides/known/scope/lifecycle#known-lifecycle-release-stale-merge-locks-cron).

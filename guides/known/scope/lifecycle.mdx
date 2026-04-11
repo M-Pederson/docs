@@ -137,6 +137,49 @@ The mentee or mentor may reconnect later, at which point a new inferred `MENTOR`
 
 **Interaction with the LLM relationship classifier:** After invalidation, if the LLM classifier later re-runs on the same pair and detects continued asymmetric interaction patterns, it can create a new inferred `MENTOR` row. The 180-day threshold is the floor — the classifier can still propose a new mentorship immediately if the signals return.
 
+## `known/lifecycle/dedupe_knows_edges` (cron)
+
+Safety net for the narrow concurrent-write race window that `MERGE` in `create_knows_edge` cannot close. Collapses any canonical pair that somehow has more than one currently-valid `KNOWS` edge into a single surviving row — the oldest — absorbing the duplicates' evidence arrays into the keeper.
+
+**Why this exists:** FalkorDB does not support `CREATE CONSTRAINT ... IS UNIQUE` on relationships, and `MERGE` on relationships is atomic-within-a-query but not serializable across concurrent queries. Two racing `create_knows_edge` calls for the same canonicalized pair can each evaluate the MATCH pattern, each see nothing, and each create. The window is small (single-digit ms), but non-zero. This cron is the nightly sweep that cleans up anything that slipped through. See [ingest → KNOWS uniqueness enforcement](/guides/known/scope/ingest#knows-uniqueness-enforcement) for the full defence-in-depth story.
+
+**Algorithm:**
+
+<Steps>
+  <Step title="Find duplicate pairs">
+    Scan all `KNOWS` edges where `valid_to IS NULL`. Group by canonical `(person_a_id, person_b_id)`. Any group with `count > 1` is a duplicate set.
+  </Step>
+  <Step title="Pick the survivor">
+    The oldest row by `created_at` wins canonical. All other rows in the group are the duplicates to be absorbed.
+  </Step>
+  <Step title="Merge evidence arrays">
+    For each duplicate, parse its `evidence` JSON array and call `append_evidence` against the survivor for every row that's not already present (dedupe on `(source, evidence_occurred_at, raw_metadata_hash)`). This preserves the full evidence history — no rows are lost.
+  </Step>
+  <Step title="Re-point Introduction.resulting_knows_uuid">
+    For each duplicate's uuid, run `MATCH (i:Introduction) WHERE i.resulting_knows_uuid = $duplicate_uuid SET i.resulting_knows_uuid = $survivor_uuid`. This uses the `Introduction.resulting_knows_uuid` index from #4669.
+  </Step>
+  <Step title="Delete the duplicate KNOWS rows">
+    Hard-delete each absorbed `KNOWS` edge. This is the one place in the Known write path where a hard delete is allowed — the rows are literal duplicates created by a race condition, not historically-meaningful state transitions, so invalidation-via-`valid_to` would be wrong.
+  </Step>
+  <Step title="Log the absorption">
+    Write a structured log entry with `survivor_uuid`, `absorbed_uuids`, `evidence_rows_merged`, `introductions_repointed`. If any group had `count > 5`, page on-call — that's evidence of a pathological write loop, not a normal race.
+  </Step>
+</Steps>
+
+**Cypher:** See [known cyphers → dedupe_knows_edges](/guides/cyphers/known#lifecycle-dedupe-knows-edges).
+
+**Cadence:** Nightly (0 3 \* \* \* local time, during the scoring cron quiet period).
+
+**Calls:** `append_evidence` (per merged evidence row), `mvp/falkor/send-cypher` (for the scan, re-point, and delete queries).
+
+**Safety guarantees:**
+- Survivor is always the oldest edge — deterministic, no data-dependency on concurrent writes.
+- Evidence is always additive — no dedupe collapses can lose a row.
+- The cron is idempotent: re-running on a clean graph is a no-op.
+- Introduction re-pointing uses the indexed `resulting_knows_uuid` so even a large duplicate set processes in ms.
+
+**Not built yet.** Spec only. Add to Phase 1 build order as a lifecycle cron — not blocking the initial deploy since the empty graph has no duplicates to collapse, but should be live before production ingest volume ramps.
+
 ## `known/lifecycle/release_stale_merge_locks` (cron)
 
 Releases `merge_in_progress_at` locks on `Person` nodes that have been held for longer than 10 minutes. Handles the case where an `execute_merge` call crashed mid-execution and left the lock set, blocking subsequent merges against the same canonical.

@@ -1,0 +1,167 @@
+---
+title: "All Indexes"
+description: "The canonical list of every scalar and vector index in the Orbiter FalkorDB graph, the Xano function that creates them, and the Known additions pending rollout"
+---
+
+Every index in the Orbiter FalkorDB graph — scalar (btree) and vector (HNSW) — is created by a single Xano function: **`tool/create-indexes`** — **#4669**. This page is the canonical, up-to-date list of what that function creates and why.
+
+## `tool/create-indexes` — #4669
+
+**Location:** Xano workspace 3, function `tool/create-indexes`, id `#4669`.
+
+**Shape:** Top-level groups, each with a `util.template_engine` block holding one `CREATE INDEX` / `CREATE VECTOR INDEX` statement, piped through `mvp/falkor/send-cypher`. The final group calls `CALL db.indexes()` and returns the full index list for confirmation.
+
+**Idempotency:** FalkorDB's `CREATE INDEX` is idempotent — re-running is safe. Run #4669 after provisioning a new FalkorDB instance or after a graph reset.
+
+**How to run:**
+
+```
+Xano workspace 3 → functions → tool/create-indexes (#4669) → Run
+```
+
+No inputs. Returns the full `CALL db.indexes()` result as the response.
+
+---
+
+## Current indexes (live — 14 total)
+
+As of 2026-04-11, #4669 creates **14 indexes**: 12 scalar (btree) + 2 vector (HNSW).
+
+### Node scalar indexes (6)
+
+All on the base `Entity` label. Because every node in the graph carries `Entity` plus a type-specific label, these indexes accelerate lookups across every node type.
+
+| Label | Property | Purpose |
+|---|---|---|
+| `Entity` | `uuid` | Primary lookup — every `MATCH (n:Entity {uuid: ...})` across the graph |
+| `Entity` | `name` | Name-based lookups before embedding search narrows further |
+| `Entity` | `imdb_url` | Film/TV dedupe by external IMDB URL |
+| `Entity` | `region_key` | Region node lookup during location hydration |
+| `Entity` | `city_key` | City node lookup during location hydration |
+| `Entity` | `announced_date` | Funding round time-range filters (`WHERE earlierRound.announced_date < ...`) |
+
+### Edge scalar indexes (6)
+
+| Edge | Property | Purpose |
+|---|---|---|
+| `ATTENDED` | `valid_from` | Time-range queries on education history |
+| `ATTENDED` | `valid_to` | Same — currently-attending filters |
+| `ATTENDED` | `degree` | Filter by degree (e.g. "PhDs only") |
+| `ATTENDED` | `major` | Filter by major |
+| `ATTENDED` | `field` | Filter by field of study |
+| `SPECIALIZES_IN` | `match_score` | Expertise quality-threshold filters on `Company → SubDomainExpertise` |
+
+### Vector HNSW indexes (2)
+
+Both use identical HNSW options: **`dimension: 1536, similarityFunction: 'cosine', M: 16, efConstruction: 200, efRuntime: 100`**. See [Vector Indexes](/guides/ontology/vector-indexes) for the full deep-dive on how these are queried.
+
+| Label | Property | Purpose |
+|---|---|---|
+| `Entity` | `name_embedding` | Semantic lookup across all node types that carry a name embedding (Person, Company, Startup, School, City, Region, Country, Film_TV, etc.) |
+| `Entity` | `expertise_embedding` | Expertise-specific semantic lookup on `DomainExpertise` / `SubDomainExpertise` |
+
+---
+
+## Proposed Known additions (23 — not yet in #4669)
+
+The Known relationship model introduces four new node types (`Person` is extended, `Introduction`, `Household`, and `MergeEvent` are net-new) plus seven new edge types (`KNOWS`, `BONDED`, `PROFESSIONAL_TIE`, `KINSHIP`, `ROMANTIC`, `ESTRANGED`, `MENTOR` v2). The committed index list lives in [Known → Schema design → Indexes](/guides/known/schema-design#indexes).
+
+Status: **none of these are live yet.** All 23 will be added to #4669 in a single pass before Known Phase 1 ships to production.
+
+### Person — extended (4 new)
+
+| Label | Property | Purpose |
+|---|---|---|
+| `Person` | `deceased_at` | `deceased_freezer` trigger scans deceased persons; queries that filter for living contacts (`Person.deceased_at IS NULL`) |
+| `Person` | `tombstone` | Filter out merged duplicates from active-person queries. Every live KNOWS traversal should start from non-tombstoned persons |
+| `Person` | `merged_into` | Stale uuid → canonical resolution used by the `resolve_canonical` read helper and the identity resolver |
+| `Person` | `merge_in_progress_at` | Fast check for concurrent-merge detection inside `execute_merge` pre-flight; also scanned by the `release_stale_merge_locks` janitor cron |
+
+### Introduction (1 new)
+
+| Label | Property | Purpose |
+|---|---|---|
+| `Introduction` | `resulting_knows_uuid` | Merge step 5: bulk re-point `Introduction.resulting_knows_uuid` when an absorbed KNOWS edge is replaced by the canonical one |
+
+### Household (2 new)
+
+| Label | Property | Purpose |
+|---|---|---|
+| `Household` | `address_hash` | Household lookup by physical address (ingest dedupe, "do we already have a Household at this place?") |
+| `Household` | `end` | Find currently-active households (`Household.end IS NULL`) — household-overlap queries and active-residency filters |
+
+### MergeEvent (3 new)
+
+| Label | Property | Purpose |
+|---|---|---|
+| `MergeEvent` | `canonical_person_id` | `get_merge_history_for_canonical`, `get_merge_count_for_canonical` — "show me every merge that produced this person" |
+| `MergeEvent` | `absorbed_person_id` | "Which merge absorbed this uuid?" audit trail for a soft-deleted Person |
+| `MergeEvent` | `merged_at` | Time-range audit queries ("all merges initiated by `identity_resolver_v1` this week") |
+
+### KNOWS envelope edge (5 new)
+
+| Edge | Property | Purpose |
+|---|---|---|
+| `KNOWS` | `(person_a_id, person_b_id)` composite | Canonical pair lookup — the single most-hit KNOWS access path. Every evidence ingest, scoring pass, and query helper resolves by this composite key |
+| `KNOWS` | `last_score_computed_at` | Differential scoring cron — only rescore edges stale beyond the watermark |
+| `KNOWS` | `last_counts_updated_at` | Differential counts cron — same pattern, different cadence |
+| `KNOWS` | `strength_score` | "High-strength edges" queries + BONDED inference threshold checks (`strength_score > 70`) + ranked "closest contacts" lists |
+
+<Note>
+  The composite `(person_a_id, person_b_id)` is the uniqueness guarantee on KNOWS. FalkorDB supports composite btree indexes via `CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.person_a_id, r.person_b_id)`. If the first run errors on composite-edge syntax we'll fall back to two single-property indexes, which still accelerates the canonical-pair lookup.
+</Note>
+
+### Facet overlay edges (8 new)
+
+| Edge | Property | Purpose |
+|---|---|---|
+| `BONDED` | `source` | Separate cron-touched (`inferred`) rows from user-touched (`declared`) rows. The scoring cron filters by `source='inferred'` |
+| `ESTRANGED` | `source` | Same split — cron-vs-declared separation |
+| `ESTRANGED` | `valid_to` | "Currently-valid estrangements" is the near-universal filter on this edge type; the penalty-to-KNOWS computation needs it on every scoring pass |
+| `PROFESSIONAL_TIE` | `company_id` | Company-scoped tie queries ("Alice's coworkers at Acme") and the `mvp/edges/create-work-edges` trigger |
+| `KINSHIP` | `relation` | Filter by `parent` / `child` / `sibling` / `in_law` / `step_*` — every co-parent, in-law, and `kinship_divorce_cascader` trigger needs this |
+| `ROMANTIC` | `is_current` | Fast "Alice's current partner" lookup. `is_current` is maintained as an invariant alongside `valid_to` (see [schema-design constraints](/guides/known/schema-design#constraints)) |
+| `RESIDED_AT` | `move_out` | Find currently-active residencies (`move_out IS NULL`). Used by household overlap queries and the deceased-freezer cascade that auto-closes residencies |
+| `MENTOR` | `valid_to` | `mentor_invalidator` cron (nightly) scans for `valid_to IS NULL AND valid_from < now - 180d` to invalidate stale inferred mentorships. The cron explicitly excludes `domain='accelerator'` rows but still needs the `valid_to` scan to be index-accelerated |
+
+### Not proposed (deliberately)
+
+These were considered but held back from the initial addition:
+
+- **`valid_to` on every facet** (BONDED, KINSHIP, ROMANTIC, PROFESSIONAL_TIE). The workshop committed only to `ESTRANGED.valid_to` and `MENTOR.valid_to`. Other facets currently get accelerated through `source` / `relation` / `is_current` / `company_id` + an implicit scan of the already-narrowed candidate set. If production scans start regressing we'll add the full `valid_to` set as a Tier 2 pass.
+- **`Household.household_type`** — cardinality is too low (4–5 values) to justify an index.
+- **`Person.name_tokens`** for the identity resolver. The resolver uses the existing `Entity.name_embedding` vector index for fuzzy name matching; a scalar `name_tokens` index would be a denormalization that duplicates the work.
+
+---
+
+## Running totals
+
+| | Current | After Known additions |
+|---|---:|---:|
+| Node scalar indexes | 6 | 16 |
+| Edge scalar indexes | 6 | 19 |
+| Vector (HNSW) indexes | 2 | 2 |
+| **Total** | **14** | **37** |
+
+---
+
+## FalkorDB index gotchas
+
+Rules that have bitten us in this codebase and should shape every new index proposal:
+
+- **Not-equal filters (`<>`) are not index-accelerated.** Prefer positive predicates. Don't write `WHERE f.source <> 'inferred'`; write `WHERE f.source = 'declared'` instead.
+- **`IS NULL` and `IS NOT NULL` ARE accelerated** by btree indexes. This is why indexing `valid_to` on ESTRANGED / MENTOR directly speeds up "currently valid" filters.
+- **Composite indexes on edges:** supported in recent FalkorDB versions via `CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.a, r.b)`. Pre-flight any new composite edge index by running it in isolation and checking `CALL db.indexes()`.
+- **Vector indexes require populated embeddings.** `CREATE VECTOR INDEX` against a label with no rows that have the embedding property is fine (the index is empty), but querying it with `db.idx.vector.queryNodes()` will return zero results until nodes are written.
+- **Label-specific vs. `Entity`-base indexes.** Nodes carry `Entity` as the base label plus a type label (`Person`, `Household`, etc.). Properties that exist across all node types (`uuid`, `name`) index on `Entity`. Properties that only exist on one type (`Person.deceased_at`, `Household.address_hash`) index on the specific type label. Do not index `Entity.deceased_at` — it would force a full-table scan for a property 95% of rows don't carry.
+- **Edge direction in index syntax.** Use undirected syntax `()-[r:EDGE]-()` for index creation regardless of whether the edge is semantically directed. FalkorDB treats edge indexes the same in both directions.
+
+---
+
+## Related
+
+- [Vector Indexes](/guides/ontology/vector-indexes) — HNSW parameters, query patterns, distance-metric thresholds, and the live expertise-matching pipeline
+- [Known → Schema design → Indexes](/guides/known/schema-design#indexes) — workshop-committed source of truth for the Known additions above
+- [Known → Cyphers](/guides/cyphers/known) — every Known cypher fragment that relies on these indexes
+- [Node Types](/guides/ontology/nodes) — property definitions for every indexed node
+- [Edge Types](/guides/ontology/edges) — property definitions for every indexed edge

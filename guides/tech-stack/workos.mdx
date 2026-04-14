@@ -14,15 +14,145 @@ description: "Authentication and identity management for Orbiter.io"
 - **User management** — user lifecycle, sessions, and organization membership
 - **Directory sync** — SCIM-based user provisioning from identity providers
 - **AuthKit** — pre-built, customizable login UI components
+- **Organizations + Stripe** — per-seat billing tied to WorkOS organizations
 
 ## How we use it at Orbiter
 
-WorkOS handles all authentication and user identity for the Orbiter.io application. Login flows, session management, and user provisioning are managed through WorkOS APIs, with Xano handling the server-side token validation and user record sync.
+WorkOS is the source of truth for identity. Xano holds application data and mirrors the WorkOS user/organization records so we can join against them in API calls. The frontend uses `@workos/authkit-tanstack-react-start` for the AuthKit-hosted sign-in/sign-up flow and the WorkOS widgets for in-app account management.
+
+## Sign-in / Sign-up flow
+
+The unauthenticated routes live under `src/routes/_auth/`:
+
+- `_auth/route.tsx` — guards the auth shell. It calls `getAuth()` server-side and redirects to `/` if a session already exists, so signed-in users never see the sign-in screen.
+- `_auth/sign-in.$.tsx` and `_auth/sign-up.$.tsx` — splat routes that mount AuthKit's hosted sign-in and sign-up components.
+
+After AuthKit completes, WorkOS redirects the browser to `/auth/callback` (`src/routes/auth/callback.tsx`). That route delegates to `handleCallbackRoute()` from `@workos/authkit-tanstack-react-start`, which exchanges the authorization code, sets the WorkOS session cookie, and redirects into the app.
+
+## WorkOS → Xano token exchange
+
+Once AuthKit has a session, the frontend still needs a Xano auth token to call our API tools. This is handled by `XanoAuthProvider` in `src/integrations/xano/provider.tsx`:
+
+1. The provider reads the WorkOS user via `useAuth()` and gets a short-lived WorkOS access token via `useAccessToken().getAccessToken()`.
+2. On first render after sign-in, it `POST`s the WorkOS token to `auth/login_workos` on Xano (`api:qMCc0ojP`), passing the standard `X-Data-Source` and `X-Branch` headers.
+3. Xano verifies the WorkOS token, finds or creates the matching user record, and returns a Xano `authToken`.
+4. The Xano token is cached in `localStorage` under `xano_auth_token`, exposed via `useXanoAuth()`, and attached to every subsequent `xanoFetch` call.
+
+The provider also coordinates a few important edge cases:
+
+- **Warm starts** — if `xano_auth_token` is already in `localStorage`, the module-level `authReadyPromise` resolves immediately so route loaders can call `xanoFetch` without waiting for the React tree.
+- **User switching** — when `user.id` changes between renders, the provider clears the React Query cache, drops the old Xano token, and re-runs `loginToXano` for the new user.
+- **401 handling** — `xanoFetch` dispatches a `XANO_UNAUTHORIZED_EVENT` on 401 responses. The provider listens for it and calls `signOut({ returnTo: VITE_WORKOS_SIGN_OUT_REDIRECT_URI })`, which terminates both the Xano and WorkOS sessions.
+- **Sign-out** — when WorkOS reports no user, the token is removed and the React Query cache is cleared so the next user starts from a clean slate.
+
+## In-app account management
+
+`src/components/global/user-button.tsx` renders the avatar dropdown and the account dialog. It uses the **WorkOS Widgets** (`@workos-inc/widgets`) so profile, security, and session management stay in sync with WorkOS without us having to build forms:
+
+- `<UserProfile />` — name, email, profile picture
+- `<UserSecurity />` — password, MFA, connected accounts
+- `<UserSessions />` — active sessions across devices
+
+Each widget is passed `authToken={getAccessToken}` so it talks directly to WorkOS using the current session. Sign-out from the dropdown clears `xano_auth_token` and calls `signOut({ returnTo: VITE_WORKOS_SIGN_OUT_REDIRECT_URI })`.
+
+## Organizations (planned)
+
+We are extending the auth flow so that **every user always belongs to at least one WorkOS organization**. The pattern is the same one Notion, Linear, and Vercel use:
+
+> 1 user = 1 personal org (created on first sign-in) + N team orgs joined via invite.
+
+This gives us a clean home for billing and entitlements: WorkOS's Stripe integration bills per seat at the organization level, which matches the model we already plan to charge on. Per-account / feature-level billing will come later.
+
+### Why a personal org for every user
+
+- Every user has a "home" — no user is ever org-less, so API code can always assume an `orgId`.
+- Billing attaches to the org, not the user — moving from personal → team → enterprise is just adding members.
+- WorkOS Seat Sync works cleanly because every user is a member of at least one org.
+- Entitlements live on the org, which is much easier to scale than retrofitting org billing later.
+
+### Where it plugs in
+
+The personal org is created **atomically during the WorkOS → Xano sync**, so we never end up with a Xano user that has no organization. The hook lives in the callback route (`src/routes/auth/callback.tsx`) via `handleCallbackRoute`'s `onSuccess`:
+
+```tsx
+import { createFileRoute } from "@tanstack/react-router";
+import { handleCallbackRoute } from "@workos/authkit-tanstack-react-start";
+
+export const Route = createFileRoute("/auth/callback")({
+  server: {
+    handlers: {
+      GET: handleCallbackRoute({
+        onSuccess: async ({ user }) => {
+          // 1. Check if the user already exists in Xano
+          const existingUser = await xano.getUser(user.id);
+          if (existingUser) return;
+
+          // 2. Create a personal org in WorkOS
+          const org = await workos.organizations.createOrganization({
+            name: `${user.firstName ?? "My"}'s Workspace`,
+          });
+
+          // 3. Add the user as admin of their personal org
+          await workos.userManagement.createOrganizationMembership({
+            userId: user.id,
+            organizationId: org.id,
+            roleSlug: "admin",
+          });
+
+          // 4. Persist the user + personal org in Xano
+          await xano.createUser({
+            workosUserId: user.id,
+            personalOrgId: org.id,
+            email: user.email,
+          });
+        },
+      }),
+    },
+  },
+  component: AuthCallbackPage,
+});
+```
+
+For users that are **invited to existing organizations**, no personal-org bootstrap runs on accept — the WorkOS invitation flow already places them into the inviting org, and Xano picks up the new membership from the WorkOS webhook (or on the next `login_workos` call) and writes it to the `organization_memberships` table.
+
+### Xano data model
+
+Xano mirrors WorkOS so we can join organization data into application queries. The `organizations` table is kept in sync with WorkOS via webhooks; WorkOS remains the source of truth.
+
+```text
+users
+  ├── workos_user_id      ← unique, from WorkOS
+  ├── personal_org_id     ← FK → organizations, the user's default org
+  └── email
+
+organizations
+  ├── workos_org_id       ← unique, from WorkOS
+  ├── is_personal: bool   ← distinguishes personal vs team orgs
+  ├── name
+  └── stripe_customer_id  ← populated when billing is enabled
+
+organization_memberships
+  ├── user_id
+  ├── organization_id
+  └── role                ← admin | member
+```
+
+The `is_personal` flag lets us:
+
+- hide personal orgs from the org switcher UI,
+- prevent invites into personal orgs,
+- apply different billing rules once per-account billing lands.
+
+### Billing decision
+
+We will **bill the org from day one** — including the personal org — rather than billing users directly. It's consistent with team plans and avoids a painful migration later when team billing is added. Per-seat charges flow through WorkOS's Stripe integration; per-feature / per-account billing will be layered on top of this once we get there.
 
 ## Resources
 
 - [WorkOS documentation](https://workos.com/docs)
-- [Authentication guide](https://workos.com/docs/user-management)
+- [AuthKit](https://workos.com/docs/authkit)
+- [User management](https://workos.com/docs/user-management)
+- [Organizations](https://workos.com/docs/user-management/organizations)
+- [Stripe + Seat Sync](https://workos.com/docs/user-management/stripe)
 - [SSO guide](https://workos.com/docs/sso)
 - [API reference](https://workos.com/docs/reference)
-- [AuthKit](https://workos.com/docs/authkit)

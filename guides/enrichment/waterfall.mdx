@@ -5,7 +5,7 @@ description: "How the enrichment pipeline flows from a single entity to a full g
 
 The enrichment waterfall is the sequence of functions that fires when a new entity enters the system. It starts with a single input (a domain, a LinkedIn URL, a name) and cascades outward — creating records, enriching from external APIs, discovering related entities, and queueing them for their own enrichment.
 
-This page documents the **company waterfall** first. The person waterfall will be added in a future session.
+This page documents both the **company waterfall** and the **person waterfall**, using Resend (`resend.com`) and its founder Zeno Rocha as running examples.
 
 ---
 
@@ -266,6 +266,272 @@ The kill switch runs in **Section 3b**, before any external API calls. This ensu
 
 ---
 
-<Note>
-**Coming next**: The person waterfall (`get-add/master-person` → `run-base-person-enrich`) will be documented in a follow-up session, including the name-format LLM pipeline and the `set-person-names` helper that bypasses the Xano naming collision.
-</Note>
+## Person Waterfall
+
+The person waterfall begins when any function calls `mvp/get-add/master-person`. Here's the full flow, using **Zeno Rocha** (founder of Resend) as the example — entered with just a LinkedIn URL.
+
+### Entry Point
+
+```text
+mvp/get-add/master-person — #12553
+```
+
+Called with:
+```json
+{
+  "links": ["https://www.linkedin.com/in/zeno-rocha-6270a914"],
+  "cascade_depth": 0,
+  "priority_tier": 1
+}
+```
+
+At depth 0, first_name and last_name are typically empty — the pipeline discovers the name from external APIs and parses it via LLM.
+
+### Phase 1: Name Parsing from Input (Section 1)
+
+If a `full_name` is provided (common at depth > 0 when the name comes from Fundable data), the function immediately calls the name-format LLM to split it:
+
+```text
+mvp/format/name-format — #2649
+```
+
+This LLM-powered function (Groq Llama 3.3, Gemini 2.5 Pro fallback) parses a full name into structured fields:
+
+```json
+{
+  "full_name": "Zeno Rocha",
+  "first_name": "Zeno",
+  "middle_name": null,
+  "last_name": "Rocha",
+  "suffix": null,
+  "nickname": null
+}
+```
+
+The result is saved as `$inputNameFormat` for later use as a fallback.
+
+### Phase 2: Dedup Cascade (Sections 3 → 5 → 7)
+
+Before creating anything, the function checks for existing records:
+
+```mermaid
+graph TD
+    A["Section 3: Quick Check<br/>input links → master_link"] -->|not found| B
+    B["Section 5: Post-Enrichment<br/>PDL/EL enriched links<br/>emails, phone numbers"] -->|not found| C
+    C["Section 7: Final Check<br/>post-resolution domain<br/>merged contact data"] -->|not found| D["Section 9: Create"]
+
+    A -->|found| R["Return existing<br/>master_person"]
+    B -->|found| R
+    C -->|found| R
+```
+
+For Zeno Rocha on first entry — no existing `master_link` for his LinkedIn URL, so all checks pass through to create.
+
+### Phase 3: External API Enrichment (Sections 4, 6)
+
+When `cascade_depth == 0`, both external APIs are called:
+
+```mermaid
+graph TD
+    A["Section 4: Enrich Layer<br/>Person LinkedIn lookup"] --> B["Section 6: People Data Labs<br/>/v5/person/enrich"]
+    B --> C["Merge results into<br/>working variables"]
+```
+
+**When `cascade_depth > 0`**: Both PDL and Enrich Layer are **skipped entirely**. The person is created from whatever data was passed in (name, links, company) and queued for later enrichment.
+
+| API | Endpoint | Data Retrieved |
+|-----|----------|----------------|
+| **Enrich Layer** | Person LinkedIn lookup | Full name, avatar, headline, current company, location |
+| **PDL** | `/v5/person/enrich` | Full name, emails, phones, profiles, work history, education |
+
+For Zeno at depth 0, PDL returns his full profile — name, work history at Resend and Liferay, education at UNIRIO and PUCPR, social profiles, and contact info.
+
+### Phase 4: Name Resolution
+
+After enrichment, the function resolves the best name using a multi-source fallback chain:
+
+```mermaid
+graph LR
+    A["PDL full_name"] -->|empty?| B["EL full_name"]
+    B -->|empty?| C["name-format<br/>from input"]
+    C -->|empty?| D["Fallback:<br/>empty string"]
+```
+
+The resolved name is then parsed through a **lambda** (`$parsedName`) that extracts `_fn`, `_ln`, `_mn`, `_suffix`, `_nick` — using non-colliding key names to avoid a Xano naming collision where `first_name`/`last_name` as data keys would resolve to the function's empty input parameters instead of the expression values.
+
+### Phase 5: Record Creation (Section 9)
+
+```mermaid
+graph TD
+    A["db.add master_person<br/>name, avatar, LinkedIn, title"] --> B["add-person-node #2601<br/>Create Neo4j graph node"]
+    B --> C["set-person-names #12820<br/>Write first/last/middle<br/>via isolated helper"]
+    C --> D["db.add person_enrich_data<br/>Store raw PDL + EL"]
+    D --> E["db.add enrich_history_person<br/>Audit trail per API source"]
+    E --> F["Section 10: Associate<br/>links, emails, phones"]
+```
+
+The `set-person-names` helper function (v2.9) writes name fields in an isolated scope — its inputs are named `fn`, `ln`, `mn` instead of `first_name`, `last_name`, which avoids Xano's naming collision bug. Without this helper, db.edit silently writes empty strings because the data keys collide with the parent function's input parameter names.
+
+For Zeno Rocha, this creates:
+- **master_person** with `name: "Zeno Rocha"`, `first_name: "Zeno"`, `last_name: "Rocha"`, avatar, LinkedIn URL
+- **Person node** in Neo4j graph
+- **person_enrich_data** storing raw PDL + EL responses
+- **master_link** entries for all known profile URLs
+- **master_email** and **master_phone** entries from PDL
+
+### Phase 6: Enrichment Dispatch (Section 11)
+
+Same routing logic as the company waterfall:
+
+```mermaid
+graph TD
+    A{cascade_depth == 0<br/>AND queue == false?} -->|Yes| B["Enrich immediately<br/>run-base-person-enrich #12554<br/>(async)"]
+    A -->|No| C{Already in queue?}
+    C -->|Yes| D["Bump count<br/>Upgrade priority_tier"]
+    C -->|No| E["db.add queue_enrich_person<br/>cascade_depth, priority_tier,<br/>source_function, source_entity_id"]
+```
+
+For Zeno at depth 0: **immediate enrichment** fires asynchronously.
+
+---
+
+## Person Enrichment Phases
+
+```text
+mvp/enrich/run-base-person-enrich — #12554
+```
+
+The person enrichment pipeline runs in 11 phases. Each phase passes independently — failures are logged but don't block later phases. Here's how it played out for Zeno Rocha:
+
+| Phase | Function | What It Does | Zeno's Result |
+|:-----:|----------|-------------|---------------|
+| **1** | PDL person enrich | Fetch/refresh PDL data | PDL profile loaded |
+| **2** | EL person enrich | Fetch/refresh Enrich Layer data | EL profile loaded |
+| **3** | resolve-edges-work | Discover employers from work history | **Resend** created (depth 0, immediate enrichment) |
+| **4** | resolve-edges-skills | Extract skills from profile | Skills extracted |
+| **5** | resolve-edges-certifications | Extract certifications | Certifications extracted |
+| **6** | resolve-edges-education | Discover schools from education history | **YC, Berkeley, UNIRIO, PUCPR** queued (depth 1, tier 3) |
+| **7** | resolve-investors-edges | Discover investors from Fundable | **SV Angel** + 7 angel investors queued |
+| **8** | Social scraping | Twitter/X profile analysis | Social insights generated |
+| **9** | LLM bios | Generate bio and bio_500 | LLM-written bios |
+| **10** | resolve-edges-projects | Discover projects and publications | **Turbo Excel, yfdpco2.com** queued (depth 1, tier 4) |
+| **11** | complete-person-enrich | Flip visibility, mark complete | `visibility: true` |
+
+### Phase 3 Detail: Resend Discovery
+
+When phase 3 (resolve-edges-work) processes Zeno's work history, it finds **Resend** as his current employer. Because Zeno is depth 0, Resend is created at **depth 0** with **immediate enrichment** — this triggers the full company waterfall documented above, including:
+
+- Fundable lookup (finds Resend's Fundable org ID)
+- PDL + EL **skipped** (Fundable data exists — v1.7 optimization)
+- Company node, enrich data, industries, about, links all created
+- `run-base-company-enrich-v3` fires async — discovers Resend's institutional investors (Polar, Accel, Charm, Fuel Capital, Gradient, Cavalry Ventures) and queues them
+
+### Phase 7 Detail: Investor Discovery
+
+Phase 7 (resolve-investors-edges) queries Fundable for Resend's investors and creates person records for each:
+
+| Investor | Source | Queue Tier | Why |
+|----------|--------|:----------:|-----|
+| Bu Kinoshita | process-yc-people (co-founder) | **1** | YC co-founder gets highest priority |
+| Diana Hu | process-yc-people (YC partner) | **2** | YC partner, high value |
+| Guillermo Rauch | resolve-investors-edges | **3** | Angel investor |
+| Dylan Field | resolve-investors-edges | **3** | Angel investor |
+| Paul Copplestone | resolve-investors-edges | **3** | Angel investor |
+| Alana Goyal | resolve-investors-edges | **3** | Angel investor |
+| Calvin French-Owen | resolve-investors-edges | **3** | Angel investor |
+| Lachy Groom | resolve-investors-edges | **3** | Angel investor |
+| Elad Gil | resolve-investors-edges | **3** | Angel investor |
+
+All 9 investors are created at **depth 1** with external APIs skipped — their names and LinkedIn URLs come from Fundable data. Each is queued to `queue_enrich_person` for full enrichment later.
+
+---
+
+## Cascade Example: Zeno Rocha at Depth 0
+
+Here's the complete cascade from the sandbox run — one LinkedIn URL generated **10 people** and **19 companies**:
+
+```
+Depth 0: Zeno Rocha (linkedin.com/in/zeno-rocha-6270a914)
+├── get-add/master-person → person #1 (immediate enrichment)
+│   └── run-base-person-enrich (11 phases)
+│
+│       Phase 3: resolve-edges-work
+│       ├── Resend (company #1) → depth 0, immediate enrichment
+│       │   └── run-base-company-enrich-v3
+│       │       └── resolve-investors-edges (institutional)
+│       │           ├── Polar (#14) → queued depth 0, tier 4
+│       │           ├── Accel (#15) → queued depth 0, tier 4
+│       │           ├── Charm (#16) → queued depth 0, tier 4
+│       │           ├── Fuel Capital (#17) → queued depth 0, tier 4
+│       │           ├── Gradient (#18) → queued depth 0, tier 4
+│       │           └── Cavalry Ventures (#19) → queued depth 0, tier 4
+│       ├── WorkOS (#7) → queued depth 1, tier 2
+│       ├── Liferay (#8) → queued depth 1, tier 2
+│       ├── Globo (#9) → queued depth 1, tier 2
+│       ├── Petrobras (#10) → queued depth 1, tier 2
+│       └── Caos (#11) → queued depth 1, tier 2
+│
+│       Phase 6: resolve-edges-education
+│       ├── Y Combinator (#2) → queued depth 1, tier 3
+│       ├── UC Berkeley (#3) → queued depth 1, tier 3
+│       ├── UNIRIO (#4) → queued depth 1, tier 3
+│       └── PUCPR (#5) → queued depth 1, tier 3
+│
+│       Phase 7: resolve-investors-edges (angel)
+│       ├── Bu Kinoshita (person #2) → queued depth 1, tier 1
+│       ├── Diana Hu (person #3) → queued depth 1, tier 2
+│       ├── Guillermo Rauch (#4) → queued depth 1, tier 3
+│       ├── Dylan Field (#5) → queued depth 1, tier 3
+│       ├── Paul Copplestone (#6) → queued depth 1, tier 3
+│       ├── Alana Goyal (#7) → queued depth 1, tier 3
+│       ├── Calvin French-Owen (#8) → queued depth 1, tier 3
+│       ├── Lachy Groom (#9) → queued depth 1, tier 3
+│       └── Elad Gil (#10) → queued depth 1, tier 3
+│
+│       Phase 10: resolve-edges-projects-publications
+│       ├── Turbo Excel (#12) → queued depth 1, tier 4
+│       └── yfdpco2.com (#13) → queued depth 1, tier 4
+```
+
+### Final Queue State
+
+After Zeno's enrichment completes, the queues contain:
+
+**queue_enrich_person** (9 entries):
+
+| Person | Tier | Source | Depth |
+|--------|:----:|--------|:-----:|
+| Bu Kinoshita | **1** | process-yc-people | 1 |
+| Diana Hu | **2** | process-yc-people | 1 |
+| Guillermo Rauch | **3** | resolve-investors-edges | 1 |
+| Dylan Field | **3** | resolve-investors-edges | 1 |
+| Paul Copplestone | **3** | resolve-investors-edges | 1 |
+| Alana Goyal | **3** | resolve-investors-edges | 1 |
+| Calvin French-Owen | **3** | resolve-investors-edges | 1 |
+| Lachy Groom | **3** | resolve-investors-edges | 1 |
+| Elad Gil | **3** | resolve-investors-edges | 1 |
+
+**queue_enrich_company** (18 entries):
+
+| Company | Tier | Source | Depth |
+|---------|:----:|--------|:-----:|
+| SV Angel | **2** | resolve-investors-edges | 1 |
+| WorkOS | **2** | resolve-edges-work | 1 |
+| Liferay | **2** | resolve-edges-work | 1 |
+| Globo | **2** | resolve-edges-work | 1 |
+| Petrobras | **2** | resolve-edges-work | 1 |
+| Caos | **2** | resolve-edges-work | 1 |
+| Y Combinator | **3** | resolve-edges-education | 1 |
+| UC Berkeley | **3** | resolve-edges-education | 1 |
+| UNIRIO | **3** | resolve-edges-education | 1 |
+| PUCPR | **3** | resolve-edges-education | 1 |
+| Polar | **4** | _(from Resend's enrichment)_ | 0 |
+| Accel | **4** | _(from Resend's enrichment)_ | 0 |
+| Charm | **4** | _(from Resend's enrichment)_ | 0 |
+| Fuel Capital | **4** | _(from Resend's enrichment)_ | 0 |
+| Gradient | **4** | _(from Resend's enrichment)_ | 0 |
+| Cavalry Ventures | **4** | _(from Resend's enrichment)_ | 0 |
+| Turbo Excel | **4** | resolve-edges-projects | 1 |
+| yfdpco2.com | **4** | resolve-edges-projects | 1 |
+
+When the queue worker processes these in priority order, each entity will trigger its own enrichment — potentially discovering more entities and queueing them at depth 2, continuing the cascade.

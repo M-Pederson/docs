@@ -1,0 +1,239 @@
+---
+title: "Refresh Activity"
+description: "Backfill activity for all active Nylas grants — replays message and calendar parse pipelines for testing and edge-case detection"
+---
+
+## mvp/nylas/refresh-activity — #12815
+
+```text
+mvp/nylas/refresh-activity — #12815
+```
+
+A wrapper that replays the message-created and calendar-event parse pipelines across all active Nylas grants. Collects messages and events from the Nylas API, then feeds each one through the same parse functions that the live webhooks use.
+
+**Purpose:** verify that `message-created-parse` and `calendar-webhook-parse-event` work correctly on real data, and surface edge cases. Error handling is intentionally omitted so that any function that breaks on unexpected input is immediately visible in the response — rather than silently swallowed.
+
+**Branch:** `v1`
+
+### Input
+
+| Field            | Type | Required | Default | Description                                                                                                       |
+| ---------------- | ---- | -------- | ------- | ----------------------------------------------------------------------------------------------------------------- |
+| `received_after` | int  | No       | `0`     | Epoch timestamp filter passed to the Nylas message fetch. `0` or omitted = use the default 7-day lookback window. |
+
+### Step-by-Step Flow
+
+<Steps>
+  <Step title="Get active grants">
+    Queries `nylas_grant` for all grants where `grant_expired = false`, sorted by `user_id`. Joins `calendar` (via `grant_id`) and `user` (via `user_id`) to pull each grant's calendars and the user's `local_timezone`.
+  </Step>
+
+<Step title="Collect messages for every grant">
+  Iterates over each grant. Computes a 7-day lookback window using
+  `mvp/widget/utc-timestamps_v2` (based on the user's local timezone), then
+  calls `mvp/nylas/fetch-messages` with `limit: 200` and `received_after` set to
+  the start of that window. All messages are merged into a single `$allMessages`
+  array.
+</Step>
+
+<Step title="Collect calendar events for every calendar">
+  Iterates over each calendar across all grants. Computes two timestamp windows:
+  7 days before and 14 days after (using the calendar's timezone). Calls
+  `mvp/nylas/fetch-calendar-events` for each calendar with those bounds. All
+  events are merged into a single `$allEvents` array.
+</Step>
+
+<Step title="Parse messages">
+  Iterates over `$allMessages` and calls `mvp/activity/message-created-parse`
+  for each message — the same function the live `message.created` webhook
+  triggers. The message is wrapped in the same `body.data.object` envelope the
+  webhook provides.
+</Step>
+
+  <Step title="Parse calendar events">
+    Iterates over `$allEvents`. For each event, sets `created_at` to the event's `when.start_time`, then calls `mvp/nylas-webhook/calendar-webhook-parse-event` with the grant ID and event — the same function the live `event.created` webhook triggers.
+  </Step>
+</Steps>
+
+### Response
+
+```json
+{
+  "grants_processed": 3,
+  "messages_collected": 142,
+  "events_collected": 57
+}
+```
+
+| Field                | Type | Description                                        |
+| -------------------- | ---- | -------------------------------------------------- |
+| `grants_processed`   | int  | Number of active Nylas grants processed            |
+| `messages_collected` | int  | Total messages fetched across all grants           |
+| `events_collected`   | int  | Total calendar events fetched across all calendars |
+
+### Functions Called
+
+| Function                                         | ID    | Role                                                                        |
+| ------------------------------------------------ | ----- | --------------------------------------------------------------------------- |
+| `mvp/widget/utc-timestamps_v2`                   | —     | Computes UTC start/end timestamps for a timezone-aware day range            |
+| `mvp/nylas/fetch-messages`                       | —     | Fetches messages from the Nylas API for a grant                             |
+| `mvp/nylas/fetch-calendar-events`                | —     | Fetches calendar events from the Nylas API for a calendar                   |
+| `mvp/activity/message-created-parse`             | #1913 | Parses a single message into activity records (same as live webhook)        |
+| `mvp/nylas-webhook/calendar-webhook-parse-event` | #2477 | Parses a single calendar event into activity records (same as live webhook) |
+
+### Design Notes
+
+- **No error handling by design.** If a message or event causes a parse function to throw, the entire run fails with the raw error. This makes it easy to identify which inputs break the pipeline and fix the underlying parse logic.
+- **Fixed time windows.** Messages always look back 7 days; calendar events span -7 to +14 days. The `received_after` input is accepted but the function currently uses the computed timestamp window instead.
+
+<Accordion title="XanoScript">
+````xanoscript
+// Backfills activity for all active grants.
+// Phase 1: collect all messages + events across grants.
+// Phase 2: parse messages. Phase 3: parse calendar events.
+function "mvp/nylas/refresh-activity" {
+  input {
+    int? received_after?
+  }
+
+stack {
+// ── Step 1: Get grants ───────────────────────────────────────────
+db.query nylas_grant {
+where = $db.nylas_grant.grant_expired == false
+sort = {nylas_grant.user_id: "asc"}
+return = {type: "list"}
+output = ["id", "grant_id", "user_id", "email_account"]
+addon = [
+{
+name : "calendar:grant_id"
+input: {grant_id: $output.grant_id}
+as : "calendars"
+}
+{
+name : "user:user_id"
+output: ["id", "local_timezone"]
+input : {user_id: $output.user_id}
+as : "user"
+}
+]
+} as $allGrants
+
+    // ── Step 2: Collect messages + events for every grant ────────────
+    var $allMessages {
+      value = []
+    }
+
+    var $allEvents {
+      value = []
+    }
+
+    foreach ($allGrants) {
+      each as $grant {
+        function.run "mvp/widget/utc-timestamps_v2" {
+          input = {
+            time_range      : -7
+            working_timezone: $grant.user.local_timezone
+          }
+        } as $timestamps
+
+        function.run "mvp/nylas/fetch-messages" {
+          input = {
+            nylas_grant_id     : $grant.grant_id
+            limit              : 200
+            page_token         : null
+            folder_id          : null
+            unread             : null
+            starred            : null
+            thread_id          : null
+            subject            : null
+            to_email           : null
+            from_email         : null
+            cc                 : null
+            bcc                : null
+            any_email          : null
+            has_attachment     : null
+            received_before    : null
+            received_after     : $timestamps.start|divide:1000
+            fields             : null
+            select             : null
+            search_query_native: null
+          }
+        } as $messages
+
+        array.merge $allMessages {
+          value = $messages|get:"messages":[]
+        }
+      }
+    }
+
+    var $calendars {
+      value = $allGrants|get:"calendars":null
+    }
+
+    foreach ($calendars) {
+      each as $calendar {
+        function.run "mvp/widget/utc-timestamps_v2" {
+          input = {time_range: -7, working_timezone: $calendar.timezone}
+        } as $sevenDaysBeforeTimestamp
+
+        function.run "mvp/widget/utc-timestamps_v2" {
+          input = {time_range: 14, working_timezone: $calendar.timezone}
+        } as $fourteenDaysAfterTimestamp
+
+        function.run "mvp/nylas/fetch-calendar-events" {
+          input = {
+            grant_id        : $calendar.grant_id
+            calendar_id     : $calendar.external_id
+            start           : $sevenDaysBeforeTimestamp.start|divide:1000
+            end             : $fourteenDaysAfterTimestamp.end|divide:1000
+            limit           : 200
+            page_token      : null
+            title           : null
+            show_cancelled  : null
+            expand_recurring: null
+          }
+        } as $events
+
+        array.merge $allEvents {
+          value = $events|get:"events":[]
+        }
+      }
+    }
+
+    // ── Step 3: Parse messages ───────────────────────────────────────
+    foreach ($allMessages) {
+      each as $message {
+        function.run "mvp/activity/message-created-parse" {
+          input = {body: {}|set:"data":({}|set:"object":$message)}
+        }
+      }
+    }
+
+    // ── Step 4: Parse calendar events ───────────────────────────────
+    foreach ($allEvents) {
+      each as $event {
+        var.update $event {
+          value = $event
+            |set:"created_at":$event.when.start_time
+        }
+
+        function.run "mvp/nylas-webhook/calendar-webhook-parse-event" {
+          input = {grant_id: $event.grant_id, event: $event}
+        }
+      }
+    }
+
+    var $response {
+      value = {}
+        |set:"grants_processed":($allGrants|count)
+        |set:"messages_collected":($allMessages|count)
+        |set:"events_collected":($allEvents|count)
+    }
+
+}
+
+response = $var.response
+}
+
+````
+</Accordion>

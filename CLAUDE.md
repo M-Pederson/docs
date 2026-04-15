@@ -18,12 +18,13 @@ When creating API documentation for a new group:
 
 Each API group has its own base URL using the Xano canonical:
 
-```
+```url
 https://xh2o-yths-38lt.n7c.xano.io/api:{group_canonical}/{endpoint}
 ```
 
 Example (Auth group, canonical `qMCc0ojP`):
-```
+
+```url
 https://xh2o-yths-38lt.n7c.xano.io/api:qMCc0ojP/auth/login
 ```
 
@@ -31,20 +32,20 @@ https://xh2o-yths-38lt.n7c.xano.io/api:qMCc0ojP/auth/login
 
 Every request to the Xano API requires these headers:
 
-| Header | Type | Required | Description |
-|--------|------|----------|-------------|
-| `Content-Type` | string | Always | `application/json` |
-| `X-Data-Source` | string | Always | Identifies the data source for the request |
-| `X-Branch` | string | Always | Xano branch to target (`v1`, `staging`, `dev`, etc.) |
-| `Authorization` | string | Conditional | `Bearer {token}` — only for authenticated endpoints |
+| Header          | Type   | Required    | Description                                          |
+| --------------- | ------ | ----------- | ---------------------------------------------------- |
+| `Content-Type`  | string | Always      | `application/json`                                   |
+| `X-Data-Source` | string | Always      | Identifies the data source for the request           |
+| `X-Branch`      | string | Always      | Xano branch to target (`v1`, `staging`, `dev`, etc.) |
+| `Authorization` | string | Conditional | `Bearer {token}` — only for authenticated endpoints  |
 
 ## MDX Endpoint File Template
 
-```mdx
+````mdx
 ---
-title: '{Endpoint Title}'
-api: '{VERB} https://xh2o-yths-38lt.n7c.xano.io/api:{group_canonical}/path/to/endpoint'
-description: '{Short description}'
+title: "{Endpoint Title}"
+api: "{VERB} https://xh2o-yths-38lt.n7c.xano.io/api:{group_canonical}/path/to/endpoint"
+description: "{Short description}"
 ---
 
 ## Overview
@@ -62,6 +63,7 @@ description: '{Short description}'
 </ParamField>
 
 <!-- Only include Authorization if endpoint requires auth -->
+
 <ParamField header="Authorization" type="string" required>
   Bearer token obtained from login or signup.
 </ParamField>
@@ -69,6 +71,7 @@ description: '{Short description}'
 ## Request Body
 
 <!-- Use ParamField body for each input from the swagger spec -->
+
 <ParamField body="field_name" type="string" required>
   Description of the field.
 </ParamField>
@@ -76,6 +79,7 @@ description: '{Short description}'
 ## Response
 
 <!-- Use ResponseField for each output field -->
+
 <ResponseField name="field_name" type="string">
   Description of the response field.
 </ResponseField>
@@ -90,15 +94,14 @@ curl -X {VERB} https://xh2o-yths-38lt.n7c.xano.io/api:{canonical}/{path} \
   -d '{
     "field": "value"
   }'
-```
 </RequestExample>
 
-<ResponseExample>
+<RequestExample>
 ```json 200
 {
   "field": "value"
 }
-```
+
 </ResponseExample>
 ```
 
@@ -118,9 +121,9 @@ New API groups go under the "API Reference" tab:
 
 ## API Groups Reference
 
-| Group | ID | Canonical | Base URL |
-|-------|----|-----------|----------|
-| Auth | 27 | `qMCc0ojP` | `https://xh2o-yths-38lt.n7c.xano.io/api:qMCc0ojP` |
+| Group | ID  | Canonical  | Base URL                                          |
+| ----- | --- | ---------- | ------------------------------------------------- |
+| Auth  | 27  | `qMCc0ojP` | `https://xh2o-yths-38lt.n7c.xano.io/api:qMCc0ojP` |
 
 <!-- Add new groups here as they are documented -->
 
@@ -130,3 +133,4 @@ New API groups go under the "API Reference" tab:
 - Kebab-case filenames: `login-clerk.mdx`, `add-local-timezone.mdx`
 - Match endpoint names where possible
 - Include realistic example values in request/response examples
+````

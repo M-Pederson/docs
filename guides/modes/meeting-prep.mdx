@@ -1,0 +1,623 @@
+---
+title: "Meeting Prep"
+description: "Calendar-driven meeting briefings: classify attendees, gather context, generate talking points and landmines."
+---
+
+<Frame>
+  <img src="/images/meeting-prep/hero-v2.png" alt="Meeting Prep hero" />
+</Frame>
+
+Meeting Prep turns every calendar event into a personalized briefing. Orbiter pulls the next 14 days from Nylas, classifies attendees into "your side" vs. "the other side(s)", and — on demand — generates talking points, openers, landmines, and shared context using Claude Sonnet 4.
+
+<CardGroup cols={3}>
+  <Card title="2 API groups" icon="layer-group">
+    Robert API + V2 Calendar Events
+  </Card>
+  <Card title="4 core Xano functions" icon="code">
+    Classify, context, memory, deep research
+  </Card>
+  <Card title="15+ DB tables" icon="database">
+    Calendar, identity, context, copilot
+  </Card>
+  <Card title="3 external services" icon="cloud">
+    Nylas, OpenRouter, Cloud Run
+  </Card>
+  <Card title="10-step pipeline" icon="timeline">
+    Calendar → enrich → classify
+  </Card>
+  <Card title="3-phase prep" icon="wand-magic-sparkles">
+    Ask goal → gather → generate
+  </Card>
+</CardGroup>
+
+## UI walkthrough
+
+<Steps>
+  <Step title="Landing — today's meetings on canvas">
+    <Frame>
+      <img src="/images/meeting-prep/ss-meeting-prep-canvas.png" alt="Meeting Prep canvas" />
+    </Frame>
+    Three-panel layout: sidebar (left), canvas (center), context panel (right). Today's meetings render as rich cards on the canvas.
+  </Step>
+  <Step title="Select a meeting — see classified attendees">
+    <Frame>
+      <img src="/images/meeting-prep/ss-meeting-selected.png" alt="Meeting selected" />
+    </Frame>
+    Canvas shows the single meeting card. Right panel groups attendees by company with logos and in-network badges.
+  </Step>
+  <Step title="Multi-participant meetings">
+    <Frame>
+      <img src="/images/meeting-prep/ss-happy-friday.png" alt="Multi participant meeting" />
+    </Frame>
+    External participants cluster under their companies in the `PARTICIPANTS` section.
+  </Step>
+  <Step title="Meetings with descriptions">
+    <Frame>
+      <img src="/images/meeting-prep/ss-jordan-cameron.png" alt="Meeting with description" />
+    </Frame>
+    Nylas event description renders in the right panel alongside classified attendees.
+  </Step>
+  <Step title="Click &ldquo;Prep this meeting&rdquo; — CrayonChat opens">
+    <Frame>
+      <img src="/images/meeting-prep/ss-crayon-chat.png" alt="CrayonChat opens" />
+    </Frame>
+    CrayonChat loads with a conversation starter. Context persistence + deep research fire in the background.
+  </Step>
+  <Step title="AI response — no in-network attendees">
+    <Frame>
+      <img src="/images/meeting-prep/ss-prep-response.png" alt="AI asks who you're meeting with" />
+    </Frame>
+    When no attendee is in the user's network, the AI asks "Who are you meeting with?" with interactive options.
+  </Step>
+  <Step title="In-network attendee — meeting goal card">
+    <Frame>
+      <img src="/images/meeting-prep/ss-mark-sync-card.png" alt="Meeting goal card" />
+    </Frame>
+    When an attendee is in-network, Phase 1 shows six suggested goals (close a deal, get an intro, pitch, build the relationship, follow up, ask for advice).
+  </Step>
+  <Step title="Sidebar — full calendar view">
+    <Frame>
+      <img src="/images/meeting-prep/ss-sidebar-scrolled.png" alt="Sidebar with multiple days" />
+    </Frame>
+    Sidebar groups events by day across the 14-day window.
+  </Step>
+</Steps>
+
+## System flow
+
+<Frame caption="End-to-end data flow: Google Calendar → Nylas → enrich → classify → Sidebar + Canvas → CrayonChat → LLM prep.">
+  <img src="/images/meeting-prep/diagram-calendar-pipeline.png" alt="Calendar pipeline diagram" />
+</Frame>
+
+## Calendar pipeline
+
+`GET /calendar-events` (endpoint #4329) is the main data source. One call drives both the sidebar and the canvas.
+
+<AccordionGroup>
+  <Accordion title="10-step processing chain" icon="list-ol">
+    1. Get user timezone from `user.settings.working_timezone`
+    2. Query active calendars from `calendar` table
+    3. Compute UTC range (14 days ahead)
+    4. Fetch Nylas events with pagination (200/page, handles `next_cursor`)
+    5. Extract unique participant emails into a Set
+    6. Bulk identity resolution via `master_email` + `master_person` join
+    7. Network badge lookup from `my_person` table
+    8. Grant email mapping via `nylas_grant`
+    9. Classify participants per event (calls function #12742)
+    10. Return enriched response with `meeting_prep` embedded
+  </Accordion>
+  <Accordion title="Two calendar fetch paths" icon="code-branch">
+    **V2 `/calendar-events` (#4329)** — uses `fetch-calendar-events` with full enrichment. Drives the UI.
+
+    **Robert API `/calendar/events` (#8125)** — uses older `nylas-calendar-get-filtered-events` with no enrichment. Called internally by `/meeting-prep` for LLM context.
+
+    These are independent calls.
+  </Accordion>
+</AccordionGroup>
+
+<Warning>
+  `classify-participants` runs **per event**. A busy calendar (~50 events × 14 days) means 50 function calls, each with multiple DB queries. Watch this for performance.
+</Warning>
+
+## Classification
+
+<Frame caption="classify-participants funnel: emails sort into My Team (green), Participating Companies (purple), Personal Participants (amber).">
+  <img src="/images/meeting-prep/diagram-classify.png" alt="Classification funnel" />
+</Frame>
+
+<Tabs>
+  <Tab title="Pass 1 — Domain classification">
+    - Extract the domain from each participant email
+    - If domain matches the user's domain → `my_team`
+    - Otherwise check `email_provider`:
+      - Personal domain → `personal_participants`
+      - Corporate domain → add to `companyDomains` for Pass 2
+    - Resolve every email to `master_person` for names/avatars
+  </Tab>
+  <Tab title="Pass 2 — Company grouping">
+    - For each unique corporate domain, look up `master_company`
+    - Collect all participant emails on that domain
+    - Resolve each to `master_person`
+    - Fall back to `logo.dev` if company logos missing
+  </Tab>
+  <Tab title="Output structure">
+    ```json
+    {
+      "my_team": {
+        "master_company_id": 10,
+        "name": "Orbiter",
+        "logo": "https://...",
+        "members": [
+          { "master_person_id": 12, "name": "Mark Pederson", "title": "CEO" }
+        ]
+      },
+      "participating_companies": [
+        {
+          "master_company_id": 20,
+          "name": "JP Morgan",
+          "logo": "...",
+          "members": [
+            { "master_person_id": 530, "name": "Susan", "title": "VP" }
+          ]
+        }
+      ],
+      "personal_participants": [
+        { "master_person_id": 540, "name": "Bob", "title": "Consultant" }
+      ]
+    }
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+  **Design insight — plaintiffs vs. defendants.** `my_team` represents "your side"; `participating_companies` is "the other side(s)". A meeting can have multiple external companies, each with its own section.
+</Note>
+
+## LLM generation
+
+<Frame caption="Meeting prep flow — Phase 1 asks for a goal, Phase 2 gathers context and calls Claude Sonnet 4.">
+  <img src="/images/meeting-prep/diagram-meeting-prep.png" alt="Meeting prep diagram" />
+</Frame>
+
+`POST /meeting-prep` (endpoint #8098) runs in two phases.
+
+<Tabs>
+  <Tab title="Phase 1 — Ask first">
+    No `user_goal` in the request → returns suggested goals immediately:
+
+    - Close a deal or partnership
+    - Get an introduction to someone in their network
+    - Pitch my product or idea
+    - Build the relationship
+    - Follow up on a previous conversation
+    - Ask for advice or mentorship
+
+    If the user types their own goal up front, Phase 1 is skipped entirely.
+  </Tab>
+  <Tab title="Phase 2 — Context gathering">
+    With `user_goal` provided, collects from 4 sources:
+
+    1. **Person context** via `get-person-context` (#12570) — YAML with work history, education, skills, roles, location
+    2. **User memories** via `build-memory-context` (#12665) — wrapped in `[USER MEMORY]...[/USER MEMORY]` tags
+    3. **Authenticated user info** from `user` table + `master_person` addon
+    4. **Calendar events** via `GET /calendar/events` (#8125) — 14 days ahead, max 10 events
+  </Tab>
+  <Tab title="Phase 3 — LLM call">
+    | Setting | Value |
+    |---|---|
+    | Provider | OpenRouter (`openrouter.ai/api/v1/chat/completions`) |
+    | Model | `anthropic/claude-sonnet-4` |
+    | Temperature | `0.4` (factual output) |
+    | Max tokens | `2048` |
+    | Timeout | `60s` |
+    | System prompt | "You are a meeting prep AI. Output ONLY valid JSON." |
+
+    Response parsing uses a regex fallback: strip markdown fences → `JSON.parse` → regex-extract a JSON object. On total failure, return a static error object with empty arrays.
+  </Tab>
+  <Tab title="Response shape">
+    ```json
+    {
+      "success": true,
+      "master_person_id": 520,
+      "person": { "name": "Ray Deck", "title": "CEO", "avatar": "..." },
+      "prep": {
+        "person_summary": "Ray is the CEO of StateChange...",
+        "talking_points": [
+          {
+            "topic": "Recent funding round",
+            "opener": "I saw StateChange just closed their Series A...",
+            "why_they_care": "They're scaling the team and looking for partnerships"
+          }
+        ],
+        "suggested_openers": ["Congrats on the funding...", "How's the team scaling?"],
+        "listen_for": ["Signs of budget constraints", "Hiring challenges"],
+        "landmines": ["Don't mention competitor X", "Avoid pricing discussions"]
+      },
+      "model": "anthropic/claude-sonnet-4"
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Meeting chat
+
+`POST /chat` (endpoint #8064) is the general copilot chat, with special behavior when `mode=meeting`:
+
+- System prompt loaded from `copilot_config` table (id `4`, name `meeting`) — instructs the AI on `TALKING POINTS`, `SUGGESTED OPENERS`, `WATCH OUT FOR` sections
+- Memory injection via `build-memory-context` appended to system prompt
+- Person context wrapped in `[ACTIVE PERSON CONTEXT]...[/ACTIVE PERSON CONTEXT]` tags
+- Temperature `0.7` (more conversational than prep's `0.4`)
+- History: last 10 messages
+- No dispatch confirmation — informational only
+
+## Frontend
+
+<Frame caption="Before/after context visibility — from opaque to informative status.">
+  <img src="/images/meeting-prep/context-gap-before-after.png" alt="Context gap before and after" />
+</Frame>
+
+### File inventory
+
+| Component | File | Lines | Purpose |
+|---|---|---|---|
+| `MeetingPrepCanvas` | `meeting-prep-canvas.tsx` | 1,247 | Main orchestrator — cards + CrayonChat + context persistence |
+| `MeetingPrepList` | `meeting-prep-list.tsx` | 192 | Sidebar — events grouped by day, company logos |
+| `MeetingPrepContextPanel` | `meeting-prep-context-panel.tsx` | 499 | Right panel — meeting details, classified attendees |
+| `MeetingPrepSearch` | `meeting-prep-search.tsx` | 33 | Debounced search input |
+| `MeetingGoalCard` | `crayon/meeting-goal-card.tsx` | ~120 | Goal selection template |
+| `MeetingPrepCard` | `crayon/meeting-prep-card.tsx` | ~200 | Full prep display template |
+
+### Canvas state machine
+
+<CardGroup cols={3}>
+  <Card title="No meeting selected" icon="calendar-days">
+    Show today's meetings as rich cards.
+  </Card>
+  <Card title="Meeting selected" icon="calendar-check">
+    Show single card with classified attendees.
+  </Card>
+  <Card title="Prep started" icon="comments">
+    Show CrayonChat with SSE streaming.
+  </Card>
+</CardGroup>
+
+### Enriched prompt
+
+When CrayonChat opens, the canvas auto-generates a prompt composed of:
+
+1. `Help me prepare for my meeting "[Title]"`
+2. Time, duration, relative time
+3. Attendees list with network status + IDs
+4. Team members on call
+5. `Pull full context on [network attendees] from my network`
+6. Meeting description (first 500 chars)
+7. Location or video call URL
+8. Desired outcome (if typed)
+9. `Give me talking points, key context, and anything I should be prepared for`
+
+### Network badge logic
+
+<Warning>
+  **Use `my_person.created_at`, not `master_person.created_at`.**
+  Badges are computed from when *this user* added the contact, not the global record creation time.
+
+  - `< 30 days` → **New to Network**
+  - `≥ 30 days` → **In Network**
+</Warning>
+
+## Context persistence pipeline
+
+<Frame>
+  <img src="/images/meeting-prep/context-pipeline-hero.png" alt="Context pipeline hero" />
+</Frame>
+
+When the user clicks **Prep this meeting**:
+
+<Steps>
+  <Step title="Create or load context (idempotent)">
+    `POST /meeting-prep-context/create` — returns `created: false` if record already exists.
+  </Step>
+  <Step title="Trigger deep research (fire-and-forget)">
+    For each in-network attendee, Cloud Run kicks off async enrichment.
+  </Step>
+  <Step title="Fetch email threads (fire-and-forget)">
+    Nylas threads for participant emails, summarized and cached.
+  </Step>
+  <Step title="Find prior meetings (fire-and-forget)">
+    Last 90 days of events with the same participants.
+  </Step>
+  <Step title="Launch CrayonChat immediately">
+    UI is responsive while background gathering accumulates into the context record.
+  </Step>
+</Steps>
+
+### New API endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /meeting-prep-context/create` | Create or load context for a meeting. Idempotent. |
+| `GET /meeting-prep-context` | Load persisted context by `nylas_event_id`. Returns `context: null` if none. |
+| `POST /meeting-prep-context/update` | Update `qa_history`, `desired_outcome`, `checklist_status`, `email_threads`, `prior_meetings`. |
+| `GET /meeting-prep-context/status` | Poll checklist + QA count for real-time progress indicators. |
+| `POST /meeting-prep-context/trigger-research` | Fire deep research for `person_ids[]`. |
+| `POST /meeting-prep-context/email-threads` | Fetch Nylas threads for participant emails. |
+| `POST /meeting-prep-context/prior-meetings` | Past events with same participants. Configurable `days_back` (default 90). |
+| `POST /meeting-prep-context/upload` | Upload files (RFPs, briefs) into context for LLM prompting. |
+
+### Meeting transcriptions (standalone)
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /meeting-transcriptions` | Create transcription record (`transcript`, `video_url`, `audio_url`, `markdown`, `summary`). |
+| `GET /meeting-transcriptions` | List transcriptions for a specific `nylas_event_id`. |
+
+<Info>
+  Transcriptions live in their own table — users transcribe **all** meetings, not just prepped ones. Context can reference transcriptions to auto-surface prior meeting notes when re-meeting the same people.
+</Info>
+
+### Race condition fix (prepInitiatedRef)
+
+<Accordion title="Why ref guards matter in React useEffect chains">
+  The `useEffect([selectedId])` was resetting `prepStarted` to `false` **after** `onPrepMeeting` set it to `true` in the same render cycle. Fixed with a ref guard:
+
+  ```javascript
+  const prepInitiatedRef = useRef(false);
+
+  // onPrepMeeting handler:
+  prepInitiatedRef.current = true;   // Guard before state change
+  setSelectedId(id);                  // Triggers useEffect
+  setPrepStarted(true);               // Would be reset without guard
+
+  // useEffect:
+  if (prepInitiatedRef.current) {
+    prepInitiatedRef.current = false; // Consume the guard
+    return;                           // Skip reset
+  }
+  setPrepStarted(false);              // Normal reset on navigation
+  ```
+</Accordion>
+
+## Deep research
+
+<Frame caption="Xano → Cloud Run (async) → Webhook → deep_bio + bio_100/300/500 + knowledge graph.">
+  <img src="/images/meeting-prep/diagram-deep-research.png" alt="Deep research pipeline" />
+</Frame>
+
+<Steps>
+  <Step title="Xano dispatches">
+    `deep-research-person-or-company` (#12747) accepts `master_person_id` or `master_company_id`, model, temperature, max_tokens, request_type, system_prompt, user_prompt, provider_order.
+  </Step>
+  <Step title="Build OpenRouter payload (Lambda)">
+    Perplexity models require system+user collapsed into a single message.
+  </Step>
+  <Step title="POST to Cloud Run">
+    `https://orbiter-enrich-20506320032.us-east4.run.app/enrich` — create `profile_enrichment_job` record.
+  </Step>
+  <Step title="Cloud Run processes (async, minutes)">
+    Long-running LLM research runs outside request lifecycles.
+  </Step>
+  <Step title="Webhook on success">
+    `POST /enrich-profile` (#8303):
+    - Update job with `llm_response`, `processing=false`
+    - Write `deep_bio` to `master_person`
+    - Run `create-llm-person-bios` → generate `bio_100`, `bio_300`, `bio_500`
+    - Run `update-person-node` → sync knowledge graph
+  </Step>
+</Steps>
+
+<Tip>
+  **Wired to meeting prep (Apr 15).** `triggerMeetingPrepResearch(contextId, personIds)` fires on prep click for each in-network attendee. Fire-and-forget — frontend continues to CrayonChat while research runs.
+</Tip>
+
+## External services
+
+| Service | Used by | Purpose | Auth |
+|---|---|---|---|
+| **Nylas v3** `api.us.nylas.com` | `fetch-calendar-events`, `send-rsvp`, email threads | Calendar sync (200/page) + email threads | Bearer token (env) |
+| **OpenRouter** `openrouter.ai` | `/meeting-prep`, `/chat` | Route to Claude Sonnet 4 | Bearer token (env) |
+| **Cloud Run** `orbiter-enrich-*.run.app` | `deep-research-person-or-company` | Async long-running research | X-API-Key (env) |
+| **logo.dev** | `classify-participants` | Fallback company logos by domain | Token in URL (`pk_Twvl42WzTX2-ySNbnZKlSA`) |
+
+## Database tables
+
+<AccordionGroup>
+  <Accordion title="Calendar & events" icon="calendar">
+    | Table | ID | Purpose |
+    |---|---|---|
+    | `calendar` | 223 | Connected calendars via Nylas OAuth |
+    | `event` | 221 | Local cache of Nylas events |
+    | `master_event` | 222 | Recurring event templates |
+    | `nylas_grant` | 183 | OAuth grants mapping `grant_id` → email |
+  </Accordion>
+  <Accordion title="Person & company identity" icon="user">
+    | Table | ID | Purpose |
+    |---|---|---|
+    | `master_person` | 139 | Master identity (name, avatar, title, bio, socials, LinkedIn, company) |
+    | `master_company` | 142 | Master company (name, logo, domain, about, LinkedIn) |
+    | `master_email` | 155 | Email → person mapping for bulk lookups |
+    | `my_person` | 128 | User's network; `created_at` drives "New to Network" badge |
+    | `email_provider` | 175 | Personal email domain list (gmail, yahoo, hotmail) |
+  </Accordion>
+  <Accordion title="Context & intelligence" icon="brain">
+    | Table | ID | Purpose |
+    |---|---|---|
+    | `work_experience` | 147 | Work history for context YAML |
+    | `education_experience` | 230 | Education for context prompt |
+    | `copilot_memory` | 658 | User memories injected into LLM prompts |
+    | `copilot_config` | 541 | System prompts per mode (meeting = id 4) |
+    | `profile_enrichment_job` | 686 | Deep research job queue (Cloud Run writes here) |
+    | `deep_biography` | 591 | Deep bio storage (legacy) |
+  </Accordion>
+  <Accordion title="Meeting prep context (new)" icon="sparkles">
+    | Table | Purpose |
+    |---|---|
+    | `meeting_prep_context` | `user_id`, `nylas_event_id`, `desired_outcome`, `team_structure`, `participant_context`, `email_threads`, `prior_meetings`, `checklist_status`, `qa_history`. Persists forever; loads instantly on revisit. |
+    | `meeting_transcriptions` | `user_id`, `nylas_event_id`, `transcript`, `video_url`, `audio_url`, `markdown`, `summary`. Standalone table for all meeting recordings. |
+  </Accordion>
+  <Accordion title="Copilot & supporting" icon="comments">
+    | Table | ID | Purpose |
+    |---|---|---|
+    | `copilot_conversations` | 636 | Conversation threads |
+    | `copilot_chat_messages` | 637 | Individual messages |
+    | `user` | 125 | User accounts (WorkOS auth) |
+    | `environment_variables` | 272 | Runtime config (Nylas API keys) |
+    | `process` | 633 | Async process tracking |
+    | `log_crash` | 542 | Error logging |
+  </Accordion>
+</AccordionGroup>
+
+## E2E walkthrough — April 15, 2026
+
+<Steps>
+  <Step title="User types a desired outcome">
+    <Frame>
+      <img src="/images/meeting-prep/ss-e2e-outcome-typed.png" alt="Desired outcome typed" />
+    </Frame>
+    "Close the partnership deal" — persists to `meeting_prep_context.desired_outcome`.
+  </Step>
+  <Step title="CrayonChat launches, context triggers in background">
+    <Frame>
+      <img src="/images/meeting-prep/ss-e2e-crayon-launched.png" alt="CrayonChat launched" />
+    </Frame>
+    Context persisted in Xano. Deep research + email threads + prior meetings all fire in parallel.
+  </Step>
+  <Step title="AI returns structured prep">
+    <Frame>
+      <img src="/images/meeting-prep/ss-e2e-prep-result.png" alt="Full prep result" />
+    </Frame>
+    Market expansion strategy, talking points, and a `Copy Brief` button.
+  </Step>
+  <Step title="Landmines surface actionable warnings">
+    <Frame>
+      <img src="/images/meeting-prep/ss-e2e-landmines.png" alt="Landmines section" />
+    </Frame>
+  </Step>
+  <Step title="Follow-up chat uses persisted context">
+    <Frame>
+      <img src="/images/meeting-prep/ss-e2e-followup.png" alt="Follow-up chat" />
+    </Frame>
+    Personal connection topics, planning strategies, conversation recovery — all grounded in accumulated context.
+  </Step>
+</Steps>
+
+## Bugs found & fixed during E2E
+
+<Frame>
+  <img src="/images/meeting-prep/e2e-bugfix-hero.png" alt="E2E bug fix hero" />
+</Frame>
+
+<AccordionGroup>
+  <Accordion title="Bug #1 — Auto-send (eliminate double-click)" icon="bug">
+    **Issue:** Clicking *Prep this meeting* opened CrayonChat but only showed the starter chip. User had to click the chip again.
+
+    **Root cause:** CrayonChat conversation starters require explicit interaction — they don't auto-fire.
+
+    **Fix:** Added `autoSentRef` + `useEffect` that polls for the starter button and auto-clicks when `prepStarted` becomes true. Retry: 30 attempts, 200 ms apart.
+
+    <Frame>
+      <img src="/images/meeting-prep/auto-send-flow.png" alt="Auto-send flow" />
+    </Frame>
+  </Accordion>
+  <Accordion title="Bug #2 — Informative status banner" icon="bug">
+    **Issue:** Banner showed generic *Gathering context…* with no details.
+
+    **Fix:** Banner now reads `prepContextRef.current` and shows specific counts:
+    - While gathering: `Gathering context — found 2 bios, 10 email threads…`
+    - When ready: `Context ready — 2 bios, 10 emails, 3 prior Q&A`
+
+    <Frame>
+      <img src="/images/meeting-prep/meeting-prep-goal-card.png" alt="Goal card with informative banner" />
+    </Frame>
+  </Accordion>
+  <Accordion title="Bug #3 — Template rendering (needs_user_goal value check)" icon="bug">
+    **Issue:** After goal selection, the response rendered as a wall of unformatted text instead of the `meeting_prep_card` template.
+
+    **Root cause:** `!("needs_user_goal" in result)` tested key *existence*, not value. When the API returned `{needs_user_goal: false, prep: {...}}`, the `in` operator returned true — the conditional evaluated to false and the template was skipped.
+
+    **Fix:** Check the actual boolean:
+
+    ```ts
+    if (!(result as Record<string, unknown>).needs_user_goal)
+    ```
+
+    <Frame caption="Before — wall of text">
+      <img src="/images/meeting-prep/ss-e2e-wall-of-text-bug.png" alt="Wall of text bug" />
+    </Frame>
+
+    <Frame caption="After — structured MeetingPrepCard">
+      <img src="/images/meeting-prep/ss-e2e-prep-card-final.png" alt="Prep card final" />
+    </Frame>
+  </Accordion>
+  <Accordion title="Bug #4 — Clean goal message" icon="bug">
+    **Issue:** Chat bubble showed `[MEETING_GOAL] Build the relationship` — leaking internal routing prefix.
+
+    **Fix:** Goal card sends clean text. Canvas uses `meetingGoalPendingRef.current` (ref-based state machine) for detection instead of prefix matching.
+  </Accordion>
+</AccordionGroup>
+
+## XanoScript gotchas
+
+<Warning>
+  **Safe field access is mandatory for Nylas responses.** Direct property access throws `Unable to locate var` when fields are missing. Always use:
+
+  ```
+  |get:"field":default
+  ```
+</Warning>
+
+<Warning>
+  **`add_days_to_timestamp` does not exist.** Use `add_secs_to_timestamp` with `days * 86400`.
+</Warning>
+
+<Warning>
+  **`in` operator ≠ value check.** `"key" in obj` returns true if the key exists, even with a falsy value. Check the actual value when you need the boolean.
+</Warning>
+
+## Roadmap
+
+### Context checklist — gather once, persist
+
+| Item | Source | Status |
+|---|---|---|
+| Deep bio per attendee | Cloud Run deep research | Wired |
+| Social insights per attendee | Enrichment pipeline | Planned |
+| Deep company research | Cloud Run | Wired |
+| Recent email threads | Nylas email API | Done |
+| YouTube transcripts | Web search | Endpoint exists |
+| Prior meeting transcript | `meeting_transcriptions` table | Done |
+
+### Implementation phases
+
+<Steps>
+  <Step title="Phase 1 — Frontend fixes">
+    Desired outcome → API, remove fake footer. **Done.**
+  </Step>
+  <Step title="Phase 2 — Backend tables + endpoints">
+    `meeting_prep_context`, `meeting_transcriptions`, 8 CRUD endpoints, deep research wiring, XanoScript fixes. **Done.**
+  </Step>
+  <Step title="Phase 3 — Frontend integration">
+    Context persistence, fire-and-forget, race condition fix, E2E verified. **Done.**
+  </Step>
+  <Step title="Phase 4 — UX polish">
+    Real progress checklist, CrayonChat Q&A persistence, YouTube integration, social insights, cost tracking. **Next.**
+  </Step>
+  <Step title="Phase 5 — Advanced integrations">
+    Web search, file upload UX, transcription pipeline.
+  </Step>
+  <Step title="Phase 6 — Enterprise">
+    Multi-tenant file management, vector store. **Blocked.**
+  </Step>
+</Steps>
+
+## Summary
+
+- **Frontend LOC:** ~2,300 (canvas 1,247 + list 192 + context panel 499 + search 33 + templates ~320)
+- **Backend endpoints:** 11 (4 calendar/prep, 7 context CRUD, 2 transcription)
+- **Database tables:** 15+ (9 core, 2 context, 4 copilot/support)
+- **External services:** 4 (Nylas, OpenRouter, Cloud Run, logo.dev)
+- **Processing:** 10-step calendar pipeline · 4-step context gathering · 3-phase meeting prep
+- **E2E bugs fixed:** 4 (auto-send, status banner, template rendering, goal message)
+
+<Info>
+  **Last updated:** April 15, 2026 · Authors: Robert Boulos & Mark Pederson
+</Info>

@@ -202,14 +202,14 @@ Each phase passes independently — failures are logged but don't block later ph
 | **6** | `process-person-phase-6` #12827 | **LLM Bios & Deep Research** — `create-llm-person-bios`; conditional `deep-research-person-prompt` when `deep_research=true`. |
 | **7** | `process-person-phase-7` #12828 | **Resolve Edges** — all 6 edge types: `resolve-edges-education` #12560, `resolve-edges-work` #12562, `resolve-edges-certifications` #12578, `resolve-edges-projects-publications` #12579, `resolve-edges-honor` #4574, `resolve-edges-volunteering` #4575. |
 | **8** | `process-person-phase-8` #12829 | **Expertise, IMDB & Angel Detection** — `llm-identify-person-expertise`, IMDB verify/link, angel flag from expertise `subdomain 22`. |
-| **9** | `process-person-phase-9` #12830 | **Investor Pipeline** — Signal NFX scrape, `person-extract-cb-signal`, Fundable investor data, `investor_profile_person` upsert. |
-| **10** | `process-person-phase-10` #12831 | **Deal Nodes & Investor Edges** — loop `fundable_angel_investments`, ensure target + VC orgs have `master_company`, `link-fundable-org`. |
+| **9** | `process-person-phase-9` #12830 | **Investor Pipeline + Deal Cascade** — Signal NFX scrape, `person-extract-cb-signal`, Fundable investor data, `investor_profile_person` upsert. **v3.0 (2026-04-19):** each angel investment now cascades through `mvp/investor/cascade-deal-participants` #12856 — portfolio company, co-angels, VC firms, VC partners (via `fundable_institutional_investments_person`), Funding_Round node, RAISED + INVESTED_IN edges, and IPO/exit signal to `company_financial.is_public`. |
+| **10** | `process-person-phase-10` #12831 | **Stub (deprecated).** v2.0 (2026-04-19) reduced this to a no-op — deal cascade is fully owned by Phase 9 v3.0. Kept in the orchestrator call chain during transition; safe to drop later. |
 | **11** | `process-person-phase-11` #12832 | **Complete Enrichment** — call `complete-person-enrich` to finalize (flip visibility, mark `enrich_success`). |
 
 <Note>
-All `resolve-edges-*` functions called by Phase 7 were upgraded in April 2026 to accept `cascade_depth` and pass `queue: true` + `priority_tier` + `source_function` + `source_entity_id` to every `get-add/master-company` and `get-add/master-person` call. This is what makes the cascade traceable in the queue tables.
+All Phase 7 `resolve-edges-*` functions were upgraded in April 2026 to accept `cascade_depth` and pass `queue: true` + `priority_tier` + `source_function` + `source_entity_id` to every `get-add/master-company` and `get-add/master-person` call. This makes the cascade traceable in the queue tables.
 
-Most recent: `resolve-edges-work` v1.3 (2026-04-14, `|first_notnull:0` fix), `resolve-edges-certifications` v2.1 (2026-04-14, added missing `master_person_id` input).
+Most recent: `process-person-phase-9` v3.0 (2026-04-19, deal cascade via `cascade-deal-participants`), `process-person-phase-10` v2.0 (2026-04-19, reduced to no-op stub — phase-9 owns the cascade), `resolve-edges-work` v1.3 (2026-04-14, `|first_notnull:0` fix), `resolve-edges-certifications` v2.1 (2026-04-14, added missing `master_person_id` input).
 </Note>
 
 ### Phase 3 Detail: Primary Current Company Auto-Enrichment
@@ -227,9 +227,24 @@ For Zeno Rocha, this means **Resend** is created and fully enriched during Phase
 
 Phase 7 runs all six `resolve-edges-*` functions sequentially. Zeno's work-history sub-call (`resolve-edges-work` v1.3) skips Resend (already enriched in Phase 3) but queues his past employers. Education resolution queues YC, Berkeley, UNIRIO, and PUCPR at tier 3.
 
-### Phase 9/10 Detail: Investor Discovery
+### Phase 9 Detail: Investor & Deal Discovery (v3.0)
 
-The investor pipeline runs across phases 9 and 10. Phase 9 handles Signal NFX / Crunchbase signal extraction and upserts `investor_profile_person`; Phase 10 loops `fundable_angel_investments` and ensures each target + VC organization has a `master_company` row (via `get-add/master-company` with cascade metadata). This is how the 9 angel investors around Zeno get discovered and queued:
+As of **v3.0 (2026-04-19)**, Phase 9 owns the full deal cascade. In addition to Signal NFX / Crunchbase signal extraction and the `investor_profile_person` upsert, it now loops `fundable_angel_investments` for the person and routes **each deal** through `mvp/investor/cascade-deal-participants` #12856.
+
+The cascade helper handles one fundable deal end-to-end:
+
+1. **Portfolio company** — `get-add/master-company` for the deal's target org (queued at **depth+1, tier 2**, `source_function: "cascade-deal-participants"`). Writes `master_company_id` back onto `fundable_organizations` for future lookups.
+2. **IPO / exit signal** — when `fundable_organizations.ipo_status == "public"`, sets `company_financial.is_public = true` for the portfolio company (initialized upstream in `get-add/master-company` Section 9).
+3. **Funding_Round node** — `add-fundable-deal-node` materializes the round as a graph node with a `RAISED` edge from the portfolio company.
+4. **Co-investors + partners** — `resolve-investors-edges` #12702 walks both sides of the deal:
+   - `fundable_angel_investments` → every **other angel** on the deal (people)
+   - `fundable_institutional_investments` → every **VC firm** on the deal (companies)
+   - `fundable_institutional_investments_person` → every **VC partner** tied to each firm on that deal (people)
+   - All queued at **depth+1**, with the correct `LEAD_INVESTED_IN` / `INVESTED_IN` / `FOLLOW_ON_INVESTED_IN` / `INVESTMENT_PARTNER_IN` / `INVESTMENT_PARTNER_AT` edges in FalkorDB.
+
+The same helper is called on the company side from `process-company-phase-7` → `add-all-fundable-deals` v2.0 (#12703), which walks both `fundable_deals WHERE organization_id=X` (rounds the org raised) **and** `fundable_institutional_investments WHERE organization_id=X` (rounds the org invested in). One cascade helper, one source of truth for deal fanout — whether entering from the angel-person side or the VC-firm-company side.
+
+Example: for Zeno, each of his angel investments pulls in the portfolio company + every other investor (angel or VC) on that round + every partner at the VC firms — at depth 1, queued for later enrichment. Here is the subset discovered via `resolve-investors-edges` on Zeno's pre-v3.0 run:
 
 | Investor | Source | Queue Tier | Why |
 |----------|--------|:----------:|-----|
@@ -244,6 +259,12 @@ The investor pipeline runs across phases 9 and 10. Phase 9 handles Signal NFX / 
 | Elad Gil | resolve-investors-edges | **3** | Angel investor |
 
 All 9 investors are created at **depth 1** with external APIs skipped — their names and LinkedIn URLs come from Fundable data. Each is queued to `queue_enrich_person` for full enrichment later.
+
+In v3.0, the same loop **also** pulls in the deal's portfolio company + VC firms + VC partners (institutional_investments_person), and writes the IPO signal to `company_financial.is_public` when the target org has exited via IPO. Queue metadata is stamped with `source_function: "cascade-deal-participants"` and `source_entity_id: master_person_id` for full traceability.
+
+### Phase 10 Detail: Stub (v2.0, 2026-04-19)
+
+Prior to v2.0 this phase had its own loop over `fundable_angel_investments` that queued target companies (tier 3) and VC firms (tier 2) at depth 1. That logic was a strict subset of what Phase 9 v3.0 now handles through `cascade-deal-participants`, so Phase 10 was reduced to a no-op stub. It's kept in the `run-base-person-enrich` call chain during the transition — safe to remove from the orchestrator in a later pass.
 
 ---
 
@@ -285,16 +306,20 @@ Depth 0: Zeno Rocha (linkedin.com/in/zeno-rocha-6270a914)
 │           ├── Turbo Excel (#12) → queued depth 1, tier 4
 │           └── yfdpco2.com (#13) → queued depth 1, tier 4
 │
-│       Phase 9 + 10 (process-person-phase-9/10) — Investor Pipeline + Deals
-│       ├── Bu Kinoshita (person #2) → queued depth 1, tier 1
-│       ├── Diana Hu (person #3) → queued depth 1, tier 2
-│       ├── Guillermo Rauch (#4) → queued depth 1, tier 3
-│       ├── Dylan Field (#5) → queued depth 1, tier 3
-│       ├── Paul Copplestone (#6) → queued depth 1, tier 3
-│       ├── Alana Goyal (#7) → queued depth 1, tier 3
-│       ├── Calvin French-Owen (#8) → queued depth 1, tier 3
-│       ├── Lachy Groom (#9) → queued depth 1, tier 3
-│       └── Elad Gil (#10) → queued depth 1, tier 3
+│       Phase 9 (process-person-phase-9 v3.0) — Investor Pipeline + Deal Cascade
+│       ├── Signal NFX + CB extraction → investor_profile_person
+│       └── foreach angel investment → cascade-deal-participants #12856
+│           ├── Portfolio co (target org) → queued depth 1, tier 2
+│           ├── IPO signal → company_financial.is_public (if applicable)
+│           ├── Funding_Round node + RAISED edge (add-fundable-deal-node)
+│           └── resolve-investors-edges walks the deal:
+│               ├── Co-angels → queued depth 1, tier 3
+│               ├── VC firms → queued depth 1, tier 2
+│               └── VC partners (institutional_investments_person) → queued depth 1, tier 2
+│       (for Zeno, this surfaced 9 investor people; v3.0 also now surfaces
+│        co-investor VCs + their partners on those same rounds)
+│
+│       Phase 10 (process-person-phase-10 v2.0) — No-op stub (cascade owned by Phase 9)
 │
 │       Phase 11 (process-person-phase-11) — Complete enrichment
 │       └── complete-person-enrich → visibility: true

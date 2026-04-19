@@ -176,7 +176,7 @@ The orchestrator runs these steps in order. Every step is wrapped in its own `tr
 | 3 | **process-company-phase-3** #12799 — YC (v1.1) | YC detection/scrape + YC data processing + `process-yc-people` (receives `cascade_depth` so YC batch-mates inherit the tree). |
 | 4 | **process-company-phase-5** #12809 — Fundable backfill | Lookup + industries + abouts + address + links + follower counts from Fundable. |
 | 5 | **process-company-phase-6** #12810 — Link res + financial | Canonicalize profile URLs; populate `company_financial`. |
-| 6 | **process-company-phase-7** #12813 — Deals (v1.1) | Calls `add-all-fundable-deals` #12703 → creates funding round nodes + investor edges (which call `resolve-investors-edges` #12702 with `cascade_depth`). |
+| 6 | **process-company-phase-7** #12813 — Deals (v1.1) | Calls `add-all-fundable-deals` #12703 (v2.0, 2026-04-19). Walks **both** `fundable_deals WHERE organization_id=X` (rounds this org raised) **and** `fundable_institutional_investments WHERE organization_id=X` (rounds this org invested in), routing each through `mvp/investor/cascade-deal-participants` #12856 — single source of truth for deal cascade shared with `process-person-phase-9` v3.0. Creates Funding_Round nodes, RAISED + INVESTED_IN / LEAD_INVESTED_IN / INVESTMENT_PARTNER_IN edges, and writes the IPO/exit signal to `company_financial.is_public` on the target org. |
 | 7 | **resolve-company-specialties** #12746 | Reads specialties from `speciality_join`, embeds each, vector-searches against `SubDomainExpertise` nodes, matches or creates new nodes, creates `SPECIALIZES_IN` FalkorDB edges (weight = `min(round(10 + match_score*80), 50)`). Writes new `SubDomainExpertise` nodes back to `sub_domain_expertise` table. |
 | 8 | **llm-company-about** (`mvp/about/llm-company-about`) | LLM-generated company description → `master_company.company_about`. |
 | 9 | **Name correction** (inline try_catch) | If PDL `display_name` exists and differs from `company_name`, overwrite; else if EL `name` exists and differs, fall back to EL. |
@@ -187,7 +187,7 @@ The orchestrator runs these steps in order. Every step is wrapped in its own `tr
 
 ---
 
-## Cascade Example: resend.com at Depth 0
+## Cascade Example: resend.com at Depth 0 (Company Seed)
 
 Here's what happens end-to-end when `resend.com` enters as a seed entity:
 
@@ -212,3 +212,56 @@ Depth 0: resend.com
 ```
 
 Each hop increments `cascade_depth`. External APIs are only called at depth 0 during the `get-add` phase. Deeper entities rely on Fundable data and input params, then get fully enriched when the queue processes them.
+
+---
+
+## Cascade Example: Person Investor at Depth 0 (Full Bloom-Out)
+
+Here's what happens when a person who invested in a company enters as a seed entity. The bloom-out spans two CRON cycles: Phase 9 fires the cascade helper for each of the person's angel investments immediately, then SpaceX's own enrichment later discovers every other round it raised.
+
+```
+Depth 0: Person (investor)
+├── get-add/master-person (immediate enrichment)
+│   └── run-base-person-enrich (all 11 phases, async)
+│       ├── Phase 3: Process PDL → identifies current employer
+│       │   └── get-add/master-company (cascade_depth: 0, queue: false)
+│       │       └── Immediate enrich
+│       │
+│       └── Phase 9 (v3.0): Investor Pipeline + Deal Cascade
+│           └── Fundable data contains: Person invested in SpaceX Series C (2021)
+│               └── foreach angel investment → cascade-deal-participants #12856
+│                   ├── SpaceX portfolio co (cascade_depth: 1, tier 2) → queue_enrich_company
+│                   ├── IPO signal → company_financial.is_public (if SpaceX exits)
+│                   ├── Funding_Round node + RAISED edge (this round only, for now)
+│                   └── resolve-investors-edges on THIS round:
+│                       ├── Co-angels on Series C → queue_enrich_person (tier 3)
+│                       ├── VC firms on Series C → queue_enrich_company (tier 2)
+│                       └── VC partners (institutional_investments_person)
+│                           → queue_enrich_person (tier 2)
+│
+│       └── When SpaceX processes via CRON → run-base-company-enrich-v3
+│           └── Phase 7: add-all-fundable-deals v2.0 (target-side + investor-side)
+│               └── cascade-deal-participants on EACH SpaceX round
+│                   ├── Series A (2005), Series B (2008), Series C, Series D, … [all rounds]
+│                   └── Each round:
+│                       ├── Funding_Round node + RAISED edge
+│                       ├── All co-investors on that round
+│                       │   (Sequoia, Valor, GV, Salesforce Ventures, Khosla, …)
+│                       └── All VC partners tied to those firms on that round
+│                           → queue_enrich_company / queue_enrich_person (depth 2)
+│
+└── Bloom-out complete when all CRON cycles finish
+    Net result: Single person seed → 1 company (depth 0) + portfolio + co-investors (depth 1)
+                → Every SpaceX round surfaced as its own Funding_Round node
+                → Every investor (firm + partner) on every round (depth 2)
+                → IPO/exit signal set on any portfolio co that went public
+                → Full transitive closure of company + investor graph
+```
+
+**Impact Analysis:**
+- **Depth 0 cost**: 1 person (all phases, PDL + EL + external APIs)
+- **Depth 1 cost**: Portfolio companies (tier 2) + co-angels (tier 3) + VC firms (tier 2) + VC partners (tier 2) surfaced directly by Phase 9's cascade helper — queued, process when CRON runs
+- **Depth 2 cost**: When each depth-1 portfolio co processes, `add-all-fundable-deals` v2.0 surfaces every round it raised + every investor on those rounds — ~5-10 investor companies and ~30-50 investor people per portfolio co, all queued at tier 2
+- **Total entities created**: ~40-60 companies + people from a single person seed
+- **API spend**: Only depth 0 person calls external APIs; all depth-1 and depth-2 entities use Fundable data only until their turn in the queue
+- **Idempotency**: Queue upsert semantics mean the same VC firm surfacing via a co-angel AND via a portfolio co gets one queue entry with `count` incremented and best-tier held

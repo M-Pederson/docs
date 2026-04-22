@@ -4,7 +4,7 @@ description: "Proposed cascade/depth/priority system for IMDB scraping — two q
 ---
 
 <Info>
-**Status: IN PROGRESS (2026-04-22).** Steps 1-5 of the 10-step execution plan are complete. Orchestrators, refactors, and crons pending. See [Execution Status](#execution-status) at the bottom of this page.
+**Status: IN PROGRESS (2026-04-22).** Steps 1-6 of the 10-step execution plan are complete. Orchestrators are live and wired into `get-add`. Refactors and crons pending. See [Execution Status](#execution-status) at the bottom of this page.
 </Info>
 
 ## Execution Status
@@ -16,7 +16,7 @@ description: "Proposed cascade/depth/priority system for IMDB scraping — two q
 | 3 | Queue upserts + get-add gates | ✅ | `mvp/queue/upsert-imdb-person` **#12871**, `mvp/queue/upsert-imdb-title` **#12872**, `mvp/imdb/get-add/imdb-person` **#12873**, `mvp/imdb/get-add/imdb-title` **#12874** |
 | 4 | Cascade helpers | ✅ | `mvp/imdb/cascade-credits-from-person` **#12875**, `cascade-crew-from-title` **#12876**, `cascade-awards-from-person` **#12877**, `cascade-awards-from-title` **#12878** |
 | 5 | `add-award-records-from-title` | ✅ | `mvp/imdb/add-award-records-from-title` **#12879** — scrapes `{imdb_url}/awards/`, LLM extracts to `awards_json`, writes `film_tv_award` rows, queues primary nominees at T2 |
-| 6 | Orchestrators (`run-base-imdb-person-enrich`, `run-base-imdb-title-enrich`) + wire sync-call into get-add | ⬜ | |
+| 6 | Orchestrators (`run-base-imdb-person-enrich`, `run-base-imdb-title-enrich`) + wire sync-call into get-add | ✅ | `mvp/imdb/run-base-imdb-person-enrich` **#12880**, `run-base-imdb-title-enrich` **#12881**; `get-add/imdb-person` **#12873** + `get-add/imdb-title` **#12874** bumped to v1.1 with sync-call branch |
 | 7 | Refactor `#10506`, `#10509`, `#10507`, `#12633` | ⬜ | |
 | 8 | Cron processors (`process-queue-imdb-person`, `process-queue-imdb-title`) | ⬜ | |
 | 9 | Sandbox test (re-seed Mark Neveldine) | ⬜ | |
@@ -29,7 +29,12 @@ description: "Proposed cascade/depth/priority system for IMDB scraping — two q
 - **`updateTableSchema` drops text `validators`:** the Xano MCP `updateTableSchema` tool silently strips `filters=trim` from text fields when replacing schema. After adding `enriched_at`/`cascade_depth`/`enrich_success` to `imdb_person` and `film_tv`, existing text columns lost their auto-trim. Low impact (inputs upstream are already trimmed), but flagging — never use `updateTableSchema` on a table with `filters=` unless you plan for validator loss. Restore via the Xano UI if needed.
 - **Queue upsert is the single source of truth:** `get-add/imdb-person` and `get-add/imdb-title` always route through `upsert-imdb-person`/`upsert-imdb-title`. No raw `db.add` into the queue tables anywhere.
 - **Kill switch is fail-open:** missing `kill_switch_imdb` env var → try_catch logs to `log_crash` and defaults to OFF. Matches `check-kill-switch-company` behavior.
-- **`cascade_depth` + `queue` param on get-add:** at depth 0 + `queue:false` the orchestrator will be sync-called once it exists (Step 6). Today all paths fall through to queue-upsert only.
+- **`cascade_depth` + `queue` param on get-add (v1.1, 2026-04-22):** when both `cascade_depth == 0` AND `queue == false` are passed, `get-add` invokes the orchestrator synchronously after the stub exists and returns `action: "enriched_direct"` — no queue entry is written. Any other combination (including `queue: null` / unset) still falls through to queue-upsert. Mirrors the `master-company` v3 behavior for a single depth-0 seed.
+- **Orchestrators (Step 6) are 7-phase with per-phase `try_catch` → `log_crash`:**
+  - `run-base-imdb-person-enrich` **#12880** — Phase 1 scrape + preprocess + LLM extract; Phase 2 save `json` / `markdown` / `name` / `image_url` onto `imdb_person`; Phase 3 create `master_person` + `master_link` + `birthday_join` (all dedup-guarded, idempotent on re-run); Phase 4 `avatar/replace-avatar` + `bios/add-person-biography` + `bios/create-llm-person-bios` + `node/add-person-node` + `node/update-person-node`, then stamp `node_uuid` + `master_person_id` back; Phase 5 `add-award-records-from-person`; Phase 6 `cascade-credits-from-person` + `cascade-awards-from-person`; Phase 7 stamp `enriched_at` / `enrich_success: true` / `cascade_depth`.
+  - `run-base-imdb-title-enrich` **#12881** — same shape without master_person creation: Phase 1 scrape/LLM; Phase 2 tagline + save `json` / `markdown` / `title` / `year` / `imdb_rating` / etc onto `film_tv`; Phase 3 `node/add-film-tv-node`; Phase 4 re-fetch `film_tv` to capture `node_uuid`; Phase 5 `add-award-records-from-title`; Phase 6 `cascade-crew-from-title` + `cascade-awards-from-title`; Phase 7 stamp `enriched_at` / `enrich_success` / `cascade_depth`.
+  - **Phase 1 guard:** if scrape+LLM fails or returns no `name` / `title`, stamp `enrich_success: false` and return early — no master_person gets created from a junk row, and the queue processor won't retry forever.
+  - Each phase emits one `log_crash` row with `qa_passed: true` (clean) or `qa_passed: false` + stack trace — matches the company/person `run-base-*-enrich` observability convention.
 - **Cascade helpers (Step 4) are pure dispatchers.** Each reads a source entity, applies tier rules via a lambda, and fans out `get-add/imdb-{person,title}` calls per tiered result. Key properties:
   - Every helper guards `cascade_depth + 1 >= 3` and short-returns with `action: "depth_exceeded"` — the hard cascade cap from the [Depth Model](#depth-model) lives in the cascade layer, not in `get-add`. This matters because `get-add` will eventually serve sync-call depth-0 seeds too.
   - Every `function.run` to `get-add` is wrapped in `try_catch` → `log_crash`, so one rotten credit / crew member does not abort the whole cascade.

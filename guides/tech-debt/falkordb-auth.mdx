@@ -1,0 +1,77 @@
+---
+title: "Graph Authentication"
+description: "What FalkorDB auth actually is, what breaks under multi-tenancy, and the choice in front of us"
+---
+
+## What FalkorDB auth actually is
+
+FalkorDB is built on Redis. Redis has a login list called **ACL (Access Control List)** — literally a list of allowed users with passwords and permissions. When you connect, you send a username + password, and the server checks that list.
+
+Today, only one user exists in our FalkorDB's ACL:
+
+- **username:** `orbiter`
+- **password:** `DzgGFacB7oln`
+- **can access:** everything — all graphs
+
+That's what `send-cypher` uses. One master user that can touch every graph.
+
+## What changes with multi-tenancy
+
+The plan is to connect as `username: workos_id`. So when Denis signs up, the connection would try:
+
+```text
+username: user_01KNXVK5HDRV0QJABSNS4AA64E
+password: DzgGFacB7oln
+```
+
+But that user doesn't exist in the ACL yet. We never told FalkorDB "here's a new user called `user_01KNXVK...`, here's their password, here's what they can access." So the server rejects the login:
+
+- **NOPERM** — "I have no user by that name, permission denied"
+- **WRONGPASS** — "I have that user but your password doesn't match"
+
+## What we'd need to do on the FalkorDB side
+
+For every new signup, run something like this against the FalkorDB server **before** calling `createUserGraph`:
+
+```text
+ACL SETUSER user_01KNXVK5HDRV0QJABSNS4AA64E on >DzgGFacB7oln ~user:user_01KNXVK5HDRV0QJABSNS4AA64E:* +@all
+```
+
+Breaking that down:
+
+| Clause | Meaning |
+| --- | --- |
+| `on` | enable the user |
+| `>DzgGFacB7oln` | set their password (same shared one) |
+| `~user:user_01KNXVK5...:*` | restrict their keyspace to only their own graph — this is the isolation magic, they literally cannot touch any other user's graph |
+| `+@all` | let them run all graph commands on their allowed keyspace |
+
+Once that ACL entry exists, `createUserGraph` works. Without it, every call fails at the login step.
+
+## Why bother with per-user ACL (vs. just using `orbiter` for everyone)?
+
+**Defense in depth.** If we use one shared `orbiter` connection for every user, a bug in our Xano code that puts the wrong graph key in a query (e.g. pulls `user:alice` data into Bob's response) will silently succeed — Redis has no reason to stop it. With per‑user ACL, Redis itself blocks cross‑tenant access at the connection layer. Our app would have to be really broken for user data to leak.
+
+Short version: it's a seatbelt. We can skip it and still have working multi‑tenancy, but we're trusting our own code to never slip up.
+
+## The choice in front of us
+
+Three options, pick one:
+
+<Steps>
+  <Step title="Keep the per-user ACL plan (strong isolation)">
+    Next step: write a second Xano function `graph/provision-user-acl` that runs `ACL SETUSER` on FalkorDB, and call it right before `createUserGraph` on signup.
+  </Step>
+  <Step title="Drop the per-user ACL (simpler)">
+    Revert `username: workosId` → `username: $var.falkorEnv.user_name`. We still get per‑user graphs (isolation by graph name), just not enforced by Redis. This is what most small multi‑tenant SaaS apps do.
+  </Step>
+  <Step title="Leave it as-is and deal with ACL provisioning manually while we're still testing">
+    `ACL SETUSER` one test user by hand (via redis‑cli or FalkorDB cloud console) to unblock the test run, then figure out the provisioning function later.
+  </Step>
+</Steps>
+
+## Discussion
+
+<Note>
+  Add notes / decision here once the team weighs in.
+</Note>

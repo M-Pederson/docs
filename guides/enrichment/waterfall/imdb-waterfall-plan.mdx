@@ -1,0 +1,315 @@
+---
+title: "IMDB Waterfall Plan"
+description: "Proposed cascade/depth/priority system for IMDB scraping — two queue tables, tiered fanout from person and title seeds, and loop prevention. Not yet implemented."
+---
+
+<Info>
+**Status: PLAN — not yet implemented (2026-04-22).** This page documents the design for applying the waterfall pattern (see [Core Concepts](/guides/enrichment/waterfall/core-concepts)) to IMDB scraping. Functions, tables, and behaviors described here are proposed. The current IMDB pipeline uses ad-hoc `!`-disabled cascade blocks in `add-title-imdb` / `create-master-person-from-imdb` to prevent runaway; this plan replaces that with a tier + depth-aware queue model.
+</Info>
+
+## Motivation
+
+A single IMDB person profile exposes **credits** (titles), each of which exposes more people (directors, writers, cast). Award pages expose **shared_with** people, each of whom exposes more credits. Without a bounded cascade, a single seed scrape of a prolific person or title can fan out to thousands of LLM-extracted scrapes over hours.
+
+The existing person + company waterfall solves this for LinkedIn/PDL/Enrich Layer. This plan applies the same pattern — **two queue tables, depth-capped cascade, priority-tiered processing, upsert dedup** — to IMDB.
+
+**Goal:**
+
+- From a seed **person**: enrich the person, pull ALL their awards, ALL related people on those awards, and their **primary credits** (director/writer roles and high-value producer credits).
+- From a seed **title**: enrich the title, pull ALL awards on it, ALL people on those awards, and its **key crew** (director, writer, cinematographer, lead producer) + top 3 cast.
+
+---
+
+## Current State & Loop Risk
+
+### Function graph today
+
+| # | Function | Role |
+|---|----------|------|
+| #10506 | `mvp/imdb/create-master-person-from-imdb` | Scrape person URL → create `imdb_person` + `master_person`. Tail-calls `add-award-records-from-person` + `add-imdb-credits` |
+| #10509 | `mvp/imdb/add-imdb-to-master-person` | Attach IMDB data to an existing `master_person`. Tail-loops credits → `add-title-imdb` |
+| #10507 | `mvp/imdb/add-title-imdb` | Scrape title → create `film_tv`. Has writer/director cascade (currently `!`-disabled in source) |
+| #10515 | `mvp/imdb/add-title-imdb-restricted` | Same scrape path, no cascade — used as cascade terminator |
+| #12633 | `mvp/imdb/add-award-records-from-person` | Scrape `imdb.com/name/nm.../awards/` → write `film_tv_award` rows, call full `add-title-imdb` per project |
+| #12632 | `mvp/imdb/add-imdb-credits` | Walks `imdb_person.json.credits[]`, calls full `add-title-imdb` per credit |
+
+### The loop
+
+```
+person seed (#10506)
+  ├─ add-award-records-from-person (#12633) → add-title-imdb (#10507) per award project
+  │                                            └─ writer/director cascade → create-master-person-from-imdb (#10506) → ♾️
+  └─ add-imdb-credits (#12632) → add-title-imdb (#10507) per credit
+                                   └─ writer/director cascade → #10506 → ♾️
+```
+
+**Current protection:** three `!`-prefix-disabled `foreach` blocks in `#10507` and `#10506`. Brittle — one accidental edit re-enables infinite recursion.
+
+**Observed in sandbox (Mark Neveldine, `imdb_person.id = 1`):** 13 credits scraped, `awards_json: []`. Stops cleanly because awards are empty and writer/director cascade is disabled.
+
+---
+
+## Depth Model
+
+Identical semantics to the existing waterfall, with a hard cap at depth 2.
+
+| Depth | Meaning | Behavior |
+|:-----:|---------|----------|
+| **0** | Seed (user-initiated) | Full scrape + LLM extract + awards + cascade fanout |
+| **1** | Direct discovery from a seed | Stub created via `get-add` (just `imdb_url` + name/title, no scrape). Queued. Cron processor scrapes + expands, but **only T1–T2 children are queued at depth 2** |
+| **2** | Transitive (from a depth-1 entity) | Stub queued. Cron processor scrapes + writes data, **no further cascade** |
+| **3+** | Never queued | Hard cap |
+
+<Check>
+**Why a hard cap at 2?** A prolific director (Neveldine: 7 director credits + 9 acting + 7 producer) at depth 0 becomes ~23 title stubs at depth 1. Each of those titles has a director + writer + DP + lead producer + 3 cast = ~7 people → ~160 people at depth 2. Capping cascade at depth 2 stops the explosion before depth 3 would reach ~1,000+.
+</Check>
+
+---
+
+## Priority Tiers
+
+### `queue_imdb_person` (1 = highest)
+
+| Tier | Rule | Example (seed = title "Gamer") |
+|:----:|------|-------------------------------|
+| **1** | Director OR Writer of seed title; award-winning/nominated person on seed | Mark Neveldine, Brian Taylor |
+| **2** | Cinematographer OR lead Producer of seed title; co-winner / co-nominee on seed's award (via `shared_with`) | Ekkehart Pollack (DP), lead producers |
+| **3** | Top 3 cast of seed title; other `shared_with` people | Gerard Butler, Michael C. Hall, Amber Valletta |
+| **4** | Everyone else mentioned | Minor cast, thanks, video-game voice actors |
+
+### `queue_imdb_title` (1 = highest)
+
+| Tier | Rule | Example (seed = person "Neveldine") |
+|:----:|------|------------------------------------|
+| **1** | Seed person was Director OR Writer on this title; award-winning/nominated title | Crank, Gamer, Ghost Rider, Crank: High Voltage, Jonah Hex, Pathology |
+| **2** | Seed person was lead Producer (not exec) AND (rating ≥ 7 OR year = current_year) | Kid Revolver (8.2 Short), Great Pretenders (8.9 Short), The Olympians (upcoming) |
+| **3** | Seed person was executive producer / cinematographer / minor role; OR rating ≥ 7 regardless of role | Officer Downe, Urge, Pathology (producer), Vatican Tapes (director) |
+| **4** | Video games / music videos / shorts without high rating | Jonah Hex (Video Game, tt38040358) |
+
+### Credit filter for person seed (Phase 5)
+
+```
+for each credit in imdb_person.json.credits:
+    if role ∈ {director, writer}:                  → T1
+    elif role = producer AND (rating ≥ 7 OR year = current_year):  → T2
+    elif role ∈ {executive producer, cinematographer, minor} OR rating ≥ 7:  → T3
+    elif type ∈ {Video Game, Music Video} OR (type = Short AND rating < 8):  → T4
+    else: skip
+    # T3 capped at top 20 by rating to prevent low-signal blowout
+```
+
+### Key crew filter for title seed (Phase 4)
+
+```
+from film_tv.json:
+    directors[]   → T1
+    writers[]     → T1
+    cinematographer (if present in json) → T2
+    lead producer (first producer in credits list) → T2
+    top 3 cast (from cast[] sorted by bill order) → T3
+```
+
+<Info>
+**"Top cast = top 3" is a starting point** — may tune upward (e.g., top 5 or top 10) once we see real fanout numbers. The tier assignment is what matters; the count is a knob.
+</Info>
+
+### Upsert on duplicate
+
+When the same `imdb_url` is discovered twice (e.g., an actor appears on two seed titles), the queue entry is upserted:
+
+- `count` is incremented
+- `priority_tier` is **upgraded** to the new (lower = better) value if applicable
+- No duplicate scrape is scheduled
+
+---
+
+## Queue Tables
+
+Two new tables, keyed on normalized `imdb_url` (not `imdb_person_id` / `film_tv_id`) because many discoveries happen before the underlying row exists. URL normalization: strip query params (`|split:"/?"|first`) and trailing slash (`|rtrim:"/"`), matching the existing convention in `#10506` / `#10507`.
+
+### `queue_imdb_person`
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | int | PK |
+| `created_at` | timestamp | |
+| `imdb_url` | text (unique) | Normalized canonical URL |
+| `name` | text | Provisional name from discovery context (nullable) |
+| `imdb_person_id` | int nullable | Populated once the stub row exists |
+| `processing` | bool | Lock flag — cron sets `true` on pickup |
+| `count` | int default 1 | Incremented on duplicate discovery |
+| `cascade_depth` | int | Hops from seed (1 or 2) |
+| `priority_tier` | int 1–4 default 4 | Tier rule above |
+| `source_function` | text | e.g. `cascade-crew-from-title`, `cascade-awards-shared-with` |
+| `source_entity_id` | int | ID of the spawning entity (imdb_person.id or film_tv.id) |
+| `source_entity_type` | text | `imdb_person` or `film_tv` |
+| `seed_imdb_person_id` | int nullable | Root of this cascade (for lineage / debugging) |
+| `seed_film_tv_id` | int nullable | Root of this cascade (for lineage / debugging) |
+
+### `queue_imdb_title`
+
+Identical shape with `imdb_url`, `title` (instead of `name`), `film_tv_id` (instead of `imdb_person_id`).
+
+### Schema additions to existing tables
+
+On **`imdb_person`** and **`film_tv`**:
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `enriched_at` | timestamp nullable | Last full scrape. Used to skip re-scrape within 30 days |
+| `cascade_depth` | int nullable | Depth at which this entity was first enriched |
+| `enrich_success` | bool default false | Flipped true on successful orchestrator completion |
+
+---
+
+## Seed Flows
+
+### Seed person flow (depth 0)
+
+<Steps>
+  <Step title="Kill switch (P1)">
+    `check-kill-switch-imdb`. If active, return existing `imdb_person` if found; otherwise log to `kill_switch_blocked_imdb` and return empty.
+  </Step>
+  <Step title="Dedup check + scrape (P2)">
+    Lookup `imdb_person` by normalized `imdb_url`. If `enriched_at` within last 30 days → return existing. Otherwise scrape via Firecrawl, run LLM extractor (existing `#10506` logic), write `imdb_person` row.
+  </Step>
+  <Step title="Awards scrape (P3)">
+    Existing `add-award-records-from-person` logic: scrape `{imdb_url}/awards/`, LLM extract, write `film_tv_award` rows.
+  </Step>
+  <Step title="Cascade — awards fanout (P4)">
+    For each `film_tv_award`:
+    - Queue the award's project title → `get-add/imdb-title` at depth 1, T1, `source_function: cascade-awards-from-person`
+    - For each name in `shared_with[]` → queue as person at depth 1, T2, `source_function: cascade-awards-shared-with` (no `imdb_url` — name-only, must be resolved at processing time via IMDB search)
+  </Step>
+  <Step title="Cascade — credits fanout (P5)">
+    Walk `imdb_person.json.credits[]`. Apply the credit filter rules above to assign tier. For each kept credit, call `get-add/imdb-title` at depth 1 with computed tier, `source_function: cascade-credits-from-person`, `source_entity_id: imdb_person.id`.
+  </Step>
+  <Step title="Person enrichment side-effects (P6)">
+    Existing logic: `master_person` creation or update, bio, avatar, roles, birthday_join, person node, `update-person-node`. Unchanged.
+  </Step>
+  <Step title="Mark success (P7)">
+    `enriched_at = now`, `enrich_success = true`, `cascade_depth = 0`.
+  </Step>
+</Steps>
+
+### Seed title flow (depth 0)
+
+<Steps>
+  <Step title="Kill switch (P1)">
+    Same as person flow.
+  </Step>
+  <Step title="Dedup check + scrape (P2)">
+    Lookup `film_tv` by normalized `imdb_url`. If `enriched_at` within 30 days → return existing. Otherwise scrape + LLM extract (existing `#10507` logic). Writes `film_tv` row.
+  </Step>
+  <Step title="Awards scrape (P3)">
+    **New function:** `add-award-records-from-title` — reuses the `#12633` pattern but scrapes `{title_imdb_url}/awards/`. Writes `film_tv_award` rows linked to `film_tv_id` (and no `imdb_person_id`).
+  </Step>
+  <Step title="Cascade — key crew (P4)">
+    Walk `film_tv.json` / `film_tv.directors` / `film_tv.writers` / `film_tv.json.cast[]`:
+    - Directors → T1
+    - Writers → T1
+    - Cinematographer → T2
+    - Lead producer (first in producer list) → T2
+    - Top 3 cast → T3
+    Each queued via `get-add/imdb-person` at depth 1, `source_function: cascade-crew-from-title`.
+  </Step>
+  <Step title="Cascade — award shared_with (P5)">
+    For each `film_tv_award` row with a `shared_with[]` list, queue those names as persons at depth 1, T2, `source_function: cascade-awards-shared-with`.
+  </Step>
+  <Step title="Title node update (P6)">
+    Existing `add-film-tv-node` logic. Unchanged.
+  </Step>
+  <Step title="Mark success (P7)">
+    `enriched_at = now`, `enrich_success = true`, `cascade_depth = 0`.
+  </Step>
+</Steps>
+
+### Depth-1 queued processing
+
+When the cron picks up a queue entry (either table), it sets `processing: true` and calls the same `run-base-imdb-person-enrich` / `run-base-imdb-title-enrich` orchestrator with `cascade_depth: 1`. The orchestrator runs all phases **but the cascade helpers (P4/P5) only queue T1–T2 discoveries at depth 2**.
+
+### Depth-2 queued processing
+
+Cron picks up, sets `processing: true`, runs orchestrator with `cascade_depth: 2`. **Cascade helpers are skipped entirely.** Entity gets scraped, data written, awards captured — but no children are queued.
+
+---
+
+## Loop Prevention (Five Layers)
+
+1. **Dedup gate in `get-add`:** `imdb_url` already in `imdb_person` / `film_tv` with `enriched_at` within 30 days → return existing, no scrape. Matches the multi-layer dedup in company/person waterfall.
+2. **Queue upsert:** duplicate `imdb_url` in queue → `count++`, tier upgrade. Single row per URL.
+3. **Depth cap:** depth 2 scrape happens but no cascade. Depth 3 never queued.
+4. **Tier cap at depth ≥ 1:** only T1–T2 discoveries are queued at depth 2 (T3–T4 discarded).
+5. **Kill switch:** zero-API blocker flippable manually via `check-kill-switch-imdb`.
+
+---
+
+## New Orchestrator Functions
+
+| Function | Role |
+|----------|------|
+| `mvp/imdb/get-add/imdb-person` | Dedup-aware entry point. At depth 0 + `queue:false` → fires `run-base-imdb-person-enrich`. Else creates stub + upserts queue row. |
+| `mvp/imdb/get-add/imdb-title` | Same for titles. |
+| `mvp/imdb/run-base-imdb-person-enrich` | 7-phase orchestrator (see Seed person flow above). Per-phase `try_catch` with `log_crash`. |
+| `mvp/imdb/run-base-imdb-title-enrich` | 7-phase orchestrator (see Seed title flow above). Per-phase `try_catch`. |
+| `mvp/imdb/cascade-credits-from-person` | Walks `imdb_person.json.credits[]`, applies tier rules, calls `get-add/imdb-title`. |
+| `mvp/imdb/cascade-crew-from-title` | Walks `film_tv` crew + cast, applies tier rules, calls `get-add/imdb-person`. |
+| `mvp/imdb/cascade-awards-from-person` | Walks `film_tv_award` rows for a person → queues award project titles (T1) and `shared_with` people (T2). |
+| `mvp/imdb/cascade-awards-from-title` | Walks `film_tv_award` rows for a title → queues `shared_with` people (T2). |
+| `mvp/imdb/add-award-records-from-title` | NEW — reuses `#12633` pattern for title awards URL. |
+| `mvp/imdb/process-queue-imdb-person` | Cron handler. Picks queue entries tier-ordered, sets `processing: true`, calls `run-base-imdb-person-enrich` with queued `cascade_depth`. |
+| `mvp/imdb/process-queue-imdb-title` | Cron handler for titles. |
+| `mvp/stop/check-kill-switch-imdb` | Pre-scrape guard. |
+
+---
+
+## Refactors to Existing Functions
+
+| # | Change |
+|---|--------|
+| #10506 `create-master-person-from-imdb` | Scrape + LLM extract logic becomes **Phase 2** of `run-base-imdb-person-enrich`. Trailing `add-award-records-from-person` + `add-imdb-credits` calls removed — cascade is now P4/P5. |
+| #10509 `add-imdb-to-master-person` | Inline credits loop removed. Becomes a thin wrapper that creates/links `imdb_person` then delegates to `run-base-imdb-person-enrich`. |
+| #10507 `add-title-imdb` | Scrape + LLM extract becomes **Phase 2** of `run-base-imdb-title-enrich`. Writer/director cascade (already `!`-disabled) **removed entirely** — replaced by `cascade-crew-from-title` in P4. |
+| #10515 `add-title-imdb-restricted` | **DEPRECATED.** The "no cascade" behavior is now encoded in the depth-2 processing rule. Safe to delete once no callers remain. |
+| #12633 `add-award-records-from-person` | Keeps scrape + LLM extract + `film_tv_award` writes. Final loop calling full `add-title-imdb` is **replaced** with `get-add/imdb-title` at depth+1 T1 (queue-only at depth ≥ 1). |
+| #12632 `add-imdb-credits` | Replaced entirely by `cascade-credits-from-person`. Safe to delete once the orchestrator is live. |
+
+---
+
+## Locked Decisions (2026-04-22)
+
+| # | Decision | Choice |
+|---|----------|--------|
+| 1 | Credit filter for person seed | Role-based with top-20-by-rating cap for T3 |
+| 2 | Key crew for title seed | Director (T1), Writer (T1), Cinematographer (T2), Lead Producer (T2), top 3 cast (T3). May tune upward later. |
+| 3 | Re-enrichment window | 30 days from `enriched_at` |
+| 4 | TV scope | Series only — no individual episodes |
+| 5 | Video games / music videos | Allowed at T4 |
+| 6 | Title awards function | Reuse `#12633` pattern as `add-award-records-from-title`. Open to optimize later. |
+| 7 | Queue keying | `imdb_url` (normalized: split on `/?`, take first, rtrim `/`) |
+
+---
+
+## Open / Deferred
+
+- **Acting-heavy seeds** — if a user seeds an actor (not a director/writer), primary credits are their highest-billed cast roles, not writer/director slots. The P5 credit filter above doesn't handle this cleanly. May need a `seed_profession` input to `run-base-imdb-person-enrich` that changes the tier rules.
+- **Name-only `shared_with` queue entries** — award `shared_with[]` gives names without `imdb_url`. The queue processor must resolve name → IMDB URL via search before scraping. Parking this; may end up skipping name-only entries.
+- **Cinematographer cascade** — DPs often have 50+ credits. At depth 1 a DP seed would cascade their full filmography at T2–T3. May need a profession-aware reduction.
+- **Kill switch table** — use existing `kill_switch_blocked_people` pattern or add `kill_switch_blocked_imdb`? TBD.
+
+---
+
+## Execution Plan
+
+Once the decisions above are approved:
+
+1. Create `queue_imdb_person` + `queue_imdb_title` tables. Add `enriched_at` / `cascade_depth` / `enrich_success` to `imdb_person` + `film_tv`.
+2. Build `check-kill-switch-imdb`.
+3. Build `get-add/imdb-person` + `get-add/imdb-title` with dedup gates.
+4. Build cascade helpers (`cascade-credits-from-person`, `cascade-crew-from-title`, `cascade-awards-from-person`, `cascade-awards-from-title`).
+5. Build `add-award-records-from-title`.
+6. Build the two orchestrators (`run-base-imdb-person-enrich`, `run-base-imdb-title-enrich`).
+7. Refactor `#10506`, `#10509`, `#10507`, `#12633` to call the new orchestrators.
+8. Build cron processors (`process-queue-imdb-person`, `process-queue-imdb-title`).
+9. Sandbox test: re-run Neveldine seed, verify depth-1 titles queued correctly, depth-2 no cascade, no infinite loops.
+10. Delete `#10515` and `#12632` after confirming no callers remain.

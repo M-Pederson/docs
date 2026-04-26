@@ -756,6 +756,235 @@ Less precise (an investor weak on founder_fit but stellar on the other 5 won't m
 - **VACUUM / ANALYZE** after the bulk import — pgvector statistics matter.
 - **Ivfflat alternative:** if dataset is mostly static and you need lower memory, `ivfflat` with `lists = sqrt(n)` is cheaper. HNSW recommended for this read-heavy workload.
 
+### Notes for Go engineers new to AlloyDB
+
+These notes cover the AlloyDB-specific things that aren't obvious if you've worked Postgres before but not AlloyDB. Skipping general Postgres/Go basics — focusing on what'll bite you in week one.
+
+#### Connecting from Go: use the AlloyDB connector + pgx
+
+Don't open a raw TCP connection or use the AlloyDB Auth Proxy as a sidecar process — both work but neither is the recommended Go path. Use the **Go-native connector** which handles IAM auth + automatic mTLS in-process:
+
+```bash
+go get cloud.google.com/go/alloydbconn
+go get github.com/jackc/pgx/v5
+go get github.com/jackc/pgx/v5/pgxpool
+go get github.com/pgvector/pgvector-go
+```
+
+```go
+package alloy
+
+import (
+    "context"
+    "fmt"
+
+    "cloud.google.com/go/alloydbconn"
+    "github.com/jackc/pgx/v5"
+    "github.com/jackc/pgx/v5/pgxpool"
+    "github.com/jackc/pgx/v5/stdlib"
+    pgvector "github.com/pgvector/pgvector-go"
+    pgxv5 "github.com/pgvector/pgvector-go/pgx"
+)
+
+func NewPool(ctx context.Context, instanceURI string) (*pgxpool.Pool, error) {
+    // instanceURI is the AlloyDB instance resource name:
+    //   projects/PROJECT/locations/REGION/clusters/CLUSTER/instances/INSTANCE
+    // Use the read-pool instance for scoring queries; use the primary for writes.
+
+    d, err := alloydbconn.NewDialer(ctx,
+        alloydbconn.WithIAMAuthN(), // service-account auth — no passwords
+    )
+    if err != nil {
+        return nil, fmt.Errorf("alloydb dialer: %w", err)
+    }
+
+    cfg, err := pgxpool.ParseConfig(
+        // user is the service-account email (without .gserviceaccount.com suffix
+        // when iam_authentication is configured in the cluster)
+        "user=thesis-engine@PROJECT.iam dbname=orbiter sslmode=disable",
+    )
+    if err != nil {
+        return nil, fmt.Errorf("parse config: %w", err)
+    }
+
+    // Hook the AlloyDB dialer into pgx
+    cfg.ConnConfig.DialFunc = func(ctx context.Context, _ string, _ string) (net.Conn, error) {
+        return d.Dial(ctx, instanceURI)
+    }
+
+    // Register pgvector type codec on every new connection
+    cfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+        return pgxv5.RegisterTypes(ctx, conn)
+    }
+
+    pool, err := pgxpool.NewWithConfig(ctx, cfg)
+    if err != nil {
+        return nil, fmt.Errorf("pool: %w", err)
+    }
+    return pool, nil
+}
+```
+
+Three points worth reading twice:
+
+1. **`WithIAMAuthN()` means no passwords.** The connector mints a short-lived OAuth token and uses it. Rotate by rotating the service-account key (which you shouldn't have anyway — use Workload Identity in Cloud Run). DBs see the SA email as the connecting user.
+2. **`AfterConnect` registers the vector codec on every new pool conn.** Without it, `vector(1536)` columns scan as raw bytes and you'll spend an afternoon wondering why `Scan(&v)` returns garbage.
+3. **Two pools, not one.** The primary instance handles writes; reads (the scoring queries) hit the read pool. Read pool replication is async with ~50-100ms typical lag — fine for scoring (the thesis row was written minutes/hours ago) but **not fine** for read-after-write (don't use the read pool to verify a `build-thesis` insert; hit primary).
+
+#### Calling `match_investors_for_pitch` from Go
+
+```go
+package score
+
+import (
+    "context"
+    "encoding/json"
+
+    "github.com/jackc/pgx/v5/pgxpool"
+    pgvector "github.com/pgvector/pgvector-go"
+)
+
+type Match struct {
+    ID                    string    `json:"id"`
+    NodeUUID              string    `json:"node_uuid"`
+    MasterCompanyID       *int      `json:"master_company_id"` // pointer = nullable
+    MasterPersonID        *int      `json:"master_person_id"`
+    FirmName              string    `json:"firm_name"`
+    InvestorType          string    `json:"investor_type"`
+    FounderFitScore       float64   `json:"founder_fit_score"`
+    ProblemMarketScore    float64   `json:"problem_market_score"`
+    CompetitiveMoatScore  float64   `json:"competitive_moat_score"`
+    TractionMomentumScore float64   `json:"traction_momentum_score"`
+    BusinessModelScore    float64   `json:"business_model_score"`
+    ExpansionRoadmapScore float64   `json:"expansion_roadmap_score"`
+    CompositeScore        float64   `json:"composite_score"`
+}
+
+func ScorePitch(
+    ctx context.Context, readPool *pgxpool.Pool,
+    pitch [6][]float32, // 6 narratives, each 1536-dim
+    topN int,
+    stageFilter, geoFilter []string, // nil = no filter
+) ([]Match, error) {
+    rows, err := readPool.Query(ctx, `
+        SELECT * FROM match_investors_for_pitch(
+            $1, $2, $3, $4, $5, $6,
+            $7,
+            CASE WHEN $8::text[] IS NULL THEN NULL
+                 ELSE to_jsonb($8::text[]) END,
+            CASE WHEN $9::text[] IS NULL THEN NULL
+                 ELSE to_jsonb($9::text[]) END
+        )`,
+        pgvector.NewVector(pitch[0]),
+        pgvector.NewVector(pitch[1]),
+        pgvector.NewVector(pitch[2]),
+        pgvector.NewVector(pitch[3]),
+        pgvector.NewVector(pitch[4]),
+        pgvector.NewVector(pitch[5]),
+        topN,
+        stageFilter,
+        geoFilter,
+    )
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+
+    var out []Match
+    for rows.Next() {
+        var m Match
+        if err := rows.Scan(
+            &m.ID, &m.NodeUUID,
+            &m.MasterCompanyID, &m.MasterPersonID,
+            &m.FirmName, &m.InvestorType,
+            &m.FounderFitScore, &m.ProblemMarketScore,
+            &m.CompetitiveMoatScore, &m.TractionMomentumScore,
+            &m.BusinessModelScore, &m.ExpansionRoadmapScore,
+            &m.CompositeScore,
+        ); err != nil {
+            return nil, err
+        }
+        out = append(out, m)
+    }
+    return out, rows.Err()
+}
+```
+
+`pgvector.NewVector([]float32{...})` is the right way to send a `vector(N)` parameter — it uses the binary protocol, which is ~10× faster than serializing as a string `"[0.1,0.2,...]"`. The `lib/pq` driver doesn't have a vector codec at all; if you tried to make this work with `database/sql + lib/pq` you'd be hand-rolling string serialization and losing all type safety.
+
+The `*int` for the two ID fields handles the XOR identity branch — exactly one is non-null per the AlloyDB CHECK constraint.
+
+#### Vector storage: budget the bytes
+
+`vector(1536)` is **6,148 bytes** binary-encoded (1536 × 4 bytes float32 + 4-byte header). Per row:
+
+| Component | Size |
+|---|---|
+| 12 vectors (6 declared + 6 derived) | ~74 KB |
+| Narratives (12 × ~1 KB text) | ~12 KB |
+| JSONB payloads (sectors, geo, partners) | ~8 KB |
+| Other Layer 1 columns | ~1 KB |
+| **Total per row** | **~95 KB** |
+
+At 1M investors that's ~95 GB. Reasonable, but plan storage class (regional persistent SSD on AlloyDB by default) and your backup costs accordingly.
+
+If you go past 1M and storage becomes a constraint, **`halfvec(1536)`** in pgvector ≥0.7 stores 16-bit half-precision floats — half the bytes, ~5% recall loss in benchmarks. AlloyDB ships with pgvector ≥0.7, so it's available without an extension upgrade.
+
+#### Read pool vs primary — concrete rules
+
+| Operation | Target | Why |
+|---|---|---|
+| `match_investors_for_pitch` (scoring) | Read pool | Read-heavy, parallelizable, tolerates stale reads |
+| `INSERT/UPDATE investment_theses` (build) | Primary | Writes only go to primary |
+| Verify a row was written ("did the build succeed?") | Primary | Read pool can lag 50-100ms |
+| Bulk export from Xano | Primary | Writes |
+| Health check / metrics | Either | But prefer read pool to spare primary |
+
+Use **two `pgxpool.Pool` instances** in your service — one for primary, one for read pool. Don't try to dynamically route inside one pool; pgx isn't built for that.
+
+#### IAM auth: no passwords, ever
+
+Set up:
+
+```bash
+# 1. Enable IAM auth on the cluster (one-time)
+gcloud alloydb clusters update orbiter-prod \
+    --region=us-central1 \
+    --database-flags=alloydb.iam_authentication=on
+
+# 2. Grant the SA the alloydb.client role
+gcloud projects add-iam-policy-binding PROJECT \
+    --member=serviceAccount:thesis-engine@PROJECT.iam.gserviceaccount.com \
+    --role=roles/alloydb.client
+
+# 3. Create the DB role (in psql) — note the trailing @ to identify as IAM
+psql ... -c "CREATE USER \"thesis-engine@PROJECT.iam\";"
+psql ... -c "GRANT ALL ON SCHEMA public TO \"thesis-engine@PROJECT.iam\";"
+psql ... -c "GRANT SELECT, INSERT, UPDATE ON investment_theses TO \"thesis-engine@PROJECT.iam\";"
+psql ... -c "GRANT EXECUTE ON FUNCTION match_investors_for_pitch TO \"thesis-engine@PROJECT.iam\";"
+```
+
+In Cloud Run, attach the SA via Workload Identity. The connector handles the rest — no env var with credentials, no secret manager.
+
+#### Common gotchas
+
+1. **Don't use `lib/pq` or `database/sql`-only patterns.** No native vector type, no JSONB binary protocol, slower everything. pgx/v5 is the only sensible choice for AlloyDB + pgvector.
+2. **Always filter `WHERE vector IS NOT NULL` in CTEs.** HNSW silently skips null rows but your composite-score arithmetic will produce `NaN` and the row will rank weirdly. Belt-and-suspenders: have the build pipeline only mark `last_validated_date` once all 12 vectors are non-null.
+3. **`CREATE INDEX CONCURRENTLY` for HNSW on big tables.** Building the index acquires a write-blocking lock by default; concurrent build is slower but doesn't lock writers. For 1M+ rows, plan for hours.
+4. **`SET LOCAL hnsw.ef_search` inside the function**, not as a global. Default 40 gives ~95% recall@10; bump to 100 for ~99% at +30% latency. Tune per-query, not cluster-wide.
+5. **`EXPLAIN` without `ANALYZE` doesn't show HNSW behavior.** The planner cost estimates for vector ops are rough; only `EXPLAIN ANALYZE` shows actual index hits and timing.
+6. **TOAST kicks in for `vector(1536)`.** Each vector is well over the 2KB inline threshold, so it's stored out-of-line. This is fine, but `EXPLAIN (ANALYZE, BUFFERS)` will show TOAST reads — they're real I/O. If you're seeing more TOAST reads than expected, you may have a query that's loading vectors it doesn't need (e.g. `SELECT *` when you only want scores).
+7. **Connection budget.** Primary supports ~5000 concurrent connections, but you don't want anywhere near that. Set `pgxpool` `MaxConns` to `(num_cpu_cores × 2) + 1` per service instance — typically 10-30. Cloud Run instances autoscale; budget total connections accordingly.
+8. **`pgxpool.Reset()` after schema changes.** If you `ALTER TABLE` a vector column or rebuild a type codec, the pool's prepared-statement cache is stale. Easy to forget in deploy scripts.
+9. **The Database Center UI** (Cloud Console → AlloyDB → Database Center) has Query Insights, slow query log, and recall/latency dashboards out of the box. Use it before reaching for pgBadger or third-party APMs.
+
+#### Useful Postgres / pgvector references
+
+- pgvector operators: `<=>` cosine distance, `<->` L2, `<#>` negative inner product. Cosine is what we use; never mix in the same query.
+- Cosine *similarity* = `1 - (a <=> b)`. The `<=>` operator returns *distance*, so `ORDER BY ... <=> q ASC` gets the most similar first.
+- `EXPLAIN (ANALYZE, BUFFERS, VERBOSE)` is the right invocation for vector queries — `BUFFERS` shows TOAST hits, `VERBOSE` shows parallel-worker counts.
+- AlloyDB's columnar engine auto-promotes hot analytical SELECTs into a column store transparently — but it doesn't help vector ORDER BY. Don't bank on it for scoring queries.
+
 ### Migration sequencing
 
 | Phase | Action | Cutover criterion |

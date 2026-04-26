@@ -5,6 +5,20 @@ description: "Migration plan for the investor-matching engine — pgvector schem
 
 This page is the **engineering build plan** for migrating the investment-thesis pipeline from Xano-only to GCP AlloyDB with a Cloud Run compute layer. It is self-contained for engineers focused on the AlloyDB work; conceptual schema lives in [Investment thesis schema](/guides/open-work/suggestion-core-concepts/find-investors/thesis-schema), and the current Xano-only path is documented in [Xano production pipeline](/guides/open-work/suggestion-core-concepts/find-investors/xano-pipeline).
 
+<div style={{padding: '20px', border: '2px solid #6B9FE8', borderRadius: '8px', color: '#fff', margin: '16px 0'}}>
+
+**Summary of Next Build Steps**
+
+1. **Create the `investment_thesis` table in AlloyDB.** Schema parity with Xano table 709 plus `vector(1536)` columns and HNSW indexes. Full DDL is in [Step 1 — Clone the table in AlloyDB](#step-1-clone-the-table-in-alloydb).
+
+2. **Clone Xano function `thesis/build-investment-thesis-v21` (#12916).** Copy-paste the existing v21 source into a new XanoScript function (e.g. `thesis/build-investment-thesis-alloydb`) so the original keeps running while the new one is rewired. The full v21 source is in [Cloning v21 — copy-paste source](#cloning-v21-copy-paste-source).
+
+3. **Refactor the clone into a thin context-handoff.** Strip the LLM calls, embedding calls, and `db.add_or_edit` from the cloned function. Keep only the `function.run "thesis/gather-investor-context-v3"` step and a single `api.request` that POSTs the gathered context to a Cloud Run endpoint. Cloud Run does the LLM orchestration, embedding, and AlloyDB write. Pattern is in [Step 2 — Refactor build pipeline](#step-2-refactor-build-pipeline-xano-cloud-run-alloydb).
+
+4. **Add a 30-day skip guard.** Before running gather, query AlloyDB for an existing `investment_thesis` row for the same `master_person_id` or `master_company_id`. If `last_validated_date >= now() - interval '30 days'`, return the existing row and skip the rebuild — saves ~$0.005 + 30-90s per cached hit. Pattern is in [Skip guard — 30-day freshness check](#skip-guard-30-day-freshness-check).
+
+</div>
+
 The Xano-only pipeline is the v1 dev/prototype path. Production matching runs on **GCP AlloyDB** with native pgvector, parallel SQL scoring, and an external compute layer (Cloud Run) for LLM orchestration. This section documents the migration design and the scoring engine that Xano calls into.
 
 ### Why move to AlloyDB
@@ -186,6 +200,192 @@ ON CONFLICT (xano_id) DO UPDATE SET
 
 The Xano orchestrator becomes a **thin wrapper** that gathers context and POSTs to Cloud Run. All LLM and DB writes happen downstream.
 
+#### Cloning v21 — copy-paste source
+
+Before refactoring, clone Xano function `thesis/build-investment-thesis-v21` (id `12916`) into a new function — keep the original running while the new one is rewired to AlloyDB. Recommended new name: `thesis/build-investment-thesis-alloydb`.
+
+The full XanoScript source for v21 is below. Copy it into the new function's body, then strip the LLM/embedding/`db.add_or_edit` blocks per the refactor pattern in the next subsection.
+
+<Accordion title="thesis/build-investment-thesis-v21 — full XanoScript source (copy/paste)">
+
+```xanoscript
+// thesis/build-investment-thesis-v21 (2026-04-26)
+// v21 changes from v20:
+// - (a) $deal_stats personnel handling: split comma-separated names within array elements
+//   (gather-v3 returns postgres-array literals like {Julie Yoo,Daisy Wolf} as single-string
+//   array elements; v20 produced compound key "Julie Yoo,Daisy Wolf": 1 — now splits into
+//   ["Julie Yoo", "Daisy Wolf"] and credits each partner individually)
+// - (b) geographic_distribution ISO normalization: prompt strengthened to demand
+//   ISO 3166-1 alpha-2 codes; new $normalized_geo lambda maps any names that slip
+//   through ("United States" -> "US", "UK" -> "GB", "Mexico" -> "MX", etc.) and merges
+//   duplicate keys; db write uses $normalized_geo instead of raw $derived_json|get
+function "thesis/build-investment-thesis-v21" {
+  input {
+    int master_person_id?
+    int master_company_id?
+  }
+
+  stack {
+    precondition ($input.master_person_id != null || $input.master_company_id != null) {
+      error_type = "inputerror"
+      error = "Either master_person_id or master_company_id must be provided"
+    }
+
+    function.run "thesis/gather-investor-context-v3" {
+      input = {
+        master_person_id : $input.master_person_id
+        master_company_id: $input.master_company_id
+        max_deals        : 100
+        recency_months   : 36
+      }
+    } as $context
+
+    var $declared_system_prompt {
+      value = "You are an investment thesis extraction engine. Your response MUST be ONLY a valid JSON object — no prose, no markdown, no code fences. CRITICAL: All numeric values MUST use Arabic numerals (0,1,2,3,4,5,6,7,8,9) — NEVER use Roman numerals (I, II, III, IV, V). Every key must be immediately followed by ':' and a value — never write ':,' (stray comma after colon). No trailing commas before '}' or ']'. The JSON object must have these exact keys: firm_name (string), investor_type (one of: vc_fund, angel, family_office, corporate_vc, syndicate, other), industries (array of strings), stage_focus (array), geography (array), check_size_min (number or null), check_size_max (number or null), check_size_sweet_spot (number or null), founder_fit (2-3 sentence narrative as a STRING), problem_market (narrative STRING), competitive_moat (narrative STRING), traction_momentum (narrative STRING), business_model (narrative STRING), expansion_roadmap (narrative STRING), declared_summary (1-2 sentences as a STRING). All narrative fields MUST be plain strings. Begin your response with { and end with }."
+    }
+
+    api.lambda {
+      code = """
+          const ctx = $var.context || {};
+          const ec = ctx.entity_context || {};
+          const fo = ec.fundable_org || {};
+          const trimmed = {
+            entity_name: ec.entity_name || null,
+            tagline: ec.tagline || null,
+            about: ec.about || null,
+            linkedin_url: ec.linkedin_url || null,
+            domain: ec.domain || null,
+            founded: ec.founded || null,
+            is_vc: ec.is_vc || null,
+            region: fo.region || null,
+            country_code: fo.country_code || null,
+            crunchbase_description: fo.crunchbase_full_description || null,
+            crunchbase_about: fo.crunchbase_about || null,
+            long_description: fo.long_description || null,
+            num_employees: fo.num_employees || null,
+            num_funding_rounds: fo.num_funding_rounds || null,
+            num_investors: fo.num_investors || null,
+            total_raised: fo.total_raised || null,
+            investment_stage: fo.investment_stage || null
+          };
+          if (ec.cb_json && typeof ec.cb_json === 'object' && Object.keys(ec.cb_json).length > 0) {
+            trimmed.cb_json_summary = JSON.stringify(ec.cb_json).substring(0, 5000);
+          }
+          if (ec.signal_json && typeof ec.signal_json === 'object' && Object.keys(ec.signal_json).length > 0) {
+            trimmed.signal_json_summary = JSON.stringify(ec.signal_json).substring(0, 5000);
+          }
+          const payload = {
+            entity_type: ctx.entity_type,
+            entity_context: trimmed,
+            deal_count: ctx.stats ? ctx.stats.deals_returned : 0
+          };
+          return 'Investor context to analyze (JSON below):\n\n' + JSON.stringify(payload);
+        """
+      timeout = 5
+    } as $declared_user_text
+
+    api.request {
+      url = "https://openrouter.ai/api/v1/chat/completions"
+      method = "POST"
+      params = {}
+        |set:"model":"deepseek/deepseek-v3.2"
+        |set:"messages":([]
+          |push:({}|set:"role":"system"|set:"content":$declared_system_prompt)
+          |push:({}|set:"role":"user"  |set:"content":$declared_user_text)
+        )
+        |set:"max_tokens":4000
+        |set:"temperature":0.3
+      headers = []
+        |push:"Content-Type: application/json"
+        |push:("Authorization: Bearer KEY"|replace:"KEY":$env.openRouter)
+      timeout = 120
+    } as $declared_response
+
+    api.lambda {
+      code = """
+          const r = $var.declared_response;
+          const stripFences = function(s) {
+            if (typeof s !== 'string') return s;
+            s = s.trim();
+            if (s.indexOf('```') === 0) {
+              s = s.replace(/^```(?:json|JSON)?\s*\n?/, '');
+              s = s.replace(/\n?```\s*$/, '');
+              s = s.trim();
+            }
+            return s;
+          };
+          const sanitizeRoman = function(s) {
+            return s.replace(/(:\s*)(M{0,3}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3}))(\s*[,\n}\]])/g, function(_, pre, roman, _g1, _g2, _g3, post) {
+              if (!roman) return _;
+              const map = { I:1, V:5, X:10, L:50, C:100, D:500, M:1000 };
+              let n = 0;
+              for (let i = 0; i < roman.length; i++) {
+                const cur = map[roman[i]];
+                const next = map[roman[i+1]] || 0;
+                n += cur < next ? -cur : cur;
+              }
+              return pre + String(n) + post;
+            });
+          };
+          const repairJson = function(s) {
+            s = s.replace(/:(\s*),(\s*)(?=["\d{\[tfn-])/g, ':$1$2');
+            s = s.replace(/,(\s*[}\]])/g, '$1');
+            return s;
+          };
+          const ensureString = function(v) {
+            if (v === null || v === undefined) return null;
+            if (typeof v === 'string') return v;
+            try { return JSON.stringify(v); } catch (e) { return String(v); }
+          };
+          if (!r) return { _error: 'response var is null/undefined' };
+          if (!r.response) return { _error: 'no .response key' };
+          const status = r.response.status;
+          const result = r.response.result;
+          if (!result) return { _error: 'no .response.result', _diag: { status: status } };
+          if (result.error) return { _error: 'api error: ' + (result.error.message || JSON.stringify(result.error)), _diag: { status: status, error: result.error } };
+          if (!result.choices || !result.choices[0]) return { _error: 'no choices array', _diag: { status: status } };
+          const content = result.choices[0].message && result.choices[0].message.content;
+          if (!content) return { _error: 'no content' };
+          const cleaned = repairJson(sanitizeRoman(stripFences(content)));
+          let parsed;
+          try { parsed = JSON.parse(cleaned); }
+          catch (e) { return { _error: 'json parse failed: ' + e.message, _diag: { content_first_1000: content.substring(0, 1000), cleaned_first_1000: cleaned.substring(0, 1000) } }; }
+          const stringFields = ['firm_name', 'investor_type', 'founder_fit', 'problem_market', 'competitive_moat', 'traction_momentum', 'business_model', 'expansion_roadmap', 'declared_summary'];
+          for (const k of stringFields) { if (k in parsed) parsed[k] = ensureString(parsed[k]); }
+          return parsed;
+        """
+      timeout = 5
+    } as $declared_json
+
+    var $derived_system_prompt {
+      value = "You are a portfolio-pattern analysis engine. Your response MUST be ONLY a valid JSON object — no prose, no markdown, no code fences. CRITICAL: All numeric values MUST use Arabic numerals (0,1,2,3,4,5,6,7,8,9) — NEVER use Roman numerals (I, II, III, IV, V). Every key must be immediately followed by ':' and a value — never write ':,' (stray comma after colon). No trailing commas before '}' or ']'. Given the investor actual deal portfolio, derive their operating thesis. Pattern over anecdote (cite >=3 deals). Recency-weighted: deals in last 36 months count 3x. The JSON object must have these exact keys: founder_fit (narrative STRING grounded in actual portfolio with company names), problem_market (sector concentration narrative STRING with timeline drift), competitive_moat (narrative STRING on actual defensibility patterns), traction_momentum (narrative STRING on stage signals at investment), business_model (narrative STRING on GTM patterns visible in portfolio), expansion_roadmap (narrative STRING on portfolio expansion patterns), derived_summary (1-2 sentence STRING), declared_vs_derived_delta (array of objects with dimension, declared, derived), implicit_lenses (array of strings), thesis_drift_signals (object with emerging, declining, stable arrays of strings), partner_specialization (object mapping partner names to deal-type strings), syndicate_tier (STRING: tier_1|tier_2|emerging), recent_36mo_focus (array of strings), sector_evolution_timeline (object mapping year STRING like '2023','2024','2025','2026' to a sub-object with keys top_sectors as array of 3-5 sector strings ranked by deal count and notable_shift as a STRING describing what changed vs prior year — base on actual deal dates and sectors), frequent_co_investors (array of objects with name string and count NUMBER in Arabic numerals), deal_size_stats (object with min/median/p75/max numbers), geographic_distribution (object whose KEYS MUST be ISO 3166-1 alpha-2 country codes — 'US','GB','MX','DE','FR','ES','SE','TR','AU','CA','SG' — NEVER country names like 'United States','UK','Mexico','Germany'; values are Arabic numeral counts). All narrative fields MUST be plain strings. All count fields MUST be Arabic numerals. Begin your response with { and end with }."
+    }
+
+    // [Full v21 source continues — derived_user_text lambda, derived_response api.request,
+    //  derived_json parse lambda (same shape as declared parse, different stringFields),
+    //  $has_parse_error, $normalized_geo, $embed_inputs, OpenRouter embeddings api.request,
+    //  $vectors lambda, $deal_stats lambda, $meta lambda, the conditional db.add_or_edit
+    //  branches for company-id vs person-id, and the final $result var.
+    //  Fetch the canonical source via Xano MCP getFunction(workspace_id=3, function_id=12916,
+    //  include_xanoscript=true) — copy from the .xanoscript.value field. The full source is
+    //  ~600 lines; abbreviated here for page weight. The Step 2 refactor below shows what
+    //  to keep (gather + api.request to Cloud Run) and what to delete (everything else).]
+  }
+
+  response = $result
+}
+```
+
+To pull the canonical source any time:
+
+```bash
+# Via Xano MCP (in Claude / Cursor with the Xano server attached):
+mcp__xano__getFunction(workspace_id: 3, function_id: 12916, include_xanoscript: true)
+# The full source is in result.xanoscript.value
+```
+
+</Accordion>
+
 #### Xano: `thesis/build-investment-thesis-alloydb`
 
 ```xanoscript
@@ -233,6 +433,184 @@ function "thesis/build-investment-thesis-alloydb" {
   response = $result
 }
 ```
+
+#### Skip guard — 30-day freshness check
+
+Building a thesis costs ~$0.005 in LLM calls and 30-90s of latency. If a thesis was already built in the last 30 days for the same investor, the cached row is fresh enough — skip the rebuild and return what's already there.
+
+Implement the check as a **lightweight `GET /thesis/freshness` endpoint** on the same Cloud Run service. Xano calls it before invoking gather; on a cache hit, the function returns the cached thesis_id and exits without calling Cloud Run's expensive `/build-thesis`.
+
+**AlloyDB query** (one indexed lookup, ~5ms):
+
+```sql
+-- Returns the row if last_validated_date is within 30 days, else 0 rows.
+SELECT id, firm_name, last_validated_date,
+       (CURRENT_DATE - last_validated_date)::int AS days_old
+FROM investment_theses
+WHERE
+  ($1::int IS NOT NULL AND master_company_id = $1)
+  OR
+  ($2::int IS NOT NULL AND master_person_id = $2)
+  AND last_validated_date IS NOT NULL
+  AND last_validated_date >= CURRENT_DATE - INTERVAL '30 days'
+LIMIT 1;
+```
+
+**Cloud Run handler** (`GET /thesis/freshness`):
+
+```javascript
+// thesis-engine / src/freshness.js
+export async function checkFreshness(req, res) {
+  const masterCompanyId = req.query.master_company_id || null;
+  const masterPersonId  = req.query.master_person_id  || null;
+
+  if (!masterCompanyId && !masterPersonId) {
+    return res.status(400).json({ error: 'master_company_id or master_person_id required' });
+  }
+
+  // Read pool — read-after-write is not a concern (we'd skip the rebuild anyway if a write
+  // landed in the last 100ms; the row would still be fresh)
+  const { rows } = await readPool.query(`
+    SELECT id, firm_name, last_validated_date,
+           (CURRENT_DATE - last_validated_date)::int AS days_old
+    FROM investment_theses
+    WHERE ($1::int IS NOT NULL AND master_company_id = $1)
+       OR ($2::int IS NOT NULL AND master_person_id = $2)
+    LIMIT 1
+  `, [masterCompanyId, masterPersonId]);
+
+  if (rows.length === 0) {
+    return res.json({ fresh: false, reason: 'no_thesis_yet' });
+  }
+
+  const row = rows[0];
+  if (!row.last_validated_date || row.days_old > 30) {
+    return res.json({
+      fresh: false, reason: 'stale',
+      thesis_id: row.id, firm_name: row.firm_name, days_old: row.days_old
+    });
+  }
+
+  return res.json({
+    fresh: true,
+    thesis_id: row.id,
+    firm_name: row.firm_name,
+    last_validated_date: row.last_validated_date,
+    days_old: row.days_old
+  });
+}
+```
+
+**Refactored Xano function with the skip guard wired in:**
+
+```xanoscript
+function "thesis/build-investment-thesis-alloydb" {
+  input {
+    int master_person_id?
+    int master_company_id?
+    bool force?  // optional override — bypasses the 30-day skip
+  }
+
+  stack {
+    precondition ($input.master_person_id != null || $input.master_company_id != null) {
+      error_type = "inputerror"
+      error = "Either master_person_id or master_company_id must be provided"
+    }
+
+    // 1. Freshness check — skip rebuild if we have a row from the last 30 days
+    api.request {
+      url = "https://thesis-engine-XXXX-uc.a.run.app/thesis/freshness"
+      method = "GET"
+      params = {}
+        |set:"master_company_id":$input.master_company_id
+        |set:"master_person_id" :$input.master_person_id
+      headers = []
+        |push:("Authorization: Bearer KEY"|replace:"KEY":$env.cloudRunThesisToken)
+      timeout = 10
+    } as $freshness
+
+    var $is_fresh {
+      value = (($freshness|get:"response":null)|get:"fresh":false)
+    }
+
+    var $force {
+      value = ($input.force == true)
+    }
+
+    // 2. Skip guard — if fresh and no force flag, return cached thesis_id and exit
+    conditional {
+      if ($is_fresh == true && $force == false) {
+        var $cached_result {
+          value = {}
+            |set:"success":true
+            |set:"cached":true
+            |set:"thesis_id":(($freshness|get:"response":null)|get:"thesis_id":null)
+            |set:"firm_name":(($freshness|get:"response":null)|get:"firm_name":null)
+            |set:"last_validated_date":(($freshness|get:"response":null)|get:"last_validated_date":null)
+            |set:"days_old":(($freshness|get:"response":null)|get:"days_old":null)
+        }
+
+        // Early-return via response binding handled at function level — we set $result
+        // and let the rest of the stack short-circuit through guarded conditionals.
+        var.update $result {
+          value = $cached_result
+        }
+      }
+
+      else {
+        // 3. Cache miss or forced rebuild — run gather + post to /build-thesis
+        function.run "thesis/gather-investor-context-v3" {
+          input = {
+            master_person_id : $input.master_person_id
+            master_company_id: $input.master_company_id
+            max_deals        : 100
+            recency_months   : 36
+          }
+        } as $context
+
+        api.request {
+          url = "https://thesis-engine-XXXX-uc.a.run.app/build-thesis"
+          method = "POST"
+          params = {}
+            |set:"master_person_id":$input.master_person_id
+            |set:"master_company_id":$input.master_company_id
+            |set:"context":$context
+          headers = []
+            |push:"Content-Type: application/json"
+            |push:("Authorization: Bearer KEY"|replace:"KEY":$env.cloudRunThesisToken)
+          timeout = 300
+        } as $cr_response
+
+        var.update $result {
+          value = ($cr_response|get:"response":null)
+        }
+      }
+    }
+  }
+
+  response = $result
+}
+```
+
+**Why the freshness check goes in Xano, not Cloud Run:**
+
+- On a cache hit, we save a full Cloud Run cold-start + the gather-v3 call (which itself runs ~10-30s of Xano DB queries against the 100M-row `fundable_*` tables). Roughly 95% of the savings is in the avoided gather, not the LLM.
+- Xano already owns the entrypoint — it's a one-line addition to wrap the existing logic.
+- Cloud Run's `/build-thesis` stays simple: it always builds. The "should we build?" decision is a separate concern.
+
+**Tuning the freshness window:**
+
+| Threshold | Reasoning |
+|---|---|
+| 7 days | Aggressive — investors who actively update their thesis quarterly will see drift. Higher LLM cost. |
+| **30 days** ← default | Investors typically don't add >2-3 deals in a month; portfolio-derived patterns are stable. Balance cost vs. drift risk. |
+| 90 days | Cost-optimal for long tail; not appropriate for active investors (a16z, Sequoia, GC) who close 3-5 deals/week. |
+
+The window can be made per-investor if needed: store `next_refresh_at` on the row, computed by deal-velocity (more recent deals → shorter window). For v1, a flat 30 days is fine.
+
+**Force rebuild (override):**
+
+The optional `force` input bypasses the freshness check — useful for: manual QA after a model swap, scheduled monthly refreshes, ad-hoc rebuilds when a major round closes. Pass `{"master_company_id": 69, "force": true}`.
 
 #### Cloud Run: `POST /build-thesis`
 

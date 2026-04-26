@@ -179,7 +179,7 @@ Mirrors the Xano workspace 3 `file` table (id `587`) with **four columns called 
 
 **Pipeline-relevant columns**
 
-- **`markdown`** (TEXT) — extracted by unstructured.io during ingest (Save File Pipeline step 2). Already present on the Xano source; preserved here because it's the input to both `classify_file` and `pplx_embeddings`.
+- **`markdown`** (TEXT) — joined plain-text output from unstructured.io's parser, written during ingest (Save File Pipeline step 2). Acts as the single-blob input to `classify_file`, `pplx_embeddings`, and `pitch/extract-pitch-profile`. Element-level structure (page numbers, tables, titles, list items) is preserved separately in the `file_element` table below — both populated by the same parsing pass. Already present on the Xano source.
 - **`llm_description`** (TEXT) — *AlloyDB-only.* Populated by `classify_file` (see LLM file classification box above). 1-2 sentence document description for UI display.
 - **`file_type`** (TEXT) — *AlloyDB-only.* Populated by `classify_file`. One of the 16 enum values; `fundraising_deck` is the trigger that fans out to `pitch/build-pitch-profile`.
 - **`pplx_embeddings`** (VECTOR) — *AlloyDB-only.* Full-document embedding of `markdown` via `perplexity/pplx-embed-v1-4b`. **Used on `file` rows only in Orbiter** — the `investment_thesis` and `fundraising_pitch_profiles` tables embed with `openai/text-embedding-3-small` instead. Verify the output dimensionality with OpenRouter before applying the migration (placeholder `VECTOR(1536)` below).
@@ -218,6 +218,91 @@ CREATE INDEX file_pplx_emb_hnsw_idx  ON file USING hnsw (pplx_embeddings vector_
 ```
 
 **Indexes** — the four btree indexes from the Xano source (`user_id`, `created_at DESC`, `file_source`, `mime_type`) plus two AlloyDB-only: `file_type` btree (so the pipeline can filter pitch decks fast) and HNSW on `pplx_embeddings` for full-document cosine similarity search.
+
+</div>
+
+<div style={{padding: '20px', border: '2px solid #6BE876', borderRadius: '8px', color: '#fff', margin: '16px 0'}}>
+
+**AlloyDB Table: `file_element`**
+
+Stores unstructured.io's element-level output for each file — one row per parsed element (Title, NarrativeText, Table, ListItem, Image, etc.) with page number, position, and original metadata preserved. Sibling to the `file` table, joined on `file_id`. The pitch pipeline (`pitch/extract-pitch-profile`) reads only `file.markdown` and is unchanged by this table — element rows are additive, unlocking opt-in upgrades without forcing a migration.
+
+**Note for devs — element ≠ chunk.** An *element* is a parsed primitive from unstructured.io (one Title, one paragraph, one Table). A *chunk* is a derived, retrieval-sized grouping of elements with overlap, used for vector retrieval at the passage level. We don't chunk yet (see "When to add chunking" at the bottom of this box). Don't conflate the two — `file_element` is structure-from-the-parser, not pre-chunked retrieval units.
+
+**Element types from unstructured.io** — `Title`, `NarrativeText`, `ListItem`, `Table`, `Image`, `Header`, `Footer`, `FigureCaption`, `Address`, `Formula`, `CodeSnippet`, `PageBreak`, `UncategorizedText`. Stored as TEXT, no enum CHECK constraint — so unstructured.io adding a new type in a release doesn't force a migration.
+
+**SQL DDL** (AlloyDB):
+
+```sql
+CREATE TABLE file_element (
+  id             BIGSERIAL    PRIMARY KEY,
+  created_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  file_id        BIGINT       NOT NULL REFERENCES file(id) ON DELETE CASCADE,
+  element_index  INT          NOT NULL,                       -- 0-based source order in the document
+  element_id     TEXT,                                        -- unstructured.io's own element_id (UUID-ish)
+  element_type   TEXT         NOT NULL,                       -- Title | NarrativeText | Table | ListItem | Image | ...
+  text           TEXT,                                        -- plain-text content
+  text_as_html   TEXT,                                        -- table HTML when element_type = 'Table'
+  page_number    INT,                                         -- 1-based page index when known
+  coordinates    JSONB,                                       -- bounding box: {points, layout_width, layout_height, system}
+  parent_id      TEXT,                                        -- references another element's element_id within the same file
+  metadata       JSONB                                        -- everything else unstructured returns (languages, links, attachments, etc.)
+);
+
+CREATE INDEX file_element_file_id_idx     ON file_element (file_id);
+CREATE INDEX file_element_file_order_idx  ON file_element (file_id, element_index);
+CREATE INDEX file_element_file_type_idx   ON file_element (file_id, element_type);
+CREATE INDEX file_element_file_page_idx   ON file_element (file_id, page_number);
+```
+
+**Cascading delete** — `ON DELETE CASCADE` on `file_id` means deleting a `file` row sweeps its `file_element` rows automatically. No orphan-cleanup task needed.
+
+**Reassembling joined markdown** — `SELECT text FROM file_element WHERE file_id = $1 ORDER BY element_index` returns the document in source order. The pipeline writes the joined output to `file.markdown` directly so this query isn't required today; it's the fallback if joined storage is ever derived rather than persisted.
+
+---
+
+**Future opt-in enhancements** (additive — none required for v1, none force a migration of existing rows)
+
+1. **Better table parsing in `pitch/extract-pitch-profile`.** Decks hide ARR / check-size / runway / market sizing in tables. Pass `WHERE file_id = $1 AND element_type = 'Table'` rows (with `text_as_html`) to DeepSeek as a structured `tables: [...]` sidecar alongside the joined markdown. More reliable than parsing pipe-table syntax.
+2. **Per-slide narrative analysis.** Group elements by `page_number`, run a per-slide LLM pass for slide-level summaries or vectors. Powers deck-level UI (highlights, hover-to-citation, "which slide pitches the team?"). Today we collapse the whole deck into 6 narratives — fine for matching, additive for UI.
+3. **Image-aware extraction.** `Image` elements arrive with optional captions / alt text / OCR text. Route them through a vision LLM (Gemini or Claude with vision) to extract chart contents — useful for traction graphs and competitive landscape diagrams that get flattened in plain text.
+4. **Speaker-notes handling.** unstructured.io distinguishes speaker notes from slide body via element type / metadata. Today they're silently included or dropped depending on parser path. Filter explicitly via element type once a use case shows up.
+5. **Page-jump UI in the front end.** Surface `coordinates` + `page_number` from `file_element` rows so the UI can jump-to-source on hover (citations, highlight matches, scroll-to-anchor on click).
+
+**When to add chunking** (for much larger docs — research reports, books, multi-hundred-page PDFs)
+
+The current schema embeds the whole `file.markdown` as one `pplx_embeddings` vector. That works as long as the markdown fits inside `perplexity/pplx-embed-v1-4b`'s context window (verify the actual limit on OpenRouter). Add chunking when one of these triggers fires:
+
+- Uploads regularly exceed the embed-model context window (truncation starts losing signal).
+- A feature requires passage-level retrieval ("jump to the page that mentions X", citation grounding, RAG over uploaded files).
+
+When that day comes, add a sibling `file_chunk` table — pure additive migration, no rewrite of `file` or `file_element`:
+
+```sql
+CREATE TABLE file_chunk (
+  id                 BIGSERIAL    PRIMARY KEY,
+  created_at         TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  file_id            BIGINT       NOT NULL REFERENCES file(id) ON DELETE CASCADE,
+  chunk_index        INT          NOT NULL,                  -- 0-based order within the file
+  chunk_text         TEXT         NOT NULL,
+  chunk_embedding    VECTOR(1536),                            -- embed model TBD per use case
+  source_element_ids INT[],                                   -- file_element.id values that contributed
+  page_start         INT,
+  page_end           INT,
+  token_count        INT
+);
+
+CREATE INDEX file_chunk_file_id_idx        ON file_chunk (file_id);
+CREATE INDEX file_chunk_embedding_hnsw_idx ON file_chunk USING hnsw (chunk_embedding vector_cosine_ops);
+```
+
+**Chunking strategy when we get there:**
+
+- Prefer **element-aware** chunkers (unstructured.io's `chunk_by_title` or `by_similarity`) over naive token-window splitting — preserves table integrity, doesn't split mid-paragraph.
+- Bound chunk size by token count to fit the chosen embed model's context (typical: 512–1024 tokens per chunk).
+- Decide overlap based on retrieval feel — 0 tokens for clean boundaries, ~50–100 tokens for context spillover.
+- Embedding model can match `file.pplx_embeddings` for consistency or switch to the workspace default `openai/text-embedding-3-small` — pick per use case.
+- Backfill existing files lazily on first retrieval-mode access; new uploads populate `file_chunk` synchronously alongside `file_element`.
 
 </div>
 

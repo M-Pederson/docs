@@ -167,7 +167,59 @@ curl -s https://openrouter.ai/api/v1/chat/completions \
 
 3. **Refactor the clone into a thin context-handoff.** Strip the LLM calls, embedding calls, and `db.add_or_edit` from the cloned function. Keep only the `function.run "thesis/gather-investor-context-v3"` step and a single `api.request` that POSTs the gathered context to a Cloud Run endpoint. Cloud Run does the LLM orchestration, embedding, and AlloyDB write. Pattern is in [Step 2 — Refactor build pipeline](#step-2-refactor-build-pipeline-xano-cloud-run-alloydb).
 
-4. **Add a 30-day skip guard.** Before running gather, query AlloyDB for an existing `investment_thesis` row for the same `master_person_id` or `master_company_id`. If `last_validated_date >= now() - interval '30 days'`, return the existing row and skip the rebuild — saves ~$0.005 + 30-90s per cached hit. Pattern is in [Skip guard — 30-day freshness check](#skip-guard-30-day-freshness-check).
+4. **Add a 30-day skip guard.** Before running gather, query AlloyDB for an existing `investment_thesis` row for the same `master_person_id` or `master_company_id`. If `last_validated_date >= now() - interval '30 days'`, return the existing row and skip the rebuild — saves ~`$0.005` + 30-90s per cached hit. Pattern is in [Skip guard — 30-day freshness check](#skip-guard-30-day-freshness-check).
+
+</div>
+
+<div style={{padding: '20px', border: '2px solid #6BE876', borderRadius: '8px', color: '#fff', margin: '16px 0'}}>
+
+**AlloyDB Table: `file`**
+
+Mirrors the Xano workspace 3 `file` table (id `587`) with **four columns called out for the AlloyDB ingest pipeline**: `markdown`, `llm_description`, `file_type`, and `pplx_embeddings`. The Qdrant-specific columns from the Xano source (`chunk_count`, `qdrant_collection`) are dropped — AlloyDB pgvector replaces Qdrant.
+
+**Pipeline-relevant columns**
+
+- **`markdown`** (TEXT) — extracted by unstructured.io during ingest (Save File Pipeline step 2). Already present on the Xano source; preserved here because it's the input to both `classify_file` and `pplx_embeddings`.
+- **`llm_description`** (TEXT) — *AlloyDB-only.* Populated by `classify_file` (see LLM file classification box above). 1-2 sentence document description for UI display.
+- **`file_type`** (TEXT) — *AlloyDB-only.* Populated by `classify_file`. One of the 16 enum values; `fundraising_deck` is the trigger that fans out to `pitch/build-pitch-profile`.
+- **`pplx_embeddings`** (VECTOR) — *AlloyDB-only.* Full-document embedding of `markdown` via `perplexity/pplx-embed-v1-4b`. **Used on `file` rows only in Orbiter** — the `investment_thesis` and `fundraising_pitch_profiles` tables embed with `openai/text-embedding-3-small` instead. Verify the output dimensionality with OpenRouter before applying the migration (placeholder `VECTOR(1536)` below).
+
+**SQL DDL** (AlloyDB / pgvector):
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE file (
+  id                BIGSERIAL PRIMARY KEY,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at        TIMESTAMPTZ,
+  user_id           BIGINT      NOT NULL REFERENCES "user"(id),
+  file_name         TEXT        NOT NULL,
+  mime_type         TEXT        NOT NULL,                  -- e.g. application/pdf, text/plain
+  file_size         BIGINT,                                -- bytes; reserved for quota/billing
+  file_url          TEXT        NOT NULL,                  -- GCP storage URL, not Xano-hosted
+  markdown          TEXT,                                  -- extracted by unstructured.io
+  preview_image_url TEXT,                                  -- GCP URL for generated preview image
+  file_source       TEXT        NOT NULL CHECK (file_source IN
+                      ('user_upload','email_attachment','web_scrape','api_import')),
+
+  -- AlloyDB-only additions for the file ingest pipeline:
+  llm_description   TEXT,                                  -- classify_file LLM output (UI label)
+  file_type         TEXT,                                  -- classify_file LLM output (16-class enum)
+  pplx_embeddings   VECTOR(1536)                           -- perplexity/pplx-embed-v1-4b — VERIFY DIM
+);
+
+CREATE INDEX file_user_id_idx        ON file (user_id);
+CREATE INDEX file_created_at_idx     ON file (created_at DESC);
+CREATE INDEX file_file_source_idx    ON file (file_source);
+CREATE INDEX file_mime_type_idx      ON file (mime_type);
+CREATE INDEX file_file_type_idx      ON file (file_type);                                       -- AlloyDB-only
+CREATE INDEX file_pplx_emb_hnsw_idx  ON file USING hnsw (pplx_embeddings vector_cosine_ops);    -- AlloyDB-only
+```
+
+**Indexes** — the four btree indexes from the Xano source (`user_id`, `created_at DESC`, `file_source`, `mime_type`) plus two AlloyDB-only: `file_type` btree (so the pipeline can filter pitch decks fast) and HNSW on `pplx_embeddings` for full-document cosine similarity search.
+
+**Dropped from Xano source** — `chunk_count` and `qdrant_collection`. Qdrant is replaced by AlloyDB native pgvector; chunk-level vectors (if needed later) can live in a separate `file_chunk` table referencing `file.id`.
 
 </div>
 

@@ -1,0 +1,95 @@
+---
+title: "Design rationale"
+description: "Why the AlloyDB rewrite splits investment_thesis into three tables, why we use small-dimension embeddings, and why we're moving to Gemini embeddings on Vertex"
+---
+
+This page captures the architecture decisions behind the AlloyDB rewrite of the investment-thesis pipeline. It is meant to be readable on its own — share it with anyone joining the project who needs to understand *why* the schema looks the way it does, not just *what* it is. For the implementation, see [Find investors — AlloyDB build](/guides/open-work/vectors-alloydb/find-investors-engine).
+
+## Why we're splitting one table into three
+
+Today one row in `investment_theses` carries 54 columns and ~95 KB of data — identity, structured filters, 12 narrative+vector pairs, and synthesis fields. That row is doing three different jobs at once, which makes every change painful.
+
+We're splitting it into three tables, each owning one job.
+
+### Table 1 — `investment_thesis` (the entity row)
+
+**Stores:** identity (`master_person_id` or `master_company_id`), structured filters (firm name, investor type, stage focus, check sizes, geography, deal counts, last-investment dates), and provenance (`data_sources`, `last_validated_date`).
+
+**Why it lives alone:** these are the columns we filter on before vector scoring runs ("Seed-stage, $500K–$2M check, US-based"). Keeping them in a narrow row means the filter step is fast and stays in cache. No vectors here, so the row is ~1 KB instead of 95 KB.
+
+### Table 2 — `investment_thesis_narrative` (the vectors)
+
+**Stores:** one row per `(investor, dimension, source)`. With 6 dimensions × 2 sources (declared, derived), that's 12 rows per investor. Each row holds the narrative text, its embedding, the model that built it (`model_id`), and a timestamp.
+
+**Why it lives alone:** vectors are the heaviest data we have (~6 KB each) and the part most likely to change. Isolating them means we can re-embed, swap models, or add a 7th dimension without touching the entity table or the synthesis table. This is where most of the operational pain went away.
+
+### Table 3 — `investment_thesis_synthesis` (the derived layer)
+
+**Stores:** `declared_summary`, `derived_summary`, `declared_vs_derived_delta`, `implicit_lenses`, `thesis_drift_signals`, `partner_specialization`, `syndicate_tier`. All the "what does this investor's behavior actually mean" fields.
+
+**Why it lives alone:** synthesis is regenerated more often than narratives (every rebuild) but is much smaller. Putting it on its own table means we can rewrite synthesis without rewriting TOAST chunks for 12 vectors per row.
+
+## Why three tables is better than one fat table
+
+1. **Re-embedding doesn't block writes.** Switching embedding models is `INSERT` rows with a new `model_id`, not `ALTER TABLE` on 12 columns. Old and new models can run side-by-side; we cut over by changing one line in the scoring SQL.
+2. **Adding a 7th narrative dimension is zero DDL.** Just start writing `dimension = 'regulatory_thesis'` rows. No migration.
+3. **No wasted I/O on filter queries.** The entity table is small and cache-friendly. Stage/sector filters never have to read vectors they don't need.
+4. **Schema generalizes to other outcomes.** The same three-table shape works for find-investors, hire-key-talent, strategic partnerships, find-mentor — anywhere we match a demand profile against supply profiles. One playbook for all 14 outcome types.
+5. **Tracking what's where becomes trivial.** "Which investors are missing a `derived/founder_fit` embedding?" is one query against the narrative table. With the fat row, we'd be writing `WHERE founder_fit_derived_vector IS NULL` for 12 columns.
+
+## Why we want small-dimension embeddings
+
+Embedding dimension drives every downstream cost: storage, index size, query latency, memory footprint.
+
+### The numbers
+
+| Dimension | Per-vector size (`halfvec`) | Per investor (12 vectors) | At 100K investors |
+|---|---|---|---|
+| 3072 (Gemini default) | ~6 KB | ~74 KB | ~7.4 GB |
+| 1536 | ~3 KB | ~37 KB | ~3.7 GB |
+| 768 | ~1.5 KB | ~18 KB | ~1.8 GB |
+
+Smaller dim = smaller table, smaller ScaNN index, less RAM in the index buffer, faster cosine math per comparison. On a vector-heavy workload, going from 3072 → 768 typically cuts query latency by ~30–50% and storage by 4×.
+
+### What we lose
+
+Recall. Going 3072 → 1536 typically costs &lt;1% on standard benchmarks. 1536 → 768 costs ~2–4%. For matching investor theses against pitch profiles, this is well below noise — the bigger driver is narrative quality, not the last 2% of recall.
+
+### Combining with `halfvec`
+
+`halfvec` stores 16-bit floats instead of 32-bit. Another ~50% storage savings on top of the dimension reduction, with another ~5% recall trade. Available in pgvector ≥0.7 (which AlloyDB ships).
+
+**Default we want:** `halfvec(1536)` to start, with the option to drop to `halfvec(768)` if storage or latency becomes a constraint at scale. ScaNN handles both.
+
+## Why we want Gemini embeddings on GCP (vs OpenAI)
+
+We're already running on GCP (AlloyDB, Cloud Run). Using Gemini embeddings via Vertex AI gives us four real advantages.
+
+### 1. Cost
+
+Vertex `gemini-embedding-001` is roughly **5× cheaper** per token than OpenAI's `text-embedding-3-small` at production volume. At 100K investors × 12 narratives × ~200 tokens each, the difference is small in absolute terms ($1 vs $5), but it compounds during re-embeds and as we add more outcome types.
+
+### 2. Matryoshka dimensions out of the box
+
+Gemini's embedding model is **Matryoshka-trained** — the same model produces 3072-dim vectors that you can **truncate** to 1536 or 768 without re-embedding. We can store at 1536 today, drop to 768 next quarter if scale demands it, all without calling the API again. OpenAI's `text-embedding-3-small` is fixed at 1536.
+
+### 3. No egress, no API key juggling
+
+- Cloud Run → Vertex AI is **same-cloud, same-region traffic**. No egress fees, lower latency (typically 50–150ms vs 200–400ms cross-cloud to OpenAI).
+- Auth is **IAM, not bearer tokens**. The Cloud Run service account gets `roles/aiplatform.user` and we never store an API key. Same auth model as AlloyDB — one less secret to rotate.
+- Data stays in GCP. Useful for compliance posture and customer trust.
+
+### 4. Higher rate limits and batch support
+
+Vertex's production tier has higher per-minute throughput than OpenAI's, and batch embedding via Vertex Pipelines means we can re-embed all investors overnight without rate-limit babysitting.
+
+### Honest tradeoffs
+
+- **Lock-in.** Switching off GCP later means re-embedding everything. We're already committed to AlloyDB, so this isn't a new constraint.
+- **Quality is comparable, not strictly better.** On most benchmarks, Gemini and OpenAI are within ~1–2% of each other. This isn't a "Gemini is more accurate" call — it's a "Gemini fits our stack better" call.
+
+## TL;DR
+
+- **Three tables** because vectors, structured filters, and synthesis change at different rates. Splitting them lets us re-embed, add dimensions, and update filters independently — none of which were practical with the 54-column row.
+- **Small dims (768–1536, halfvec)** because storage, index size, and query latency all scale with dimension. We trade ~2–5% recall for 4× storage savings and ~30% lower latency. Easy call for our workload.
+- **Gemini embeddings on Vertex** because we're already on GCP. Cheaper per token, Matryoshka means we can truncate dimensions without re-embedding, IAM auth instead of bearer tokens, and no egress. Functionally on par with OpenAI on quality; better fit on cost and operations.

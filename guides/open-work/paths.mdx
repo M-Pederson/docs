@@ -1,0 +1,275 @@
+---
+title: "Paths"
+description: "Compute relationship paths from each team member to every entity referenced by a discover query — persists the result on every discover_*_node row and returns a unified response"
+---
+
+This page documents the **paths pipeline** running in Xano workspace 3 (`OrbiterV2`). For every entity that surfaces during a discover query (response nodes, context nodes, per-question nodes), the function computes the shortest non-geo path through the FalkorDB knowledge graph from each team member's `master_person` node, and writes the result back onto the row's `paths` column so the UI can render relationship trails inline.
+
+### Components
+
+| Component | Type | ID | Role |
+|---|---|---|---|
+| `mvp/paths/create-discover-path` | Function | `12931` | Orchestrator — pulls team, loops every related node, writes per-row paths |
+| `mvp/paths/build-team-paths-for-target` | Function | `12932` | Helper — given one target uuid + team source uuids, builds & runs the FalkorDB cypher and returns the `team_paths` array |
+| `mvp/falkor/send-cypher` | Function | `2815` | Wrapper around `npm:falkordb` with retry + timeout, called by the helper |
+
+```text
+mvp/paths/create-discover-path     #12931
+mvp/paths/build-team-paths-for-target  #12932
+```
+
+### Tables read & written
+
+| Table | ID | Role | `paths` column |
+|---|---|---|---|
+| `discover` | 564 | Source — read for `user_id` + `team_id` list | — |
+| `team_member` | 614 | Source — team roster (one row per (team_id, user_id)) | — |
+| `user` | 125 | Source — joins user → master_person | — |
+| `master_person` | 139 | Source — supplies `node_uuid`, `name`, `avatar` | — |
+| `discover_question` | 566 | Source — finds child nodes per question | — |
+| **`discover_response_node`** | 567 | **Updated** — one row per top-level entity returned by the discover answer | ✓ |
+| **`discover_context_node`** | 572 | **Updated** — one row per supporting context entity | ✓ |
+| **`discover_question_context_node`** | 592 | **Updated** — context entity tied to a specific sub-question | ✓ |
+| **`discover_question_response_node`** | 565 | **Updated** — response entity tied to a specific sub-question | ✓ (column added 2026-05-03) |
+
+The `paths` column on each of the four `discover_*_node` tables holds a **`team_paths` JSON array** (schema below). It is overwritten on every run of the orchestrator.
+
+### What `mvp/paths/create-discover-path` does, step by step
+
+<Steps>
+  <Step title="Resolve the team">
+    `db.get discover` with addons: load the discover row plus the owner's user → master_person, projecting `master_person_id`, `node_uuid`, `name`, `avatar`. The `team_id` field is a list — the function `foreach`'s over it and pulls every `team_member` row, joining each member to their user → master_person with the same projection. Owner + all team members are de-duplicated by `master_person_id` into the `$paths` array.
+  </Step>
+
+  <Step title="Build source uuid list for FalkorDB">
+    A small lambda flattens `$paths` to `$source_uuids` — just an array of `node_uuid` strings, ready to drop into the cypher `WHERE source.uuid IN [...]` clause.
+  </Step>
+
+  <Step title="Loop discover_response_node (top-level answer entities)">
+    Query every row where `discover_id == $input.discover_id`. For each row, pick the target uuid from the first non-null of `person_node_uuid`, `company_node_uuid`, `funding_round_uuid`, `film_tv_uuid`, `film_tv_award_uuid`, `live_event_node_uuid`. Skip rows with no uuid. Call `mvp/paths/build-team-paths-for-target` and `db.edit` the row's `paths` column.
+
+    > **Socket hook:** A `// ADD SOCKET HERE TO UPDATE UI WITH RESPONSE NODES` comment marks where to push real-time updates to the frontend after this loop completes.
+  </Step>
+
+  <Step title="Loop discover_context_node (supporting context entities)">
+    Same pattern as response nodes, just against table `discover_context_node` (572) using the same `discover_id` filter. Updates each row's `paths` column.
+  </Step>
+
+  <Step title="Loop questions, then per-question context + response nodes">
+    Query `discover_question` rows for the discover. For each question, run two inner loops:
+    1. `discover_question_context_node` WHERE `discover_question_id == question.id`
+    2. `discover_question_response_node` WHERE `discover_question_id == question.id`
+
+    Same target-uuid extraction + helper call + `db.edit` pattern.
+
+    > **Socket hook:** A `// ADD SOCKET HERE TO UPDATE UI WITH CONTEXT & QUESTION NODES` comment marks the second push point, fired after both inner loops complete.
+  </Step>
+
+  <Step title="Return a structured summary">
+    The orchestrator returns `{ discover_id, paths, source_uuids, results }`, where `results` is an object with four buckets (one per loop) so consumers can see what was processed without re-querying.
+  </Step>
+</Steps>
+
+### What `mvp/paths/build-team-paths-for-target` does
+
+The helper is the FalkorDB-facing layer. It is the single source of truth for the cypher query, geo filter list, and post-processing. Inputs:
+
+- `target_node_uuid` (text, required)
+- `source_uuids` (text[]) — team `node_uuid`s
+- `paths` (json) — full team source profiles `{master_person_id, node_uuid, name, avatar}` used to enrich the response
+
+It assembles the cypher inside a JS template literal (avoiding `util.template_engine`'s Markdown autolinker), sends it via `mvp/falkor/send-cypher`, then in a second lambda zips `path_nodes` + `edges` into a `hops` array of `{from, to, edge}`, sorted ascending by `total_weight` (lower-weight = stronger paths first).
+
+#### Cypher used
+
+```cypher
+MATCH (target:Entity {uuid: '$TARGET'})
+MATCH (source:Entity)
+WHERE source.uuid IN ['$SRC1', '$SRC2', ...]
+MATCH p = (source)-[*1..4]-(target)
+WHERE NONE(node IN nodes(p)[1..-1] WHERE node['display_label'] IN ['City','Region','Country','State','Continent','Location'])
+  AND NONE(rel IN relationships(p) WHERE type(rel) IN ['LOCATED_IN','IN_REGION','IN_CITY','IN_COUNTRY','IN_STATE','HEADQUARTERED_IN','HEADQUARTERS_IN','BASED_IN','LIVES_IN','BORN_IN','FROM_LOCATION','HAS_LOCATION'])
+WITH source, p, length(p) AS hops
+ORDER BY hops ASC
+WITH source, head(collect(p)) AS p
+RETURN
+  source['uuid']            AS source_uuid,
+  length(p)                 AS hops_count,
+  [node IN nodes(p) | { node_uuid: node['uuid'], name: node['name'], display_label: node['display_label'], avatar: node['avatar'], logo: node['logo'] }] AS path_nodes,
+  [rel IN relationships(p) | { type: type(rel), weight: rel['weight'], description: coalesce(rel['description'], rel['fact']) }] AS edges,
+  reduce(total = 0, rel IN relationships(p) | total + coalesce(rel['weight'], 0)) AS total_weight
+```
+
+Key choices:
+
+- **Up to 4 hops** undirected. `shortestPath` is unavailable (FalkorDB requires it inside `WITH`/`RETURN` AND directed); `(s)-[*1..4]-(t)` + `head(collect(p))` after `ORDER BY length(p)` is the supported workaround.
+- **Self-source filtered** in JS before substitution, so a team member who *is* the target is silently skipped.
+- **Geo filter is two-layer** — node `display_label` filter on intermediate hops AND edge type filter anywhere on the path. Without this, "both live in Austin" surfaces as a relationship.
+- **Bracket property access** (`node['name']`) is mandatory inside the cypher string — dot access (`node.name`) gets corrupted by Mintlify-style Markdown autolinkers (the `.name` TLD, `.app`, `.dev` etc. all get linkified), and our generation path historically went through `util.template_engine` which applies markdown post-processing.
+
+### Schema of the saved `paths` JSON (per row)
+
+Each updated `discover_*_node` row has its `paths` column overwritten with an **array of team-member entries, sorted lowest `total_weight` first**:
+
+<ResponseField name="paths" type="object[]">
+Array of team members. One entry per unique `master_person_id` from the discover's owner + team members. Members with no graph connection appear with `path: null` at the bottom.
+
+  <Expandable title="Member entry">
+    <ResponseField name="master_person_id" type="int">Xano `master_person.id`.</ResponseField>
+    <ResponseField name="node_uuid" type="text">FalkorDB Person node uuid (mirror of `master_person.node_uuid`).</ResponseField>
+    <ResponseField name="name" type="text">Display name from `master_person.name`.</ResponseField>
+    <ResponseField name="avatar" type="text">Avatar URL from `master_person.avatar` (may be null).</ResponseField>
+    <ResponseField name="path" type="object | null">
+      The graph path object, or `null` when no non-geo path exists within 4 hops.
+
+      <Expandable title="Path object">
+        <ResponseField name="hops_count" type="int">Number of relationships traversed (= number of entries in `hops`).</ResponseField>
+        <ResponseField name="total_weight" type="int">Sum of `edge.weight` across all hops. Lower = stronger / more direct.</ResponseField>
+        <ResponseField name="hops" type="object[]">
+          One entry per relationship traversed, in path order. Each hop carries both endpoints AND the connecting edge — no need to cross-reference.
+
+          <Expandable title="Hop entry">
+            <ResponseField name="from" type="object">Source node of this hop. Same shape as `to`. Equal to the previous hop's `to` (intentional duplication for consumer clarity).</ResponseField>
+            <ResponseField name="to" type="object">Destination node of this hop. Always present.</ResponseField>
+            <ResponseField name="edge" type="object">Relationship between `from` and `to`.</ResponseField>
+          </Expandable>
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+#### Node shape (used inside `from` / `to`)
+
+| Field | Type | Notes |
+|---|---|---|
+| `node_uuid` | text | FalkorDB node uuid |
+| `name` | text | Node name |
+| `display_label` | text | `Person`, `Company`, `FundingRound`, `Live_Event`, etc. |
+| `avatar` | text \| null | Populated for Person nodes (mirrored from `master_person.avatar`) |
+| `logo` | text \| null | Populated for Company nodes (mirrored from `master_company.logo`) |
+
+#### Edge shape (used inside `edge`)
+
+| Field | Type | Notes |
+|---|---|---|
+| `type` | text | Relationship type (`WORKS_AT`, `CERTIFIED_BY`, `FOUNDED`, etc.) |
+| `weight` | int | Edge weight (10–50 typical) |
+| `description` | text \| null | `coalesce(edge.description, edge.fact)` — human-readable when set |
+
+### Example saved row
+
+For a `discover_response_node` whose target is `VamosWatu` (uuid `881dc387-...`), with team members Charles, Denis, Njogu, the persisted `paths` JSON looks like:
+
+<Accordion title="Example team_paths array (3 members, target = VamosWatu)">
+
+```json
+[
+  {
+    "master_person_id": 4,
+    "node_uuid": "3fcf33b0-29d4-4e40-bad6-881a8642b768",
+    "name": "Njogu Kimondo",
+    "avatar": "https://storage.googleapis.com/orbiter-staging/avatars/4/actual/7lQLr-kimondo.webp",
+    "path": {
+      "hops_count": 1,
+      "total_weight": 20,
+      "hops": [
+        {
+          "from": {
+            "node_uuid": "3fcf33b0-29d4-4e40-bad6-881a8642b768",
+            "name": "Njogu Kimondo",
+            "display_label": "Person",
+            "avatar": "https://storage.googleapis.com/orbiter-staging/avatars/4/actual/7lQLr-kimondo.webp",
+            "logo": null
+          },
+          "to": {
+            "node_uuid": "881dc387-6846-4ab4-b2b9-65db31eff123",
+            "name": "VamosWatu",
+            "display_label": "Company",
+            "avatar": null,
+            "logo": "https://img.logo.dev/vamoswatu.com?token=pk_..."
+          },
+          "edge": {
+            "type": "WORKS_AT",
+            "weight": 20,
+            "description": "Njogu works at VamosWatu as engineer"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "master_person_id": 6,
+    "node_uuid": "4ee1e4cc-8cbb-45ea-b521-0b68eb189fe3",
+    "name": "Dynamo Denis Mbugua",
+    "avatar": "https://storage.googleapis.com/orbiter-staging/avatars/6/actual/eYE2V-mbugua.webp",
+    "path": {
+      "hops_count": 1,
+      "total_weight": 20,
+      "hops": [
+        {
+          "from": { "node_uuid": "4ee1e4cc-...", "name": "Dynamo Denis Mbugua", "display_label": "Person", "avatar": "https://...", "logo": null },
+          "to":   { "node_uuid": "881dc387-...", "name": "VamosWatu", "display_label": "Company", "avatar": null, "logo": "https://..." },
+          "edge": { "type": "WORKS_AT", "weight": 20, "description": null }
+        }
+      ]
+    }
+  },
+  {
+    "master_person_id": 1,
+    "node_uuid": "7f7c403a-6c24-47cd-b603-b313e8434c99",
+    "name": "Charles Njenga",
+    "avatar": "https://storage.googleapis.com/orbiter-staging/avatars/1/actual/hdV6P-njenga.webp",
+    "path": {
+      "hops_count": 3,
+      "total_weight": 70,
+      "hops": [
+        {
+          "from": { "node_uuid": "7f7c403a-...", "name": "Charles Njenga", "display_label": "Person", "avatar": "https://...", "logo": null },
+          "to":   { "node_uuid": "707063a6-...", "name": "Udemy", "display_label": "Company", "avatar": null, "logo": "https://..." },
+          "edge": { "type": "CERTIFIED_BY", "weight": 25, "description": null }
+        },
+        {
+          "from": { "node_uuid": "707063a6-...", "name": "Udemy", "display_label": "Company", "avatar": null, "logo": "https://..." },
+          "to":   { "node_uuid": "4ee1e4cc-...", "name": "Dynamo Denis Mbugua", "display_label": "Person", "avatar": "https://...", "logo": null },
+          "edge": { "type": "CERTIFIED_BY", "weight": 25, "description": null }
+        },
+        {
+          "from": { "node_uuid": "4ee1e4cc-...", "name": "Dynamo Denis Mbugua", "display_label": "Person", "avatar": "https://...", "logo": null },
+          "to":   { "node_uuid": "881dc387-...", "name": "VamosWatu", "display_label": "Company", "avatar": null, "logo": "https://..." },
+          "edge": { "type": "WORKS_AT", "weight": 20, "description": null }
+        }
+      ]
+    }
+  }
+]
+```
+
+</Accordion>
+
+### Top-level orchestrator response
+
+The same `team_paths` payload that gets persisted to each row is also returned in the function response, grouped by which table the row came from. Useful for debugging or rendering without a second DB hit.
+
+```json
+{
+  "discover_id": 65,
+  "paths": [ /* same shape as a team member entry sans `path` */ ],
+  "source_uuids": ["7f7c403a-...", "4ee1e4cc-...", "3fcf33b0-..."],
+  "results": {
+    "response_nodes":          [ { "row_id": 61, "target_node_uuid": "881dc387-...", "team_paths": [ /* full team_paths array */ ] } ],
+    "context_nodes":           [ /* one entry per discover_context_node row processed */ ],
+    "question_context_nodes":  [ /* per-question entries with discover_question_id */ ],
+    "question_response_nodes": [ /* per-question entries with discover_question_id */ ]
+  }
+}
+```
+
+`question_context_nodes` and `question_response_nodes` entries additionally carry `discover_question_id` so the consumer can group rows by their parent question.
+
+### Notes for developers extending this pipeline
+
+- **Adding socket pushes:** Two `// ADD SOCKET HERE` markers in `create-discover-path` indicate the recommended push points. The first fires after response nodes are written; the second after all question-related nodes are written. Both already have the relevant accumulator vars (`$response_node_results`, `$context_node_results`, `$question_context_node_results`, `$question_response_node_results`) ready to ship.
+- **Adding a new `discover_*_node` table:** Mirror an existing inner block exactly — query the table, foreach + var.update `$current_row` + `$current_row_id`, lambda to extract target uuid, conditional + `function.run "mvp/paths/build-team-paths-for-target"`, `db.edit`, push entry into a new accumulator. The helper is intentionally table-agnostic.
+- **Tuning hop limit / geo filter:** Both live in `mvp/paths/build-team-paths-for-target`'s first lambda. The cypher uses `[*1..4]` and a fixed geo blocklist; bumping the hop count is the most expensive change (paths grow combinatorially).
+- **Edge `description` fallback:** the helper uses `coalesce(edge.description, edge.fact)` so older edges with `fact` (the legacy property) still surface a human-readable string. Newer edges should write to `description`.

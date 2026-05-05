@@ -1,0 +1,599 @@
+---
+title: "Merge"
+description: "Spec for merging duplicate master_person and master_company records — table-by-table flow, deduplication rules, and FalkorDB graph merge cypher."
+---
+
+<Note>
+  This is a clean-room spec for a new `merge/person-v2` and `merge/company-v2`. The existing
+  `merge/person` (#2269), `mvp/dupe/merge-company-nodes` (#10505), and `merge/mp-merge` (#159 — deprecated)
+  functions are reference points only — none of them touch every table that now holds a
+  `master_person_id` or `master_company_id`, none reconcile the FalkorDB graph atomically with the
+  Xano writes, and none are idempotent or audited. Build to this spec, not to the existing code.
+</Note>
+
+## Why merge is hard
+
+A duplicate is not just two rows in `master_person`. It's two rows that are each pointed at by
+**86 other tables for person** and **65 other tables for company**, plus a node in FalkorDB with
+N edges, plus join rows under `my_person` for every user who has either copy in their CRM.
+
+A correct merge has to:
+
+1. Pick a survivor and aggregate scalar fields from the duplicates onto it
+2. Repoint every FK in every dependent table from each duplicate → survivor
+3. Collapse rows that become duplicates after repoint (e.g. two `master_email` rows with the same address)
+4. Re-route every graph edge from the duplicate Person/Company node → survivor node, deduping on type
+5. Delete the duplicate rows + duplicate nodes
+6. Re-derive computed state (employment, embeddings, person/company nodes)
+7. Be idempotent — re-running with the same input is a no-op
+8. Be audited — every merge writes a snapshot row that can roll back
+
+Inputs follow the same shape for both:
+
+```ts
+type MergeInput = {
+  survivor_id: number;          // master_person_id or master_company_id we keep
+  duplicate_ids: number[];      // array of master IDs that collapse into the survivor
+  initiated_by: 'user' | 'cron' | 'admin';
+  merge_suspect_id?: number;    // when triggered from merge_suspect (#284)
+};
+```
+
+## Merging a Person
+
+```text
+function: merge/person-v2  (TO BUILD — workspace 3, branch v1)
+```
+
+### Phase flow
+
+<Steps>
+  <Step title="Validate & lock">
+    Reject if `survivor_id` ∈ `duplicate_ids`, if any duplicate is `null`, or if any `master_person`
+    row is missing. Lock all involved rows for the duration of the merge by writing a row to
+    `merge_lock` (new table — see [Open questions](#open-questions)).
+  </Step>
+  <Step title="Snapshot for rollback">
+    Write a `merge_audit` row (new table) with the JSON of the survivor + each duplicate's
+    `master_person` row, plus the counts of dependent rows in every table touched. This is the
+    rollback artifact and the audit log.
+  </Step>
+  <Step title="Aggregate scalar fields onto the survivor">
+    For each scalar column on `master_person` (139), apply the column-specific merge rule below.
+  </Step>
+  <Step title="Repoint master_person_id FKs across all 86 dependent tables">
+    `UPDATE … SET master_person_id = survivor_id WHERE master_person_id IN (duplicate_ids)`.
+  </Step>
+  <Step title="Reconcile my_person + its joins">
+    For each user that has a `my_person` (128) row pointing at one of the duplicates, fold it
+    into their existing `my_person` row pointing at the survivor (if any), or repoint it.
+  </Step>
+  <Step title="Dedup multi-row tables">
+    After the repoint, several tables now contain rows that are duplicates of each other on a
+    natural key. Collapse them per the rules below.
+  </Step>
+  <Step title="Regenerate derived state">
+    Re-run `mvp/work/process-work-experience` (rebuilds `employment` 263) and
+    `mvp/node/update-person-node` (#2758, syncs FalkorDB Person node properties + embedding).
+  </Step>
+  <Step title="Graph merge in FalkorDB">
+    Re-route every edge from each duplicate Person node → survivor Person node, dedup on
+    `(type, target_uuid)`, then `DETACH DELETE` the duplicates. See [Graph merge cypher](#graph-merge-cypher).
+  </Step>
+  <Step title="Delete duplicate master_person rows">
+    Only after every dependent FK is repointed, every join is reconciled, and the graph is in sync.
+  </Step>
+  <Step title="Update merge_suspect + re-enqueue enrichment">
+    Set `merged=true` on every `merge_suspect` (284) row that referenced any of the merged IDs.
+    Push the survivor to `queue_enrich_person` (582) so search indexes refresh.
+  </Step>
+</Steps>
+
+### Scalar field aggregation rules (master_person, table 139)
+
+| Field group | Rule |
+| --- | --- |
+| `name`, `first_name`, `middle_name`, `last_name`, `suffix`, `nickname` | Survivor wins if non-null. Else longest non-null from duplicates. Re-run `mvp/format/set-person-names` after. |
+| `headline`, `bio_500`, `bio_2000`, `tagline` | Longest non-null wins. |
+| `is_angel`, `is_c_suite`, `is_investor`, `is_founder`, any `is_*` boolean | Logical OR across survivor + all duplicates. |
+| `node_uuid` | Survivor's node_uuid is canonical. Duplicates' node_uuids drop out via the graph merge. |
+| `master_company_id` (primary current company) | Survivor wins if non-null; else most recent non-null from duplicates by `updated_at`. |
+| `visibility`, `enriched_at`, `qa_passed`, `enrichment_complete_at` | Survivor wins; if any duplicate has a more recent `enriched_at`, copy that timestamp + the related fields together as a unit. |
+| `created_at` | Min across survivor + duplicates (preserve oldest provenance). |
+| `updated_at` | `now`. |
+
+### Tables touched — Person merge
+
+<Note>
+  86 tables hold `master_person_id`. Bucketed by handling rule below — every table in the
+  workspace with a `master_person_id` column appears in exactly one bucket.
+</Note>
+
+<AccordionGroup>
+  <Accordion title="Identity records — repoint, then dedup on natural key">
+    These hold contact identifiers that should be unique per person after merge.
+
+    | Table | ID | Natural key for dedup |
+    | --- | --- | --- |
+    | `master_email` | 155 | `lower(trim(email_address))` |
+    | `master_phone` | 151 | normalized E.164 |
+    | `master_link` | 166 | `lower(trim(url))` |
+    | `master_address` | 164 | `(street, city, region, country)` canonical hash |
+    | `master_avatar` | 227 | `(url)` — keep all unique URLs, recompute `main` flag |
+
+    **Dedup rule:** after the repoint, group by natural key. Keep the row with the
+    oldest `created_at`. Before deleting the rest, merge any non-null fields the loser has that
+    the winner doesn't (e.g. `data_source_id` array union, `verified_at` max).
+  </Accordion>
+
+  <Accordion title="Profile content — repoint, dedup on (entity, time window)">
+    | Table | ID | Natural key |
+    | --- | --- | --- |
+    | `work_experience` | 147 | `(master_company_id, start_date)` |
+    | `education_experience` | 230 | `(school_id, start_date)` |
+    | `certification` | 283 | `(name, master_company_id)` |
+    | `honor` | 573 | `(name, year)` |
+    | `award` | 305 | `(name, year)` |
+    | `project` | 575 | `(name, start_date)` |
+    | `publication` | 574 | `(title, published_at)` |
+    | `volunteering` | 577 | `(organization, role, start_date)` |
+    | `cooking` | 664 | `(recipe_name)` |
+    | `about_person` | 365 | `(hash)` |
+    | `deep_biography` | 591 | `(version)` |
+
+    **Dedup rule:** group by natural key, keep oldest, merge non-null fields from losers.
+    `employment` (263) is intentionally **not** in this bucket — see "Regenerate derived state".
+  </Accordion>
+
+  <Accordion title="Tag/taxonomy joins — repoint, dedup on join key">
+    | Table | ID | Dedup on |
+    | --- | --- | --- |
+    | `industry_join` | 307 | `(master_person_id, industry_id)` |
+    | `interest_join` | 327 | `(master_person_id, interest_id)` |
+    | `language_join` | 326 | `(master_person_id, language_id)` |
+    | `role_join` | 329 | `(master_person_id, role_id)` |
+    | `skills_join` | 325 | `(master_person_id, skill_id)` |
+    | `keyword_join` | 306 | `(master_person_id, keyword_id)` |
+    | `expertise_join` | 469 | `(master_person_id, expertise_id)` |
+    | `expertise_person_join` | 596 | `(master_person_id, expertise_id)` |
+    | `person_has_expertise` | 711 | `(master_person_id, expertise_node_uuid)` — apply graph MERGE semantics from `mvp/expertise/upsert-person-has-expertise` (#12925) when collapsing |
+    | `available_for_join` | 344 | `(master_person_id, opportunity_type_id)` |
+    | `birthday_join` | 406 | `(master_person_id, birthday_id)` |
+    | `imdb_award_join` | 407 | `(master_person_id, imdb_award_id)` |
+    | `live_event_participants` | 703 | `(master_person_id, live_event_id, edge_type)` |
+    | `linkedin_connection_join` | 258 | `(master_person_id, connection_master_person_id)` |
+    | `orbiter_connection_join` | 257 | `(master_person_id, other_master_person_id)` |
+    | `yc_partner_join` | 487 | `(master_person_id, yc_batch_id)` |
+    | `file_attached_join` | 589 | `(master_person_id, file_id)` |
+
+    **Dedup rule:** keep one row per join key. For weighted joins (`person_has_expertise`),
+    apply the graph MERGE aggregation: max(confidence), strongest depth, most current recency,
+    pipe-concat evidence/identified_as. For simple joins, just keep the oldest row.
+  </Accordion>
+
+  <Accordion title="External profile data — repoint only (never dedup)">
+    These tables hold provider-keyed records (Crunchbase, PDL, IMDB, social platforms). Each
+    row is its own provenance — collapsing them loses signal. Just repoint.
+
+    `crunchbase_people` (237), `crunchbase_permalink` (302), `permalink_person` (465),
+    `fundable_people` (667), `imdb_person` (394), `person_imdb_scrape` (269),
+    `instagram` (369), `twitter_person` (368), `twitter_join` (497), `tiktok` (442),
+    `youtube` (441), `youtube_subscribers` (661), `youtube_transcript` (653),
+    `linkedin_follower` (495), `social_insights` (649)
+  </Accordion>
+
+  <Accordion title="Enrichment provenance — repoint only (audit trail, never dedup)">
+    Every row is an enrichment event. Preserving the full history lets us reconstruct what was
+    known when. Just repoint.
+
+    `enrich_history_person` (160), `person_enrich_data` (500), `log_enrichment_person` (579),
+    `log_qa_enrichment` (682), `log_re_enrichment` (683), `re_enriched_log` (477),
+    `profile_enrichment_job` (686), `person_fingerprint` (652), `expertise_identification_log` (660),
+    `update_experience_queue` (244), `vector_logs` (604)
+  </Accordion>
+
+  <Accordion title="Investor records — repoint, dedup on deal key">
+    | Table | ID | Dedup on |
+    | --- | --- | --- |
+    | `investor_profile_person` | 475 | one row per `master_person_id` total — keep oldest, merge non-null |
+    | `founders` | 320 | `(master_person_id, master_company_id)` |
+    | `company_investor` | 265 | `(master_person_id, master_company_id, funding_round_id)` |
+    | `company_investment_partner` | 266 | `(master_person_id, master_company_id, funding_round_id)` |
+    | `investment_theses` | 709 | one row per `master_person_id` — keep most recent |
+    | `fundable_people` | 667 | `(master_person_id, fundable_id)` |
+  </Accordion>
+
+  <Accordion title="App / CRM state — repoint, special my_person handling">
+    | Table | ID | Note |
+    | --- | --- | --- |
+    | `my_person` | 128 | See [my_person reconciliation](#my-person-reconciliation) |
+    | `user` | 125 | If a `user` row's `master_person_id` is a duplicate, repoint to survivor. Two `user` rows pointing to the same survivor is allowed (they're different humans logged in differently). |
+    | `suggestion_request` | 529 | Repoint, no dedup. |
+    | `copilot_conversations` | 636 | Repoint, no dedup. |
+    | `scheduling_link` | 601 | Repoint, no dedup. |
+    | `threads` | 444 | Repoint, no dedup. |
+    | `person_personas` | 714 | Dedup on `(master_person_id, persona_id)`. |
+    | `person_view` | 403 | Repoint, dedup on `(master_person_id, viewer_user_id)`. |
+    | `email_campaign` | 629 | Repoint, no dedup. |
+    | `email_template_attachment` | 630 | Repoint, dedup on `(master_person_id, email_template_id)`. |
+    | `referrals` | 264 | Repoint, no dedup. |
+    | `expertise` | 595 | Repoint. |
+    | `contact_merge_join` | 285 | If either side ID is in `duplicate_ids`, repoint to survivor; if both sides become survivor, delete the row. |
+    | `possible_conflicts` | 271 | Repoint; delete rows where both sides are now survivor. |
+    | `needs_more_info` | 249 | Repoint, dedup on `(master_person_id, master_company_id, field_name)`. |
+  </Accordion>
+
+  <Accordion title="System / queue / log — repoint or delete duplicate-keyed queue rows">
+    | Table | ID | Rule |
+    | --- | --- | --- |
+    | `queue_enrich_person` | 582 | After repoint, dedup on `master_person_id` (apply `mvp/queue/upsert-enrich-person` #12855 semantics — bump count, keep best priority_tier). |
+    | `employment` | 263 | Bulk-delete rows for survivor + duplicates, then `mvp/work/process-work-experience` regenerates from `work_experience` (147). |
+    | `log_crash` | 542 | Repoint, never dedup. |
+    | `error_current_work` | 615 | Repoint, never dedup. |
+    | `yc_stats` | 581 | Repoint, dedup on `(master_person_id, yc_batch_id)`. |
+    | `crunch-resolve-jobs` | 240 | Repoint, dedup on `(master_person_id, job_type)`. |
+  </Accordion>
+
+  <Accordion title="Merge tracking — finalize">
+    | Table | ID | Rule |
+    | --- | --- | --- |
+    | `merge_suspect` | 284 | Mark `merged=true, merged_at=now, merged_into=survivor_id` on every row where `master_person_id IN duplicate_ids` OR `merge_with_master_person_id IN duplicate_ids`. Repoint the surviving side to `survivor_id`. |
+    | `possible_duplicates` | 400 | Repoint `my_person_id` references via the [my_person reconciliation](#my-person-reconciliation) step. |
+  </Accordion>
+</AccordionGroup>
+
+### my_person reconciliation
+
+`my_person` (128) is per-user. Different users can each have their own `my_person` row pointing at
+the same `master_person`. After repointing, multiple rows for the same `(user_id, master_person_id)`
+are illegal — collapse them.
+
+For each user that owns a `my_person` row pointing at any duplicate:
+
+1. Look up the user's existing `my_person` row pointing at `survivor_id` (if any).
+2. **If none**: just `UPDATE my_person SET master_person_id = survivor_id WHERE id = duplicate_my_person.id`. Done.
+3. **If one exists**: fold the duplicate's joins into the survivor's joins, then delete the duplicate `my_person` row.
+
+Tables that hold `my_person_id` and need fold-in handling:
+
+| Table | ID | Rule when folding |
+| --- | --- | --- |
+| `my_person_email_join` | 312 | Repoint to survivor's `my_person.id`, then dedup on `(my_person_id, master_email_id)` |
+| `my_person_phone_join` | 313 | Repoint, dedup on `(my_person_id, master_phone_id)` |
+| `my_person_address_join` | 310 | Repoint, dedup on `(my_person_id, master_address_id)` |
+| `my_person_link_join` | 311 | Repoint, dedup on `(my_person_id, master_link_id)` |
+| `my_note_person_join` | 318 | Repoint, dedup on `(my_person_id, my_note_id)` |
+| `activity` | 218 | Repoint, no dedup (every activity is a unique event) |
+| `email_activity` | 597 | Repoint, no dedup |
+| `calendar_event_activity` | 598 | Repoint, no dedup |
+| `important_date` | 242 | Repoint, dedup on `(my_person_id, date_descriptor_id, date_value)` |
+| `possible_duplicates` | 400 | Repoint; delete rows where both sides become the same `my_person_id` |
+
+## Merging a Company
+
+```text
+function: merge/company-v2  (TO BUILD — workspace 3, branch v1)
+```
+
+### Phase flow
+
+Same shape as person merge:
+
+<Steps>
+  <Step title="Validate & lock">
+    Reject self-merge, missing rows; lock all `master_company` rows.
+  </Step>
+  <Step title="Snapshot for rollback">
+    Write `merge_audit` row.
+  </Step>
+  <Step title="Aggregate scalar fields onto the survivor">
+    See [scalar rules below](#scalar-field-aggregation-rules-master-company-table-142).
+  </Step>
+  <Step title="Repoint master_company_id FKs across all 65 dependent tables">
+    `UPDATE … SET master_company_id = survivor_id WHERE master_company_id IN (duplicate_ids)`.
+  </Step>
+  <Step title="Reconcile my_company">
+    `my_company` (149) is per-user; repoint with the same logic as `my_person`.
+  </Step>
+  <Step title="Repoint master_person.master_company_id">
+    Anyone whose primary current company points at a duplicate gets repointed to the survivor.
+  </Step>
+  <Step title="Dedup multi-row tables">
+    Identity records, joins, and any other table that becomes duplicate-keyed after repoint.
+  </Step>
+  <Step title="Regenerate derived state">
+    Re-run `mvp/node/add-update-company-node` to refresh the survivor's FalkorDB Company node
+    properties + embedding. Re-run `process-work-experience` for any affected master_persons
+    (their `employment` rows now reference the survivor).
+  </Step>
+  <Step title="Graph merge in FalkorDB">
+    Re-route every edge from duplicate Company nodes → survivor Company node, dedup on type +
+    target. See [Graph merge cypher](#graph-merge-cypher). The existing
+    `mvp/dupe/merge-company-nodes` (#10505) is a starting point for the property-merge logic
+    but only handles `profiles` — the new version must handle every property and every edge type.
+  </Step>
+  <Step title="Delete duplicate master_company rows">
+    Only after every dependent FK is repointed and the graph is in sync.
+  </Step>
+  <Step title="Update merge_suspect + re-enqueue enrichment">
+    Add a company-side `merge_suspect` table or extend #284 with a `kind` column. Push survivor
+    to `queue_enrich_company` (583).
+  </Step>
+</Steps>
+
+### Scalar field aggregation rules (master_company, table 142)
+
+| Field group | Rule |
+| --- | --- |
+| `name`, `legal_name` | Survivor wins if non-null; else longest non-null. |
+| `domain`, `linkedin_url`, `twitter_url`, `website_url` | Survivor wins if non-null; else first non-null from duplicates ordered by `created_at`. |
+| `industries[]`, `specialties[]`, `keywords[]` (text array fields) | Union, dedup, preserve order: survivor first, then duplicates by `created_at`. |
+| `description`, `tagline`, `summary_500`, `summary_2000` | Longest non-null wins. |
+| `founded_year`, `employee_count_min`, `employee_count_max` | Most recent non-null by `enriched_at`. |
+| `is_public`, `is_acquired`, `is_school`, `is_vc`, any `is_*` boolean | Logical OR. |
+| `total_funding_usd`, `valuation_usd`, `last_round_amount_usd` | Re-derive from `company_funding_round` (201) after the repoint — don't merge directly. |
+| `node_uuid` | Survivor canonical; duplicates drop out via graph merge. |
+| `created_at` | Min. |
+| `updated_at` | `now`. |
+
+### Tables touched — Company merge
+
+<AccordionGroup>
+  <Accordion title="Identity records — repoint, then dedup on natural key">
+    | Table | ID | Natural key |
+    | --- | --- | --- |
+    | `master_email` | 155 | `lower(trim(email_address))` |
+    | `master_phone` | 151 | normalized E.164 |
+    | `master_link` | 166 | `lower(trim(url))` |
+    | `master_address` | 164 | canonical address hash |
+    | `master_banner` | 228 | `(url)` |
+
+    Same dedup rule as person side — keep oldest, merge non-null from losers.
+  </Accordion>
+
+  <Accordion title="People-on-this-company — repoint master_person.master_company_id">
+    The `master_person` (139) table has its own `master_company_id` (the person's primary current
+    company). Anyone whose primary company points at a duplicate must be repointed to the survivor
+    **before** any per-person dedup — otherwise their `work_experience` collapse rules misfire.
+  </Accordion>
+
+  <Accordion title="Profile content — repoint, dedup on natural key">
+    | Table | ID | Natural key |
+    | --- | --- | --- |
+    | `about_company` | 366 | `(hash)` |
+    | `company_financial` | 287 | one row per `master_company_id` — keep most recent by `updated_at`, merge non-null |
+    | `company_acquirer` | 239 | `(master_company_id, acquirer_master_company_id, acquired_at)` |
+    | `company_funding_round` | 201 | `(master_company_id, announced_on, round_type)` |
+    | `company_investor` | 265 | `(master_company_id, master_person_id, funding_round_id)` |
+    | `back_fill_funding_round` | 625 | `(master_company_id, fundable_round_id)` |
+    | `missing_fundable_rounds` | 626 | `(master_company_id, fundable_round_id)` |
+    | `school` | 300 | one row per `master_company_id` — keep most recent |
+    | `organization` | 695 | `(master_company_id, kind)` |
+  </Accordion>
+
+  <Accordion title="Tag/taxonomy joins — repoint, dedup on join key">
+    | Table | ID | Dedup on |
+    | --- | --- | --- |
+    | `industry_join` | 307 | `(master_company_id, industry_id)` |
+    | `keyword_join` | 306 | `(master_company_id, keyword_id)` |
+    | `speciality_join` | 456 | `(master_company_id, speciality_id)` |
+    | `live_event_companies` | 704 | `(master_company_id, live_event_id, edge_type)` |
+    | `file_attached_join` | 589 | `(master_company_id, file_id)` |
+
+    Person-on-company joins (handled here too because they also reference master_company_id):
+    `certification` (283), `education_experience` (230), `employment` (263), `honor` (573),
+    `work_experience` (147), `volunteering` (577), `founders` (320),
+    `company_investment_partner` (266) — for these, dedup on the *person* natural key, not the
+    company side.
+  </Accordion>
+
+  <Accordion title="External profile data — repoint only">
+    `cb_company` (467), `crunchbase_company` (238), `crunchbase_permalink` (302),
+    `permalink_company` (431), `fundable_organizations` (666), `instagram` (369),
+    `instagram_company` (430), `twitter_company` (429), `twitter_join` (497),
+    `twitter_person` (368), `linkedin_profile_company` (499), `linkedin_follower` (495),
+    `vc_company` (277), `youtube_subscribers` (661), `scrape_crunchbase_company` (267),
+    `add_master_person` (468)
+  </Accordion>
+
+  <Accordion title="Enrichment provenance — repoint only (audit trail)">
+    `enrich_history_company` (404), `company_enrich_data` (485), `log_enrichment_company` (632),
+    `log_queue_company` (640), `log_qa_enrichment` (682), `log_re_enrichment` (683),
+    `profile_enrichment_job` (686), `vector_logs` (604), `error_current_work` (615),
+    `error_location_nodes` (602), `log_agent_tools` (470), `log_crash` (542)
+  </Accordion>
+
+  <Accordion title="Investor records">
+    | Table | ID | Dedup |
+    | --- | --- | --- |
+    | `investor_profile_company` | 478 | one row per `master_company_id` — keep oldest, merge non-null |
+    | `investment_theses` | 709 | one row per `master_company_id` — keep most recent |
+    | `company_investor` | 265 | already covered above |
+  </Accordion>
+
+  <Accordion title="App / CRM state">
+    | Table | ID | Note |
+    | --- | --- | --- |
+    | `my_company` | 149 | Same logic as `my_person` reconciliation — fold duplicate user-owned rows into the survivor row |
+    | `company_view` | 402 | Repoint, dedup on `(master_company_id, viewer_user_id)` |
+    | `needs_more_info` | 249 | Repoint, dedup on `(master_person_id, master_company_id, field_name)` |
+  </Accordion>
+
+  <Accordion title="System / queue">
+    | Table | ID | Rule |
+    | --- | --- | --- |
+    | `queue_enrich_company` | 583 | Dedup on `master_company_id` via `mvp/queue/upsert-enrich-company` (#12855) semantics |
+    | `queue_enrich_funding` | 584 | Dedup on `(master_company_id, funding_round_id)` |
+    | `queue_enrich_vc_firm` | 585 | Dedup on `master_company_id` |
+    | `crunch-resolve-jobs` | 240 | Dedup on `(master_company_id, job_type)` |
+    | `temp_fix` | 593 | Repoint only (one-off backfill table) |
+  </Accordion>
+</AccordionGroup>
+
+## Graph merge cypher
+
+The graph merge runs **after** every Xano FK is repointed but **before** the duplicate
+`master_*` rows are deleted (so we still know which `node_uuid` to delete from the graph).
+
+FalkorDB does not support APOC, so edge re-routing must enumerate relationship types. We have
+~25 edge types in production — see [Edges](/guides/ontology/edges) — so the cypher template
+below loops over them in the orchestrator.
+
+### Step 1 — Aggregate properties onto the survivor
+
+<CodeGroup>
+```cypher Person
+MATCH (s:Person {uuid: $survivor_uuid})
+UNWIND $duplicate_uuids AS dup_uuid
+MATCH (d:Person {uuid: dup_uuid})
+
+SET s.full_name      = coalesce(s.full_name, d.full_name),
+    s.first_name     = coalesce(s.first_name, d.first_name),
+    s.last_name      = coalesce(s.last_name, d.last_name),
+    s.headline       = coalesce(s.headline, d.headline),
+    s.bio_500        = coalesce(s.bio_500, d.bio_500),
+    s.bio_2000       = coalesce(s.bio_2000, d.bio_2000),
+    s.is_angel       = coalesce(s.is_angel, false) OR coalesce(d.is_angel, false),
+    s.is_c_suite     = coalesce(s.is_c_suite, false) OR coalesce(d.is_c_suite, false),
+    s.is_investor    = coalesce(s.is_investor, false) OR coalesce(d.is_investor, false),
+    s.is_founder     = coalesce(s.is_founder, false) OR coalesce(d.is_founder, false),
+    s.profiles       = CASE
+      WHEN d.profiles IS NULL THEN s.profiles
+      WHEN s.profiles IS NULL THEN d.profiles
+      ELSE s.profiles + ',' + d.profiles
+    END
+
+RETURN s.uuid AS survivor_uuid, count(d) AS duplicates_seen
+```
+
+```cypher Company
+MATCH (s:Company {uuid: $survivor_uuid})
+UNWIND $duplicate_uuids AS dup_uuid
+MATCH (d:Company {uuid: dup_uuid})
+
+SET s.company_name   = coalesce(s.company_name, d.company_name),
+    s.company_domain = coalesce(s.company_domain, d.company_domain),
+    s.tagline        = coalesce(s.tagline, d.tagline),
+    s.summary_500    = coalesce(s.summary_500, d.summary_500),
+    s.summary_2000   = coalesce(s.summary_2000, d.summary_2000),
+    s.is_public      = coalesce(s.is_public, false) OR coalesce(d.is_public, false),
+    s.is_acquired    = coalesce(s.is_acquired, false) OR coalesce(d.is_acquired, false),
+    s.is_school      = coalesce(s.is_school, false) OR coalesce(d.is_school, false),
+    s.profiles       = CASE
+      WHEN d.profiles IS NULL THEN s.profiles
+      WHEN s.profiles IS NULL THEN d.profiles
+      ELSE s.profiles + ',' + d.profiles
+    END
+
+RETURN s.uuid AS survivor_uuid, count(d) AS duplicates_seen
+```
+</CodeGroup>
+
+After this query returns, normalize comma-separated `profiles` (split → trim → unique → join) in
+a follow-up `SET` to keep the column compact. The pattern is borrowed from
+`mvp/dupe/merge-company-nodes` (#10505) but generalized to all string-list properties.
+
+### Step 2 — Re-route edges per relationship type
+
+For each edge type, run the template below with `$rel_type` substituted in. The orchestrator
+loops over the edge type list from [Edges](/guides/ontology/edges).
+
+```cypher
+// $rel_type is substituted in by the template engine — Cypher does not allow parameterized rel types
+MATCH (d:Person)-[r:KNOWS]-(other)
+WHERE d.uuid IN $duplicate_uuids AND other.uuid <> $survivor_uuid
+
+WITH d, other, r, properties(r) AS props,
+     CASE WHEN startNode(r) = d THEN 'out' ELSE 'in' END AS direction
+
+MATCH (s:Person {uuid: $survivor_uuid})
+
+// Branch on direction so we preserve edge orientation
+FOREACH (_ IN CASE WHEN direction = 'out' THEN [1] ELSE [] END |
+  MERGE (s)-[new_r:KNOWS]->(other)
+  SET new_r += props,
+      new_r.merged_from = coalesce(new_r.merged_from, []) + d.uuid
+)
+FOREACH (_ IN CASE WHEN direction = 'in' THEN [1] ELSE [] END |
+  MERGE (other)-[new_r:KNOWS]->(s)
+  SET new_r += props,
+      new_r.merged_from = coalesce(new_r.merged_from, []) + d.uuid
+)
+
+DELETE r
+RETURN count(*) AS edges_rerouted
+```
+
+**Per-edge-type aggregation rules** when the `MERGE` lands on an existing edge:
+
+| Edge type | Aggregation |
+| --- | --- |
+| `KNOWS` | Apply `known/ingest/append_evidence` (#12779) semantics: union evidence array, max confidence, min `known_since`, max `last_evidence_at` |
+| `HAS_EXPERTISE` | Apply `mvp/expertise/upsert-person-has-expertise` (#12925) semantics: max confidence, strongest depth, most current recency, pipe-concat evidence |
+| `WORKED_AT`, `EDUCATED_AT` | Keep both edges if `start_date` differs; merge if same `start_date` (sum tenure-derived weight) |
+| `INVESTED_IN`, `RAISED` | Keep both — investments are time-stamped events, not duplicates |
+| `REGISTERED_FOR`, `ATTENDED` | Dedup on target uuid (one event per person) |
+| `WON_AWARD`, `NOMINATED_FOR` | Dedup on target Award uuid |
+| Any other relationship | Default: `SET new_r += props` (last write wins on scalar props) |
+
+### Step 3 — Detach delete the duplicate nodes
+
+```cypher
+MATCH (d:Person)
+WHERE d.uuid IN $duplicate_uuids
+DETACH DELETE d
+RETURN count(d) AS nodes_deleted
+```
+
+For company side, swap `:Person` → `:Company`.
+
+### Step 4 — Re-sync the survivor node
+
+After the merge, call `mvp/node/update-person-node` (#2758) for person or the equivalent
+`mvp/node/add-update-company-node` for company. This recomputes the embedding from the now-merged
+`master_person` / `master_company` row and re-applies any dynamic labels (e.g. `:Angel`, `:C_Suite`).
+
+## Idempotency & safety guarantees
+
+1. **Idempotent**: re-running `merge/person-v2` with the same `(survivor_id, duplicate_ids)` after a
+   successful merge is a no-op — the duplicate IDs no longer exist, so all `WHERE id IN duplicate_ids`
+   queries match zero rows. The orchestrator should detect this and return `{status: 'already_merged'}`
+   instead of failing.
+2. **Atomic per-table**: each table's repoint+dedup runs inside a single transaction. The whole merge
+   is *not* one mega-transaction (Xano can't hold one open across 80+ tables) — instead, the
+   `merge_audit` snapshot is the rollback point. A `merge/rollback` function uses the snapshot to
+   un-merge.
+3. **Fail-loud**: any FK constraint violation or unexpected row count writes a `log_crash` row and
+   sets `merge_audit.status = 'failed'`. No silent partial merges.
+4. **Survivor lock**: while a merge is in flight, the survivor + duplicate IDs are written to a
+   `merge_lock` table. Other writers (enrichment crons, user actions) check this table and either
+   wait or skip.
+
+## Open questions
+
+- **New tables to create**: `merge_audit` (snapshot + status), `merge_lock` (in-flight merges),
+  optional `company_merge_suspect` (vs. extending `merge_suspect` with a `kind` column).
+- **`my_note_person_join`**: should notes from the duplicate `my_person` be appended to the
+  survivor's notes, or should we keep both? Currently spec'd as "dedup on (my_person_id, my_note_id)"
+  which keeps both unless they reference the same note — confirm this is the desired UX.
+- **Activity timeline**: when two `my_person` rows fold together, the resulting timeline can show
+  duplicate-looking events (same email, same calendar event) if both `my_person` rows had separate
+  `activity` rows for them. The reconciliation step should dedup `activity` on
+  `(my_person_id, message_id)` and `(my_person_id, event_id)` after repoint, not just repoint.
+- **Conflict resolution UI**: when scalar fields collide (different `headline`, different `bio_500`),
+  should the user pick? The current spec auto-picks "longest non-null wins" — for high-stakes fields
+  this may need a UI-driven override.
+- **Suspect lifecycle**: after a merge, every other `merge_suspect` row that pairs the survivor with
+  some third person/company should be re-scored — the survivor's profile just got more data and
+  some pairs that were below threshold may now be above (or vice-versa).
+
+## Reference functions (do not trust — context only)
+
+| Function | ID | What it does today | What's wrong |
+| --- | --- | --- | --- |
+| `merge/person` | 2269 | Loops `from_master_persons` → `to_master_person`. Repoints ~25 of the 86 affected tables. Calls an unnamed `function.run` mid-stack. Calls `mvp/work/process-work-experience` and `mvp/node/update-person-node` at the end. | Misses 60+ tables. Not idempotent. No graph merge for incoming edges or properties. No audit. No `merge_lock`. The unnamed `function.run` is opaque. |
+| `mvp/dupe/merge-company-nodes` | 10505 | Cypher-only: finds duplicate `Company` nodes by `(name + domain)` or `(name + profile overlap)`, merges `profiles` property, `DETACH DELETE`s duplicates. | Doesn't repoint Xano FKs at all. Doesn't merge any properties besides `profiles`. Doesn't re-route edges from duplicate nodes — the `DETACH DELETE` drops them. |
+| `merge/mp-merge` | 159 | Older 1:1 person merge. Tagged `depreciated`. | Superseded by `merge/person`; still listed because old code may call it. |
+| `mvp/merge/master-merge` | 12736 | Placeholder called by `mvp/merge/detect-suspects` (#12709) on deterministic exact-match. | Stub — TODO comment says "Implement actual merge logic — reassign edges, deduplicate fields, soft-delete loser." This spec is what fills that stub. |
+| `mvp/merge/get-suspects` | 12549 | Returns `merge_suspect` rows for the UI. | Read-only; not affected. |
+| `mvp/merge/detect-suspects` | 12709 | Embedding + LLM pipeline that writes `merge_suspect` rows. | Producer, not merger. The new `merge/person-v2` is what runs when the user clicks "merge" on a suspect. |

@@ -263,9 +263,9 @@ Tables that hold `my_person_id` and need fold-in handling:
 | `my_person_address_join` | 310 | Repoint, dedup on `(my_person_id, master_address_id)` |
 | `my_person_link_join` | 311 | Repoint, dedup on `(my_person_id, master_link_id)` |
 | `my_note_person_join` | 318 | Repoint, dedup on `(my_person_id, my_note_id)` |
-| `activity` | 218 | Repoint, no dedup (every activity is a unique event) |
-| `email_activity` | 597 | Repoint, no dedup |
-| `calendar_event_activity` | 598 | Repoint, no dedup |
+| `activity` | 218 | Repoint, then dedup on `(my_person_id, message_id)` — keep oldest, merge non-null metadata (`read_at`, `replied_at`, etc.) from losers onto the winner |
+| `email_activity` | 597 | Repoint, then dedup on `(my_person_id, message_id)` — same metadata-merge rule |
+| `calendar_event_activity` | 598 | Repoint, then dedup on `(my_person_id, event_id)` — same metadata-merge rule |
 | `important_date` | 242 | Repoint, dedup on `(my_person_id, date_descriptor_id, date_value)` |
 | `possible_duplicates` | 400 | Repoint; delete rows where both sides become the same `my_person_id` |
 
@@ -569,23 +569,118 @@ After the merge, call `mvp/node/update-person-node` (#2758) for person or the eq
    `merge_lock` table. Other writers (enrichment crons, user actions) check this table and either
    wait or skip.
 
-## Open questions
+## New infrastructure tables (decided)
 
-- **New tables to create**: `merge_audit` (snapshot + status), `merge_lock` (in-flight merges),
-  optional `company_merge_suspect` (vs. extending `merge_suspect` with a `kind` column).
-- **`my_note_person_join`**: should notes from the duplicate `my_person` be appended to the
-  survivor's notes, or should we keep both? Currently spec'd as "dedup on (my_person_id, my_note_id)"
-  which keeps both unless they reference the same note — confirm this is the desired UX.
-- **Activity timeline**: when two `my_person` rows fold together, the resulting timeline can show
-  duplicate-looking events (same email, same calendar event) if both `my_person` rows had separate
-  `activity` rows for them. The reconciliation step should dedup `activity` on
-  `(my_person_id, message_id)` and `(my_person_id, event_id)` after repoint, not just repoint.
-- **Conflict resolution UI**: when scalar fields collide (different `headline`, different `bio_500`),
-  should the user pick? The current spec auto-picks "longest non-null wins" — for high-stakes fields
-  this may need a UI-driven override.
-- **Suspect lifecycle**: after a merge, every other `merge_suspect` row that pairs the survivor with
-  some third person/company should be re-scored — the survivor's profile just got more data and
-  some pairs that were below threshold may now be above (or vice-versa).
+Three new pieces of bookkeeping that don't exist yet — required by the spec above.
+
+### `merge_audit` (new table)
+
+One row per merge attempt. Stores the rollback artifact and the audit trail.
+
+| Column | Type | Note |
+| --- | --- | --- |
+| `id` | int | PK |
+| `kind` | text | `'person'` or `'company'` |
+| `survivor_id` | int | FK → master_person.id or master_company.id |
+| `duplicate_ids` | int[] | array of master IDs collapsed into the survivor |
+| `initiated_by` | text | `'user'`, `'cron'`, `'admin'` |
+| `merge_suspect_id` | int | FK → merge_suspect.id when triggered from a suspect (nullable) |
+| `status` | text | `'pending'`, `'success'`, `'failed'`, `'rolled_back'` |
+| `pre_merge_snapshot` | json | full JSON of survivor + each duplicate's `master_*` row, plus row counts per dependent table at start time |
+| `error_message` | text | populated when `status='failed'` |
+| `started_at` | timestamp | |
+| `finished_at` | timestamp | |
+
+### `merge_lock` (new table)
+
+Short-lived rows held while a merge is in flight. Other writers (enrichment crons, user actions)
+check this table and either wait or skip.
+
+| Column | Type | Note |
+| --- | --- | --- |
+| `id` | int | PK |
+| `entity_kind` | text | `'person'` or `'company'` |
+| `master_id` | int | locked master_person.id or master_company.id |
+| `merge_audit_id` | int | FK → merge_audit.id |
+| `acquired_at` | timestamp | |
+
+Index: unique on `(entity_kind, master_id)` so a second merge touching the same row blocks
+immediately. Cleared on merge success/failure.
+
+### `merge_suspect` extension
+
+Add a `kind` column (`'person'` or `'company'`) to the existing `merge_suspect` (284). Keeps one
+suspect-feed UI. Existing rows backfill to `kind='person'`.
+
+## Conflict resolution (decided)
+
+Scalar field conflicts (survivor and a duplicate both have non-null values that disagree) split
+into two tiers:
+
+### High-stakes fields — surface to the user when interactive
+
+- `headline`, `bio_500`, `bio_2000`, `tagline`, `summary_500`, `summary_2000`
+- `name`, `first_name`, `middle_name`, `last_name`, `suffix`, `nickname`
+- `legal_name` (company)
+- `domain`, `linkedin_url`, `twitter_url`, `website_url` (company)
+
+When a **user-initiated** merge hits a conflict on any of these, the merge orchestrator pauses
+and surfaces a side-by-side conflict-resolution UI. The user picks per field, or accepts the
+"longest non-null" auto-pick default. Then the merge proceeds with the user's choices.
+
+### Everything else — auto-pick silently
+
+All other scalar fields auto-pick by the rules in the [scalar aggregation tables](#scalar-field-aggregation-rules-master-person-table-139)
+without surfacing anything.
+
+### Cron-initiated merges — never block on a human
+
+Cron paths (deterministic exact-match via `mvp/merge/master-merge` #12736, future scheduled
+re-merges of high-confidence suspects) auto-pick high-stakes fields too, AND write each
+overridden field to `merge_audit.conflicts_resolved[]`:
+
+```json
+{
+  "conflicts_resolved": [
+    {
+      "field": "headline",
+      "winner_value": "Founder & CEO at Acme",
+      "winner_source_master_id": 12345,
+      "loser_values": ["Co-founder, Acme Inc."],
+      "loser_source_master_ids": [67890],
+      "rule_applied": "longest_non_null"
+    }
+  ]
+}
+```
+
+A "review recent auto-merges" feed reads from `merge_audit` where `conflicts_resolved` is
+non-empty, letting the user override after the fact (the override writes a follow-up
+`merge_field_override` row but does NOT re-run the full merge).
+
+### Confidence escape hatch — deterministic matches skip even the logging
+
+When the merge was triggered by a deterministic exact-match (same email or normalized phone),
+the records are by definition the same person. Conflicts on scalar fields are just stale data
+from one source — auto-pick "longest non-null" without writing to `conflicts_resolved`. This
+keeps the after-the-fact review feed focused on actually ambiguous merges.
+
+The trigger source is recorded in `merge_audit.initiated_by` plus a new
+`merge_audit.match_kind` column with values `'deterministic'` (email/phone exact-match),
+`'llm_confirmed'` (Tier 1/Tier 2 from `mvp/merge/detect-suspects` #12709), or
+`'user_picked'` (manual merge from the suspect UI).
+
+## Suspect lifecycle after merge (decided)
+
+When a merge completes, the orchestrator finalizes `merge_suspect` (284) in three steps:
+
+1. **Repoint** — `UPDATE merge_suspect SET master_person_id = survivor_id WHERE master_person_id IN duplicate_ids` and same for `merge_with_master_person_id` (or the company-side equivalent FKs once `kind` is added).
+2. **Delete collapsed pairs** — after repoint, delete any row where both sides now equal `survivor_id`. The pair is meaningless (the suspect was for two records that are now one).
+3. **Flag for re-score** — on every remaining row touching the survivor, set `needs_rescore=true`. A cron (new or extension to `mvp/merge/detect-suspects` #12709) picks up flagged rows and re-runs Tier 1 / Tier 2 scoring just for the affected pairs. The new score writes back to the same row and clears the flag.
+
+UI behavior while `needs_rescore=true`: hide the row from the active suspect feed, or show with a "re-evaluating" tag. Don't let users action a stale-score suspect.
+
+**Why deferred re-score, not synchronous**: scoring at merge time would burn Gemini Flash + Pro tokens on every merge — most of which are routine deterministic matches that don't need their downstream suspects re-evaluated. Deferring lets the cron batch them.
 
 ## Reference functions (do not trust — context only)
 

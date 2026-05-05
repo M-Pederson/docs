@@ -1,0 +1,524 @@
+---
+title: "Tables & APIs"
+description: "Orbiter ↔ APIANT integration: Xano workspace 3 tables, API group, middleware, and outbound helpers."
+---
+
+## Overview
+
+APIANT is the integration middleware between meeting-source providers (Google Meet, Granola, Zoom, future) and Orbiter. APIANT owns OAuth, source webhooks/polling, token refresh, artifact discovery, and normalization. Orbiter receives normalized data through a small set of generic endpoints and handles calendar matching, storage, and graph processing.
+
+This page is the live build log for the integration. It is updated as each milestone lands in Xano workspace 3.
+
+## Build status
+
+<Steps>
+  <Step title="Tables" titleSize="h3">
+    Status: **shipped** — 5 tables, all tagged `integrations`, in workspace 3, branch `v1`.
+  </Step>
+  <Step title="API group" titleSize="h3">
+    Status: **shipped** — `Integrations` group, id `1273`, canonical `Q-8qLxQi`.
+  </Step>
+  <Step title="Auth + idempotency helpers" titleSize="h3">
+    Status: **shipped** — `integrations/auth_check` (function id 12937) and `integrations/idempotency_check` (function id 12938) called as the first two steps of every inbound endpoint.
+  </Step>
+  <Step title="Inbound endpoints" titleSize="h3">
+    Status: **shipped** — 5 endpoints (POST/PATCH/DELETE connections, POST meetings, POST events) live under `Integrations` group on branch `v1`.
+  </Step>
+  <Step title="Outbound APIANT helpers" titleSize="h3">
+    Status: **shipped** — 3 functions for Orbiter → APIANT calls: start OAuth, trigger backfill, revoke connection. APIANT base URL/paths stubbed against `env.apiant_base_url` + `env.apiant_api_key` — confirm with APIANT before going live.
+  </Step>
+</Steps>
+
+## Tables
+
+All tables live in Xano workspace 3, tagged `integrations`. Foreign keys reference the existing `user` table (id `125`).
+
+### `integration_api_key` (table id 716)
+
+Workspace-scoped Bearer keys. APIANT sends one in every inbound request. Format: `orb_live_wsk_<workspace_id>_<random>`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | int | PK |
+| `workspace_id` | int | Scoping workspace |
+| `api_key` | text | Full bearer token. Unique. Sensitive. |
+| `label` | text | Human-readable, e.g. "APIANT production" |
+| `status` | enum | `active`, `revoked` |
+| `created_by` | text | Operator who minted the key |
+| `last_used_at` | timestamp | Updated on each successful auth |
+| `revoked_at` | timestamp | Set when status flips to revoked |
+| `created_at` | timestamp | |
+
+Indexes: unique on `api_key`, btree on `(workspace_id, status)`.
+
+### `integration_connection` (table id 717)
+
+One row per (user, source, external_account_id). Created/upserted via `POST /v1/integrations/connections`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | int | PK |
+| `user_id` | int → user | Orbiter user. APIANT obtains this from the OAuth state param Orbiter passes in. |
+| `workspace_id` | int | Must match the workspace scoping the auth bearer. |
+| `source` | enum | `google_meet`, `granola`, `zoom`. Extensible. |
+| `external_account_id` | text | Stable identifier at source (email for Google/Zoom, owner email for Granola). |
+| `external_account_label` | text | Display string for UI, e.g. `mark@orbiter.io (Workspace)` |
+| `apiant_connection_id` | text | APIANT's own connection ID. Unique. Primary lookup for Orbiter ↔ APIANT. |
+| `status` | enum | `active`, `needs_reauth`, `error`, `revoked`, `inactive` |
+| `scopes` | text[] | Granted OAuth scopes for audit |
+| `connected_at` | timestamp | When OAuth completed at source |
+| `last_event_at` | timestamp | Updated when this connection delivers a meeting/event |
+| `revoked_at` | timestamp | Set when DELETE fires |
+| `created_at` | timestamp | |
+| `updated_at` | timestamp | |
+
+Indexes: unique on `apiant_connection_id`; btree on `(workspace_id, user_id, source)` and on `status`.
+
+### `integration_meeting` (table id 718)
+
+Normalized meeting envelope. The dedup key is `(workspace_id, source, source_meeting_id)`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | int | PK |
+| `user_id` | int → user | Owning user |
+| `workspace_id` | int | Owning workspace |
+| `source` | enum | Same enum as connections |
+| `source_meeting_id` | text | Provider's stable meeting ID. Uniqueness key. |
+| `apiant_connection_id` | text | FK string to `integration_connection.apiant_connection_id` |
+| `integration_connection_id` | int → integration_connection | Resolved FK for joins (denormalized) |
+| `title` | text | Falls back to "Untitled Meeting" if absent |
+| `started_at` | timestamp | ISO8601, required |
+| `ended_at` | timestamp | Required. Computed from duration if only `started_at` provided. |
+| `duration_sec` | int | Computed if absent |
+| `organizer` | json | `{ email, name }` |
+| `participants` | json | Array of `{ email, name, role, joined_at, left_at, speaking_time_sec }` |
+| `calendar_match_hints` | json | `{ conference_url, conference_id, ical_uid, external_calendar_event_id }` |
+| `artifacts` | json | Array of artifact objects (see [artifact types](#artifact-types)) |
+| `status` | enum | `accepted`, `duplicate`, `partial` |
+| `calendar_match` | json | `{ matched_event_id, confidence, method }` from Nylas/calendar match |
+| `raw_payload` | json | Full source response. Optional. |
+| `created_at` | timestamp | |
+| `updated_at` | timestamp | Updated on subsequent backfill/append |
+
+Indexes: unique on `(workspace_id, source, source_meeting_id)`; btree on `apiant_connection_id`, `integration_connection_id`, `(user_id, started_at desc)`, `started_at desc`.
+
+#### Artifact types
+
+| Type | Format | Inline `content`? | `url`? |
+|---|---|---|---|
+| `transcript_text` | `text/plain` | yes | optional |
+| `transcript_structured` | `application/json` | yes | optional |
+| `summary_md` | `text/markdown` | yes | optional |
+| `summary_doc` | `text/html` | yes | recommended |
+| `summary_text` | `text/plain` | yes | optional |
+| `video_mp4` | `video/mp4` | URL-only | required |
+| `audio_m4a` | `audio/m4a` | URL-only | required |
+| `chat_log` | `text/plain` | yes | optional |
+| `action_items_json` | `application/json` | yes | optional |
+
+<Note>
+Per Orbiter v1 decision: video and audio are URL-only (no upload to Orbiter storage). Inline `content` should be null for those types.
+</Note>
+
+### `integration_idempotency` (table id 719)
+
+Stores Idempotency-Key for 48 hours. Same key + same payload returns the original response with `status: "duplicate"`. Same key + different payload returns `409 idempotency_conflict`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | int | PK |
+| `idempotency_key` | text | Client-supplied uuid-v4 |
+| `workspace_id` | int | Scoping workspace |
+| `endpoint` | text | e.g. `POST:/v1/integrations/meetings` |
+| `payload_hash` | text | SHA256 of canonicalized request body |
+| `response_status` | int | HTTP status of original request |
+| `response_body` | json | Full body to replay on duplicate |
+| `record_type` | enum | `connection`, `meeting`, `event` |
+| `record_id` | int | Row id created/updated by the original request |
+| `created_at` | timestamp | |
+| `expires_at` | timestamp | `created_at + 48h` |
+
+Indexes: unique on `(workspace_id, idempotency_key)`; btree on `expires_at` (for cleanup task).
+
+### `integration_event` (table id 720)
+
+Generic event log from `POST /v1/integrations/events`. Catches partial failures, source warnings, status notifications that aren't full webhook deliveries.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | int | PK |
+| `user_id` | int → user | When known |
+| `workspace_id` | int | Owning workspace |
+| `source` | enum | Source provider |
+| `apiant_connection_id` | text | When known |
+| `integration_connection_id` | int → integration_connection | Resolved FK |
+| `source_meeting_id` | text | When known |
+| `integration_meeting_id` | int → integration_meeting | Resolved FK |
+| `event_type` | text | Free-form, e.g. `transcript_not_yet_available`, `meeting_too_short_to_process`, `user_revoked_at_source` |
+| `severity` | enum | `info`, `warning`, `error` |
+| `message` | text | Human-readable from APIANT |
+| `payload` | json | Full event payload for replay/debug |
+| `created_at` | timestamp | |
+
+Indexes: btree on `(workspace_id, created_at desc)`, `apiant_connection_id`, `source_meeting_id`, `event_type`, `(severity, created_at desc)`.
+
+## API group
+
+| Field | Value |
+|---|---|
+| Group | `Integrations` |
+| ID | `1273` |
+| Canonical | `Q-8qLxQi` |
+| Branch | `v1` |
+| Base URL | `https://xh2o-yths-38lt.n7c.xano.io/api:Q-8qLxQi` |
+
+Every endpoint below sits under this group. Full URL example:
+
+```
+POST https://xh2o-yths-38lt.n7c.xano.io/api:Q-8qLxQi/v1/integrations/meetings
+```
+
+## Authentication
+
+### Inbound (APIANT → Orbiter)
+
+Workspace-scoped Bearer API key from `integration_api_key`.
+
+```http
+Authorization: Bearer orb_live_wsk_<workspace_id>_<random>
+Content-Type: application/json
+Idempotency-Key: <uuid-v4>
+X-Orbiter-Source: google_meet
+```
+
+- One key per Orbiter workspace. Hot rotation supported.
+- Keys are scoped to a single workspace and cannot read or write other workspaces' data.
+- Compromised keys can be revoked individually; APIANT will receive `401 invalid_api_key` and must alert.
+
+### Outbound (Orbiter → APIANT)
+
+Standard APIANT API key, held in Orbiter Xano environment variables. Used for: starting OAuth flows, triggering backfill, revoking connections.
+
+## Helper functions
+
+Every inbound endpoint calls these two helpers as the first two steps in its stack. They are not endpoints themselves — they're reusable Xano functions invoked via `function.run`.
+
+### `integrations/auth_check` (function id 12937)
+
+```xs
+function.run "integrations/auth_check" as $auth
+```
+
+- Reads `Authorization` header from `$env.$http_headers`, case-tolerant.
+- Strips the `Bearer ` prefix.
+- Looks up the token in `integration_api_key` where `status = active`.
+- Updates `last_used_at` on success.
+- Throws `accessdenied` with `{error:{code:"invalid_api_key"}}` body if missing/invalid/revoked.
+- Returns `{ workspace_id, api_key_id }`.
+
+### `integrations/idempotency_check` (function id 12938)
+
+```xs
+function.run "integrations/idempotency_check" {
+  input = {
+    workspace_id: $auth.workspace_id
+    endpoint: "POST:/v1/integrations/meetings"
+    raw_body: $body
+  }
+} as $idem
+```
+
+- Reads `Idempotency-Key` header. Throws `invalid_payload` if missing.
+- SHA256 hashes the canonicalized body.
+- Looks up `(workspace_id, idempotency_key)` in `integration_idempotency`.
+- **Same key + same hash** → returns `{ duplicate: true, response_body, ... }` so the endpoint can replay the original response verbatim.
+- **Same key + different hash** → throws `idempotency_conflict`.
+- **New key** → inserts a row with `expires_at = now + 48h` and returns `{ duplicate: false, key_row_id }`. The endpoint backfills `response_body` + `record_id` after writing.
+
+## Endpoints
+
+All endpoints live under the `Integrations` API group (canonical `Q-8qLxQi`).
+
+| Verb | Path | API ID | Purpose |
+|---|---|---|---|
+| POST | `/v1/integrations/connections` | 8429 | Register or upsert a user's connection to a source |
+| PATCH | `/v1/integrations/connections/{apiant_connection_id}` | 8430 | Update connection status |
+| DELETE | `/v1/integrations/connections/{apiant_connection_id}` | 8431 | Mark connection revoked |
+| POST | `/v1/integrations/meetings` | 8432 | Push one normalized meeting (real-time + backfill) |
+| POST | `/v1/integrations/events` | 8433 | Generic event log |
+
+<Warning>
+URL param `apiant_connection_id` is provisional. APIANT spec uses `external_id` in URL examples but `apiant_connection_id` in body and field reference. Confirming with APIANT — easy rename via `updateAPI` once decided.
+</Warning>
+
+### POST /v1/integrations/connections
+
+Register or upsert a connection. Idempotent on `apiant_connection_id` (creates if not found, updates if found).
+
+**Request body**
+
+```json
+{
+  "user_id": 123,
+  "workspace_id": 3,
+  "source": "google_meet",
+  "external_account_id": "mark@orbiter.io",
+  "external_account_label": "mark@orbiter.io (Workspace)",
+  "apiant_connection_id": "conn_abc123",
+  "status": "active",
+  "scopes": ["meetings.space.readonly", "drive.readonly"],
+  "connected_at": "2026-04-30T14:00:00Z"
+}
+```
+
+**Response 200**
+
+```json
+{ "id": 42, "status": "created" }
+```
+
+`status` is `"created"`, `"updated"`, or `"duplicate"` (idempotency replay).
+
+### PATCH /v1/integrations/connections/{apiant_connection_id}
+
+Update connection status (e.g., when APIANT detects re-auth required, source revocation, or persistent errors).
+
+**Request body** — only fields you want to change:
+
+```json
+{ "status": "needs_reauth" }
+```
+
+**Response 200**
+
+```json
+{ "external_id": "conn_abc123", "status": "updated", "connection_status": "needs_reauth" }
+```
+
+### DELETE /v1/integrations/connections/{apiant_connection_id}
+
+Mark connection revoked. Does not delete historical meetings.
+
+**Response 200**
+
+```json
+{ "id": "conn_abc123", "status": "revoked" }
+```
+
+### POST /v1/integrations/meetings
+
+Push one normalized meeting. Single most important endpoint. Both real-time webhook deliveries and backfill batches use this same path with the same Idempotency-Key.
+
+**Dedup strategy** — idempotent on **two** levels:
+1. `Idempotency-Key` header (48h window)
+2. Natural key `(workspace_id, source, source_meeting_id)` — second write to the same meeting upserts (extends `artifacts`, `participants`, etc.) and returns `status: "duplicate"`.
+
+**Calendar match** — performed inline against the existing `event` table:
+1. If `calendar_match_hints.ical_uid` provided → match against `event.external_id`. Confidence: high.
+2. Else if `calendar_match_hints.conference_url` provided → match against `event.url`. Confidence: medium.
+3. Else: `calendar_match` is null. (Granola fuzzy-match path: time + organizer + attendee — TODO, run as background pass.)
+
+**Request body** — see [meeting envelope](#integration_meeting-table-id-718) field reference.
+
+**Response 200**
+
+```json
+{
+  "id": 42,
+  "status": "accepted",
+  "calendar_match": {
+    "matched_event_id": 7891,
+    "confidence": "high",
+    "method": "ical_uid"
+  }
+}
+```
+
+`status` is `"accepted"`, `"duplicate"`, or `"partial"` (stored but artifacts incomplete).
+
+### POST /v1/integrations/events
+
+Generic event log. Use cases: `transcript_not_yet_available`, `meeting_too_short_to_process`, `user_revoked_at_source`. Resolves `apiant_connection_id` → `integration_connection_id` and `(source, source_meeting_id)` → `integration_meeting_id` for join convenience when known.
+
+**Request body**
+
+```json
+{
+  "user_id": 123,
+  "workspace_id": 3,
+  "source": "zoom",
+  "apiant_connection_id": "conn_abc123",
+  "source_meeting_id": "uuid-from-zoom",
+  "event_type": "transcript_not_yet_available",
+  "severity": "info",
+  "message": "Zoom AI Companion still processing; will retry in 5min",
+  "payload": { "retry_after_sec": 300 }
+}
+```
+
+**Response 200**
+
+```json
+{ "id": 99 }
+```
+
+## Outbound helpers (Orbiter → APIANT)
+
+Three reusable Xano functions for Orbiter UI to call APIANT. Auth uses `env.apiant_api_key` (Bearer). Base URL falls back to `https://api.apiant.com` if `env.apiant_base_url` not set.
+
+<Warning>
+APIANT path shapes are stubs based on the spec's section 3.2 description. Confirm each path with APIANT before going live and update via `updateFunction`.
+</Warning>
+
+| Function | Function ID | Path called | Purpose |
+|---|---|---|---|
+| `integrations/apiant_start_oauth` | 12939 | `POST {base}/v1/connections/oauth/start` | Returns OAuth URL for Orbiter UI to redirect to. State param carries `user_id` + `workspace_id`. |
+| `integrations/apiant_trigger_backfill` | 12940 | `POST {base}/v1/connections/{id}/backfill` | Default 30 days. APIANT delivers via `POST /v1/integrations/meetings` (the inbound endpoint). |
+| `integrations/apiant_revoke_connection` | 12941 | `DELETE {base}/v1/connections/{id}` | Revokes at APIANT and flips local `integration_connection.status` → `revoked`. |
+
+## Idempotency & retries
+
+Every POST/PATCH/DELETE request must include `Idempotency-Key: <uuid-v4>`.
+
+- Orbiter stores the key for 48 hours.
+- Duplicate key + identical payload → `200` with `status: "duplicate"` and the original `id`.
+- Duplicate key + different payload → `409 idempotency_conflict`.
+- APIANT retries on `5xx` and network failures with exponential backoff (start 30s, max 1h, max 10 attempts), reusing the same Idempotency-Key.
+- APIANT does not retry `4xx` except `429`. On `429`, honor `Retry-After`.
+
+## Error contract
+
+```json
+{
+  "error": {
+    "code": "invalid_payload",
+    "message": "Field 'started_at' must be ISO8601",
+    "field": "started_at",
+    "request_id": "req_abc123"
+  }
+}
+```
+
+| HTTP | Code | Meaning | APIANT action |
+|---|---|---|---|
+| 400 | `invalid_payload` | Malformed/missing required field | Do not retry; log + alert |
+| 401 | `invalid_api_key` | Bad bearer token | Do not retry; alert |
+| 403 | `forbidden_workspace` | Key doesn't match `workspace_id` in body | Do not retry; alert |
+| 404 | `connection_not_found` | `apiant_connection_id` unknown | Do not retry; resync connection state |
+| 409 | `idempotency_conflict` | Same key, different payload | Do not retry; investigate |
+| 422 | `unprocessable` | Valid shape, semantic violation (e.g. `ended_at` before `started_at`) | Do not retry; log |
+| 429 | `rate_limited` | Workspace quota exceeded | Retry per `Retry-After` |
+| 500 | `internal_error` | Orbiter bug | Retry with backoff |
+| 503 | `service_unavailable` | Maintenance / dependency down | Retry with backoff |
+
+## Validation rules (Orbiter-side)
+
+These rules are enforced by Orbiter; understanding them helps APIANT avoid `400`s.
+
+1. `started_at < ended_at` (returns `422` otherwise).
+2. `duration_sec >= 0`.
+3. `source_meeting_id` non-empty and `< 512` chars.
+4. `participants[].email` must validate as email or be null.
+5. Artifact `content` `<= 5MB` inline. Larger transcripts must be split or sent as `url`.
+6. Artifact `url` must be HTTPS.
+7. `summary_doc.url` recommended even when `content` provided (preserves source link for users).
+8. `raw_payload <= 5MB`.
+9. Total request body `< 10MB`.
+
+## Backfill expectations
+
+- After connection created, Orbiter calls APIANT to trigger 30-day backfill.
+- APIANT delivers backfill via the same `POST /v1/integrations/meetings` endpoint.
+- APIANT may parallelize up to 10 concurrent requests per workspace.
+- Backfill ordering does not matter; meetings are independent.
+
+## Per-source field mapping
+
+### Google Meet
+
+| Canonical | Source |
+|---|---|
+| `source` | (constant `google_meet`) |
+| `source_meeting_id` | `conferenceRecord.name` |
+| `title` | Calendar event `summary` |
+| `started_at` | `conferenceRecord.startTime` |
+| `ended_at` | `conferenceRecord.endTime` |
+| `duration_sec` | computed |
+| `organizer.email` | Calendar event organizer |
+| `participants[].email` | `participants.list[].signedinUser.email` |
+| `participants[].name` | `signedinUser.displayName` |
+| `participants[].joined_at` | `participants.earliestStartTime` |
+| `participants[].left_at` | `participants.latestEndTime` |
+| `calendar_match_hints.conference_url` | `https://meet.google.com/{space.meetingCode}` |
+| `calendar_match_hints.conference_id` | `space.meetingCode` |
+| `calendar_match_hints.ical_uid` | Calendar event `iCalUID` |
+| `artifacts[transcript_text]` | `transcripts.entries.list` joined by `\n` with `participant: text` format |
+| `artifacts[transcript_structured]` | `transcripts.entries.list` raw |
+| `artifacts[summary_doc]` | Drive Doc found via Calendar event attachment OR Drive search by recency + organizer |
+| `artifacts[video_mp4]` | `recordings.driveDestination.file` |
+
+Notes: Gemini Doc requires organizer to have eligible Workspace plan; if absent, omit `summary_doc` (do not error). Recording may not exist for every meeting; omit `video_mp4` when absent.
+
+### Granola
+
+| Canonical | Source |
+|---|---|
+| `source` | (constant `granola`) |
+| `source_meeting_id` | `note.id` (e.g. `not_1d3tmYTlCICgjy`) |
+| `title` | `note.title` |
+| `started_at` | `note.created_at` (Granola doesn't expose meeting start) |
+| `ended_at` | computed from utterance timestamps if available, else null |
+| `duration_sec` | sum of utterance durations |
+| `organizer.email` | `note.owner.email` |
+| `organizer.name` | `note.owner.name` |
+| `participants[]` | (best-effort; Granola API does not expose attendees — Orbiter infers from calendar match) |
+| `calendar_match_hints.conference_url` | null (Granola has no conference URL) |
+| `calendar_match_hints.*` | all null — forces Orbiter fuzzy match (time + organizer + attendee inferred from calendar) |
+| `artifacts[summary_md]` | `note.summary` |
+| `artifacts[transcript_structured]` | `note.transcript[]` (each item: `{ speaker: { source: "microphone" \| "speaker" }, text }`) |
+| `artifacts[transcript_text]` | `note.transcript[]` joined as `[microphone]: text\n[speaker]: text` |
+| `artifacts[video_mp4]` | omit (Granola does not record video) |
+| `artifacts[audio_m4a]` | omit (Granola does not store audio for retrieval) |
+
+Notes: Granola API only returns notes with completed summary + transcript. APIANT polls on a 5–10 minute cadence using `?created_after=` cursor. Auth: APIANT collects user's `grn_*` API key; no OAuth.
+
+### Zoom
+
+| Canonical | Source |
+|---|---|
+| `source` | (constant `zoom`) |
+| `source_meeting_id` | `meeting.uuid` (UUID per instance — recurring meetings have one per occurrence) |
+| `title` | `meeting.topic` |
+| `started_at` | `meeting.start_time` |
+| `ended_at` | computed (`start_time + duration`; Zoom returns minutes, convert to seconds) |
+| `duration_sec` | `meeting.duration * 60` |
+| `organizer.email` | `meeting.host_email` |
+| `participants[].email` | `past_meeting_participants[].user_email` |
+| `participants[].name` | `participants[].name` |
+| `participants[].joined_at` | `participants[].join_time` |
+| `participants[].left_at` | `participants[].leave_time` |
+| `calendar_match_hints.conference_url` | `meeting.join_url` |
+| `calendar_match_hints.conference_id` | `meeting.id` (numeric, e.g. `82...`) |
+| `calendar_match_hints.ical_uid` | When available via calendar integration |
+| `artifacts[transcript_text]` | Cloud recording transcript (VTT) → joined text |
+| `artifacts[transcript_structured]` | VTT parsed to `[{speaker, start, end, text}]` |
+| `artifacts[summary_text]` | AI Companion `meeting_summary.summary_overview` |
+| `artifacts[action_items_json]` | AI Companion `meeting_summary.next_steps[]` |
+| `artifacts[chat_log]` | Cloud recording file (`CC.*txt`) |
+| `artifacts[video_mp4]` | `recording_files[?file_type=MP4].download_url` |
+| `artifacts[audio_m4a]` | `recording_files[?file_type=M4A].download_url` |
+
+Notes: Zoom MP4/M4A `download_url` requires the access token to actually download. APIANT must surface a signed playback URL (if Orbiter UI needs to stream — or pass through the access token, not recommended). Decide per playback strategy. AI Companion (summaries + next steps) requires Zoom AI Companion license; absent for non-licensed accounts. Omit those artifacts when unavailable.
+
+## Open questions for APIANT
+
+1. **Webhook dedup behavior** — when Zoom fires `recording.completed` and `meeting.summary_completed` separately, does APIANT consolidate into one Orbiter call, or push twice? Orbiter is idempotent on natural key, so either works — preference for one consolidated push when feasible.
+2. **Backfill kickoff** — APIANT exposes a "trigger backfill" API that Orbiter calls? Confirm endpoint shape.
+3. **Connection re-auth flow** — when APIANT detects token expiry, does APIANT prompt the user directly, or signal Orbiter to prompt via `PATCH /connections` with `status: needs_reauth`? Orbiter UI will show banner from connection status either way.
+4. **Per-user rate limits at source** — does APIANT smooth source-side rate limits, or pass through? Orbiter's `429` will only apply to Orbiter API.
+5. **PII handling in `raw_payload`** — some sources include emails/IPs. Confirm APIANT's encryption-at-rest posture before populating `raw_payload`.
+
+## Future sources
+
+The same envelope is expected to handle Microsoft Teams, Otter.ai, Fireflies.ai, Read.ai, Fathom. No schema changes anticipated.

@@ -73,6 +73,56 @@ is_c_suite=true. His 5 `work_experience` rows are all on 1047 — including row 
 originally pointed at 4423 and would have been orphaned by v0.5 (`current=true`, master_company_id 10170,
 data_source 88). The long-tail repoint caught it correctly.
 
+### FalkorDB graph-merge-person v0.7 — incident, recovery, fix (2026-05-05)
+
+**Incident:** First attempt at `merge/helpers/graph-merge-person` (#12949) used a single complex
+cypher per edge type with `OPTIONAL MATCH` chains and a `FOREACH (CASE WHEN ... | CREATE ...)`
+trick. In FalkorDB, when the inner `OPTIONAL MATCH` returned NULL for the target node, the FOREACH
+CREATE failed with `"Failed to create relationship; endpoint was not found"` — but the outer
+DETACH DELETE on the orphan still ran. Result: Traver's two orphan Person nodes (1cadc19b...,
+12329e15...) were deleted with all 28 of their edges still attached. **Edges were lost.**
+
+**Recovery:**
+- The only truly unique lost edge (WORKS_AT to Unknown Company `34951bf7-5d54-46e9-83cf-2bfb0e2c05fe`,
+  master_company_id 10170) was restored via direct cypher MERGE with the original properties
+  recovered from inspection logs
+- The other ~26 lost edges were almost certainly duplicates of survivor's existing edges (HAS_EXPERTISE,
+  WORKS_AT, FOUNDED, LOCATED_IN to common targets), so the loss was effectively absorbed by
+  survivor's intact edges
+- **Acknowledged real loss:** ~2 KNOWS edges from orphans to other Persons. KNOWS isn't
+  re-derivable without re-running the original ingest. Documented as accepted loss.
+
+**Fix — v2.1 graph-merge-person:** completely restructured cypher pattern:
+
+1. **Per-orphan, per-edge-type cypher** instead of one big chained query. 5 edge types × N orphans.
+2. **MATCH (not OPTIONAL MATCH)** — if no edges exist, returns 0 rows, no-op.
+3. **MERGE on survivor** with `ON CREATE SET r_new = properties(r_old)` — copies orphan props
+   to new edge if survivor didn't have one. On collision (survivor already has edge to same target):
+   survivor's edge wins, orphan's props discarded. **v0.8 will add per-type smart merge.**
+4. **DELETE orphan edge** after MERGE.
+5. **Safety gate:** after all 5 cyphers run, query `MATCH (o)-[r]-() RETURN count(r) AS remaining`.
+   `DETACH DELETE` only fires if `remaining == 0`. Otherwise orphan stays alive and the function
+   reports it in `orphans_skipped`.
+6. **try_catch around every cypher** — failure on one edge type doesn't kill the whole orphan.
+
+**Verification on Sam Seely orphans (still alive at this point):**
+
+- Isolated test: moved 1 FOUNDED edge from orphan 6cfa7efd to survivor 2f883678 cleanly. Other
+  edges intact. Cypher pattern verified.
+- Full v2.1 run on both Seely orphans: **24 edges moved (HAS_EXPERTISE 13, WORKS_AT 8, FOUNDED 1,
+  LOCATED_IN 2, KNOWS 0), 2 orphan nodes DETACH DELETEd, zero errors.** Survivor 2f883678 ended
+  with 10 HAS_EXPERTISE, 5 WORKS_AT, 3 KNOWS, 1 FOUNDED, 1 LOCATED_IN.
+
+**Lessons:**
+- Test cypher in isolation before wrapping it in a delete. The first attempt would have failed
+  silently in dry_run if I'd separated the cypher generation from the execution — but I'd jumped
+  straight to running it.
+- "Defense in depth" via try_catch around the master_person delete (v0.5) was the wrong instinct.
+  It masked the orphan-leaving bug instead of preventing it. The fix is to gate destructive ops
+  on positive confirmation that the migrate succeeded — not to swallow errors.
+- FalkorDB's `OPTIONAL MATCH` chains with `FOREACH (CASE | CREATE...)` patterns are dangerous.
+  Prefer simple `MATCH ... MERGE ... DELETE` per-edge-type sequences.
+
 ### `fundable_people` (#667) requirement
 
 Specifically called out: every person-side merge must include `fundable_people` in the repoint

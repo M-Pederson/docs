@@ -13,16 +13,64 @@ description: "Spec for merging duplicate master_person and master_company record
 
 ## Build status (2026-05-05)
 
-v0.5 of the orchestrator is live in WS3 v1 and verified end-to-end against the John Traver
-and Sam Seely fixtures with `dry_run=true`. The whole call returns in ~1s and writes a complete
-`merge_audit` row.
+v0.6 of the orchestrator is live in WS3 v1 and verified end-to-end against the John Traver
+and Sam Seely fixtures. **First real merge (`dry_run: false`) ran on Sam Seely** — surfaced the
+critical Xano FK gotcha below.
+
+### Critical finding: Xano `tableref_id` is documentation, not an enforced FK constraint
+
+When v0.5 ran for-real on Sam Seely (4458 ← [4457, 4459]), the duplicate `master_person`
+deletes succeeded **silently leaving orphans** in 8 dependent tables (61 rows total: log_crash 26,
+work_experience 12, enrich_history_person 8, education_experience 6, person_view 3, plus
+expertise_identification_log/log_enrichment_person/vector_logs).
+
+The orphans were rows in tables we hadn't covered in v0.5's main path. Their `master_person_id`
+columns now pointed at deleted IDs (4457/4459). His Frame.io / Knock work history was effectively
+lost from the survivor's profile until a cleanup pass repointed everything to 4458.
+
+Lesson: every uncovered table needs a repoint pass **before** the master_person delete, or the
+delete strands data. The try_catch we put around the delete in v0.5 was the wrong instinct — it
+masked the correctness gap rather than preventing it.
+
+### v0.6 (2026-05-05) — added long-tail repoint helper
+
+`merge/helpers/repoint-long-tail-person` (#12947) sweeps **69 person-side tables not covered by
+the main path** — query rows where `master_person_id IN duplicate_ids`, when `dry_run=false`
+update each row's `master_person_id` to `survivor_id`. Repoint-only (no dedup yet for these
+tables — they're mostly logs / event history / external profile data where dedup isn't needed).
+
+The orchestrator calls this helper **after** all the covered-table repoint+dedup blocks but
+**before** the duplicate `master_person` delete loop. Coverage is now: 12 covered tables
+(repoint + dedup) + 69 long-tail tables (repoint-only) + 1 special case (`person_enrich_data`
+collapse) + master_person itself = **82 of 86 tables touched**.
+
+Skipped (need special handling, in v0.7+):
+- `merge_suspect` — needs `merged=true, merged_at=now` write, not just repoint
+- `my_person` — needs reconciliation: fold duplicate users' rows into the survivor's row, then
+  dedup the `my_person_*_join` chains and `activity` on `(my_person_id, message_id)`
+- `user` — usually unset; when set, special semantics
+
+### Cleanup of Sam Seely orphans (2026-05-05)
+
+Ran `merge/helpers/repoint-long-tail-person { survivor_id: 4458, duplicate_ids: [4457, 4459] }`
+to clean up the orphans v0.5 left. All 61 rows successfully repointed. Sam Seely's profile is
+whole again.
+
+### `fundable_people` (#667) requirement
+
+Specifically called out: every person-side merge must include `fundable_people` in the repoint
+sweep. The table holds investor enrichment data with a nullable `master_person_id` FK. Sam Seely
+had no rows there, but the table is in the v0.6 long-tail helper. The `master_person_node_uuid`
+column on `fundable_people` should also be re-synced to the survivor's `node_uuid` post-merge —
+tracked as a v0.7 task.
 
 | Component | ID | Status |
 | --- | --- | --- |
 | `merge/helpers/snapshot-person` | 12942 | ✅ live, verified |
 | `merge/helpers/aggregate-scalars-person` | 12943 | ✅ live, verified — covers 22 master_person scalar fields |
 | `merge/helpers/merge-enrich-data-person` | 12944 | ✅ live, verified — first-not-empty across 11 JSON columns |
-| `merge/person-v2` | 12945 | ✅ live (v0.5), dry_run verified end-to-end on both fixtures |
+| `merge/person-v2` | 12945 | ✅ live (v0.6), real merge run on Sam Seely + cleanup |
+| `merge/helpers/repoint-long-tail-person` | 12947 | ✅ live, sweeps 69 uncovered person-side tables |
 | `merge_audit` table | 721 | ✅ provisioned |
 | `merge_lock` table | 722 | ✅ provisioned (not yet wired into orchestrator) |
 | `merge_suspect` extension (`kind`, `needs_rescore`, company FKs) | 284 | ✅ live |

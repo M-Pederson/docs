@@ -22,11 +22,13 @@ A correct merge has to:
 1. Pick a survivor and aggregate scalar fields from the duplicates onto it
 2. Repoint every FK in every dependent table from each duplicate → survivor
 3. Collapse rows that become duplicates after repoint (e.g. two `master_email` rows with the same address)
-4. Re-route every graph edge from the duplicate Person/Company node → survivor node, deduping on type
-5. Delete the duplicate rows + duplicate nodes
-6. Re-derive computed state (employment, embeddings, person/company nodes)
-7. Be idempotent — re-running with the same input is a no-op
-8. Be audited — every merge writes a snapshot row that can roll back
+4. Collapse 1-row-per-entity caches by merging columns first-not-empty (`person_enrich_data`, `company_enrich_data`)
+5. Re-route every graph edge from the duplicate Person/Company node → survivor node, deduping on type
+6. Delete the duplicate rows + duplicate nodes
+7. Re-derive computed state (employment, embeddings, person/company nodes)
+8. Be idempotent — re-running with the same input is a no-op
+9. Be audited — every merge writes a snapshot row that can roll back
+10. Be dry-runnable — every `db.edit` / `db.del` / Cypher write gates on a `dry_run` flag so the function can be tested against live data without mutating it
 
 Inputs follow the same shape for both:
 
@@ -36,8 +38,59 @@ type MergeInput = {
   duplicate_ids: number[];      // array of master IDs that collapse into the survivor
   initiated_by: 'user' | 'cron' | 'admin';
   merge_suspect_id?: number;    // when triggered from merge_suspect (#284)
+  dry_run?: boolean;            // when true, every db.edit/db.del/Cypher write is logged but skipped
 };
 ```
+
+When `dry_run=true`, the function still writes a `merge_audit` row (with `status='dry_run'`) and
+populates `pre_merge_snapshot` and `conflicts_resolved` exactly as it would for a real merge,
+so the operator can inspect what *would* have changed. No FK repoint, dedup, graph mutation, or
+row deletion happens. The full read path runs — including FK count probes — so the audit row's
+counts reflect what's actually in the database.
+
+## Test fixtures
+
+Two real duplicate sets exist in the **live** data source. The build plan is to test
+`merge/person-v2` against these directly, gated by `dry_run=true` on the first runs so the writes
+are logged-only. Sandbox is left clean for unrelated work.
+
+### Fixture A — John Traver
+
+Three `master_person` rows for the same human, varying enrichment depth:
+
+| ID | data_source_id | linkedin_url | bio | master_company_id | is_c_suite |
+| --- | --- | --- | --- | --- | --- |
+| **1047** (survivor) | 91 | `linkedin.com/in/john-traver-81a36943` | full bio + bio_500 | 121 | true |
+| 4423 | 47 | null | null | 10170 | false |
+| 4424 | 47 | null | null | null | false |
+
+`survivor_id=1047, duplicate_ids=[4423, 4424]`. Good test for **scalar aggregation**: longest bio
+wins, `is_c_suite` ORs to true, `linkedin_url` survives via "survivor wins if non-null", and
+`master_company_id` resolves to 121 (survivor wins; the 10170 from #4423 drops out).
+
+### Fixture B — Sam Seely
+
+Three `master_person` rows, near-identical except for the `linkedin_url` on one:
+
+| ID | data_source_id | linkedin_url | master_company_id | current_title |
+| --- | --- | --- | --- | --- |
+| **4458** (survivor) | 91 | `linkedin.com/in/sam-seely-669128a` | 10204 | Co-Founder + Chief Executive Officer |
+| 4457 | 91 | null | 10204 | Co-Founder + Chief Executive Officer |
+| 4459 | 91 | null | 10204 | Co-Founder + Chief Executive Officer |
+
+`survivor_id=4458, duplicate_ids=[4457, 4459]`. Good test for the **uneventful path**: most scalar
+fields don't conflict at all, the `linkedin_url` is the only meaningful difference, and the dedup
+work is concentrated in `master_email`/`master_phone`/`master_link`/joins downstream.
+
+### Test loop
+
+1. Run `merge/person-v2 { survivor_id, duplicate_ids, initiated_by: 'admin', dry_run: true }`.
+2. Inspect the resulting `merge_audit` row: `pre_merge_snapshot`, `conflicts_resolved`, and the
+   per-table row counts that *would* change.
+3. If the dry-run plan looks right, re-run with `dry_run: false`.
+4. Inspect the post-merge `master_person` row, the `merge_audit` row, the FalkorDB Person node,
+   and a spot-check of dependent tables.
+5. Roll back via `merge/rollback` (or restore from `pre_merge_snapshot` manually) if anything's wrong.
 
 ## Merging a Person
 
@@ -186,10 +239,32 @@ function: merge/person-v2  (TO BUILD — workspace 3, branch v1)
     Every row is an enrichment event. Preserving the full history lets us reconstruct what was
     known when. Just repoint.
 
-    `enrich_history_person` (160), `person_enrich_data` (500), `log_enrichment_person` (579),
+    `enrich_history_person` (160), `log_enrichment_person` (579),
     `log_qa_enrichment` (682), `log_re_enrichment` (683), `re_enriched_log` (477),
     `profile_enrichment_job` (686), `person_fingerprint` (652), `expertise_identification_log` (660),
     `update_experience_queue` (244), `vector_logs` (604)
+  </Accordion>
+
+  <Accordion title="Enrichment cache — collapse to one row, first-not-empty per column">
+    `person_enrich_data` (500) is a **single-row-per-master_person** cache holding raw provider
+    responses across ~13 JSON columns (`people_data_labs`, `enrich_layer_data`, `linkedin_profile`,
+    `raw_linkedin_email`, `raw_linkedin`, `contactout_data`, `email_signature`, `clado_data`,
+    `scrapin_data`, `scrapecreator_person`, `fundable`). It is not an event log — it's the latest
+    enrichment payload per provider.
+
+    After repoint there will be N rows for the survivor (one from the original survivor + one from
+    each duplicate). Collapse to one row using the **first-not-empty per column** rule:
+
+    1. Order rows: survivor's original row first, then duplicates by `created_at` ascending.
+    2. For each JSON column, walk rows in order and pick the first row where the column is
+       non-null AND non-empty (`{}` and `[]` count as empty).
+    3. Build a single output row from those picks. `master_person_id = survivor_id`.
+       `created_at = min` of inputs. `updated_at = now`.
+    4. Delete all the input rows. Insert the merged row.
+
+    This preserves the survivor's known-good payload when present, and falls back to whatever
+    a duplicate enriched in fields the survivor never got (e.g. duplicate had a Clado scrape
+    the survivor never triggered).
   </Accordion>
 
   <Accordion title="Investor records — repoint, dedup on deal key">
@@ -397,10 +472,22 @@ Same shape as person merge:
   </Accordion>
 
   <Accordion title="Enrichment provenance — repoint only (audit trail)">
-    `enrich_history_company` (404), `company_enrich_data` (485), `log_enrichment_company` (632),
+    `enrich_history_company` (404), `log_enrichment_company` (632),
     `log_queue_company` (640), `log_qa_enrichment` (682), `log_re_enrichment` (683),
     `profile_enrichment_job` (686), `vector_logs` (604), `error_current_work` (615),
     `error_location_nodes` (602), `log_agent_tools` (470), `log_crash` (542)
+  </Accordion>
+
+  <Accordion title="Enrichment cache — collapse to one row, first-not-empty per column">
+    `company_enrich_data` (485) is a **single-row-per-master_company** cache holding raw provider
+    responses across ~13 JSON columns (`fundable`, `people_data_labs`, `enrich_layer`, `enrich_data`,
+    `website_scrape`, `about_page`, `linkedin_profile`, `yc_data`, `yc_partner_page`,
+    `pitchbook_crunchbase_leads`, `crunchbase_page`, `contactout`, `scrapin`).
+
+    Same rule as `person_enrich_data`: after repoint, collapse N rows to one using
+    **first-not-empty per column**. Survivor's original row first, then duplicates by `created_at`
+    asc; for each column, take the first non-null, non-empty value. `master_company_id = survivor_id`,
+    `created_at = min`, `updated_at = now`. Delete the input rows, insert the merged row.
   </Accordion>
 
   <Accordion title="Investor records">

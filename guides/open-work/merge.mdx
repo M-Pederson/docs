@@ -49,9 +49,65 @@ end verified against real and synthetic fixtures spanning all hot-path code bran
 | 100 | 4425 ← [99999990] | Person B1: suspect lifecycle bug fix verified — collapsed-pair deleted (row 5), survivor-only-touched suspect correctly flagged `needs_rescore=true` (row 6) |
 | 101 | 4425 ← [4497, 4498] | Person C1: 3-row cluster — multi-id lock acquire/release, multi-orphan graph merge, multi-deletion all clean |
 
-**Status:** both orchestrators are **shippable for human-driven merges**. Cron-driven activation
-requires filling the `mvp/merge/master-merge` (#12736) stub and building the re-score cron —
-both still pending.
+**Status:** both orchestrators are **shippable for human-driven and cron-driven merges**.
+v0.18 (below) ships master-merge fill, the re-score cron, and B2/B3 verifications.
+
+### v0.18 (2026-05-06) — Cron-driven path live
+
+Three pieces shipped today that close the cron-driven activation prerequisites plus two
+defensive verifications:
+
+**`mvp/merge/master-merge` (#12736) — stub filled.** Replaces the v1 placeholder that
+returned `status='placeholder'` without doing any work. Picks a survivor between input
+`(master_person_id_a, master_person_id_b)` by these rules in priority order: (1) if exactly
+one side has `orbiter_user=true`, that side is survivor (never delete a real user account);
+(2) richer non-null field count wins across `linkedin_url`, `bio`, `bio_500`, `current_title`,
+`master_company_id`, `avatar` (6 fields scored); (3) tiebreak: oldest `created_at` wins.
+Maps `match_type` → `match_kind`: `'email'` → `'email_exact'`, `'phone'` → `'phone_exact'`,
+else `'deterministic'`. Calls `merge/person-v2` with `initiated_by='cron'`. Test wrapper
+`master-merge-test` (api 8482). Verified end-to-end: audit 102 (email match, 4499 ← 4500,
+`a_richer` with score 3 vs 0) and audit 103 (phone match, 4501 ← 4502).
+
+**Re-score cron — `merge/helpers/rescore-suspect-pair` (#12973) + `merge/task/rescore-flagged-
+suspects` (#164).** Helper takes a `merge_suspect_id`, loads both master_persons + their
+master_company names, builds `(name | title | company | linkedin_url)` labels, calls Gemini
+2.5 Flash via OpenRouter. Conf ≥ 0.80 → keep with new `merge_context`. Conf 0.40-0.79 →
+escalate to Gemini 3.1 Pro. Conf < 0.40 → mark `do_not_merge=true`. Always clears
+`needs_rescore=false`. Task scans `merge_suspect WHERE needs_rescore=true AND kind='person'
+AND do_not_merge=false` every 30 min, calls helper for each. Person-only in v1; extends to
+company once detect-suspects writes company-side rows. Test wrapper
+`rescore-suspect-pair-test` (api 8483). Verified live: suspect 8 (4425 vs 4499) returned
+Flash conf=0.10, correct rejection with reasoning *"The names, titles, and company
+information are completely different."*
+
+**Env var fix — `$env.openRouter` (camelCase).** Both `mvp/merge/detect-suspects` (#12709)
+and `merge/helpers/rescore-suspect-pair` (#12973) had `$env.OPENROUTER_API_KEY` references
+that evaluated to empty in v1, sending `Authorization: Bearer ` with no key. Fixed to
+`$env.openRouter` matching the workspace's actual env name (used by
+`outcome/extract-ideal-persona` #12927). Without this fix, every OpenRouter call from these
+two functions would have silently failed JSON parsing on the empty-choices response.
+
+**B2 — concurrent contention verified.** Fired two real merges in parallel via curl `&` with
+overlapping master_person id 4504. Merge2 (4504 ← [4505]) won the lock race, audit 104,
+`status: success`. Merge1 (4503 ← [4504]) was blocked, audit 105,
+`status: blocked_locked`, `failed_lock_target: 4504`. v0.14's all-ids locking strategy
+handles real concurrent load correctly.
+
+**B3 — stale-lock cleanup cron path verified.** Planted `merge_audit` row 106 (status=pending,
+started_at=42min ago) + `merge_lock` row 156 (acquired_at=42min ago). Called
+`release-stale-locks-test` (api 8453) with threshold=600s. Helper found the stale lock,
+released it, marked audit 106 `status=aborted_stale` with `finished_at` populated.
+Cron #163 fires this same helper every 5 min in production.
+
+**Tested fixtures — additions to v0.17 tables:**
+
+| Audit | Side | Inputs | What it exercised |
+| --- | --- | --- | --- |
+| 102 | person | 4499 ← [4500] (email) | Master-merge fill: a_richer survivor pick, email→email_exact mapping, full delegation to person-v2 |
+| 103 | person | 4501 ← [4502] (phone) | Master-merge fill: phone→phone_exact mapping |
+| 104 | person | 4504 ← [4505] | B2 concurrent winner — acquired all 3 ids during parallel race |
+| 105 | person | 4503 ← [4504] | B2 concurrent loser — `blocked_locked` with `failed_lock_target=4504` |
+| 106 | person | 99999990 ← [99999989] | B3 stale-lock cleanup — synthetic pending audit, helper marked `aborted_stale` |
 
 ### v0.17 (2026-05-06) — Gaps 1/2/3 + suspect-lifecycle bug fix
 

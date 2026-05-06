@@ -13,11 +13,21 @@ description: "Spec for merging duplicate master_person and master_company record
 
 ## Build status (2026-05-06)
 
-v0.11 of the orchestrator is live in WS3 v1. The pipeline is end-to-end and fully optimized on
-the my_person side: master_person rows merged + deleted, all 70 long-tail tables repointed
-(incl. `my_person`), per-user my_person fold-in now does **full natural-key dedup on all 10
-my_person-linked tables** plus metadata merge on activity/email/calendar dedup losers, FalkorDB
-graph nodes consolidated, `merge_suspect` lifecycle handled, full `merge_audit` row written.
+v0.12 of the orchestrator is live in WS3 v1. Concurrent-merge protection, user-conflict guard,
+master_address dedup, and fundable_people graph-uuid sync are all wired in. Every write gates
+on `$is_writable = (!dry_run && lock_acquired && !user_conflict)`. Pipeline coverage end-to-end:
+all 13 covered identity/tag tables repoint+dedup, 70 long-tail tables repoint (incl. my_person),
+per-user my_person fold-in does full dedup + metadata merge on all 10 child tables, FalkorDB
+graph nodes consolidated, fundable_people node_uuid resynced, merge_suspect lifecycle handled,
+full merge_audit row written, merge_lock acquired and released.
+
+**v0.12 (2026-05-06) — added 4 orchestrator gaps:** (1) `merge_lock` acquire/release wrapping
+all writes — concurrent merges of the same survivor return `status=blocked_locked`; (2)
+user-conflict guard — merges where `>1 user.master_person_id IN all_ids` return
+`status=blocked_user_conflict` (data integrity protection: each user must own ≤1 master_person);
+(3) `master_address` dedup on lowercased+trimmed `formatted_address` (was previously the only
+identity-side table without dedup); (4) `fundable_people.master_person_node_uuid` re-sync to
+survivor's graph node_uuid after graph merge (closes the v0.7 deferred task).
 
 **v0.11 (2026-05-06) — `merge/helpers/fold-my-persons-on-survivor` (#12951) extended to cover
 all 10 my_person-linked tables with full dedup + metadata merge.** Previously 6 tables were
@@ -163,6 +173,52 @@ larger than Traver/Seely.
 Coverage now: HAS_EXPERTISE, WORKS_AT, FOUNDED, LOCATED_IN, KNOWS, **ADVISOR_TO, INVESTED_IN**.
 The pattern for extending coverage is clear: when `orphans_skipped` shows `remaining_edges > 0`,
 inspect orphan edges by type, add the new type to the helper's `$edge_types` array, re-run.
+
+### v0.12 — concurrent-merge guard + user FK + master_address dedup + fundable sync (2026-05-06)
+
+```text
+function/12945
+merge/person-v2
+```
+
+Four orchestrator-level changes, all gated through a single `$is_writable` flag:
+
+```text
+$is_writable = ($is_dry == false && $lock_acquired == true && $user_conflict == false)
+```
+
+**1. `merge_lock` acquire/release** — first write step inside the orchestrator wraps `db.add merge_lock`
+in `try_catch`. Unique index on `(entity_kind, master_id)` makes this fail-fast if another merge
+is in flight on the same survivor. On catch, `$lock_acquired=false`, status becomes
+`blocked_locked`, all subsequent writes skip. Lock row is deleted at the end if it was acquired.
+**Caveat:** an orchestrator crash mid-run leaves the lock dangling. v0.13+ will add a stale-lock
+cleanup cron (e.g. `acquired_at < now - 10 minutes` → release).
+
+**2. User-conflict guard** — queries `user` (#125) for any row where `master_person_id IN $all_ids`.
+If `count > 1`, the merge is rejected — multiple distinct users cannot collapse to one master_person
+(each user is a separate real human). Status becomes `blocked_user_conflict`. The single-user case
+(only survivor or only one duplicate has an attached user) is fine and proceeds normally — the
+long-tail helper will repoint `user.master_person_id` from any duplicate to the survivor.
+
+**3. `master_address` dedup** — was previously repoint-only. Now uses the same scan-once pattern
+as master_email/phone/link/avatar:
+
+```text
+key = formatted_address|trim|to_lower (rows with empty formatted_address skip dedup, repoint only)
+```
+
+Reports as `master_address_repoint` and `master_address_dedup_delete` in the result's
+`repoint_plan`.
+
+**4. `fundable_people.master_person_node_uuid` re-sync** — after graph-merge runs, the orchestrator
+queries `fundable_people` (#667) for rows where `master_person_id == survivor_id` and updates each
+row's `master_person_node_uuid` to the survivor's `node_uuid` (from the snapshot). This closes the
+deferred task from v0.6/v0.7. Reported as `fundable_synced` count.
+
+The result now includes `lock_plan: {lock_acquired, lock_id, released}` and
+`user_conflict_plan: {attached_user_count, conflict}` for full auditability. Dry-run on Sam Seely
+(no duplicates, no users, no fundable rows) returns `status: dry_run`, lock acquired+released,
+all v0.12 fields populated cleanly.
 
 ### v0.11 — full dedup + metadata merge in fold-in (2026-05-06)
 
@@ -321,12 +377,12 @@ tracked as a v0.7 task.
 | `merge/helpers/snapshot-person` | 12942 | ✅ live, verified |
 | `merge/helpers/aggregate-scalars-person` | 12943 | ✅ live, verified — covers 22 master_person scalar fields |
 | `merge/helpers/merge-enrich-data-person` | 12944 | ✅ live, verified — first-not-empty across 11 JSON columns |
-| `merge/person-v2` | 12945 | ✅ live (v0.10), end-to-end on Traver / Seely / Grady |
+| `merge/person-v2` | 12945 | ✅ live (v0.12), lock + user-conflict + master_address dedup + fundable sync |
 | `merge/helpers/repoint-long-tail-person` | 12947 | ✅ live (v0.9), sweeps 70 person-side tables incl. my_person |
 | `merge/helpers/graph-merge-person` | 12949 | ✅ live (v2.3), 27 Person edge types covered |
-| `merge/helpers/fold-my-persons-on-survivor` | 12951 | ✅ live (v0.10), per-user my_person collapse |
+| `merge/helpers/fold-my-persons-on-survivor` | 12951 | ✅ live (v0.11), per-user my_person collapse + full dedup + metadata merge |
 | `merge_audit` table | 721 | ✅ provisioned |
-| `merge_lock` table | 722 | ✅ provisioned (not yet wired into orchestrator) |
+| `merge_lock` table | 722 | ✅ provisioned + wired (v0.12) |
 | `merge_suspect` extension (`kind`, `needs_rescore`, company FKs) | 284 | ✅ live |
 | Test endpoint `POST /api:7LJisE8R/merge-person-v2-test` | 8434 | ✅ live, defaults `dry_run=true` |
 

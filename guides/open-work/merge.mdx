@@ -13,13 +13,25 @@ description: "Spec for merging duplicate master_person and master_company record
 
 ## Build status (2026-05-06)
 
-v0.12 of the orchestrator is live in WS3 v1. Concurrent-merge protection, user-conflict guard,
-master_address dedup, and fundable_people graph-uuid sync are all wired in. Every write gates
-on `$is_writable = (!dry_run && lock_acquired && !user_conflict)`. Pipeline coverage end-to-end:
-all 13 covered identity/tag tables repoint+dedup, 70 long-tail tables repoint (incl. my_person),
-per-user my_person fold-in does full dedup + metadata merge on all 10 child tables, FalkorDB
-graph nodes consolidated, fundable_people node_uuid resynced, merge_suspect lifecycle handled,
-full merge_audit row written, merge_lock acquired and released.
+v0.13 graph-merge + v0.12 orchestrator are live in WS3 v1. The Person merge pipeline is now
+fully optimized end-to-end: concurrent-merge protection, user-conflict guard, all 13 identity/
+tag tables repoint+dedup, master_address dedup, 70 long-tail tables repoint, per-user my_person
+fold-in with full dedup + metadata merge on all 10 child tables, FalkorDB graph merge with
+**smart per-edge-type property merge on collisions** (survivor wins, orphan fills gaps),
+fundable_people node_uuid resynced, merge_suspect lifecycle handled, full merge_audit row
+written, merge_lock acquired and released. Every write gates on `$is_writable = (!dry_run &&
+lock_acquired && !user_conflict)`.
+
+**v0.13 (2026-05-06) — `merge/helpers/graph-merge-person` (#12949) extended with smart
+property merge on edge collisions.** Previous behavior: `MERGE (s)-[r_new:T]->(t) ON CREATE SET
+r_new = properties(r_old)` — orphan's edge properties were silently dropped on collision. New
+behavior: split into two cyphers per edge-type-direction. (1) **NO-COLLISION MOVE** — when
+survivor has no edge to t, `CREATE (s)-[r_new:T]->(t) SET r_new = properties(r_old) DELETE r_old`.
+(2) **COLLISION MERGE** — when survivor already has an edge: capture both property maps, set
+r_new = oldprops, then overlay newprops. Net result: survivor's existing values win on key
+conflicts, but any keys present only on the orphan's edge get inherited (fill-missing semantics
+— "merge all parameters" without information loss). Total cyphers per orphan: 29 move + 29
+merge = 58 (was 29 in v2.3). Verified clean execution: 58/58 cyphers succeed against FalkorDB.
 
 **v0.12 (2026-05-06) — added 4 orchestrator gaps:** (1) `merge_lock` acquire/release wrapping
 all writes — concurrent merges of the same survivor return `status=blocked_locked`; (2)
@@ -173,6 +185,61 @@ larger than Traver/Seely.
 Coverage now: HAS_EXPERTISE, WORKS_AT, FOUNDED, LOCATED_IN, KNOWS, **ADVISOR_TO, INVESTED_IN**.
 The pattern for extending coverage is clear: when `orphans_skipped` shows `remaining_edges > 0`,
 inspect orphan edges by type, add the new type to the helper's `$edge_types` array, re-run.
+
+### v0.13 — smart per-edge-type property merge in graph-merge (2026-05-06)
+
+```text
+function/12949
+merge/helpers/graph-merge-person
+```
+
+Splits each edge-type-direction into **two cyphers** per orphan instead of one:
+
+**1. NO-COLLISION MOVE** — when survivor has no edge of this type to the target node:
+
+```cypher
+MATCH (o:Person {uuid: $orphan})-[r_old:EDGE_TYPE]->(t)
+MATCH (s:Person {uuid: $survivor})
+WHERE id(t) <> id(s) AND NOT (s)-[:EDGE_TYPE]->(t)
+CREATE (s)-[r_new:EDGE_TYPE]->(t)
+SET r_new = properties(r_old)
+DELETE r_old
+RETURN count(*) AS edges_moved
+```
+
+Identical to v2.3 behavior — moves the edge with all its properties intact.
+
+**2. COLLISION MERGE** — when survivor already has an edge of this type to the target:
+
+```cypher
+MATCH (o:Person {uuid: $orphan})-[r_old:EDGE_TYPE]->(t)
+MATCH (s:Person {uuid: $survivor})-[r_new:EDGE_TYPE]->(t)
+WHERE id(t) <> id(s)
+WITH r_new, r_old, properties(r_old) AS oldprops, properties(r_new) AS newprops
+SET r_new = oldprops              -- replace with orphan's props
+WITH r_new, r_old, newprops
+SET r_new += newprops              -- overlay survivor's original props (newprops wins on conflict)
+DELETE r_old
+RETURN count(*) AS edges_merged
+```
+
+The two-phase SET is the trick: capture both prop maps before any writes, replace with orphan's,
+then overlay survivor's. End state: every key the survivor had keeps the survivor's value;
+every key only the orphan had gets inherited. **Survivor wins on conflict, orphan fills gaps.**
+
+This is the "merge all parameters" semantic — no orphan-edge data is lost on collision unless
+the same key already exists on the survivor's edge with a different value (in which case
+survivor's wins, which is the safe default).
+
+**Counts:** 25 outgoing-only × 2 phases + 2 bidirectional × 2 directions × 2 phases = 50 + 8 =
+58 cyphers per orphan (was 29 in v2.3). Each cypher is logged with `phase: "move"` or
+`"merge"` and a `count` of edges affected.
+
+The DETACH DELETE safety gate is unchanged — orphan node deletion is still gated on a final
+`MATCH (o)-[r]-() RETURN count(r) AS remaining` query confirming `remaining == 0`.
+
+Verified: 58/58 cyphers ran cleanly against FalkorDB on a non-existent test orphan
+(00000000-...) — no errors, all returned `count: 0` as expected.
 
 ### v0.12 — concurrent-merge guard + user FK + master_address dedup + fundable sync (2026-05-06)
 
@@ -379,7 +446,7 @@ tracked as a v0.7 task.
 | `merge/helpers/merge-enrich-data-person` | 12944 | ✅ live, verified — first-not-empty across 11 JSON columns |
 | `merge/person-v2` | 12945 | ✅ live (v0.12), lock + user-conflict + master_address dedup + fundable sync |
 | `merge/helpers/repoint-long-tail-person` | 12947 | ✅ live (v0.9), sweeps 70 person-side tables incl. my_person |
-| `merge/helpers/graph-merge-person` | 12949 | ✅ live (v2.3), 27 Person edge types covered |
+| `merge/helpers/graph-merge-person` | 12949 | ✅ live (v0.13), 27 Person edge types + smart property merge on collisions |
 | `merge/helpers/fold-my-persons-on-survivor` | 12951 | ✅ live (v0.11), per-user my_person collapse + full dedup + metadata merge |
 | `merge_audit` table | 721 | ✅ provisioned |
 | `merge_lock` table | 722 | ✅ provisioned + wired (v0.12) |

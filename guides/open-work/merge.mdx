@@ -13,10 +13,17 @@ description: "Spec for merging duplicate master_person and master_company record
 
 ## Build status (2026-05-06)
 
-v0.10 of the orchestrator is live in WS3 v1. The pipeline is end-to-end: master_person rows
-merged + deleted, all 70 long-tail tables repointed (incl. `my_person`), per-user `my_person`
-fold-in collapses duplicate CRM rows for users who tracked both sides, FalkorDB graph nodes
-consolidated, `merge_suspect` lifecycle handled, full `merge_audit` row written.
+v0.11 of the orchestrator is live in WS3 v1. The pipeline is end-to-end and fully optimized on
+the my_person side: master_person rows merged + deleted, all 70 long-tail tables repointed
+(incl. `my_person`), per-user my_person fold-in now does **full natural-key dedup on all 10
+my_person-linked tables** plus metadata merge on activity/email/calendar dedup losers, FalkorDB
+graph nodes consolidated, `merge_suspect` lifecycle handled, full `merge_audit` row written.
+
+**v0.11 (2026-05-06) — `merge/helpers/fold-my-persons-on-survivor` (#12951) extended to cover
+all 10 my_person-linked tables with full dedup + metadata merge.** Previously 6 tables were
+repoint-only; v0.11 adds dedup to all of them, plus metadata-field merge on activity/email/
+calendar dedup losers (so non-null fields from losers are preserved on the winner before
+delete).
 
 **v0.10 (2026-05-06) — wired `merge/helpers/fold-my-persons-on-survivor` (#12951) into the
 orchestrator, positioned between `repoint-long-tail-person` and `graph-merge-person`.** v0.9
@@ -156,6 +163,40 @@ larger than Traver/Seely.
 Coverage now: HAS_EXPERTISE, WORKS_AT, FOUNDED, LOCATED_IN, KNOWS, **ADVISOR_TO, INVESTED_IN**.
 The pattern for extending coverage is clear: when `orphans_skipped` shows `remaining_edges > 0`,
 inspect orphan edges by type, add the new type to the helper's `$edge_types` array, re-run.
+
+### v0.11 — full dedup + metadata merge in fold-in (2026-05-06)
+
+```text
+function/12951
+merge/helpers/fold-my-persons-on-survivor
+```
+
+v0.10 covered 4 of the 10 my_person-linked tables with full repoint+dedup; the other 6 were
+repoint-only. v0.11 closes that gap and adds **metadata merge** on the activity-style tables
+so non-null fields from dedup losers are preserved on the winner before delete.
+
+Coverage matrix after v0.11:
+
+| Table | Dedup key | Metadata merge |
+| --- | --- | --- |
+| `activity` (218) | `message_id` | `unread` (AND), `clean_message`, `status`, `my_notes_id` (fill-if-empty) |
+| `email_activity` (597) | `message_id` | `unread` (AND), `clean_message`, `temp_email_body` (fill-if-empty) |
+| `calendar_event_activity` (598) | `event_id` | `status` (fill-if-empty) |
+| `my_person_email_join` (312) | `master_email_id` | `primary` (OR) |
+| `my_person_phone_join` (313) | `master_phone_id` | `primary` (OR) |
+| `my_person_link_join` (311) | `master_link_id` | — |
+| `my_person_address_join` (310) | `master_address_id` | — |
+| `my_note_person_join` (318) | `my_note_id` | `mention` (OR) |
+| `important_date` (242) | `(date_descriptor_id, date)` | `note` (fill-if-empty), `reminder` (max), `annual_recurring` (OR) |
+| `possible_duplicates` (400) | `(min_id, max_id)` after repoint | self-loop delete + pair dedup |
+
+`possible_duplicates` previously only repointed the `my_person_id` side. v0.11 also repoints
+`possible_duplicate_id`, then deletes any row where both ends collapse to the same my_person id
+(self-loop), then dedups remaining rows on the normalized `(min, max)` pair.
+
+The fold-op output now includes `*_metadata_merged` and `*_dedup` counters per table for
+auditability. Verified clean dry-run on all three fixtures (Traver/Seely/Grady): 3 my_person
+rows each, 0 users with dups, 0 fold ops needed — the v0.10 deploy already collapsed them.
 
 ### v0.10 — per-user my_person fold-in (2026-05-06)
 
@@ -690,29 +731,30 @@ merge/helpers/fold-my-persons-on-survivor
 the same `master_person`. After repointing, multiple rows for the same `(user_id, master_person_id)`
 are illegal — collapse them.
 
-The orchestrator's v0.10 path implements this in two steps:
+The orchestrator's v0.11 path implements this in two steps:
 
 1. **`merge/helpers/repoint-long-tail-person` (#12947)** — sweeps `my_person` along with all
    other person-side tables, updating `master_person_id` from any duplicate to the survivor.
 2. **`merge/helpers/fold-my-persons-on-survivor` (#12951)** — for each user with multiple
    `my_person` rows under the survivor, picks the oldest as keeper, repoints all child rows
-   from non-keeper my_person ids to the keeper, dedups child rows on natural keys, and deletes
-   the non-keeper `my_person` row.
+   from non-keeper my_person ids to the keeper, dedups on natural keys, merges metadata from
+   dedup losers onto winners, and deletes the non-keeper `my_person` row.
 
-Tables that hold `my_person_id` and are handled by the fold-in helper:
+All 10 my_person-linked tables are now handled with full repoint + dedup + (where applicable)
+metadata merge:
 
-| Table | ID | Rule when folding |
-| --- | --- | --- |
-| `my_person_email_join` | 312 | Repoint to survivor's `my_person.id`, then dedup on `(my_person_id, master_email_id)` |
-| `my_person_phone_join` | 313 | Repoint, dedup on `(my_person_id, master_phone_id)` |
-| `my_person_address_join` | 310 | Repoint, dedup on `(my_person_id, master_address_id)` |
-| `my_person_link_join` | 311 | Repoint, dedup on `(my_person_id, master_link_id)` |
-| `my_note_person_join` | 318 | Repoint, dedup on `(my_person_id, my_note_id)` |
-| `activity` | 218 | Repoint, then dedup on `(my_person_id, message_id)` — keep oldest, merge non-null metadata (`read_at`, `replied_at`, etc.) from losers onto the winner |
-| `email_activity` | 597 | Repoint, then dedup on `(my_person_id, message_id)` — same metadata-merge rule |
-| `calendar_event_activity` | 598 | Repoint, then dedup on `(my_person_id, event_id)` — same metadata-merge rule |
-| `important_date` | 242 | Repoint, dedup on `(my_person_id, date_descriptor_id, date_value)` |
-| `possible_duplicates` | 400 | Repoint; delete rows where both sides become the same `my_person_id` |
+| Table | ID | Dedup key | Metadata merge |
+| --- | --- | --- | --- |
+| `activity` | 218 | `(my_person_id, message_id)` | `unread` (AND), `clean_message`, `status`, `my_notes_id` (fill-if-empty) |
+| `email_activity` | 597 | `(my_person_id, message_id)` | `unread` (AND), `clean_message`, `temp_email_body` (fill-if-empty) |
+| `calendar_event_activity` | 598 | `(my_person_id, event_id)` | `status` (fill-if-empty) |
+| `my_person_email_join` | 312 | `(my_person_id, master_email_id)` | `primary` (OR) |
+| `my_person_phone_join` | 313 | `(my_person_id, master_phone_id)` | `primary` (OR) |
+| `my_person_link_join` | 311 | `(my_person_id, master_link_id)` | — |
+| `my_person_address_join` | 310 | `(my_person_id, master_address_id)` | — |
+| `my_note_person_join` | 318 | `(my_person_id, my_note_id)` | `mention` (OR) |
+| `important_date` | 242 | `(my_person_id, date_descriptor_id, date)` | `note` (fill-if-empty), `reminder` (max), `annual_recurring` (OR) |
+| `possible_duplicates` | 400 | `(min_id, max_id)` after repoint | self-loop delete + pair dedup |
 
 ## Merging a Company
 

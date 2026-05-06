@@ -13,14 +13,26 @@ description: "Spec for merging duplicate master_person and master_company record
 
 ## Build status (2026-05-06)
 
-v0.13 graph-merge + v0.12 orchestrator are live in WS3 v1. The Person merge pipeline is now
-fully optimized end-to-end: concurrent-merge protection, user-conflict guard, all 13 identity/
+v0.14 orchestrator + v0.13 graph-merge are live in WS3 v1. The Person merge pipeline is fully
+optimized end-to-end: lock acquired on **every id** (survivor + all duplicates) with rollback
+on partial failure, automated stale-lock cleanup cron, user-conflict guard, all 13 identity/
 tag tables repoint+dedup, master_address dedup, 70 long-tail tables repoint, per-user my_person
 fold-in with full dedup + metadata merge on all 10 child tables, FalkorDB graph merge with
-**smart per-edge-type property merge on collisions** (survivor wins, orphan fills gaps),
-fundable_people node_uuid resynced, merge_suspect lifecycle handled, full merge_audit row
-written, merge_lock acquired and released. Every write gates on `$is_writable = (!dry_run &&
-lock_acquired && !user_conflict)`.
+smart per-edge-type property merge on collisions, fundable_people node_uuid resynced,
+merge_suspect lifecycle handled, full merge_audit row written. Every write gates on
+`$is_writable = (!dry_run && lock_acquired && !user_conflict)`.
+
+**v0.14 (2026-05-06) — closed two race-condition gaps in merge_lock handling.**
+(1) **Lock all_ids, not just the survivor.** Previously a merge with `survivor=A,
+duplicate_ids=[B]` only locked A. Concurrent merge2 picking `survivor=B` (a duplicate of merge1)
+would race because B existed up until merge1's master_person delete near the end. v0.14
+sequentially acquires `merge_lock` rows for every id in `[survivor, ...duplicate_ids]`. On any
+unique-constraint failure, rolls back the locks already acquired and aborts with
+`status=blocked_locked`. (2) **Stale-lock cleanup cron.** New helper
+`merge/helpers/release-stale-locks` (#12952) scheduled as `merge/task/release-stale-locks`
+(#163, every 5 min, threshold 10 min) — releases any merge_lock row older than the threshold and
+marks the corresponding merge_audit row `status=aborted_stale` if still `pending`. Defends against
+orchestrator crashes that leave the lock dangling.
 
 **v0.13 (2026-05-06) — `merge/helpers/graph-merge-person` (#12949) extended with smart
 property merge on edge collisions.** Previous behavior: `MERGE (s)-[r_new:T]->(t) ON CREATE SET
@@ -185,6 +197,56 @@ larger than Traver/Seely.
 Coverage now: HAS_EXPERTISE, WORKS_AT, FOUNDED, LOCATED_IN, KNOWS, **ADVISOR_TO, INVESTED_IN**.
 The pattern for extending coverage is clear: when `orphans_skipped` shows `remaining_edges > 0`,
 inspect orphan edges by type, add the new type to the helper's `$edge_types` array, re-run.
+
+### v0.14 — lock all_ids + stale-lock cleanup cron (2026-05-06)
+
+```text
+function/12945  merge/person-v2
+function/12952  merge/helpers/release-stale-locks
+task/163        merge/task/release-stale-locks
+```
+
+Two race-condition fixes for the lock subsystem.
+
+**Lock all_ids.** v0.12 only acquired a lock for the survivor. Concurrent attack: merge1 starts
+with `survivor=A, duplicate_ids=[B,C]`. Before merge1's master_person delete runs, merge2 calls
+the orchestrator with `survivor=B` (which still exists). merge2's lock for B succeeds (different
+master_id from merge1's lock on A), and now both merges run on overlapping data. v0.14 fixes by
+acquiring locks for every id in `$all_ids` sequentially:
+
+```text
+for $id in $all_ids:
+  try: db.add merge_lock {entity_kind: "person", master_id: $id, ...}
+  catch: $acquire_failed = true; $failed_lock_target = $id
+
+if $acquire_failed:
+  for $lid in $acquired_lock_ids: db.del merge_lock {id: $lid}
+  $lock_acquired = false   → status = "blocked_locked"
+else:
+  $lock_acquired = true    → proceed
+```
+
+**Stale-lock cleanup.** If the orchestrator crashes between acquire and release, the lock rows
+remain — blocking all future merges of those master_ids forever. The new
+`merge/helpers/release-stale-locks` (#12952) takes `stale_threshold_seconds` (default 600) and
+deletes any merge_lock row where `acquired_at < (now - threshold_ms)`. Each released lock's
+corresponding merge_audit row is marked `status=aborted_stale` if it was still `pending`, so
+post-mortem inspection knows which merges were aborted by the cleanup vs explicitly blocked.
+
+Scheduled as task **#163** (`merge/task/release-stale-locks`) — every 5 min, threshold 10 min.
+A normal merge takes 1–10s; 10 min is comfortably above any legitimate run time.
+
+**Verification matrix:**
+
+| Scenario | Expected | Verified |
+| --- | --- | --- |
+| Single-id merge, no conflict | `lock_acquired=true`, 1 lock acquired+released | ✅ |
+| Multi-id merge, no conflict | `lock_acquired=true`, N locks acquired+released | ✅ (3 of 3) |
+| Multi-id merge, pre-existing lock on duplicate id | `lock_acquired=false`, `failed_lock_target=conflicting_id`, 0 acquired (rollback) | ✅ |
+| Stale lock present | Cleanup releases + marks audit `aborted_stale` | ✅ |
+
+Result now includes `lock_plan: {locked_master_ids, acquired_lock_ids, failed_lock_target,
+released_lock_ids}` for full auditability.
 
 ### v0.13 — smart per-edge-type property merge in graph-merge (2026-05-06)
 
@@ -444,12 +506,14 @@ tracked as a v0.7 task.
 | `merge/helpers/snapshot-person` | 12942 | ✅ live, verified |
 | `merge/helpers/aggregate-scalars-person` | 12943 | ✅ live, verified — covers 22 master_person scalar fields |
 | `merge/helpers/merge-enrich-data-person` | 12944 | ✅ live, verified — first-not-empty across 11 JSON columns |
-| `merge/person-v2` | 12945 | ✅ live (v0.12), lock + user-conflict + master_address dedup + fundable sync |
+| `merge/person-v2` | 12945 | ✅ live (v0.14), lock all_ids + rollback + user-conflict + master_address dedup + fundable sync |
 | `merge/helpers/repoint-long-tail-person` | 12947 | ✅ live (v0.9), sweeps 70 person-side tables incl. my_person |
 | `merge/helpers/graph-merge-person` | 12949 | ✅ live (v0.13), 27 Person edge types + smart property merge on collisions |
 | `merge/helpers/fold-my-persons-on-survivor` | 12951 | ✅ live (v0.11), per-user my_person collapse + full dedup + metadata merge |
+| `merge/helpers/release-stale-locks` | 12952 | ✅ live (v0.14), releases stale merge_lock rows |
+| `merge/task/release-stale-locks` | task/163 | ✅ active, every 5 min, threshold 10 min |
 | `merge_audit` table | 721 | ✅ provisioned |
-| `merge_lock` table | 722 | ✅ provisioned + wired (v0.12) |
+| `merge_lock` table | 722 | ✅ provisioned + wired (v0.14, all_ids) |
 | `merge_suspect` extension (`kind`, `needs_rescore`, company FKs) | 284 | ✅ live |
 | Test endpoint `POST /api:7LJisE8R/merge-person-v2-test` | 8434 | ✅ live, defaults `dry_run=true` |
 

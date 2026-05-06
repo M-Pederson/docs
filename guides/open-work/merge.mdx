@@ -13,6 +13,96 @@ description: "Spec for merging duplicate master_person and master_company record
 
 ## Build status (2026-05-06)
 
+**person-v2 v0.17 + company-v2 v0.8 live in WS3 v1.** Both orchestrators now write
+`merge_audit.conflicts_resolved` on high-stakes scalar disagreements (gated by deterministic-
+match-class skip rule), dedup `work_experience` + `education_experience` on natural keys after
+long-tail repoint, and correctly distinguish "suspect actually merged" from "suspect just touched
+because survivor side matched" so the `needs_rescore` cron path will have rows to process. End-to-
+end verified against real and synthetic fixtures spanning all hot-path code branches.
+
+**Tested company-v2 fixtures (2026-05-06):**
+
+| Audit | Survivor ← Duplicates | What it exercised |
+| --- | --- | --- |
+| 30 | 726 ← [727] | Black Sheep Capital (domain dup) — pre-Gap-1 |
+| 31 | 10205 ← [10206, 10207] | (3-row real cluster) — pre-Gap-1 |
+| 32 | 10123 ← [10124] | (domain dup) — pre-Gap-1 |
+| 33 | 10125 ← [10126] | JHH vc — pre-Gap-1 |
+| 36 | 8665 ← [9472] | Eli Lilly — pre-Gap-1 |
+| 69 | 1653 ← [1646, 1647] | USC Marshall — pre-Gap-1 |
+| 72 | 4210 ← [4205] | James Ruse Agricultural High School — pre-Gap-1 |
+| **90** | **7068 ← [7343]** | **Atlantic Pictures — first real merge under v0.7+ Gap 1/2/3 patches; `conflicts_resolved` populated with 1 tagline conflict** |
+| 92 | 7068 ← [99999997] | A2: dedup-experience deletion path verified end-to-end (synthetic dup row 22750 deleted, 22749 kept) |
+| 93 | 7068 ← [7343] | A3: idempotency verified — re-run is graceful no-op |
+| 96 | 7068 ← [99999992] | B1: suspect lifecycle bug fix verified — collapsed-pair deleted (row 3), survivor-only-touched suspect correctly flagged `needs_rescore=true` (row 4) |
+| 97 | 7068 ← [10312, 10313] | C1: 3-row cluster — multi-id lock acquire/release, multi-orphan graph merge, multi-deletion all clean |
+
+**Status:** company-v2 is **shippable for human-driven merges**. Cron-driven activation requires
+filling the `mvp/merge/master-merge` (#12736) stub and building the re-score cron — both still
+pending. person-v2 has not yet been A1-tested with conflicts_resolved on real data (4 historical
+real merges predate Gap 1 patches; current state is structural correctness inherited from company-
+v2 helpers + empty-array smoke test from audit 75).
+
+### v0.17 (2026-05-06) — Gaps 1/2/3 + suspect-lifecycle bug fix
+
+Three concrete gaps closed plus one bug found in real-world testing:
+
+**Gap 1 — `conflicts_resolved` logging in orchestrators (was: schema column existed but
+orchestrator never wrote to it).** New helpers `merge/helpers/detect-conflicts-company` (#12969,
+covers `company_name`, `company_domain`, `linkedin_url`, `tagline`) and
+`merge/helpers/detect-conflicts-person` (#12970, covers `name`, `linkedin_url`, `bio`, `bio_500`).
+Each scans survivor + duplicates, finds the master row whose value matches the winner picked
+by `aggregate-scalars-*`, and collects disagreeing non-null values from other rows as
+`{field, winner_value, winner_source_master_id, loser_values[], loser_source_master_ids[],
+rule_applied}`. Orchestrators call the helper after aggregate-scalars and write the result to
+`merge_audit.conflicts_resolved`. Skipped entirely when match_kind is in the deterministic class
+(see [match_kind taxonomy](#confidence-escape-hatch--deterministic-matches-skip-even-the-logging)).
+Verified on Adjacent fixture (audit 73) — 3 conflicts logged (domain, linkedin, tagline);
+verified end-to-end on real Atlantic Pictures merge (audit 90) — 1 tagline conflict persisted
+to disk on a `status: success` row.
+
+**Gap 2 — `work_experience` + `education_experience` dedup after long-tail repoint (was:
+long-tail helper was repoint-only; James Ruse merge surfaced the gap when master_person 187
+ended up with two education rows for the same school/years).** New helpers
+`merge/helpers/dedup-experience-after-company-merge` (#12971) and
+`-after-person-merge` (#12972). Each takes the survivor id, queries
+`master_*_id == survivor_id`, groups by natural key (work: `(person, start_year, end_year, lower-trim title)`;
+education: `(person/company, start_year, end_year)`), picks oldest by `created_at` as keeper,
+deletes losers. dry_run=true returns the plan. Wired into both orchestrators between long-tail
+and fold. Verified on synthetic fixture (audit 92) — row 22750 deleted, 22749 kept.
+
+**Gap 3 — `match_kind` enum normalized to broader taxonomy (was: spec listed 3 values but real
+merges used 5+ subtypes like `domain_exact`, `linkedin_exact`, `manual_inspection`).** Both
+orchestrators now compute a `$is_deterministic_match` predicate that accepts
+`'deterministic' | 'email_exact' | 'phone_exact' | 'domain_exact' | 'linkedin_exact'`. The
+`merge_audit.match_kind` column description and the conflict-logging skip-rule documentation
+have been rewritten to reflect the actual taxonomy. No backfill of historic audit rows —
+existing values like `linkedin_exact` carry useful audit signal vs. flattening to generic
+`deterministic`. Verified on Adjacent fixture: `linkedin_exact` (audit 86) and `domain_exact`
+(audit 87) both correctly skip; `manual_inspection` (audit 88) still logs 3 conflicts.
+
+**Bug found + fixed — suspect-lifecycle else-branch was over-eager.** In both orchestrators,
+the `else` branch of the `merge_suspect` collapse/repoint logic was unconditionally setting
+`merged=true` on every survivor-touching suspect, even when neither side of the suspect's pair
+was an actual duplicate in the merge. Cascade: the subsequent `needs_rescore` step queries
+`WHERE merged == false AND survivor side matches`, which always returned zero rows. The
+planned re-score cron loop would have had nothing to process. Fixed by adding an inner
+conditional that only marks `merged=true` when at least one side was actually a duplicate
+(`$a_match_count > 0 || $b_match_count > 0`); otherwise the suspect stays `merged=false`
+so the rescore step can flag it. Verified on synthetic fixture (audit 96) — collapsed-pair
+deleted, survivor-only-touched pair correctly flagged `needs_rescore=true`.
+
+**XanoScript gotcha learned the hard way.** The `|` character inside string literals breaks
+the runtime parser with `ERROR_FATAL: Invalid syntax. Try using the "transform" filter or an
+expression.` — even though the function deploys cleanly. Discovered while building
+`dedup-experience-after-company-merge` (#12971) — the original key `"p" ~ id ~ "|y" ~ year`
+errored at runtime; switching to `"p" ~ id ~ "_y" ~ year` fixed it. Worth adding to the
+xanoscript-builder skill's gotchas section. Note also: every failed test left 2 dangling
+`merge_lock` rows that needed manual cleanup before the next try (the orchestrator dies mid-
+stack on these errors and never reaches the lock-release block).
+
+### Pre-v0.17 history (live but superseded by v0.17)
+
 v0.14 orchestrator + v0.13 graph-merge are live in WS3 v1. The Person merge pipeline is fully
 optimized end-to-end: lock acquired on **every id** (survivor + all duplicates) with rollback
 on partial failure, automated stale-lock cleanup cron, user-conflict guard, all 13 identity/
@@ -1501,15 +1591,24 @@ non-empty, letting the user override after the fact (the override writes a follo
 
 ### Confidence escape hatch — deterministic matches skip even the logging
 
-When the merge was triggered by a deterministic exact-match (same email or normalized phone),
-the records are by definition the same person. Conflicts on scalar fields are just stale data
-from one source — auto-pick "longest non-null" without writing to `conflicts_resolved`. This
-keeps the after-the-fact review feed focused on actually ambiguous merges.
+When the merge was triggered by a deterministic exact-match (same email, normalized phone,
+canonical domain, or LinkedIn URL), the records are by definition the same entity. Conflicts
+on scalar fields are just stale data from one source — auto-pick "longest non-null" without
+writing to `conflicts_resolved`. This keeps the after-the-fact review feed focused on actually
+ambiguous merges.
 
-The trigger source is recorded in `merge_audit.initiated_by` plus a new
-`merge_audit.match_kind` column with values `'deterministic'` (email/phone exact-match),
-`'llm_confirmed'` (Tier 1/Tier 2 from `mvp/merge/detect-suspects` #12709), or
-`'user_picked'` (manual merge from the suspect UI).
+The trigger source is recorded in `merge_audit.initiated_by` plus the
+`merge_audit.match_kind` column. Values fall into three classes (orchestrator skips
+`conflicts_resolved` logging only for the deterministic class):
+
+| Class | Values | Conflict logging |
+| --- | --- | --- |
+| Deterministic | `'deterministic'`, `'email_exact'`, `'phone_exact'`, `'domain_exact'`, `'linkedin_exact'` | Skipped — auto-pick is by definition correct |
+| LLM | `'llm_confirmed'`, `'llm_flash_confirmed'`, `'llm_pro_confirmed'` (Tier 1/2 from `mvp/merge/detect-suspects` #12709) | Logged to review feed |
+| User | `'user_picked'`, `'manual_inspection'` (human picked from suspect UI or admin tool) | Logged to review feed |
+
+The skip rule is implemented in both orchestrators as a `$is_deterministic_match` predicate;
+extending the deterministic class is a 1-line change in each orchestrator.
 
 ## Suspect lifecycle after merge (decided)
 

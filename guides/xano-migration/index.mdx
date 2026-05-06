@@ -1,0 +1,331 @@
+---
+title: "Xano to Go Migration"
+description: "Migration plan for transitioning the Orbiter backend from Xano to a native Go service."
+---
+
+## Overview
+
+This document outlines the strategy for migrating the Orbiter backend from Xano (a no-code platform) to a custom Go backend. The migration is driven by the need for greater control over performance, data integrity, testing, and long-term maintainability. Each section below covers a key area of the migration along with the recommended approach and open decisions.
+
+---
+
+## Why Go
+
+Go was chosen over other backend languages after evaluating Python, Java, and Node.js. The decision came down to performance, concurrency, and operational simplicity.
+
+### Performance
+
+Go compiles to native machine code with no virtual machine or interpreter overhead. In benchmarks, Go consistently outperforms Python and Node.js for CPU-bound and I/O-bound workloads alike, and matches or exceeds Java while producing significantly smaller binaries and using a fraction of the memory.
+
+### Concurrency
+
+Go's concurrency model — goroutines and channels — is purpose-built for the kind of workloads Orbiter handles: thousands of concurrent API requests, webhook ingestion, enrichment pipelines, and real-time event streaming. Goroutines are lightweight (a few KB of stack each), meaning a single Go process can handle hundreds of thousands of concurrent operations without the complexity of thread pools (Java), callback chains (Node.js), or the GIL limitations (Python).
+
+### Language Comparison
+
+| Criteria | Go | Node.js | Python | Java |
+|---|---|---|---|---|
+| **Concurrency model** | Goroutines — lightweight, native | Single-threaded event loop | GIL-limited threads; async is bolted on | OS threads + virtual threads (Loom) |
+| **Performance** | Compiled to native code, very fast | V8 JIT — fast for scripting, not compute | Interpreted, slowest of the group | JIT-compiled, fast but high memory |
+| **Memory footprint** | Low (~10-30 MB typical) | Moderate | Moderate-high | High (JVM overhead) |
+| **Binary deployment** | Single static binary, no runtime | Requires Node.js runtime + `node_modules` | Requires Python runtime + virtualenv | Requires JVM + fat JAR or container |
+| **Type safety** | Statically typed, compile-time checks | Dynamic (TypeScript helps but is opt-in) | Dynamic (type hints are opt-in) | Statically typed |
+| **Build & startup time** | Fast compile, instant startup | No compile, fast startup | No compile, moderate startup | Slow compile, slow JVM startup |
+| **Ecosystem for APIs** | Strong (Gin, Fiber, stdlib `net/http`) | Very strong (Express, Fastify) | Strong (FastAPI, Django) | Strong (Spring Boot) |
+
+### Operational Simplicity
+
+Go produces a single statically-linked binary with no external runtime dependencies. Deployment is as simple as copying a binary — no `node_modules`, no virtualenvs, no JVM tuning. This reduces container image sizes, simplifies CI/CD pipelines, and eliminates an entire class of "works on my machine" issues.
+
+---
+
+## Database — PostgreSQL
+
+PostgreSQL is the chosen database engine for the Go backend. It is the most capable open-source relational database available and aligns with every requirement of the Orbiter platform.
+
+### Why PostgreSQL
+
+- **Proven at scale** — PostgreSQL powers companies like Instagram, Stripe, and GitLab at far greater scale than Orbiter will require in the near term.
+- **Rich data types** — native support for JSONB, arrays, UUIDs, timestamps with time zones, and full-text search means less application-level workaround code.
+- **ACID compliance** — strong transactional guarantees are critical for financial data, contact deduplication, and multi-step enrichment pipelines where partial writes are unacceptable.
+- **Advanced indexing** — B-tree, GIN, GiST, and trigram indexes give fine-grained control over query performance as data volumes grow.
+- **Vector support** — with the `pgvector` extension, PostgreSQL can handle embedding storage and similarity search natively, which is relevant to Orbiter's suggestion engine and AI features.
+- **Extensibility** — extensions like `pg_cron` (scheduled jobs), `pgcrypto` (encryption), and `PostGIS` (geospatial) can be added without changing databases.
+- **Ecosystem & tooling** — first-class support in every Go ORM and data-access library under consideration (GORM, sqlc, sqlx, Ent), as well as mature tooling for backups, replication, and monitoring.
+
+### Why Not Other Databases
+
+| Database | Why Not |
+|---|---|
+| **MySQL / MariaDB** | Fewer advanced data types, weaker JSON support, less capable indexing. PostgreSQL is strictly more feature-rich for this use case. |
+| **MongoDB** | Document databases add complexity for relational data with strong consistency requirements. Orbiter's data model is inherently relational. |
+| **SQLite** | Excellent for embedded/local use but not suitable for a multi-user production API with concurrent writes. |
+| **CockroachDB / YugabyteDB** | Distributed SQL adds operational complexity that isn't justified at current scale. Can be revisited if global distribution is needed. |
+
+---
+
+## Database Migration
+
+The database migration will follow a phased approach, prioritising the most critical tables first and expanding outward.
+
+### Phase 1 — Core Master Records
+
+The first tables to migrate are the foundational master records that most of the application depends on:
+
+- **`master_person`** — the canonical person record
+- **`master_company`** — the canonical company record
+- All related child tables (emails, phones, links, addresses, etc.)
+
+### Phase 2 — Auth & Organisation Tables
+
+Immediately following core records, the auth and multi-tenancy layer must be in place:
+
+- **`users`** — application user accounts
+- **WorkOS-related tables** — `organizations`, `organization_memberships`, and any role/permission mappings
+
+### Phase 3 — Remaining Domain Tables
+
+Once the foundation is stable, migrate the remaining domain tables (activities, collections, notes, suggestions, travels, etc.) in order of feature priority.
+
+### Environment Strategy
+
+Three isolated database environments will be maintained from day one:
+
+| Environment | Purpose |
+|---|---|
+| **Local** | Developer machines — seeded with anonymised sample data |
+| **Staging** | Pre-production validation with production-like data volumes |
+| **Production** | Live customer data — deployed only after staging sign-off |
+
+### Data Integrity Constraints
+
+The Go backend should enforce constraints at the database level that Xano could not reliably enforce:
+
+- **Unique indexes on contact details** — e.g. a given email address must be unique per person, preventing silent duplicates.
+- **Foreign key constraints** — enforced at the database layer rather than the application layer.
+- **NOT NULL constraints** where data is required, avoiding empty-string defaults.
+
+### Soft Deletes
+
+All record deletions will use **soft deletes** (a `deleted_at` timestamp column) rather than hard deletes. This is the enterprise-standard approach and provides:
+
+- An audit trail for compliance and debugging
+- The ability to recover accidentally deleted records
+- Referential safety — foreign keys are never left dangling
+
+**Retention policy:** Soft-deleted records will be permanently purged after **30 days** via a scheduled cleanup job. This balances recoverability with storage hygiene.
+
+---
+
+## Primary Keys — UUID vs Integer ID
+
+Two primary-key strategies are under consideration:
+
+### Option A — Dual-Key (Recommended)
+
+| Key | Type | Purpose |
+|---|---|---|
+| `id` | Auto-incrementing integer | Internal foreign keys, joins, indexes — fast and compact |
+| `uuid` | UUIDv4 | External-facing identifier exposed in APIs and URLs |
+
+This approach keeps join performance high while preventing enumeration attacks on public endpoints.
+
+### Option B — UUID Only
+
+Use UUIDs as the sole primary key everywhere. Simpler schema, but slightly larger indexes and marginally slower joins at scale.
+
+**Decision:** If the team determines that the performance trade-off of UUID-only keys is acceptable, Option B is a valid simplification. Otherwise, go with dual-key.
+
+---
+
+## Schema Migrations — `golang-migrate`
+
+All schema changes will be managed with [`golang-migrate`](https://github.com/golang-migrate/migrate):
+
+- Every migration is a pair of **up** and **down** SQL files, ensuring rollbacks are always possible.
+- Migrations are version-controlled alongside application code.
+- CI will validate that all migrations apply cleanly to a fresh database on every pull request.
+- Production migrations run as a dedicated step in the deployment pipeline — never inside the application boot sequence.
+
+---
+
+## ORM Selection
+
+The ORM or data-access library is still under discussion. The candidates being evaluated include:
+
+| Library | Style | Notes |
+|---|---|---|
+| **GORM** | Full ORM | Widely adopted, convention-heavy, auto-migrations |
+| **sqlc** | Code-gen from SQL | Type-safe, no runtime reflection, raw SQL control |
+| **sqlx** | Thin wrapper | Lightweight, struct scanning, manual queries |
+| **Ent** | Graph-based ORM | Schema-as-code, strong relationship modelling |
+
+**Open decision** — the final choice will be driven by the team's preference for type safety vs. flexibility, and how much schema abstraction is desired.
+
+---
+
+## Third-Party Integrations
+
+### SDK-First Approach
+
+Where an official Go SDK exists, it will be used directly:
+
+- **WorkOS** — authentication, SSO, directory sync
+- **Nylas** — email, calendar, contacts
+- **Knock** — notifications
+- Any other provider with a maintained Go SDK
+
+### Custom Service Layer
+
+For third-party APIs that do not offer a Go SDK, a thin service wrapper will be created:
+
+- Each integration gets its own package under `internal/services/{provider}/`
+- The wrapper handles authentication, retries, rate limiting, and response mapping
+- Interfaces are defined so integrations can be swapped or mocked in tests
+
+---
+
+## HTTP Framework
+
+The choice of HTTP framework is between two leading Go options:
+
+| Framework | Strengths | Considerations |
+|---|---|---|
+| **Fiber** | Express-like API, high performance (fasthttp), middleware ecosystem | `fasthttp` is not fully `net/http`-compatible — some stdlib middleware won't work |
+| **Gin** | Mature, battle-tested, large community, `net/http`-compatible | Slightly more verbose than Fiber |
+
+**Open decision** — both are production-grade. The choice may come down to team familiarity and middleware compatibility requirements.
+
+---
+
+## Webhook Handling
+
+Third-party webhooks (Nylas, WorkOS, Knock, Stripe, etc.) require a publicly reachable URL to deliver payloads.
+
+### Local Development
+
+Use **ngrok** (or a similar tunnelling tool) to expose the local Go server to the internet during development:
+
+```bash
+ngrok http 8080
+```
+
+The resulting public URL is registered with each third-party provider's webhook settings for the development environment.
+
+### Staging & Production
+
+In staging and production, webhooks will hit dedicated routes on the deployed service — no tunnelling needed. Webhook signature verification will be enforced on all environments.
+
+---
+
+## Project Structure
+
+The directory layout will depend on the chosen HTTP framework, but will follow standard Go conventions:
+
+```
+orbiter-api/
+├── cmd/
+│   └── server/          # Application entrypoint
+├── internal/
+│   ├── config/          # Environment & config loading
+│   ├── database/        # Connection pool, migrations
+│   ├── handlers/        # HTTP route handlers
+│   ├── middleware/       # Auth, logging, CORS, etc.
+│   ├── models/          # Domain structs & DB models
+│   ├── repositories/    # Data-access layer
+│   ├── services/        # Business logic & 3rd-party integrations
+│   └── queue/           # Job queue producers & consumers
+├── migrations/          # SQL migration files
+├── pkg/                 # Shared utilities (if any)
+├── tests/               # Integration & e2e tests
+├── go.mod
+└── go.sum
+```
+
+This structure will be refined once the framework and ORM decisions are finalised.
+
+---
+
+## Testing Strategy
+
+Testing is non-negotiable. The Go backend must maintain a minimum of **90% code coverage** at all times.
+
+### Unit Tests
+
+- Every package ships with `_test.go` files
+- Business logic in `services/` is tested with mocked dependencies
+- Table-driven tests are the default pattern
+
+### Integration Tests
+
+- Database operations are tested against a real PostgreSQL instance (via Docker / testcontainers)
+- Third-party integrations are tested with recorded HTTP fixtures or sandbox environments
+
+### CI Enforcement
+
+- Pull requests that drop coverage below 90% will be blocked
+- Tests run on every push — no merging without a green build
+
+---
+
+## Background Jobs & Queues
+
+Long-running or resource-intensive tasks (e.g. enrichment pipelines, bulk imports, webhook processing) will be handled by a **job queue** rather than spinning up separate microservices.
+
+### Recommended Approach
+
+- Use a queue library such as [River](https://github.com/riverqueue/river) (PostgreSQL-backed) or [Asynq](https://github.com/hibiken/asynq) (Redis-backed)
+- Workers run in the same binary, consuming jobs from the queue
+- This keeps the deployment footprint small — one service, not many
+
+### When to Use Microservices
+
+Microservices should only be introduced when there is a clear, demonstrated need:
+
+- A workload requires independent scaling (e.g. the enrichment pipeline processes millions of records)
+- A component has fundamentally different availability or deployment requirements
+- The overhead of inter-service communication is justified by the isolation benefits
+
+**Default:** queue-based background jobs within a single service. Microservices are the exception, not the rule.
+
+---
+
+## Replacing AI-Dependent Xano Functions
+
+Several Xano functions currently rely on AI/LLM calls for tasks that have well-established open-source alternatives. Where possible, these should be replaced with deterministic, locally-run libraries:
+
+| Task | Current (Xano) | Proposed (Go) |
+|---|---|---|
+| Phone number parsing & validation | LLM-based or custom logic | [`google/libphonenumber`](https://github.com/nyaruka/phonenumbers) (Go port) |
+| Email validation | Custom regex | [`badoux/checkmail`](https://github.com/badoux/checkmail) or similar |
+| URL parsing & normalisation | Custom logic | Go stdlib `net/url` + [`PuerkitoBio/purell`](https://github.com/PuerkitoBio/purell) |
+| Date/time parsing from text | LLM-based | [`olebedev/when`](https://github.com/olebedev/when) or similar NLP date parser |
+
+This reduces latency, cost, and external dependencies for deterministic operations. LLM calls should be reserved for tasks that genuinely require natural language understanding.
+
+---
+
+## Real-Time Frontend Updates — Server-Sent Events (SSE)
+
+For pushing real-time updates to the frontend (e.g. enrichment progress, notification badges, live activity feeds), the backend will use **Server-Sent Events (SSE)** rather than WebSockets.
+
+### Why SSE over WebSockets
+
+- **Unidirectional** — the use case is server-to-client only, which is exactly what SSE is designed for
+- **Simpler infrastructure** — works over standard HTTP, no upgrade handshake, no special proxy config
+- **Auto-reconnect** — the browser's `EventSource` API handles reconnection natively
+- **Lightweight** — no need for a WebSocket library or connection management on the server
+
+### Implementation
+
+The Go server will expose an SSE endpoint (e.g. `/api/v1/events/stream`) that clients subscribe to with an `EventSource`. Events are typed and scoped to the authenticated user:
+
+```
+event: enrichment.complete
+data: {"person_id": "uuid", "status": "done"}
+
+event: notification.new
+data: {"count": 3}
+```
+
+If the application later requires bidirectional communication (e.g. collaborative editing, in-app chat), WebSockets can be introduced for those specific features.

@@ -1,0 +1,349 @@
+---
+title: "New Company Enrichment"
+description: "Replacing People Data Labs company enrichment with a grounded OpenRouter LLM call for ~10–20x cost reduction. Full system prompt, recommended models, and a sample response."
+---
+
+<Note>
+  Status: design draft (2026-05-06). PDL company enrichment currently lives at [People Data Labs](/guides/third-party-apis/people-data-labs); this proposal is a parallel pipeline that shifts company-level fact-finding to a grounded LLM call via [OpenRouter](/guides/third-party-apis/openrouter). Person-level data stays in the existing [Exa](https://exa.ai) pipeline — this prompt is company-only.
+</Note>
+
+## Why replace PDL
+
+People Data Labs charges roughly $0.05–0.20 per company enrichment depending on tier and volume. A grounded LLM call (Gemini Flash with `:online`) costs ~$0.005–0.015 per call — **10–20x cheaper** — and returns fresher data because the model searches the live web instead of querying a 30–90 day old snapshot.
+
+Tradeoffs we accept:
+
+- LLMs hallucinate. We mitigate with mandatory source citations and per-field confidence scores.
+- Coverage is uneven for niche/private companies. We accept `null` over guesswork.
+- Some PDL fields (`dataset_version`, internal IDs, `likelihood`) are dropped — they were artifacts, not signal.
+
+## Recommended models
+
+Three OpenRouter models cover the price/quality spectrum. All three support web grounding.
+
+<CardGroup cols={3}>
+  <Card title="Gemini 2.5 Flash :online" icon="bolt">
+    `google/gemini-2.5-flash:online` — best price/performance, the default choice
+  </Card>
+  <Card title="Perplexity Sonar" icon="magnifying-glass">
+    `perplexity/sonar` — purpose-built for web research; no `:online` suffix needed
+  </Card>
+  <Card title="Claude Sonnet 4.6 :online" icon="brain">
+    `anthropic/claude-sonnet-4.6:online` — escalation tier for low-confidence records
+  </Card>
+</CardGroup>
+
+| Model | Approx cost / call | Strengths | When to use |
+| --- | --- | --- | --- |
+| `google/gemini-2.5-flash:online` | $0.005–0.015 | Fast, cheap, strong JSON output, native grounding | Default for bulk enrichment |
+| `perplexity/sonar` | $0.008–0.012 | Built for web research, reliable citations | A/B against Gemini; fallback for verticals where Gemini under-cites |
+| `anthropic/claude-sonnet-4.6:online` | $0.04–0.08 | Best extraction quality, handles ambiguity well | Re-run when `_meta.confidence.overall < 0.7` or for high-value targets |
+
+**Tier the calls.** Run Gemini Flash first. If `_meta.confidence.overall` falls below threshold or `_meta.notes` flags ambiguity, escalate that single record to Sonnet. Blended cost stays close to Gemini Flash pricing while tail-risk on important records is protected.
+
+## System prompt
+
+Copy/paste-ready. Inputs are passed in the user message: `company_name` (always present) and at least one of `company_domain` or `linkedin_url`.
+
+```text System Prompt
+You are a precise B2B company research analyst. Given a company name plus either a domain or LinkedIn URL (or both), you return a single JSON object describing the company. You ground every non-obvious claim in web search results.
+
+# Inputs
+
+You will receive in the user message:
+- company_name (always present)
+- company_domain (may be null)
+- linkedin_url (may be null)
+
+At least one of company_domain or linkedin_url is always present. Use whichever you have as the primary identifier — the other inputs are confirmation signals to make sure you research the correct entity (companies share names).
+
+# Research methodology
+
+1. Verify identity first. If domain is provided, the official site is canonical. If only linkedin_url is provided, treat the LinkedIn page as canonical and follow links from there to find the official domain.
+2. Cross-reference at least two independent sources for any factual claim (revenue, headcount, funding, parent company, founding year). One source = lower confidence.
+3. Source priority, highest to lowest: official company website > LinkedIn > Crunchbase / PitchBook / SEC filings > reputable news (Reuters, Bloomberg, TechCrunch, industry trades) > Wikipedia > everything else. Discount aggregators (ZoomInfo, RocketReach, Apollo) — they often republish stale data.
+4. For acquired or subsidiary companies, research both the entity and its parent.
+5. Prefer recent sources. Note `as_of` dates where the schema asks for them.
+
+# Hard rules
+
+- If a field cannot be verified from your search results, set it to null. Never guess. Never fill from training-data priors. "Probably" is not good enough.
+- Cite every source URL you actually used in `_meta.sources`. Do not include URLs you did not visit.
+- Set per-field confidence in `_meta.confidence` on a 0–1 scale: 1.0 = official source, recent, unambiguous; 0.7 = single reputable source or slight ambiguity; 0.4 = inferred from indirect signals; below 0.4 = set the field to null instead.
+- Revenue and funding totals: use numeric ranges (`_low` and `_high`). Do not invent precision.
+- For employee count, prefer the LinkedIn employee count over self-reported "size" ranges.
+- `primary_product` is the company's flagship offering — the product or service most strongly associated with the brand, generally the one most prominently featured on the homepage. For pure services firms, use the dominant service line. If the company has no clear flagship, set to null. Always also include it in the `products[]` array.
+- `email_address` and `phone_number` are the company's primary public contact details, sourced from the official website's contact, about, or footer pages. Prefer general inboxes (info@, hello@, contact@) over role-specific ones (sales@, support@) when both exist. Use E.164 format for phone numbers (e.g. +18889412111). Do not include personal email addresses or direct lines for individuals. If no public contact is listed, set to null.
+- Do not research or return information about individual employees, executives, or founders. People data is handled by a separate system.
+- Output ONLY the JSON object. No markdown fences, no preamble, no explanation. The first character of your response must be `{` and the last must be `}`.
+
+# Output schema
+
+Return exactly this shape. Include every key. Use null for unknown values, [] for empty arrays.
+
+{
+  "name": string,
+  "legal_name": string | null,
+  "aliases": string[],
+  "domain": string | null,
+  "alt_domains": string[],
+  "headline": string | null,
+  "summary": string | null,
+  "founded_year": number | null,
+  "company_type": "private" | "public" | "public_subsidiary" | "private_subsidiary" | "nonprofit" | "government" | "educational" | null,
+  "ticker": string | null,
+  "industry": {
+    "primary": string | null,
+    "secondary": string[],
+    "naics_code": string | null,
+    "sic_code": string | null
+  },
+  "business_model": string[],
+  "primary_product": {"name": string, "category": string} | null,
+  "products": [{"name": string, "category": string}],
+  "target_customers": string[],
+  "size": {
+    "employee_count": number | null,
+    "employee_range": string | null,
+    "as_of": string | null
+  },
+  "revenue": {
+    "estimate_usd_low": number | null,
+    "estimate_usd_high": number | null,
+    "is_estimate": boolean
+  },
+  "funding": {
+    "total_raised_usd": number | null,
+    "last_round": string | null,
+    "last_round_date": string | null,
+    "investors": string[],
+    "is_acquired": boolean,
+    "acquired_by": string | null,
+    "acquired_date": string | null
+  },
+  "corporate_structure": {
+    "immediate_parent": {"name": string, "domain": string | null} | null,
+    "ultimate_parent": {"name": string, "domain": string | null} | null,
+    "subsidiaries": [{"name": string, "domain": string | null}],
+    "division_of": string | null
+  },
+  "headquarters": {
+    "street": string | null,
+    "city": string | null,
+    "region": string | null,
+    "country": string | null,
+    "postal_code": string | null,
+    "lat": number | null,
+    "lon": number | null
+  },
+  "other_locations": [{"city": string, "region": string | null, "country": string}],
+  "email_address": string | null,
+  "phone_number": string | null,
+  "social": {
+    "linkedin": string | null,
+    "linkedin_id": string | null,
+    "twitter": string | null,
+    "facebook": string | null,
+    "crunchbase": string | null,
+    "youtube": string | null,
+    "github": string | null
+  },
+  "competitors": string[],
+  "tags": string[],
+  "_meta": {
+    "researched_at": string,
+    "confidence": {
+      "overall": number,
+      "identity": number,
+      "size": number,
+      "revenue": number,
+      "funding": number,
+      "corporate_structure": number
+    },
+    "sources": string[],
+    "notes": string | null
+  }
+}
+
+# Failure modes
+
+- If you cannot confidently identify the company from the inputs (e.g. ambiguous name, dead domain, deleted LinkedIn): return the JSON with `name` set to the input, `_meta.confidence.identity` < 0.4, `_meta.notes` explaining the ambiguity, and all other fields null.
+- If the company is defunct: still return data, set `_meta.notes` to indicate status and date of closure if known.
+- Never refuse. Never return prose. Always return JSON.
+```
+
+## User message format
+
+Templated for the Xano function — `$input` / `$var.input` resolve to the function inputs at runtime:
+
+```text User Message
+company_name: {{$input.company_name}}
+company_domain: {{$var.input.company_domain}}
+linkedin_url: {{$input.linkedin_url}}
+```
+
+Resolved at runtime for the Teradek example:
+
+```text Resolved Example
+company_name: Teradek
+company_domain: teradek.com
+linkedin_url: https://linkedin.com/company/teradek
+```
+
+## Simulated response
+
+Sample shaped response for Teradek (a Videndum plc subsidiary, wireless video transmission). Note the per-field confidence scores and the `_meta.notes` field flagging Videndum's recent corporate activity as something to reverify.
+
+```json Sample Response — Teradek
+{
+  "name": "Teradek",
+  "legal_name": "Teradek, LLC",
+  "aliases": ["Teradek LLC"],
+  "domain": "teradek.com",
+  "alt_domains": [],
+  "headline": "High performance video solutions for broadcast, cinema, and imaging applications",
+  "summary": "Teradek designs and manufactures wireless video transmission systems, IP-based encoders, and cloud workflow tools for broadcast, cinema, and live production. A brand within the Creative Solutions division of Videndum plc.",
+  "founded_year": 2008,
+  "company_type": "public_subsidiary",
+  "ticker": null,
+  "industry": {
+    "primary": "Broadcast & Cinema Equipment Manufacturing",
+    "secondary": ["Wireless Video Transmission", "Live Streaming Hardware", "IP Video Workflow Software"],
+    "naics_code": "334310",
+    "sic_code": "3651"
+  },
+  "business_model": ["B2B", "Hardware", "SaaS"],
+  "primary_product": {
+    "name": "Bolt",
+    "category": "Zero-delay wireless video transmitter"
+  },
+  "products": [
+    {"name": "Bolt", "category": "Zero-delay wireless video transmitter"},
+    {"name": "Prism", "category": "Cellular-bonded HEVC encoder"},
+    {"name": "Serv", "category": "On-set IP video streaming"},
+    {"name": "Cube", "category": "H.264 streaming encoder"},
+    {"name": "Core", "category": "Cloud video workflow management"}
+  ],
+  "target_customers": [
+    "Broadcast networks",
+    "Cinematographers and DPs",
+    "Live event producers",
+    "ENG / news crews",
+    "Sports production"
+  ],
+  "size": {
+    "employee_count": null,
+    "employee_range": "51-200",
+    "as_of": "2026-05-06"
+  },
+  "revenue": {
+    "estimate_usd_low": 25000000,
+    "estimate_usd_high": 50000000,
+    "is_estimate": true
+  },
+  "funding": {
+    "total_raised_usd": null,
+    "last_round": null,
+    "last_round_date": null,
+    "investors": [],
+    "is_acquired": true,
+    "acquired_by": "Vitec Group (now Videndum plc)",
+    "acquired_date": "2015"
+  },
+  "corporate_structure": {
+    "immediate_parent": {"name": "Videndum plc", "domain": "videndum.com"},
+    "ultimate_parent": {"name": "Videndum plc", "domain": "videndum.com"},
+    "subsidiaries": [],
+    "division_of": "Creative Solutions"
+  },
+  "headquarters": {
+    "street": "8 Mason",
+    "city": "Irvine",
+    "region": "California",
+    "country": "United States",
+    "postal_code": "92618",
+    "lat": 33.65,
+    "lon": -117.81
+  },
+  "other_locations": [],
+  "email_address": "sales@teradek.com",
+  "phone_number": "+18889412111",
+  "social": {
+    "linkedin": "https://linkedin.com/company/teradek",
+    "linkedin_id": "1478237",
+    "twitter": "https://twitter.com/teradek",
+    "facebook": "https://facebook.com/teradek",
+    "crunchbase": "https://crunchbase.com/organization/teradek",
+    "youtube": "https://youtube.com/@teradek",
+    "github": null
+  },
+  "competitors": [
+    "LiveU",
+    "TVU Networks",
+    "Haivision",
+    "Hollyland",
+    "AJA Video Systems",
+    "Blackmagic Design"
+  ],
+  "tags": [
+    "wireless video",
+    "cellular bonding",
+    "live broadcast",
+    "cinematography",
+    "on-set monitoring",
+    "live streaming",
+    "IP video",
+    "ENG"
+  ],
+  "_meta": {
+    "researched_at": "2026-05-06T00:00:00Z",
+    "confidence": {
+      "overall": 0.75,
+      "identity": 0.98,
+      "size": 0.55,
+      "revenue": 0.45,
+      "funding": 0.7,
+      "corporate_structure": 0.85
+    },
+    "sources": [
+      "https://teradek.com/pages/about-us",
+      "https://www.linkedin.com/company/teradek",
+      "https://www.crunchbase.com/organization/teradek",
+      "https://www.videndum.com/our-businesses/creative-solutions"
+    ],
+    "notes": "Videndum plc has had significant corporate activity in 2024–2025; ultimate_parent and division_of should be reverified. Employee range from LinkedIn; exact count unverified."
+  }
+}
+```
+
+## Schema highlights vs PDL
+
+| Change | Why |
+| --- | --- |
+| Added `_meta.sources` | Verify or downgrade hallucinated citations programmatically |
+| Added `_meta.confidence` per field | Drives downstream routing — escalate, retry, or null out |
+| Added `primary_product` | Flagship offering separated from the full `products[]` list |
+| `revenue` as numeric range | `estimate_usd_low` / `estimate_usd_high` instead of PDL's `"$25M-$50M"` string — sortable, filterable |
+| Added `competitors[]` | Free with web search, costs extra in PDL ecosystem |
+| Added `email_address` and `phone_number` | Public contact fields PDL doesn't surface cleanly; sourced from official site footer/contact page |
+| Removed `key_people` | Handled by [Exa](https://exa.ai) people-search pipeline |
+| Removed `tech_stack` | Unreliable from web search; use BuiltWith/Wappalyzer if needed |
+| Removed `growth_signals` | Most time-sensitive fields → stale fastest in cache; better as on-demand call |
+| Dropped PDL artifacts | `id`, `dataset_version`, `status`, `likelihood`, `mic_exchange` were vendor noise |
+
+## Routing & caching (sketch)
+
+- **Default:** Gemini Flash :online for every new enrichment request.
+- **Escalate:** if `_meta.confidence.overall < 0.7`, re-run on Claude Sonnet 4.6 :online.
+- **Manual review:** if Sonnet still returns < 0.7, route to a human queue.
+- **Cache key:** domain (or `linkedin_id` if no domain).
+- **TTL by field group:** 90 days for `corporate_structure`, `founded_year`, `industry`; 30 days for `size`, `revenue`. Probably store the whole record with a `researched_at` and refresh field-by-field on read.
+
+## Status
+
+Design draft. Not yet wired into the enrichment pipeline. Next steps:
+
+1. Build the Xano function that invokes OpenRouter with this system prompt.
+2. Run on a sample of 50–100 companies and diff against existing PDL records.
+3. Tune confidence thresholds based on the diff.
+4. Decide on Perplexity Sonar A/B vs going straight to production with Gemini Flash.

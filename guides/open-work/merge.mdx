@@ -11,11 +11,19 @@ description: "Spec for merging duplicate master_person and master_company record
   Xano writes, and none are idempotent or audited. Build to this spec, not to the existing code.
 </Note>
 
-## Build status (2026-05-05)
+## Build status (2026-05-06)
 
-v0.7 of the orchestrator is live in WS3 v1. Both real-merge fixtures (Traver, Seely) are fully
-processed: master_person rows merged + deleted, dependent tables repointed + deduped, FalkorDB
-graph nodes consolidated. The whole call returns in ~1-2s and writes a complete `merge_audit` row.
+v0.10 of the orchestrator is live in WS3 v1. The pipeline is end-to-end: master_person rows
+merged + deleted, all 70 long-tail tables repointed (incl. `my_person`), per-user `my_person`
+fold-in collapses duplicate CRM rows for users who tracked both sides, FalkorDB graph nodes
+consolidated, `merge_suspect` lifecycle handled, full `merge_audit` row written.
+
+**v0.10 (2026-05-06) — wired `merge/helpers/fold-my-persons-on-survivor` (#12951) into the
+orchestrator, positioned between `repoint-long-tail-person` and `graph-merge-person`.** v0.9
+brought all duplicate `my_person` rows under the survivor master_person_id; v0.10 collapses
+them per-user — picks the oldest `my_person` row per `(user_id, master_person_id)` as keeper,
+repoints child rows from non-keeper my_person ids → keeper, dedups child rows on natural keys
+(message_id / event_id / master_email_id), and deletes non-keeper my_person rows.
 
 **v0.7 (2026-05-05) — wired `merge/helpers/graph-merge-person` (#12949) into the orchestrator,
 positioned between `repoint-long-tail-person` and the `master_person` delete loop.** Pulls the
@@ -149,6 +157,48 @@ Coverage now: HAS_EXPERTISE, WORKS_AT, FOUNDED, LOCATED_IN, KNOWS, **ADVISOR_TO,
 The pattern for extending coverage is clear: when `orphans_skipped` shows `remaining_edges > 0`,
 inspect orphan edges by type, add the new type to the helper's `$edge_types` array, re-run.
 
+### v0.10 — per-user my_person fold-in (2026-05-06)
+
+```text
+function/12951
+merge/helpers/fold-my-persons-on-survivor
+```
+
+After v0.9 brought duplicate `my_person` rows under the survivor `master_person_id`, users who
+tracked both sides of a merge ended up with **two `my_person` rows for the same
+(user_id, master_person_id) pair** — visible as a duplicated person in their CRM list.
+
+v0.10 adds a fold-in helper that runs **after the long-tail repoint** and **before graph merge**:
+
+1. Query all `my_person` rows for the survivor sorted by `created_at asc`.
+2. Walk rows building `{user_id → first_my_person_id}` (the keeper per user).
+3. For each non-keeper, scan-once over each child table:
+   - **Repoint + dedup on natural key**: `activity` (message_id), `email_activity` (message_id),
+     `calendar_event_activity` (event_id), `my_person_email_join` (master_email_id).
+   - **Repoint only (v0.11 will add dedup)**: `my_person_phone_join`, `my_person_link_join`,
+     `my_person_address_join`, `my_note_person_join`, `important_date`, `possible_duplicates`.
+4. `db.del my_person` for the non-keeper id.
+
+The helper is **idempotent**: re-running on a survivor with no duplicate users is a no-op
+(`my_persons_examined > 0`, `users_with_dups: 0`, no deletes).
+
+**Verified end-to-end on Sam Seely (2026-05-06):**
+
+```text
+{ "my_persons_examined": 4,
+  "users_with_dups": 1,
+  "deleted_my_person_ids": [216],
+  "fold_ops": [{ "user_id": 16,
+                 "keeper_my_person_id": 204,
+                 "non_keeper_my_person_id": 216,
+                 "email_activity_repointed": 1,
+                 "email_join_repointed": 1,
+                 "link_join_repointed": 2 }] }
+```
+
+Post-fold survivor 4458 has 3 `my_person` rows — one each for users 12, 16, 21 — with no
+`(user_id, master_person_id)` duplicates and zero orphans pointing at the deleted row 216.
+
 ### v0.9 — my_person FK orphan fix
 
 `my_person` (#128) is per-user CRM data with a `master_person_id` FK. Earlier versions of the
@@ -230,8 +280,10 @@ tracked as a v0.7 task.
 | `merge/helpers/snapshot-person` | 12942 | ✅ live, verified |
 | `merge/helpers/aggregate-scalars-person` | 12943 | ✅ live, verified — covers 22 master_person scalar fields |
 | `merge/helpers/merge-enrich-data-person` | 12944 | ✅ live, verified — first-not-empty across 11 JSON columns |
-| `merge/person-v2` | 12945 | ✅ live (v0.6), real merge run on Sam Seely + cleanup |
-| `merge/helpers/repoint-long-tail-person` | 12947 | ✅ live, sweeps 69 uncovered person-side tables |
+| `merge/person-v2` | 12945 | ✅ live (v0.10), end-to-end on Traver / Seely / Grady |
+| `merge/helpers/repoint-long-tail-person` | 12947 | ✅ live (v0.9), sweeps 70 person-side tables incl. my_person |
+| `merge/helpers/graph-merge-person` | 12949 | ✅ live (v2.3), 27 Person edge types covered |
+| `merge/helpers/fold-my-persons-on-survivor` | 12951 | ✅ live (v0.10), per-user my_person collapse |
 | `merge_audit` table | 721 | ✅ provisioned |
 | `merge_lock` table | 722 | ✅ provisioned (not yet wired into orchestrator) |
 | `merge_suspect` extension (`kind`, `needs_rescore`, company FKs) | 284 | ✅ live |
@@ -629,17 +681,25 @@ function: merge/person-v2  (TO BUILD — workspace 3, branch v1)
 
 ### my_person reconciliation
 
+```text
+function/12951
+merge/helpers/fold-my-persons-on-survivor
+```
+
 `my_person` (128) is per-user. Different users can each have their own `my_person` row pointing at
 the same `master_person`. After repointing, multiple rows for the same `(user_id, master_person_id)`
 are illegal — collapse them.
 
-For each user that owns a `my_person` row pointing at any duplicate:
+The orchestrator's v0.10 path implements this in two steps:
 
-1. Look up the user's existing `my_person` row pointing at `survivor_id` (if any).
-2. **If none**: just `UPDATE my_person SET master_person_id = survivor_id WHERE id = duplicate_my_person.id`. Done.
-3. **If one exists**: fold the duplicate's joins into the survivor's joins, then delete the duplicate `my_person` row.
+1. **`merge/helpers/repoint-long-tail-person` (#12947)** — sweeps `my_person` along with all
+   other person-side tables, updating `master_person_id` from any duplicate to the survivor.
+2. **`merge/helpers/fold-my-persons-on-survivor` (#12951)** — for each user with multiple
+   `my_person` rows under the survivor, picks the oldest as keeper, repoints all child rows
+   from non-keeper my_person ids to the keeper, dedups child rows on natural keys, and deletes
+   the non-keeper `my_person` row.
 
-Tables that hold `my_person_id` and need fold-in handling:
+Tables that hold `my_person_id` and are handled by the fold-in helper:
 
 | Table | ID | Rule when folding |
 | --- | --- | --- |

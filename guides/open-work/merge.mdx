@@ -974,59 +974,34 @@ helpers:
   - merge/helpers/delete-master-companies-by-ids (#12960)
 ```
 
-**v0.3 known issue (NOT shared with person-v2):** the orchestrator's `db.del master_company`
-silently no-ops in deployed stack context — observed across 8 fixtures. Both inline
-`foreach + db.del` and `function.run`-helper-call patterns return `delete_plan.deleted=[]`
-with `errors=[]` even when `$is_writable=true` and the row exists. **Person-v2 v0.14 does
-NOT share this bug** — verified against audits 13, 16, 19 (3 successful person merges): all
-7 duplicate master_person ids (4411, 4412, 4413, 4423, 4424, 4457, 4459) are confirmed
-deleted in the live data source.
+**v0.5 (2026-05-06) — FIXED.** Root cause was a XanoScript operator-precedence bug:
+`$is_dry == false && $lock_acquired == true` was parsing as
+`$is_dry == (false && $lock_acquired) == true` — `&&` binds tighter than `==`. Result:
+`$is_writable` evaluated to **null**, and the conditional `if ($is_writable)` failed loose-equality
+(`null == false` → true), silently skipping the entire master_company.del block. **Fix:**
+wrap each `==` in explicit parens: `($is_dry == false) && ($lock_acquired == true)`. Patched
+in #12956. Test wrapper #8458 cleaned up — chained cleanup helper removed since orchestrator
+now does the delete itself. End-to-end verified on temp dups 10299 + 10300 — orchestrator
+reports `delete_plan.deleted=[id]` and the row is actually gone.
 
-Bisect attempts (via `debug-orchestrator-stripped` / `debug-stack-bisect`):
-- Phase 0 (just create+delete): works
-- Phase 1 (+ snapshot helper): works
-- Phase 2 (+ master_company.edit on survivor): works
-- Phase 3 (+ master_link repoint): works
-- Phase 4 (+ master_person repoint): works
-- Phase 5 (+ merge-enrich-data-company helper): works
-- Phase 6 (+ graph-merge-company helper): works
-- Phase 6 + audit + locks: works
-- Even with a temp dup having ZERO real FKs run through the full orchestrator: still fails
+The bisect was misleading because every isolated reconstruction had its own scope where the
+expression happened to parse correctly (or was simpler). The orchestrator's specific token
+arrangement plus the chained `==` triggered the precedence issue.
 
-The bug ONLY reproduces inside `merge/company-v2` itself — every isolated reconstruction
-of the same stack works. Cleanup helper called from a fresh outer endpoint context
-deletes successfully. Adding a no-op `db.edit master_company` between graph-merge and
-delete (mimicking person-v2's `fundable_synced` section) did NOT fix it.
+**Confirmed reproducible.** Created `merge/company-v2-clone` (#12961) with the same
+expression — bug reproduced (`is_writable: null`, `iterations: 0`). Replaced expression with
+just `$lock_acquired` — bug fixed in clone. Replaced expression in #12956 with explicit
+parens — bug fixed in production orchestrator.
 
-**Workaround:** the test wrapper `merge-company-v2-test` chains orchestrator +
-`delete-master-companies-by-ids` helper as a final cleanup step on real merges (skipped on
-dry_run). End-to-end verified across 8 fixtures.
+**Person-v2 v0.14 may have the same latent bug.** Its `$is_writable` is
+`($is_dry == false && $lock_acquired == true && $user_conflict == false)` — same pattern with
+3 chained conditions. Person merges DID delete master_person rows in audits 13/16/19, so
+either the 3-operand form parses differently or the bug just never triggered. Worth patching
+defensively: tracked as task #8.
 
-**Patch-drift hypothesis ruled out (2026-05-06):** rebuilt the orchestrator via a single
-`update_function` call with a fully assembled clean v0.4 script (1145 lines, 30KB, brace-balanced,
-no incremental patches), then tested against a fresh temp duplicate (master_company id 10293)
-via both the chained test wrapper AND a `debug-orchestrator-only` endpoint that invokes the
-orchestrator without any chained cleanup. Both invocations returned `status=success`,
-`delete_plan.deleted=[]`, `errors=[]`, and `debug-master-company-check` confirmed 10293
-**still existed** after the orchestrator ran. So the bug is NOT patch-tool drift — it is
-intrinsic to merge/company-v2 #12956 itself.
-
-**Remaining hypotheses:**
-- Xano stack-execution limit (timeout / op count / memory) silently truncating the stack
-  before the master_company.del block runs. Unlike person-v2, company-v2 has more upstream
-  helper invocations (snapshot, aggregate-scalars, merge-enrich-data, long-tail with 53 tables,
-  graph-merge with 14 edge types) before reaching the delete; cumulatively that may exceed
-  some limit. **Test:** reorder so master_company.del happens FIRST (right after lock-acquire,
-  before any helper calls). If it fires there, it's an execution-budget issue.
-- Some specific XanoScript syntax in the orchestrator silently aborts the conditional block
-  containing the foreach. **Test:** strip the orchestrator down to just lock + master_company.del,
-  verify it works, then add helpers one-by-one until it stops working.
-- A Xano runtime defect specific to `db.del` on the master_company table when invoked from a
-  function-context with N>K prior writes. **Test:** open a Xano support ticket with the audit
-  row IDs and minimal repro.
-
-**The workaround (chained test wrapper) remains the canonical path** for company merges in
-v0.3/v0.4 until root cause is found.
+**XanoScript precedence rule (verified 2026-05-06):** `&&` binds tighter than `==` (the
+opposite of every other language we use). Always wrap each `==` in explicit parens when
+combining with `&&`. Update `xanoscript-builder` skill if it doesn't already say this.
 
 ### Phase flow
 

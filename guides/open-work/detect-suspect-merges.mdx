@@ -1,0 +1,408 @@
+---
+title: "Detect Suspect Merges"
+description: "What mvp/merge/detect-suspects (#12709) does today, and the plan to migrate it to Go on AlloyDB with Gemini embeddings and ScaNN replacing Qdrant."
+---
+
+```text
+12709  mvp/merge/detect-suspects
+```
+
+## Overview
+
+`detect-suspects` is the **producer** for the merge pipeline. It does not merge anything — it
+finds *candidate* duplicate `master_person` pairs and writes them as rows in `merge_suspect`
+(#284) for either the human review UI or the deterministic auto-merge path to act on.
+
+It is a two-stage funnel:
+
+1. **Vector recall** — for each candidate `master_person`, the function builds a label
+   (`name | title | company | linkedin_url`), embeds it, and asks the vector store for the
+   top-N nearest neighbors. Today this hits a **Qdrant** collection that mirrors the
+   `master_person` table.
+2. **LLM precision** — every recalled pair is sent through a tiered LLM judge (Gemini Flash on
+   Tier 1, Gemini Pro on Tier 2 escalation) which returns a confidence score and a
+   reasoning string. The pair is written to `merge_suspect` with a `match_kind` of
+   `llm_flash_confirmed` / `llm_pro_confirmed`, plus a `merge_context` blob.
+
+When two candidates share an exact identifier (email, phone, canonical domain, or LinkedIn
+URL), the function **short-circuits the LLM** and calls `mvp/merge/master-merge` (#12736)
+directly — which in turn calls `merge/person-v2` (#12945) with `match_kind='email_exact'` /
+`'phone_exact'` / `'domain_exact'` / `'linkedin_exact'`. The
+[merge orchestrator](/guides/open-work/merge) treats those as deterministic and skips
+conflict logging.
+
+The output is a feed of suspect pairs sorted by confidence. Anything ≥ 0.80 is auto-merge
+eligible; 0.40–0.79 escalates to Pro; below 0.40 is dropped or marked `do_not_merge=true`.
+
+**Where it sits in the merge stack**
+
+| Layer | Function | Role |
+|---|---|---|
+| Producer | `mvp/merge/detect-suspects` (#12709) | Finds candidates, scores, writes `merge_suspect` |
+| Reader | `mvp/merge/get-suspects` (#12549) | Returns rows for the suspect-review UI |
+| Cron entry | `mvp/merge/master-merge` (#12736) | Wraps `person-v2` for exact matches |
+| Orchestrator | `merge/person-v2` (#12945) | The thing that actually merges |
+| Re-score | `merge/helpers/rescore-suspect-pair` (#12973) | Re-runs Tier 1/2 on `needs_rescore=true` |
+
+## Step-by-step (current XanoScript implementation)
+
+<Steps>
+  <Step title="Pick the candidate set">
+    Scan `master_person` for rows that haven't been scored yet, or whose `merge_suspect` row
+    has `needs_rescore=true`. The cron variant batches a fixed number (e.g. 50–200) per run
+    to keep token spend bounded.
+  </Step>
+
+  <Step title="Build the comparable label">
+    For every candidate, concatenate the fields used for similarity:
+
+    ```text
+    "{name} | {current_title} | {company_name} | {linkedin_url}"
+    ```
+
+    Empty/null fields collapse to an empty segment so the separator stays consistent. This
+    label is what gets embedded — *not* the full master_person row.
+  </Step>
+
+  <Step title="Embed the label">
+    Call the embedding model (current implementation: an OpenAI-compatible model via
+    OpenRouter) and store the resulting vector. The dimensionality and the model are pinned
+    in the function — changing them requires re-indexing Qdrant.
+  </Step>
+
+  <Step title="Vector recall against Qdrant">
+    Search the Qdrant `master_person` collection for the top-N nearest neighbors, excluding
+    the candidate itself and any pair already scored with `do_not_merge=true`. N is small
+    (typically 5–10) — recall is intentionally narrow because every survivor goes through an
+    LLM next.
+  </Step>
+
+  <Step title="Deterministic short-circuit">
+    Before sending anything to the LLM, check whether the candidate and any neighbor share:
+    an `email_address` (lowercased + trimmed), a normalized phone, a `canonical_domain` on
+    the linked company, or a `linkedin_url`. If yes → skip LLM, call
+    `mvp/merge/master-merge` (#12736) with the matching `match_type`, and break out of the
+    LLM loop for that pair.
+  </Step>
+
+  <Step title="Tier 1 — Gemini Flash judge">
+    For each remaining (candidate, neighbor) pair, send both labels to **Gemini 2.5 Flash**
+    via OpenRouter using `$env.openRouter` (camelCase — see
+    [Env var fix](/guides/open-work/merge#v0-18-2026-05-06--cron-driven-path-live)). The
+    prompt asks for a structured JSON response with a confidence score in [0, 1] and a
+    one-sentence reasoning string.
+
+    Bucket the response:
+
+    | Confidence | Action |
+    |---|---|
+    | ≥ 0.80 | Write `merge_suspect` row, `match_kind='llm_flash_confirmed'` |
+    | 0.40 – 0.79 | Escalate to Tier 2 |
+    | < 0.40 | Drop, OR write a `merge_suspect` row with `do_not_merge=true` so it isn't re-tried |
+  </Step>
+
+  <Step title="Tier 2 — Gemini Pro escalation">
+    Borderline pairs are re-judged by **Gemini 3.1 Pro**. Same prompt shape, more capable
+    model. Output buckets:
+
+    | Confidence | Action |
+    |---|---|
+    | ≥ 0.80 | Write `merge_suspect`, `match_kind='llm_pro_confirmed'` |
+    | < 0.80 | Write `merge_suspect` with `do_not_merge=true` |
+  </Step>
+
+  <Step title="Write to merge_suspect">
+    Each kept pair becomes one row in `merge_suspect` (#284) with:
+
+    ```text
+    master_person_id              — the candidate
+    merge_with_master_person_id   — the neighbor
+    kind                          — 'person' (extends to 'company' once company-side ships)
+    match_kind                    — 'llm_flash_confirmed' | 'llm_pro_confirmed' | 'email_exact' | ...
+    confidence                    — 0..1 from the LLM judge
+    merge_context                 — JSON: { reasoning, model, prompt_version, scored_at }
+    do_not_merge                  — true if Tier 2 said no
+    needs_rescore                 — false on initial write
+    ```
+
+    Suspects with `match_kind` in the deterministic class were already merged by
+    `master-merge` in the short-circuit step, so most rows here represent LLM-graded
+    candidates awaiting human action or auto-merge gating.
+  </Step>
+
+  <Step title="Cron loop + re-score">
+    On a recurring schedule, `merge/task/rescore-flagged-suspects` (#164) scans
+    `merge_suspect WHERE needs_rescore=true AND kind='person' AND do_not_merge=false` every
+    30 min and calls `merge/helpers/rescore-suspect-pair` (#12973), which repeats Tier 1 →
+    Tier 2 just for the affected pairs. Re-score happens because a successful merge changes
+    the survivor's profile, which can invalidate every other suspect that touched the
+    survivor.
+  </Step>
+</Steps>
+
+## Migrate to AlloyDB
+
+Detect-suspects is one of the cleanest candidates for the Go-on-AlloyDB rewrite: it's a
+batch job, has no transactional dependency on Xano's request lifecycle, and the only things
+holding it inside Xano today are the LLM call and the Qdrant client. Both go away in the
+new design.
+
+<Note>
+**The refactor does NOT use Qdrant.** The new pipeline embeds with **Gemini
+`text-embedding-004`** and stores those vectors directly in **AlloyDB** with an
+`alloydb_scann` index. There is no Qdrant in the target stack — Qdrant is decommissioned
+as part of this migration.
+</Note>
+
+**Target stack**
+
+| Concern | Today (legacy) | Target |
+|---|---|---|
+| Runtime | XanoScript fn #12709 | Go service on **Cloud Run** (job mode for cron, service mode for ad-hoc) |
+| Embeddings | OpenAI-compatible via OpenRouter | **Vertex AI `text-embedding-004`** (Gemini embeddings) |
+| Vector store | Qdrant collection `master_person` (decommission) | **AlloyDB** `master_person_vec` table with `vector(768)` column + `alloydb_scann` index |
+| LLM judge | Gemini Flash / Pro via OpenRouter | Gemini Flash / Pro via **Vertex AI** (same models, native auth) |
+| Auth to Xano | n/a (in-process) | Service account → IAP-protected Xano endpoint, or direct Postgres on Xano via Cloud SQL Auth Proxy |
+| Cron | Xano Background Tasks | **Cloud Scheduler** → Cloud Run job |
+
+The migration is a sequence of independently shippable steps. Each step keeps the existing
+Xano function running until the new path is verified.
+
+<Steps>
+  <Step title="1. Stand up the Go service skeleton">
+    Create a new Cloud Run job in the Orbiter GCP project. Repo layout:
+
+    ```text
+    services/detect-suspects/
+      cmd/detect-suspects/main.go      # entrypoint, reads flags + env
+      internal/
+        candidates/                    # build_label, fetch_batch
+        embed/                         # Vertex AI embeddings client
+        vectors/                       # AlloyDB ScaNN nearest-neighbor query
+        deterministic/                 # email/phone/domain/linkedin shortcut
+        judge/                         # Gemini Flash + Pro tiered judge
+        suspect/                       # writer for merge_suspect
+      Dockerfile
+      cloudbuild.yaml
+    ```
+
+    Auth uses Workload Identity. Wire env: `ALLOYDB_INSTANCE`, `XANO_BASE_URL`,
+    `VERTEX_PROJECT`, `VERTEX_LOCATION`, `MASTER_PERSON_BATCH_SIZE`. Defer the actual logic;
+    just deploy a no-op job that logs "starting" / "done" so Cloud Scheduler wiring is
+    proven first.
+  </Step>
+
+  <Step title="2. Add the AlloyDB target table + ScaNN index">
+    Mirror the columns we need for vector recall. We don't need the full `master_person`
+    schema in AlloyDB — only what the label is built from plus an embedding column.
+
+    ```sql
+    CREATE EXTENSION IF NOT EXISTS alloydb_scann CASCADE;
+
+    CREATE TABLE master_person_vec (
+      master_person_id  bigint PRIMARY KEY,
+      label             text NOT NULL,
+      label_embedding   vector(768) NOT NULL,
+      email_lc          text,                    -- normalized email
+      phone_e164        text,                    -- normalized phone
+      linkedin_url      text,                    -- exact-match dimension
+      canonical_domain  text,                    -- via linked master_company
+      updated_at        timestamptz NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX master_person_vec_scann
+      ON master_person_vec
+      USING scann (label_embedding cosine)
+      WITH (num_leaves = 'auto');
+
+    CREATE INDEX master_person_vec_email_lc      ON master_person_vec (email_lc);
+    CREATE INDEX master_person_vec_phone_e164    ON master_person_vec (phone_e164);
+    CREATE INDEX master_person_vec_linkedin_url  ON master_person_vec (linkedin_url);
+    CREATE INDEX master_person_vec_canonical_dom ON master_person_vec (canonical_domain);
+    ```
+
+    Vector dim is `768` because that's `text-embedding-004`'s native size. ScaNN index
+    choice mirrors the [find-investors AlloyDB build](/guides/open-work/vectors-alloydb/find-investors-engine):
+    inline filtering on the deterministic columns is the load-bearing reason — the LLM
+    short-circuit needs to query "neighbors WHERE email_lc = X" cheaply.
+  </Step>
+
+  <Step title="3. Backfill + keep-in-sync">
+    Two pieces:
+
+    **Backfill (one-shot).** A separate Cloud Run job that reads `master_person` from Xano
+    (paged), builds the label, embeds with Vertex AI in batches of 100, and upserts into
+    `master_person_vec`. Idempotent on `master_person_id` PK. Track progress in a
+    `master_person_vec_backfill` cursor table.
+
+    **Keep-in-sync.** Add a hook on every Xano writer that touches the label inputs (`name`,
+    `current_title`, `master_company_id`, `linkedin_url`) — `merge/person-v2` already runs
+    after merges; smaller paths come from the [enrichment pipelines](/guides/enrichment/waterfall/person-enrichment-phases).
+    Hook posts to a Cloud Run "vec-upsert" endpoint with the changed `master_person_id`.
+    The endpoint re-embeds and upserts.
+
+    Acceptable lag: minutes, not seconds. Detect-suspects is a batch job; it doesn't need
+    real-time embedding freshness.
+  </Step>
+
+  <Step title="4. Port the candidate selector + label builder">
+    First Go module to land. Reads from Xano (REST) or directly from Xano's Postgres via
+    Cloud SQL Auth Proxy — picks `master_person` rows that have no `merge_suspect` row, or
+    whose suspect has `needs_rescore=true`. Returns `(id, label, email_lc, phone_e164,
+    linkedin_url, canonical_domain)` tuples in pages of N.
+
+    No vectors yet. Verify by logging the first 100 candidates and diffing against a Xano
+    query with the same filter.
+  </Step>
+
+  <Step title="5. Embed via Vertex AI">
+    Replace OpenRouter embeddings with Vertex AI `text-embedding-004`. Use the official
+    `cloud.google.com/go/aiplatform` client; batch 100 inputs per request. Auth is
+    automatic under Workload Identity — no API keys to rotate.
+
+    ```go
+    req := &aiplatformpb.PredictRequest{
+        Endpoint: fmt.Sprintf(
+            "projects/%s/locations/%s/publishers/google/models/text-embedding-004",
+            project, location),
+        Instances: instancesFromLabels(labels),
+    }
+    resp, err := client.Predict(ctx, req)
+    // resp.Predictions[i].StructValue.Fields["embeddings"]["values"] → []float32 of len 768
+    ```
+
+    Persist embeddings to `master_person_vec.label_embedding`. Store the model name on a
+    sibling column or in a `vec_model_version` row so a future re-embed knows what to
+    invalidate.
+  </Step>
+
+  <Step title="6. Run vector recall against AlloyDB ScaNN">
+    Vector recall now happens entirely in AlloyDB — no Qdrant. For each candidate:
+
+    ```sql
+    SELECT master_person_id, label, email_lc, phone_e164, linkedin_url, canonical_domain,
+           label_embedding <=> $1 AS distance
+    FROM master_person_vec
+    WHERE master_person_id <> $2
+    ORDER BY label_embedding <=> $1
+    LIMIT $3;
+    ```
+
+    `$1` is the candidate's embedding as a `pgvector` literal, `$2` is the candidate id,
+    `$3` is the recall N (start with 10). The `<=>` cosine operator handles the distance;
+    ScaNN handles the index traversal automatically.
+
+    Validation during cutover only: run Qdrant recall (legacy path) and AlloyDB recall
+    side-by-side for the same candidate set and diff the returned ids. Acceptable: identical
+    top-3 in ≥ 95% of cases. Once verified, the legacy Qdrant path is removed entirely.
+  </Step>
+
+  <Step title="7. Move the deterministic short-circuit into SQL">
+    The shortcut becomes a single AlloyDB query before vector recall:
+
+    ```sql
+    SELECT master_person_id, 'email_exact' AS match_type
+      FROM master_person_vec
+     WHERE email_lc = $1 AND master_person_id <> $2
+    UNION ALL
+    SELECT master_person_id, 'phone_exact'    FROM master_person_vec WHERE phone_e164 = $3 AND master_person_id <> $2
+    UNION ALL
+    SELECT master_person_id, 'linkedin_exact' FROM master_person_vec WHERE linkedin_url = $4 AND master_person_id <> $2
+    UNION ALL
+    SELECT master_person_id, 'domain_exact'   FROM master_person_vec WHERE canonical_domain = $5 AND master_person_id <> $2;
+    ```
+
+    Any hit → call `master-merge` (#12736) directly via Xano's HTTP endpoint with the
+    matching `match_type`. Skip the LLM judge for that pair.
+
+    Inline-filtering note: because the columns are indexed and we're using ScaNN on the
+    vector column, mixed queries like *"top-N nearest neighbors with `canonical_domain =
+    X`"* — useful for "find people at the same company who might be the same person" —
+    are also fast. ScaNN pushes the filter into the index traversal; HNSW would have post-
+    filtered with degraded recall.
+  </Step>
+
+  <Step title="8. Port the Tier 1 / Tier 2 judge to Vertex AI">
+    Same prompt as today, same models (Gemini 2.5 Flash → 3.1 Pro), but called via the
+    Vertex AI Generative API instead of OpenRouter. Native Workload Identity auth, no
+    `$env.openRouter` to manage, JSON mode supported natively.
+
+    Confidence buckets unchanged:
+
+    ```text
+    Tier 1 (Flash):
+      conf ≥ 0.80   → write merge_suspect, match_kind = 'llm_flash_confirmed'
+      0.40 ≤ conf  → escalate to Tier 2
+      conf < 0.40  → write merge_suspect with do_not_merge = true
+
+    Tier 2 (Pro):
+      conf ≥ 0.80   → write merge_suspect, match_kind = 'llm_pro_confirmed'
+      conf < 0.80  → write merge_suspect with do_not_merge = true
+    ```
+
+    Keep the prompt version in `merge_context.prompt_version` so a future prompt change can
+    re-trigger `needs_rescore=true` for old rows.
+  </Step>
+
+  <Step title="9. Write merge_suspect rows back to Xano">
+    `merge_suspect` (#284) stays in Xano — it's read by the existing UI (#12549) and acted
+    on by `merge/person-v2`. The Go service writes via a small Xano endpoint that takes a
+    `(master_person_id, merge_with_master_person_id, match_kind, confidence, merge_context,
+    do_not_merge)` payload and does the insert.
+
+    Don't bypass Xano with a direct Postgres write — the existing
+    [suspect lifecycle](/guides/open-work/merge#suspect-lifecycle-after-merge-decided)
+    has rules around `merged`, `merged_at`, `needs_rescore` that the Xano insert path is
+    aware of.
+  </Step>
+
+  <Step title="10. Cron via Cloud Scheduler, retire the Xano task">
+    Schedule the Cloud Run job: `every 1 hours` for new candidates, `every 30 minutes` for
+    `needs_rescore=true` rows (matches the current cadence of
+    `merge/task/rescore-flagged-suspects` #164). Keep the Xano task disabled but not deleted
+    until the new path has 7 days of clean runs.
+
+    Once verified: deactivate `mvp/merge/detect-suspects` (#12709) in Xano, drop the Qdrant
+    `master_person` collection, mark the function `[deprecated]` in tags but keep it for
+    one release cycle in case rollback is needed.
+  </Step>
+</Steps>
+
+### Cutover safety
+
+- **Shadow mode first.** Run the Go job for a week writing to a `merge_suspect_shadow`
+  table. Compare row-for-row against the Xano function's output on the same candidate
+  batch. Diff on `(master_person_id, merge_with_master_person_id)` identity and
+  confidence delta.
+- **Auto-merge gating.** Don't enable the Cloud Run path's deterministic short-circuit
+  (the `master-merge` call) until the LLM-graded suspects shadow-match for ≥ 7 days.
+  The deterministic path is the destructive one — exact matches feed straight into a
+  real merge.
+- **Embedding model lock.** Pin `text-embedding-004` and the `768` dim everywhere. A
+  model swap is a re-embed + re-index cycle — treat it as a separate project.
+- **Token budget alert.** Cloud Run will run faster than the Xano cron, which means
+  more LLM calls per unit time. Add a budget alert on Vertex AI Gemini spend before
+  the first full cron run. Existing observed cost shape:
+  Flash ≈ \$0.10/M in · \$0.40/M out, Pro ≈ \$3/M in · \$15/M out (verify against
+  current Vertex pricing at cutover).
+
+### What stays in Xano
+
+- `merge_suspect` (#284) — the table.
+- `mvp/merge/get-suspects` (#12549) — the read endpoint for the UI.
+- `mvp/merge/master-merge` (#12736) — called via HTTP by the Go service on deterministic
+  match.
+- `merge/person-v2` (#12945) — the merge orchestrator. Untouched by this migration.
+- `merge/helpers/rescore-suspect-pair` (#12973) — kept for in-Xano re-scoring of
+  individual rows; the Go cron handles bulk re-score, this helper handles ad-hoc.
+
+## Related
+
+- [Merge spec](/guides/open-work/merge) — the orchestrator, helpers, and tables this
+  function feeds.
+- [Find investors — AlloyDB build](/guides/open-work/vectors-alloydb/find-investors-engine) —
+  reference pattern for Cloud Run + AlloyDB + ScaNN.
+- [Vectors in FalkorDB](/guides/open-work/vectors-alloydb/graph-vectors) — inventory of
+  every embedding-writing function in the graph (companion migration scope).
+- [Known: identity merge](/guides/known/scope/identity-merge) — the alternative path if
+  Known supersedes this whole pipeline.

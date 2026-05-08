@@ -9,40 +9,60 @@ description: "What mvp/merge/detect-suspects (#12709) does today, and the plan t
 
 ## Overview
 
-`detect-suspects` is the **producer** for the merge pipeline. It does not merge anything — it
-finds *candidate* duplicate `master_person` pairs and writes them as rows in `merge_suspect`
-(#284) for either the human review UI or the deterministic auto-merge path to act on.
+Detect-suspects finds duplicates **inside a single user's `my_person` list**. The duplicates
+we care about are within one operator's CRM — "John Smith @ Acme" and "J. Smith @ Acme" both
+sitting in the same user's contacts as separate `my_person` rows. We're not looking for
+duplicates across the global `master_person` corpus; we're looking for duplicates a user
+would want to clean up in their own view.
 
-It is a two-stage funnel:
+That changes everything about how the vectors are stored and searched.
 
-1. **Vector recall** — for each candidate `master_person`, the function builds a label
-   (`name | title | company | linkedin_url`), embeds it, and asks the vector store for the
-   top-N nearest neighbors. Today this hits a **Qdrant** collection that mirrors the
-   `master_person` table.
-2. **LLM precision** — every recalled pair is sent through a tiered LLM judge (Gemini Flash on
-   Tier 1, Gemini Pro on Tier 2 escalation) which returns a confidence score and a
-   reasoning string. The pair is written to `merge_suspect` with a `match_kind` of
-   `llm_flash_confirmed` / `llm_pro_confirmed`, plus a `merge_context` blob.
+**Per-user, per-my-person — not master_person.** Every user gets their own vector index
+populated from their own `my_person` rows and the contact details linked to those rows
+(emails, phones, links, addresses, titles, companies — as the user has them). User A's
+vector for "Sarah Chen" is built from User A's notes and contact details on Sarah; User B's
+vector for the same underlying person can be totally different. Vectors live alongside
+`my_person.id`, not `master_person.id`.
 
-When two candidates share an exact identifier (email, phone, canonical domain, or LinkedIn
-URL), the function **short-circuits the LLM** and calls `mvp/merge/master-merge` (#12736)
-directly — which in turn calls `merge/person-v2` (#12945) with `match_kind='email_exact'` /
-`'phone_exact'` / `'domain_exact'` / `'linkedin_exact'`. The
-[merge orchestrator](/guides/open-work/merge) treats those as deterministic and skips
-conflict logging.
+**Vectors are stored in AlloyDB.** One table — `my_person_vec` — with `(user_id,
+my_person_id)` as the natural key. ScaNN index for nearest-neighbor search; `user_id` is a
+filter pushed inline so cross-user neighbors are never returned. Embeddings come from
+Gemini `text-embedding-004` via Vertex AI. No Qdrant in the new design.
 
-The output is a feed of suspect pairs sorted by confidence. Anything ≥ 0.80 is auto-merge
-eligible; 0.40–0.79 escalates to Pro; below 0.40 is dropped or marked `do_not_merge=true`.
+**Two functions, run in order.**
+
+1. **Backfill (required first).** A per-user backfill function walks every existing
+   `my_person` row for a user, builds the contact-derived label, embeds with Gemini, and
+   upserts into `my_person_vec`. Until backfill has completed for a given user, detection
+   has nothing to query against — running detect on an unbacked user returns zero suspects.
+   Backfill is idempotent on `(user_id, my_person_id)`; safe to re-run.
+
+2. **Detect (runs after backfill).** Per-user detection scans the user's `my_person_vec`
+   rows, runs vector recall + the deterministic short-circuit + the tiered LLM judge,
+   and writes suggested merges to `merge_suspect` (#284) scoped to that user. The user's
+   suspect-review UI reads only their own rows.
+
+**Implication for testing.** Before you can test detection on any user, run the backfill
+for that user. The recommended dev loop is: backfill `user_id=N` → verify
+`my_person_vec` row count matches `my_person` row count for N → run detect for `user_id=N`
+→ inspect `merge_suspect` rows for that user. Skipping the backfill is the most common
+reason detection appears to "do nothing."
 
 **Where it sits in the merge stack**
 
 | Layer | Function | Role |
 |---|---|---|
-| Producer | `mvp/merge/detect-suspects` (#12709) | Finds candidates, scores, writes `merge_suspect` |
-| Reader | `mvp/merge/get-suspects` (#12549) | Returns rows for the suspect-review UI |
+| Backfill (new) | `my_person/vec-backfill` *(planned, Cloud Run)* | One-shot per-user; populates `my_person_vec` from existing `my_person` rows |
+| Producer | `mvp/merge/detect-suspects` (#12709) → Cloud Run port | Per-user; vector recall + LLM judge → writes `merge_suspect` |
+| Reader | `mvp/merge/get-suspects` (#12549) | Returns the user's own `merge_suspect` rows for the review UI |
 | Cron entry | `mvp/merge/master-merge` (#12736) | Wraps `person-v2` for exact matches |
 | Orchestrator | `merge/person-v2` (#12945) | The thing that actually merges |
 | Re-score | `merge/helpers/rescore-suspect-pair` (#12973) | Re-runs Tier 1/2 on `needs_rescore=true` |
+
+The producer (#12709) today operates against `master_person`; the planned migration ports
+it to Cloud Run AND shifts its scope to per-user `my_person` semantics simultaneously. The
+sections below describe both states — the existing XanoScript implementation against
+`master_person`, and the AlloyDB target with the per-user model.
 
 ## Step-by-step (current XanoScript implementation)
 

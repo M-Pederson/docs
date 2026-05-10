@@ -134,3 +134,44 @@ New API groups go under the "API Reference" tab:
 - Match endpoint names where possible
 - Include realistic example values in request/response examples
 ````
+
+## Xano artifact reference blocks (functions, tables, APIs)
+
+When a docs page lists Xano artifacts created or referenced for a feature (functions, tables, API endpoints), use the **Card + fenced code block** pattern. Locked example: `guides/open-work/fundable-investor-enrich.mdx`.
+
+Each artifact gets its own block with:
+- A `<Card>` component with an `icon` only (no `title` prop)
+- A fenced code block inside the card body, on its own paragraph, containing `name — ID` as the first element. Mintlify renders this with a bordered, tinted-background container AND a one-click copy icon in the top-right.
+- A short plain-English description paragraph below the code block.
+
+```mdx
+<Card icon="play">
+
+```
+enrichment/resolve_org_identity — 12984
+```
+
+**Public entry point** — the function callers invoke. Orchestrates context build → classify → LLM call → write-back.
+
+</Card>
+```
+
+Icon conventions (Font Awesome names — Mintlify supports them directly):
+
+| Artifact kind | Icon |
+|---|---|
+| Public entry point / orchestrator function | `play` |
+| Context-assembly / join-builder function | `layer-group` |
+| Classifier / filter function | `filter` |
+| External API call / OpenRouter / network | `cloud-arrow-up` |
+| Database table | `database` |
+| Public HTTP endpoint / API wrapper | `globe` |
+| Helper / utility function | `wrench` |
+| Backfill / scheduled task | `clock-rotate-left` |
+
+Use this pattern whenever the page is a quick-reference for "what got built in Xano" — the kind a teammate scans to find an ID to copy into another function's `function.run` call. Do NOT use this pattern when the page is a tutorial / step-by-step / deep-design explainer — those should use plain headings + code examples instead.
+
+### Notes
+- Blank lines before/after the fenced code block inside the Card are **required** — MDX won't parse the code block correctly otherwise.
+- Omit the `title` prop on Card so the icon sits cleanly at the top-left and the code block becomes the visible label.
+- Keep descriptions to 1–2 short paragraphs. Anything longer should live on a separate detailed page (and be linked at the top/bottom of the reference page).

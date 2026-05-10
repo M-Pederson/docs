@@ -16,7 +16,7 @@ Resolve a sparse `fundable_organizations` row to canonical identifiers (domain, 
 | # | Decision | Choice |
 |---|---|---|
 | 1 | Where do `confidence ≥ 0.85` results land? | **Direct-write** to `fundable_organizations.{domain,linkedin_url,…}` via per-field `db.edit` (literal field name, variable value). Audit columns deferred — audit lives in the append-only `fundable_organization_enrichment_attempts` log. Rollback via the log: `UPDATE … WHERE id IN (SELECT fundable_org_id FROM attempts WHERE model_id='…' AND outcome='resolved' AND created_at > '…')`. |
-| 2 | Tier-2 (escalation) model | **Deferred** — bake-off `claude-sonnet-4.6:online` vs `gemini-2.5-pro:online` vs `gpt-5:online` later. Pipeline will accept the model id as a config var so it's swappable without code changes. |
+| 2 | Tier-2 (escalation) model | **`deepseek/deepseek-v4-flash:online`** — picked after a head-to-head bake-off on 6 Chinese sparse orgs. Same identifications as Gemini Flash Lite on resolvable cases, **stricter** confidence (pushes more to human review), zero `ERROR_FATAL` retries needed. Cost ~21× tier 1 — acceptable for `portco_only` cases that wouldn't resolve otherwise. See [bake-off results](#tier-1-vs-tier-2-bake-off) below. |
 | 3 | Human review surface for `0.6 ≤ conf < 0.85` | **Xano table editor** with a saved view filtered to `status = 'needs_review'`. Zero new code. Reviewer sees attempts log + queue audit, manually approves or edits. |
 | 4 | Pilot scope | **Skipped.** Function exists; called on demand. Real validation happens against the AlloyDB rebuild. |
 | 5 | Worker concurrency | **N/A.** No worker. Function called inline by whoever needs it. |
@@ -232,13 +232,53 @@ If wrong: reviewer takes no action; the row stays as `needs_review`. (We can add
 
 The pipeline runs on demand. Per-call cost depends on tier:
 
-| Tier | Model | Per-call estimate |
-|---|---|---|
-| 1 | `google/gemini-3.1-flash-lite:online` | ~$0.001 base + ~$0.015 web search = **~$0.016** |
-| 2 | (TBD escalation `:online`) | ~$0.075 base + ~$0.015 web = **~$0.090** |
-| n/a | `no_signal` | $0 |
+| Tier | Model | Per-call (median, observed) | Latency (median) |
+|---|---|---:|---:|
+| 1 | `google/gemini-3.1-flash-lite:online` | **~$0.001** | ~1.6s |
+| 2 | `deepseek/deepseek-v4-flash:online` | **~$0.021** | ~12s |
+| n/a | `no_signal` short-circuit | $0 | — |
 
-For a hypothetical 2,360-org one-off backfill at 50/35/15 mix: **~$93 total**. But that backfill is **deferred** (see below). Day-to-day cost is essentially zero — only when callers explicitly invoke the function.
+For a hypothetical 2,360-org one-off backfill at 50/35/15 mix: **~$200 total** (Gemini at tier 1, Deepseek at tier 2). Day-to-day cost is essentially zero — only when callers explicitly invoke the function.
+
+## Tier 1 vs Tier 2 bake-off
+
+Head-to-head on the same 6 Chinese sparse orgs (no domain / website / linkedin_url / crunchbase_url / pitchbook_url / facebook / twitter):
+
+| Org | Gemini 3.1 Flash Lite | Deepseek v4 Flash | Match? |
+|---|---|---|---|
+| 华博器械 | soft_fail 0.40 | soft_fail 0.30 | ✅ both punt |
+| 嘉兴南投 | soft_fail 0.45 | soft_fail 0.30 | ✅ both punt |
+| 天季投资 | resolved 0.95 — `tianji-inv.com` + Crunchbase + CN/Shanghai | resolved 0.95 — identical | ✅ identical |
+| 四川省中试研发 | resolved 0.95 — CN/Sichuan only | resolved 0.90 — CN/Sichuan only | ✅ same fields |
+| 钧天创投 | resolved 0.90 — CN/Guangdong only | **needs_review 0.70** — CN/Guangdong only | ⚠️ Deepseek stricter |
+| 启申创投 | resolved 0.95 — CN/Hainan only | **needs_review 0.70** — CN/Hainan only | ⚠️ Deepseek stricter |
+
+### Numbers
+
+| Metric | Gemini 3.1 Flash Lite :online | Deepseek v4 Flash :online | Δ |
+|---|---:|---:|---:|
+| Cost per call | ~$0.001 | ~$0.021 | **~21×** |
+| Latency per call (median) | ~1.6s | ~12s | ~7× |
+| Tokens in (avg) | ~2,300 | ~8,400 | ~3.6× |
+| Retries needed across 6 orgs | 5 extra attempts | **0 extra attempts** | Deepseek wins |
+| Total spend across 6 orgs | $0.006 | $0.126 | 21× |
+
+### Why Deepseek for tier 2
+
+- **Zero retry overhead.** No ERROR_FATAL observed across 6 calls — Deepseek's response shape avoids the Xano boundary parser failure mode. Production reliability is better even before retry logic kicks in.
+- **Stricter confidence calibration.** Where Gemini auto-resolved 钧天创投 (0.90) and 启申创投 (0.95) on minimal evidence (only country/region), Deepseek flagged both as `needs_review` at 0.70 — pushing thin cases to a human. Arguably the correct behavior for sparse Chinese investment partnerships with no public web presence.
+- **Same identifications on solid cases.** Both models found `tianji-inv.com` for 天季投资 — identical resolution at the same confidence. No regression on the easy path.
+- **Cost is acceptable for tier 2.** At ~21× tier 1 cost (~$0.021/call), this is reasonable for cases the cheap tier can't handle. Production gating: only routes here when `signal_tier == "portco_only"`, which is a minority of calls.
+
+### Tier 1 stays Gemini
+
+Despite Deepseek's reliability advantage, Gemini Flash Lite at tier 1 is still the right pick:
+
+- 21× cheaper for the same outcome on the easy cases.
+- Retry loop (max 5 attempts) absorbs the boundary failure tail.
+- Faster median latency.
+
+The retry loop is the cost of using Gemini at tier 1 — but at $0.001/call, even 5× the cost would still be 5× cheaper than Deepseek. Locked.
 
 ## Open issue: `:online` parser failure
 

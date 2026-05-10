@@ -1,0 +1,131 @@
+---
+title: "Fundable investor enrich"
+description: "On-demand LLM identity resolution for sparse fundable_organizations records — what functions exist in Xano, what they do, and how they chain together. Detailed design lives in the archived Co Enrichment Pipeline doc."
+---
+
+> **Quick reference page.** Use this to invoke the pipeline or trace what happens when you do. The full design rationale, bake-off results, and prompt versioning history live in [Archive → Co Enrichment Pipeline](/guides/archive/co-enrichment-pipeline).
+
+## What it does
+
+Given a `fundable_organizations.id` for an investor row that has **no domain, website, or profile URL of any kind**, return canonical identifiers (domain, LinkedIn, Crunchbase, PitchBook, country, region) verified via web search. High-confidence results auto-write back to the row.
+
+## Xano components (workspace 3)
+
+| Kind | Name | ID | Purpose |
+|---|---|---:|---|
+| Table | `fundable_organization_enrichment_attempts` | **723** | Append-only audit log. Every call to `resolve_org_identity` writes one row regardless of outcome — full LLM request/response, signal tier, confidence, outcome, tokens, cost, latency. Filter by `outcome='needs_review'` for the human review queue. |
+| Function | `enrichment/build_org_enrichment_context` | **12980** | Assembles the LLM-ready YAML payload for one org. Joins `fundable_organizations` + `fundable_institutional_investments` + `fundable_deals` + portfolio company rows + top 5 articles per deal. Caps at 8 deals. Returns both raw JSON and pre-serialized YAML strings. |
+| Function | `enrichment/classify_signal_tier` | **12981** | Deterministic, no LLM. Inspects the org row + deal context, looks for the 5 signal types (row description, deal-named investor, entity phrase, founder name, portco fingerprint), and returns `has_name_signal` / `portco_only` / `no_signal`. Drives model routing. |
+| Function | `enrichment/run_llm_resolution` | **12983** | Single OpenRouter chat-completions call. Builds the request body, sends it, parses the response with `\|get` deep-path access (tolerates `:online` plugin response shape variations), returns `parsed_json` + tokens + latency + cost. JSON parse failures return cleanly (no throw); HTTP failures are caught in try_catch. |
+| Function | `enrichment/resolve_org_identity` | **12984** | Public entry point — the function callers invoke. Orchestrates everything below. |
+| API endpoint | `GET enrichment/build_org_enrichment_context` | **API 8517** (in `Admin Backfill` group, canonical `rlSvC4qe`) | HTTP wrapper around the context-building function. Useful for inspection / tooling. |
+
+## Defaults (locked)
+
+| Setting | Default | Why |
+|---|---|---|
+| Tier 1 model | `google/gemini-3.1-flash-lite:online` | ~$0.001/call, ~1.6s. Used when `signal_tier = has_name_signal`. |
+| Tier 2 model | `deepseek/deepseek-v4-flash:online` | ~$0.021/call, ~12s. Used when `signal_tier = portco_only` — stricter confidence calibration, no boundary retries needed. |
+| Prompt version | `v0.3` | Includes the RESPONSE FORMATTING reliability section. |
+| Max LLM attempts | `5` | Retries swallow the Xano boundary `ERROR_FATAL` from OpenRouter `:online` responses. Caller never sees a transient failure. |
+
+## How to call it
+
+From any other XanoScript stack:
+
+```xs
+function.run "enrichment/resolve_org_identity" {
+  input = {
+    fundable_org_id: $org_id
+  }
+} as $result
+```
+
+Optional overrides:
+
+```xs
+function.run "enrichment/resolve_org_identity" {
+  input = {
+    fundable_org_id: $org_id
+    tier1_model_id: "google/gemini-3.1-flash-lite:online"
+    tier2_model_id: "deepseek/deepseek-v4-flash:online"
+    max_llm_attempts: 5
+    prompt_version: "v0.3"
+  }
+} as $result
+```
+
+## Step-by-step — what happens on each call
+
+1. **`build_org_enrichment_context($fundable_org_id)`** runs first.
+   - Queries `fundable_organizations` for the row, strips null/empty fields.
+   - Queries `fundable_institutional_investments` joined to `fundable_deals` + portfolio companies + `fundable_articles` (top 5 articles per deal).
+   - Caps at 8 deals, prioritized by `lead_investor` role → richer description → most recent.
+   - Returns `{fundable_data, deal_context, fundable_data_yaml, deal_context_yaml, deal_count_total, deal_count_returned}`.
+
+2. **`classify_signal_tier(fundable_data, deal_context)`** runs next.
+   - Deterministic checks for the 5 signal types (see [Co Enrichment Optimization](/guides/open-work/co-enrichment-optimization) for the signal catalogue).
+   - Returns `signal_tier`: `has_name_signal`, `portco_only`, or `no_signal`.
+
+3. **Short-circuit if `no_signal`.**
+   - Skip the LLM call entirely. Mark outcome `soft_fail`. Write an attempt row. Return. Cost: $0.
+
+4. **Otherwise, route to a model.**
+   - `has_name_signal` → tier 1 (`gemini-3.1-flash-lite:online`).
+   - `portco_only` → tier 2 (`deepseek-v4-flash:online`).
+
+5. **Call `run_llm_resolution` in a retry loop.**
+   - Up to `max_llm_attempts` (default 5).
+   - First call that returns without throwing wins. `ERROR_FATAL` from Xano's boundary parser is caught by `try_catch` and treated as a transient failure.
+
+6. **Parse the LLM response.**
+   - If `run_llm_resolution.error != null` → outcome `api_error`.
+   - If `parsed_json == null` (model returned non-JSON) → outcome `parse_error`.
+   - Else continue.
+
+7. **Route by confidence:**
+   - `confidence >= 0.85` → outcome `resolved`. Per-field `db.edit` writes back to `fundable_organizations` for each non-empty field the model returned (`domain`, `website`, `linkedin_url`, `crunchbase_url`, `pitchbook_url`, `twitter`, `facebook`, `country_code`, `region`).
+   - `0.6 <= confidence < 0.85` → outcome `needs_review`. No write. `resolved_fields` returned for human inspection.
+   - `confidence < 0.6` → outcome `soft_fail`. No write.
+
+8. **Always log to the attempts table.**
+   - One row per call. Includes the exact YAML payloads sent, the raw LLM response, the parsed JSON, tokens, latency, cost, and outcome.
+
+## Response shape
+
+```json
+{
+  "outcome": "resolved" | "needs_review" | "soft_fail" | "parse_error" | "api_error",
+  "signal_tier": "has_name_signal" | "portco_only" | "no_signal",
+  "signals": ["row_description", "deal_named_investor", "entity_phrase", "portco_fingerprint"],
+  "confidence": 0.95,
+  "resolved_fields": { "domain": "...", "linkedin_url": "...", ... },
+  "attempt_id": 42,
+  "model_used": "google/gemini-3.1-flash-lite:online",
+  "llm_attempts": 1,
+  "last_caught_error": null,
+  "latency_ms": 1622,
+  "tokens_in": 1969,
+  "tokens_out": 290,
+  "cost_usd": 0.00092,
+  "deal_count_at_call": 2
+}
+```
+
+## Validated performance (small-cohort)
+
+Across the 12 truly-sparse orgs tested during build (6 CJK + 6 non-CJK Chinese / international funds):
+
+- **67% auto-resolved** at confidence ≥ 0.85 (write-back happened)
+- **33% honest soft_fail** (bare-name orgs with no fingerprint — model correctly punted)
+- **0 `api_error`** leaked to caller (retry loop absorbed the boundary failures)
+- **~$0.001/call** median spend on tier 1
+
+## Where to read more
+
+- **[Co Enrichment Optimization](/guides/open-work/co-enrichment-optimization)** — Prompt design page. The v0.2/v0.3 system prompt, the 5 signal types with examples, 9-case live workshop results, the 4-table SQL recipe used by `build_org_enrichment_context`.
+- **[Archive → Co Enrichment Pipeline](/guides/archive/co-enrichment-pipeline)** — Full design history. Locked decisions, tier-1 vs tier-2 bake-off, deferred scope (queue table, cron worker, triggers — skipped pending AlloyDB rebuild), open `:online` parser issue write-up, combined production validation tables.
+
+## Triggers & queue / backfill
+
+**There are none right now.** All calls are explicit — invoke `resolve_org_identity` when you know an org needs more identity data. No table triggers, no cron worker, no one-shot backfill task. The full queued-pipeline design is deferred until after the Fundable → AlloyDB rebuild — see the archived doc for the rationale.

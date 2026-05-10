@@ -1,0 +1,252 @@
+---
+title: "Co Enrichment Pipeline (Design)"
+description: "On-demand LLM identity-resolution function for sparse fundable_organizations records. No queue, no cron, no triggers — just a function called when more identity data is needed. Status: design locked, ready to build."
+---
+
+> **Status: design locked. Not yet built.** Scope is intentionally minimal because the broader Fundable → AlloyDB refactor is on the near-term roadmap; the proper queue / trigger / backfill machinery will be designed against that target. This doc covers only what's needed in the short term to call enrichment on demand.
+
+## Goal
+
+Resolve a sparse `fundable_organizations` row to canonical identifiers (domain, LinkedIn, Crunchbase, PitchBook, etc.) using the LLM identity-resolution prompt designed in [Co Enrichment Optimization](/guides/open-work/co-enrichment-optimization) — exposed as a single callable function that any caller can invoke when it knows an org needs more identity data.
+
+## Locked decisions
+
+| # | Decision | Choice |
+|---|---|---|
+| 1 | Where do `confidence ≥ 0.85` results land? | **Direct-write** to `fundable_organizations.{domain,linkedin_url,…}` with audit columns (`enrichment_resolved_at`, `enrichment_resolved_by_model`, `enrichment_confidence`). No staging table. |
+| 2 | Tier-2 (escalation) model | **Deferred** — bake-off `claude-sonnet-4.6:online` vs `gemini-2.5-pro:online` vs `gpt-5:online` later. Pipeline will accept the model id as a config var so it's swappable without code changes. |
+| 3 | Human review surface for `0.6 ≤ conf < 0.85` | **Xano table editor** with a saved view filtered to `status = 'needs_review'`. Zero new code. Reviewer sees attempts log + queue audit, manually approves or edits. |
+| 4 | Pilot scope | **Skipped.** Function exists; called on demand. Real validation happens against the AlloyDB rebuild. |
+| 5 | Worker concurrency | **N/A.** No worker. Function called inline by whoever needs it. |
+| 6 | OpenRouter API key location | **`$env.openRouter`** |
+| 7 | Auto-trigger on new investments / new orgs | **No triggers.** All calls are explicit; no Xano table triggers in this iteration. |
+
+## Architecture overview
+
+```
+Caller
+  │
+  ▼
+enrichment/resolve_org_identity(fundable_org_id)
+  │
+  ├──▶ enrichment/build_org_enrichment_context  (✅ exists)
+  │       returns: { fundable_data, deal_context, *_yaml, deal_count_total, ... }
+  │
+  ├──▶ enrichment/classify_signal_tier
+  │       deterministic — no LLM call
+  │       returns: "has_name_signal" | "portco_only" | "no_signal"
+  │
+  ├──▶ if signal_tier == "no_signal":
+  │       log attempt as soft_fail, return { outcome: "soft_fail" }
+  │
+  ├──▶ enrichment/run_llm_resolution(model_id, prompt, payload)
+  │       single OpenRouter call ($env.openRouter), :online model
+  │       returns: { parsed_json, raw_response, tokens_in, tokens_out, latency_ms, cost_usd }
+  │
+  ├──▶ Validate JSON shape + extract confidence
+  │
+  ├──▶ Route by confidence:
+  │       conf ≥ 0.85   → write resolved fields to fundable_organizations
+  │                       + audit columns; return { outcome: "resolved", ... }
+  │       0.6 ≤ <0.85   → return { outcome: "needs_review", ... }; do NOT write
+  │       conf < 0.6    → return { outcome: "soft_fail", ... }
+  │
+  └──▶ append row to fundable_organization_enrichment_attempts (always, every path)
+```
+
+## Schema changes
+
+### New table — `fundable_organization_enrichment_attempts` (append-only)
+
+Every call to `resolve_org_identity` writes one row here, regardless of outcome. This is the audit trail and the surface humans review for `needs_review` cases.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | int | primary |
+| `created_at` | timestamp | |
+| `fundable_org_id` | uuid (FK) | |
+| `signal_tier` | text | `has_name_signal` / `portco_only` / `no_signal` |
+| `prompt_version` | text | e.g. `v0.2` |
+| `model_id` | text | e.g. `google/gemini-3.1-flash-lite:online` (null for `no_signal` short-circuit) |
+| `fundable_data_snapshot` | json | exact YAML/JSON sent to the model |
+| `deal_context_snapshot` | json | exact YAML/JSON sent |
+| `deal_count_at_call` | int | for re-run gating |
+| `llm_response_raw` | text \| null | exact string the model returned (pre-parse) |
+| `llm_response_parsed` | json \| null | null on parse failure |
+| `confidence` | decimal \| null | |
+| `outcome` | text | `resolved` / `needs_review` / `soft_fail` / `parse_error` / `api_error` |
+| `latency_ms` | int \| null | |
+| `tokens_in` / `tokens_out` | int \| null | |
+| `cost_usd` | decimal \| null | computed at call time |
+
+### Columns added to `fundable_organizations`
+
+For `confidence ≥ 0.85` results, the existing fields (`domain`, `linkedin_url`, `crunchbase_url`, `pitchbook_url`, `website`, `country_code`, `region`, `twitter`, `facebook`) get **direct-write** alongside these new audit columns:
+
+| Field | Type | Notes |
+|---|---|---|
+| `enrichment_resolved_at` | timestamp \| null | |
+| `enrichment_resolved_by_model` | text \| null | which model produced the canonical answer |
+| `enrichment_confidence` | decimal \| null | |
+| `enrichment_canonical_name_alt` | text \| null | for legacy / consolidated entities (e.g. "Pfizer R&D Innovate" → canonical Pfizer Ventures) |
+
+Reversibility: `UPDATE fundable_organizations SET domain=null, … WHERE enrichment_resolved_by_model='…' AND enrichment_resolved_at > '…'` rolls back any batch.
+
+## Functions to build
+
+| Name | Purpose |
+|---|---|
+| `enrichment/build_org_enrichment_context` | ✅ Already built (fn 12980). Assemble YAML context for one org. |
+| `enrichment/classify_signal_tier` | 🆕 Deterministic signal-tier classifier. No LLM call. |
+| `enrichment/run_llm_resolution` | 🆕 Single OpenRouter call given a model id + prompt + payload. Returns parsed JSON + cost/latency metadata. |
+| `enrichment/resolve_org_identity` | 🆕 Orchestrator — ties everything together, writes back, logs attempt. The public entry point. |
+
+### `classify_signal_tier` — deterministic
+
+Keeps `no_signal` cases from ever calling an LLM.
+
+```
+let signals = []
+
+# Signal 1: has descriptive short_description (not just the name repeated)
+if fundable_data.short_description exists
+   AND length(short_description) > 50
+   AND short_description != fundable_data.name
+  → signals += "row_description"
+
+# Signal 2: an investor mention inside any deal long_description
+for each deal in deal_context:
+  if deal.long_description contains fundable_data.name (case-insensitive)
+    → signals += "deal_named_investor"
+    break
+
+# Signal 3 / 4: "kind of entity" or "founder" cues
+keywords = ["founded by", "its brands", "subsidiary of", "parent of",
+            "venture arm of", "family office", "state-owned"]
+if any keyword appears in row OR any deal description
+  → signals += "entity_phrase"
+
+# Signal 5: at least 2 portcos with names (fingerprint)
+if deal_context length >= 2 AND each has a non-null portco
+  → signals += "portco_fingerprint"
+
+# Tiering
+if signals contains any of (row_description, deal_named_investor, entity_phrase)
+  → "has_name_signal"
+elif signals contains "portco_fingerprint"
+  → "portco_only"
+else
+  → "no_signal"
+```
+
+Edge: if a non-Latin name has no romanization in any description, Signal 2 will silently miss. Acceptable — those will fall to `portco_only` and pay for the stronger model.
+
+### `run_llm_resolution` — OpenRouter
+
+Single API call to `https://openrouter.ai/api/v1/chat/completions`. Bearer token from `$env.openRouter`.
+
+| Input | Type | Notes |
+|---|---|---|
+| `model_id` | text | e.g. `google/gemini-3.1-flash-lite:online` |
+| `system_prompt` | text | the v0.2 prompt from the optimization page |
+| `user_payload_yaml` | text | concatenation of `fundable_data_yaml` + `deal_context_yaml` (with section headers) |
+| `temperature` | decimal | 0.0 — deterministic for identity resolution |
+| `response_format` | text | `json_object` if the model supports it |
+
+| Output | Type |
+|---|---|
+| `parsed_json` | json (or null on parse failure) |
+| `raw_response` | text |
+| `tokens_in` / `tokens_out` | int |
+| `latency_ms` | int |
+| `cost_usd` | decimal |
+| `error` | text \| null |
+
+Handles HTTP errors, JSON parse failures, schema validation. All failure modes still return cleanly so `resolve_org_identity` can log them.
+
+### `resolve_org_identity` — orchestrator (public entry point)
+
+| Input | Type |
+|---|---|
+| `fundable_org_id` | uuid |
+| `tier1_model_id` | text (default `google/gemini-3.1-flash-lite:online`) |
+| `tier2_model_id` | text (default same as tier1 for now; switch to escalation model later) |
+
+| Output | Type |
+|---|---|
+| `outcome` | text — `resolved` / `needs_review` / `soft_fail` / `parse_error` / `api_error` |
+| `signal_tier` | text |
+| `confidence` | decimal \| null |
+| `resolved_fields` | json — what we wrote back (or would have, for `needs_review`) |
+| `attempt_id` | int — FK to the attempts row |
+
+Logic:
+
+1. Call `build_org_enrichment_context(fundable_org_id)` → context.
+2. Call `classify_signal_tier(context)` → tier.
+3. If `tier == "no_signal"`: log attempt with `outcome = soft_fail`, return.
+4. Else: pick `model_id` based on tier (tier1 for `has_name_signal`, tier2 for `portco_only`).
+5. Call `run_llm_resolution(model_id, prompt, payload)`.
+6. If LLM call errors: log attempt with `outcome = api_error`, return.
+7. If JSON parse fails: log attempt with `outcome = parse_error`, return.
+8. Validate confidence: required field, 0..1 numeric.
+9. Route by confidence:
+   - `≥ 0.85` → write resolved fields + audit columns to `fundable_organizations`. `outcome = resolved`.
+   - `0.6..0.85` → do NOT write. `outcome = needs_review`.
+   - `< 0.6` → no write. `outcome = soft_fail`.
+10. Log attempt row, return.
+
+## Confidence routing
+
+| Confidence band | Action | Where data lives |
+|---|---|---|
+| `≥ 0.85` | **Auto-write** to `fundable_organizations` | Direct merge with audit columns |
+| `0.6 – 0.85` | **Human review (Xano table view)** — no write | In attempts log |
+| `< 0.6` | **Soft fail** — no write | Attempts log only |
+
+## Human review surface
+
+Reviewer opens the Xano table editor for `fundable_organization_enrichment_attempts`, applies a saved filter `outcome = 'needs_review'` joined with the source `fundable_organizations` row, and inspects:
+
+- The `llm_response_parsed` JSON (LLM's proposed values + reasoning + alternatives)
+- The `fundable_data_snapshot` and `deal_context_snapshot` (what the model saw)
+
+If the proposal looks right, the reviewer manually edits the `fundable_organizations` row to set the resolved fields + audit columns. The attempts row is left in place as the audit trail.
+
+If wrong: reviewer takes no action; the row stays as `needs_review`. (We can add an explicit reviewer-decision column later if needed.)
+
+## Cost — per-call, not backfill
+
+The pipeline runs on demand. Per-call cost depends on tier:
+
+| Tier | Model | Per-call estimate |
+|---|---|---|
+| 1 | `google/gemini-3.1-flash-lite:online` | ~$0.001 base + ~$0.015 web search = **~$0.016** |
+| 2 | (TBD escalation `:online`) | ~$0.075 base + ~$0.015 web = **~$0.090** |
+| n/a | `no_signal` | $0 |
+
+For a hypothetical 2,360-org one-off backfill at 50/35/15 mix: **~$93 total**. But that backfill is **deferred** (see below). Day-to-day cost is essentially zero — only when callers explicitly invoke the function.
+
+## Deferred for post-AlloyDB
+
+These were on the original full-scope design but are out of scope for this iteration:
+
+- `queue_enrich_fundable_org` table + cron worker
+- Table trigger on `fundable_organizations` insert (auto-enqueue new sparse orgs)
+- Table trigger on `fundable_institutional_investments` insert (re-trigger soft-failed orgs when new deals arrive)
+- One-shot backfill task for the 2,360 currently-eligible orgs
+- Manual admin re-trigger endpoint
+- Tier-2 model bake-off
+- Stratified pilot
+
+When the AlloyDB rebuild is in motion, design these against the new graph topology rather than retrofitting them onto the Fundable Postgres tables we're about to migrate away from.
+
+## What gets built next
+
+1. Create `fundable_organization_enrichment_attempts` table.
+2. Add audit columns to `fundable_organizations`.
+3. Build `enrichment/classify_signal_tier`.
+4. Build `enrichment/run_llm_resolution`.
+5. Build `enrichment/resolve_org_identity` (orchestrator).
+6. Smoke-test by calling it on 2-3 known orgs from the [9-case test set](/guides/open-work/co-enrichment-optimization#live-test-results-prompt-v01-web-tools).
+7. Hand off — callers invoke as needed.

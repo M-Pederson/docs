@@ -1,0 +1,585 @@
+---
+title: "Co Enrichment Optimization"
+description: "LLM-driven identity resolution for sparse fundable_organizations records — design, prompt workshop, sample test set."
+---
+
+## Why this exists
+
+Roughly 14% of `fundable_people` (72,174 of 528,045) are linked to ≥1 deal. On the org side, many investor records arrive nearly empty: a name and not much else — no `domain`, no `linkedin_url`, no `crunchbase_url`, no `website`. These records are unusable for downstream graph merging, profile rendering, or warm-intro discovery until we resolve them to a real-world entity.
+
+This page tracks the work to fill that gap with a small, focused LLM enrichment loop.
+
+## Sample test set — 8 multi-deal orgs
+
+Drawn from `fundable_organizations` filtered to `is_investor=true` with deal_count between 2 and 8 (avoiding mega-VCs that skew tests).
+
+| Name | Deals | Domain | UUID |
+|---|---:|---|---|
+| Madrona Venture Labs | 6 | madronavl.com | `97e16873-46bd-4073-85b3-aa799c7bf617` |
+| Neptunia Invest | 4 | neptuniainvest.se | `71ed9ffe-6767-49a8-82ec-25a6b348d7f3` |
+| Incore Invest | 3 | incoreinvest.com | `25688a24-3215-419c-a64a-a7d57aa60217` |
+| Altus Group | 3 | altusgroup.com | `dc4261e6-df46-4e4a-a409-e7a3bf041cb1` |
+| Cigna Investments | 2 | cignaventures.com | `bd3611be-0d2a-4b15-b996-ab6c47401841` |
+| **Capital Venture Investment Fund** | **2** | **— (sparse)** | `76af7202-b26d-41c5-81c4-862e874cd047` |
+| **SeedSyndicates** | **2** | **— (no domain)** | `26cf564f-4554-4f53-be8a-35cea17b09ce` |
+| **嘉植基金** | **2** | **— (sparse)** | `c7ca6f59-f58b-41c7-b461-b1d4ff2df672` |
+
+The bolded three are the sparse-record cases the LLM enrichment is designed to handle. SeedSyndicates is partial-sparse (has Crunchbase/Twitter/Facebook but no domain or LinkedIn); the other two have effectively only a name + a couple of deal links.
+
+## Three more sparse multi-deal orgs (workshop set)
+
+Picked at random from `fundable_organizations` where `deal_count > 2` AND domain/website/linkedin_url/crunchbase_url all null.
+
+| Name | Deals | Country | Notes (from `short_description`) | UUID |
+|---|---:|---|---|---|
+| Skyworks Venture Capital | 3 | — | _no description_ | `53b1219b-db8a-4639-8cc9-b6255f0a9f20` |
+| Gates Frontier | 18 | — | "venture capital firm based in Denver, Colorado. It serves as the venture investment arm of Bill Gates, co-founder of Microsoft" | `326f726c-4ea1-4764-bbcb-b2d5476369c9` |
+| JLA Ventures | 7 | — | "venture capital firm that invests in the software-as-a-service, digital media, and mobile applications and services sectors" | `a71e2f6a-c51a-4019-97d6-e05d53ebcc32` |
+
+These give a useful spread for testing:
+
+- **Gates Frontier** — well-known fund with a rich text description; should resolve trivially.
+- **JLA Ventures** — moderately known fund with a sector hint; medium difficulty.
+- **Skyworks Venture Capital** — only a name; hard mode (and possibly ambiguous: similar names exist).
+- **Capital Venture Investment Fund** — generic-sounding name + no context; hardest mode.
+- **嘉植基金** — non-Latin name, but deal descriptions transliterate it as "Jiazhifund" and reference two specific portfolio companies — solvable if we surface the deal context.
+
+## LLM Identity Enrichment — design
+
+### Goal
+
+Given a sparse `fundable_organizations` record, return any of:
+
+- **`domain`** — primary website domain (no protocol)
+- **`website`** — full URL
+- **`linkedin_url`** — LinkedIn company page
+- **`crunchbase_url`** — Crunchbase organization page
+- **`twitter`** / **`facebook`** — social handles or URLs
+- **`canonical_name`** — official name if it differs from `name` (e.g. romanization, full legal name)
+- **`country_code`** / **`region`** if missing
+
+Plus a **confidence score** (0–1) and a **reasoning** string the human reviewer can audit.
+
+### Input shape — ONE YAML field, not many
+
+**Recommendation: a single input `fundable_data` (YAML) with null/empty fields stripped, plus a separate `deal_context` input for surrounding signals.**
+
+Why one consolidated YAML beats individual inputs:
+
+1. **Sparse rows.** A typical sparse record has ~3 non-null fields out of ~30. Individual inputs would ship 27 explicit `null`s to the model every call — token waste, noise.
+2. **Variable schema is free.** YAML lets each call carry whatever's actually present without a fixed contract.
+3. **Token cost.** Directly impacts per-call price. For the sparse-record case, the YAML prompt is roughly 4× smaller than the equivalent labeled-field prompt.
+4. **Model attention.** The LLM does better when it sees only the signal. Fewer distractor "null" lines = fewer pattern-match misfires.
+5. **Easier prompt evolution.** Adding a new field to the org table doesn't require updating the function signature.
+
+The org-level YAML alone is often not enough though — for the China/Jiazhifund case the **deal descriptions** were the data point that surfaced the romanized name. So:
+
+- Input 1: **`fundable_data`** (YAML) — non-null fields from the org row
+- Input 2: **`deal_context`** (YAML) — list of deals this org participated in, each with portfolio company name, financing type, size, deal description, source article URLs
+
+### Building `deal_context` — the SQL recipe
+
+A useful `deal_context` entry combines fields from **four tables**:
+
+| Source table | Fields used | Why |
+|---|---|---|
+| `fundable_institutional_investments` | `lead_investor`, `personnel`, `fund` | Org's role on this deal. `fund` sometimes carries the actual fund name (e.g. "Sequoia Capital Growth Fund III"). |
+| `fundable_deals` | `financing_type`, `size_usd`, `date`, `short_description`, `long_description`, `canonical_deal_id` | Descriptions are where romanizations / alt names / sector hints live (the Jiazhifund case, the Capital Venture Investment Fund case). |
+| `fundable_organizations` (joined on `deals.organization_id`) | `name`, `country_code` | **Portco name** — 5 known portcos = a near-unique fingerprint. |
+| `fundable_articles` (joined on `canonical_deal_id`) | `link`, `date`, `source_priority` | Web-fetchable URLs. Critical for any model with browse access. |
+
+**Cap at 8 deals**, prioritized by:
+
+1. Deals where the org was `lead_investor` (descriptions are far more likely to name them by canonical / transliterated form when they're the lead).
+2. Longest `short_description` (more text = more chance of an alt-name surfacing).
+3. Most recent first.
+
+**Cap at 5 articles per deal**, ordered by `source_priority DESC, date DESC`. Some deals (esp. high-profile US Series A/B) have 16+ articles in `fundable_articles`; shipping all of them is pure token waste — the top 5 by source quality is plenty.
+
+**Strip nulls and the empty-array sentinels.** `personnel` and `fund` are stored as `["{}"]` when empty — drop those.
+
+The query (Postgres, runnable via `db.direct_query`):
+
+```sql
+WITH inv AS (
+  SELECT *
+  FROM x3_678_fundable_institutional_investments
+  WHERE organization_id = ?
+)
+SELECT COALESCE(jsonb_agg(deal_obj ORDER BY ord), '[]'::jsonb) AS deal_context
+FROM (
+  SELECT
+    jsonb_strip_nulls(jsonb_build_object(
+      'portco',            NULLIF(po.name, ''),
+      'portco_country',    NULLIF(po.country_code, ''),
+      'role',              CASE WHEN inv.lead_investor THEN 'lead_investor' ELSE 'co_investor' END,
+      'financing_type',    NULLIF(d.financing_type, ''),
+      'size_usd',          NULLIF(d.size_usd::text, '0')::numeric,
+      'date',              CASE WHEN d.date > 0 THEN to_char(to_timestamp(d.date / 1000), 'YYYY-MM-DD') END,
+      'short_description', NULLIF(d.short_description, ''),
+      'long_description',  NULLIF(d.long_description, ''),
+      'articles', (
+        SELECT jsonb_agg(a.link ORDER BY a.source_priority DESC NULLS LAST, a.date DESC NULLS LAST)
+        FROM x3_680_fundable_articles a
+        WHERE a.canonical_deal_id = d.canonical_deal_id
+          AND a.link IS NOT NULL AND a.link <> ''
+      ),
+      'fund',      CASE WHEN inv.fund      IS NOT NULL AND inv.fund::text      NOT IN ('null','[]','["{}"]') THEN inv.fund      END,
+      'personnel', CASE WHEN inv.personnel IS NOT NULL AND inv.personnel::text NOT IN ('null','[]','["{}"]') THEN inv.personnel END
+    )) AS deal_obj,
+    ROW_NUMBER() OVER (
+      ORDER BY
+        CASE WHEN inv.lead_investor THEN 0 ELSE 1 END,
+        COALESCE(LENGTH(d.short_description), 0) DESC,
+        d.date DESC NULLS LAST
+    ) AS ord
+  FROM inv
+  JOIN x3_671_fundable_deals d ON d.id = inv.deal_id
+  LEFT JOIN x3_666_fundable_organizations po ON po.id = d.organization_id
+  LIMIT 8
+) ranked;
+```
+
+The org-level `fundable_data` payload is one extra line:
+
+```sql
+SELECT jsonb_strip_nulls(to_jsonb(o.*)) AS fundable_data
+FROM x3_666_fundable_organizations o
+WHERE o.id = ?;
+```
+
+### Xano function — `enrichment/build_org_enrichment_context`
+
+Both queries are wrapped in a reusable Xano function that returns a single payload containing JSON + ready-to-prompt YAML.
+
+| | Value |
+|---|---|
+| **Function ID** | `12980` |
+| **Name** | `enrichment/build_org_enrichment_context` |
+| **API endpoint** | `GET https://xh2o-yths-38lt.n7c.xano.io/api:rlSvC4qe/enrichment/build_org_enrichment_context` |
+| **API ID** | `8517` (in `Admin Backfill` group) |
+| **Auth** | None (public — invoked by enrichment workers) |
+
+**Input**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `fundable_org_id` | uuid | yes | UUID of the `fundable_organizations` row |
+
+**Output**
+
+| Field | Type | Description |
+|---|---|---|
+| `fundable_data` | object | Org row, null/empty fields stripped |
+| `deal_context` | array | Up to 8 deals, prioritized as described above |
+| `fundable_data_yaml` | string | Same as `fundable_data` but pre-serialized to YAML — drop straight into a prompt |
+| `deal_context_yaml` | string | Same as `deal_context` but pre-serialized to YAML |
+| `deal_count_total` | int | Total deals for this org (so caller knows if context was capped) |
+| `deal_count_returned` | int | How many deals are in `deal_context` (≤ 8) |
+
+**Example call**
+
+```bash
+curl -sS "https://xh2o-yths-38lt.n7c.xano.io/api:rlSvC4qe/enrichment/build_org_enrichment_context?fundable_org_id=c7ca6f59-f58b-41c7-b461-b1d4ff2df672" \
+  -H "X-Data-Source: live" \
+  -H "X-Branch: v1" | jq
+```
+
+**Headers**
+
+| Header | Required | Value |
+|---|---|---|
+| `X-Data-Source` | yes | `live` (or `staging`/`sandbox`) |
+| `X-Branch` | yes | `v1` |
+| `Content-Type` | optional | `application/json` |
+
+**Calling from another XanoScript stack**
+
+```xs
+function.run "enrichment/build_org_enrichment_context" {
+  input = {
+    fundable_org_id: $org_id
+  }
+} as $context
+
+// $context.fundable_data_yaml   → drop into LLM prompt
+// $context.deal_context_yaml    → drop into LLM prompt
+// $context.deal_count_total     → log if capped (> 8)
+```
+
+**Behavior**
+
+- Throws `notfound` if the `fundable_organizations` row doesn't exist.
+- Returns an empty `deal_context: []` if the org has no rows in `fundable_institutional_investments`.
+- The 8-deal cap is hard-coded. If you want a different cap, fork the function — don't surface it as input (keeps the LLM prompt size predictable).
+
+### System prompt (v0.2)
+
+Updated based on live testing against real `fundable_organizations` rows. Changes from v0.1:
+
+- **Explicit web-tool directive** (was implicit "if you have web tools").
+- **Search strategy section** with specific query patterns to try.
+- **Disambiguation guidance** using portco fingerprints — the v0.1 case where searching `Synaire` alone returned a respiratory-device company instead of the PLA-materials Synaire from our deal context.
+- **Legacy / consolidated entity handling** — the Pfizer R&D Innovate case, where the canonical entity changed (now Pfizer Ventures) but historical Crunchbase rows still use the old name.
+- **Strict JSON output** — no preamble, no markdown fences.
+- **Confidence calibration table** — concrete anchors so models don't drift to 0.5 by default.
+- **Reasoning depth tier** — high-confidence answers can be terse; low-confidence answers must enumerate evidence.
+
+```text
+You are an identity-resolution assistant. Given a sparse record from a venture
+capital database, identify the real-world entity behind it and return canonical
+identifiers (domain, LinkedIn, Crunchbase, etc.).
+
+You have access to a web search tool and a web fetch tool. Use them — do not
+answer from prior knowledge alone.
+
+INPUT
+You will receive two YAML payloads:
+- `fundable_data`: non-null fields from the database row (organization-level).
+  Names may be in any language. Treat the `name` field as a starting point, not
+  the truth — it can be a romanization, abbreviation, partial name, or a legacy
+  name that has since been consolidated under a different parent entity.
+- `deal_context`: up to 8 deals where this organization appears as an investor,
+  prioritized by lead-investor role + richer descriptions. Each deal carries
+  the portfolio company name, financing type, USD size, date, descriptions,
+  and up to 5 source article URLs. Deal descriptions are often the strongest
+  signal — they sometimes name the investor in their canonical / transliterated
+  / legal form, name co-launching parent entities, or describe fund structure.
+
+SEARCH STRATEGY
+1. First, scan `deal_context.*.short_description` and `deal_context.*.long_description`
+   for any romanization, alt name, parent entity, fund family, or descriptive
+   phrase about the investor. Extract these before searching the web.
+2. Web search with the most specific name + a portco name. The combination
+   disambiguates common-sounding names (e.g. "Synaire" alone could be a
+   medical device company; "Synaire" + "Jiazhifund" + "PLA bio-materials"
+   pins down the right company).
+3. If you find candidate Crunchbase / LinkedIn / PitchBook / CB Insights pages,
+   fetch them to confirm sector + portco overlap with the deal_context.
+4. For non-Latin names: search both the original name AND any romanization you
+   extracted from the descriptions.
+5. For sparse name-only inputs: pivot off the portco set. Investing fingerprint
+   (which companies + when + what stage) is often enough to resolve the
+   investor when name search fails.
+
+DISAMBIGUATION
+When the same name returns multiple plausible entities:
+- Cross-check against the deal_context's portcos: which candidate has the most
+  portfolio overlap?
+- Cross-check the deal date(s) against each candidate's known activity period.
+- Cross-check sector signal — investor focus must match the deals' sectors.
+- If you still can't disambiguate, populate `alternatives` with the top 2-3
+  candidates and set `confidence < 0.6`. Do not coin-flip.
+
+LEGACY / CONSOLIDATED ENTITIES
+If the original entity has been renamed, merged, or consolidated:
+- `canonical_name` = current canonical entity name
+- `canonical_name_alt` = original name from `fundable_data.name` (for audit)
+- Note the consolidation in `reasoning`
+- Use the current entity's domain/LinkedIn/Crunchbase, not the legacy ones
+
+OUTPUT
+Return a single JSON object. No preamble, no markdown fences, no commentary
+outside the JSON.
+
+{
+  "domain": string | null,
+  "website": string | null,
+  "linkedin_url": string | null,
+  "crunchbase_url": string | null,
+  "pitchbook_url": string | null,
+  "twitter": string | null,
+  "facebook": string | null,
+  "canonical_name": string | null,
+  "canonical_name_romanized": string | null,
+  "canonical_name_alt": string | null,
+  "country_code": string | null,        // ISO 3166-1 alpha-2 (e.g. "US", "CN")
+  "region": string | null,
+  "confidence": number,                  // 0..1, see calibration below
+  "reasoning": string,                   // see depth requirements below
+  "alternatives": [                      // populate when confidence < 0.85
+    {
+      "canonical_name": string,
+      "domain": string | null,
+      "evidence": string,
+      "confidence": number
+    }
+  ]
+}
+
+CONFIDENCE CALIBRATION
+- 0.95+  : direct hit — the entity has a public web page that confirms name +
+           sector + at least one portco from deal_context.
+- 0.85-0.94 : strong hit — multiple corroborating sources but one or two fields
+           are inferred (e.g. country from address, not explicit).
+- 0.60-0.84 : moderate — entity probably identified, some uncertainty (rare-name
+           overlap, partial portco match, or consolidation history).
+- 0.30-0.59 : weak — name and one signal point to a candidate, but no strong
+           confirmation. Populate `alternatives`.
+- < 0.30 : no plausible candidate found. Most fields should be null.
+
+REASONING DEPTH
+- For confidence ≥ 0.85: 1 sentence, naming the primary source(s).
+- For confidence 0.6-0.84: 2-3 sentences listing the corroborating signals
+  and any remaining uncertainty.
+- For confidence < 0.6: enumerate every signal you considered and explain
+  why none was decisive. Future re-runs depend on this reasoning.
+
+RULES
+- NEVER invent a domain, LinkedIn, or Crunchbase URL. If you can't verify via
+  search or fetch, set the field to null and put the unverified candidate in
+  `reasoning`.
+- Prefer the entity's own LinkedIn / Crunchbase / website over third-party
+  listings (Tracxn, Bloomberg, Premier Alts, goldi.ai, etc.).
+- For non-English / non-Latin names, always populate `canonical_name_romanized`.
+- A confidence < 0.6 means a human will review before merging — be honest;
+  false-positives at high confidence are far worse than false-negatives.
+```
+
+### Workshop — five test cases
+
+For each, the YAML below is what the LLM would receive. We're mainly checking that the included signal is sufficient for a strong human reader (proxy for a strong model + web tools) to land on the right answer.
+
+#### 1. Capital Venture Investment Fund (looked hardest, turned out solvable)
+
+```yaml
+# fundable_data
+id: 76af7202-b26d-41c5-81c4-862e874cd047
+name: Capital Venture Investment Fund
+short_description: |
+  Capital Venture Investment Fund is not directly identifiable from the
+  provided links. The information provided includes general descriptions of
+  venture capital funds and unrelated entities.
+is_investor: true
+```
+
+```yaml
+# deal_context (assembled by build_org_enrichment_context — see below)
+- portco: Yuntongxun
+  portco_country: China
+  role: lead_investor
+  financing_type: SERIES_F
+  size_usd: 120
+  date: 2020-11-06
+  short_description: |
+    Sequoia-backed Beijing cloud communication provider Yuntongxun raised a
+    $120M Series F led by the state-owned Capital Venture Investment Fund.
+  long_description: |
+    Yuntongxun announced a $120 million Series F round. The round was led by
+    the state-owned Capital Venture Investment Fund. The article describes
+    that fund as a 200 billion yuan ($30 billion) vehicle co-launched in 2016
+    by China Reform Holdings Corporation, Postal Savings Bank of China, China
+    Construction Bank, and Shenzhen Investment Holdings. ...
+  articles:
+    - https://www.dealstreetasia.com/stories/sequoia-yuntongxun-series-f-214454
+- portco: Innoforce Pharmaceuticals
+  portco_country: China
+  role: lead_investor
+  financing_type: SERIES_D
+  size_usd: 46.1
+  date: 2021-03-22
+  short_description: |
+    Chinese pharmaceutical company Innoforce raised 625 million yuan ($96M) in a Series A.
+  articles:
+    - https://www.dealstreetasia.com/stories/innoforce-winicssec-232919
+```
+
+**Outcome:** the deal context is decisive — the Yuntongxun deal's `long_description` literally describes the fund: state-owned, RMB 200B / $30B vehicle, co-launched 2016 by China Reform Holdings + Postal Savings Bank + China Construction Bank + Shenzhen Investment Holdings. With this in the prompt, the LLM should resolve to the Chinese state-owned fund 国新央企运营投资基金 (or its formal CN name) at high confidence.
+
+> **Lesson:** the apparent "hardest case" was actually solvable — the org-level row was noise, the deal context was the signal. This is the central reason we ship deal_context, not just `fundable_data`.
+
+#### 2. 嘉植基金 (Jiazhifund) — non-Latin
+
+```yaml
+# fundable_data
+id: c7ca6f59-f58b-41c7-b461-b1d4ff2df672
+name: 嘉植基金
+short_description: |
+  Based on the available articles, 嘉植基金 is a Chinese investment fund that
+  acted as the sole investor in the Series B round of Shanghai Jinghai Weixiang
+  Biomaterials Co., indicating its focus on venture-stage opportunities in the
+  advanced materials / biotech sector.
+is_investor: true
+```
+
+```yaml
+# deal_context
+deals:
+  - portco: Synaire
+    financing_type: SERIES_B
+    size_usd: 14290000
+    role: lead_investor
+    short_description: |
+      Bio-based materials startup Synaire raised a nearly RMB 100 million
+      Series B equity round solely from Jiazhifund.
+    articles:
+      - https://www.vbdata.cn/1519057612
+      - https://www.vbdata.cn/1519057619
+  - portco: 经海纬象
+    financing_type: SERIES_B
+    size_usd: 14290000
+    role: lead_investor
+    short_description: |
+      Bio-based materials startup 经海纬象 raised a nearly RMB 100 million
+      Series B round solely financed by 嘉植基金.
+    articles:
+      - https://www.donews.com/news/detail/1/6363128.html
+```
+
+**Expected outcome:** model should return `canonical_name_romanized: "Jiazhifund"` (lifted from the deal description), sector "advanced materials / biotech," country `CN`. With web access, it can hit the vbdata.cn / donews.com articles to confirm and possibly find a website.
+
+#### 3. Gates Frontier (easy, baseline)
+
+```yaml
+# fundable_data
+id: 326f726c-4ea1-4764-bbcb-b2d5476369c9
+name: Gates Frontier
+short_description: |
+  Gates Frontier is a venture capital firm based in Denver, Colorado. It serves
+  as the venture investment arm of Bill Gates, co-founder of Microsoft. The
+  firm focuses on a variety of sectors and has made several investments,
+  including diversity investments.
+is_investor: true
+```
+
+**Expected outcome:** trivial. Strong description + 18 deals = high-confidence identification. Should return Gates Frontier's actual LinkedIn / website if any exists, or note that the firm operates without a public web presence (known Gates-family pattern).
+
+#### 4. JLA Ventures (moderate)
+
+```yaml
+# fundable_data
+id: a71e2f6a-c51a-4019-97d6-e05d53ebcc32
+name: JLA Ventures
+short_description: |
+  JLA Ventures is a venture capital firm that invests in the software-as-a-service,
+  digital media, and mobile applications and services sectors.
+is_investor: true
+```
+
+**Expected outcome:** model should resolve to JLA Ventures (Toronto-based) given sector + name. Confidence likely moderate (0.7–0.85) without deal_context to disambiguate from similarly-named firms.
+
+#### 5. Skyworks Venture Capital (hard, name-only)
+
+```yaml
+# fundable_data
+id: 53b1219b-db8a-4639-8cc9-b6255f0a9f20
+name: Skyworks Venture Capital
+is_investor: true
+```
+
+**Expected outcome:** should return low confidence and lean on `deal_context`. "Skyworks" alone is ambiguous (Skyworks Solutions is the well-known semiconductor firm, not a VC). Without deal context the model should flag uncertainty rather than guess.
+
+## Expanded test set
+
+Pulled at random from `fundable_organizations` where `is_investor=true` AND `domain/website/linkedin_url IS NULL` AND `deal_count >= 2`, split into two tiers. These supplement the original 8-org sample.
+
+**Tier A — has `short_description` (richer signal):**
+
+| Name | Deals | Country | Notes | UUID |
+|---|---:|---|---|---|
+| Susquehanna Private Equity Investments | 21 | US | "private equity firm based in Bala Cynwyd, Pennsylvania, focuses on early to late-stage … hospitality, property management, and PropTech" — has Crunchbase + PitchBook URLs already | `225e1497-2b4c-47e4-bbad-7dba2bcc4b9f` |
+| Jiaqiao Capital | 2 | — | description names it "**Jinqiao Capital**" — alt-name signal sitting in the description | `9af528b8-5bdf-4648-a524-a4bfa54b99b5` |
+| Yuan Yi Capital | 3 | CN | Guangdong-based; description says "Yuanyi Investment Partnership" — alt-name signal | `ec369fc0-aa27-4c77-af2e-aec7619e166c` |
+| Eleven Prime | 2 | US | "boutique investing and consulting firm … founded by Bubba Murarka" — founder name is high-signal | `bc9f4916-6eef-48b0-a4fc-76188f4d4ef8` |
+
+**Tier B — name only (description is just the name repeated):**
+
+| Name | Deals | Country | UUID |
+|---|---:|---|---|
+| Corecam Capital Partners | 3 | — | `eae9b064-efc5-4d86-837a-697526c2b12e` |
+| Schestowitz Group | 2 | IL | `a4ddfff2-e006-47e7-8a3b-d49e8d5703a0` |
+| Orchid India | 2 | — | `b3210352-36cb-4478-b1f4-5d8a5ca69122` |
+| Pfizer R&D Innovate | 2 | — | `71dd83cd-1e23-4a9c-937c-c9f5ad229868` |
+
+## Live test results (prompt v0.1 + web tools)
+
+Each test fetches context from `enrichment/build_org_enrichment_context`, then a strong reasoner with web search + fetch applies the v0.1 prompt. Findings drove the v0.2 changes above.
+
+### Pass — Gates Frontier
+
+- **Result:** `confidence: 0.92`, `crunchbase_url: https://crunchbase.com/organization/gates-frontier-fund` (we didn't have this), `country_code: US`, `region: Colorado`.
+- **What worked:** the org row's `short_description` already carried "venture investment arm of Bill Gates" — a single search confirmed Crunchbase + CB Insights + Tracxn pages. Multiple deal portcos (Neurophos, etc.) corroborated.
+- **What was missing in v0.1:** the prompt didn't explicitly tell the model to prefer the entity's own properties over third-party listings (Premier Alts, Bloomberg, goldi.ai all came up as noise).
+
+### Pass — Pfizer R&D Innovate (legacy / consolidated entity)
+
+- **Result:** `canonical_name: Pfizer Ventures`, `canonical_name_alt: Pfizer R&D Innovate`, `domain: pfizerventures.com`, `confidence: 0.92`, with reasoning noting the 2018 consolidation.
+- **What worked:** the deal `long_description` for Jnana Therapeutics ("Polaris Partners, Avalon Ventures, Versant Ventures, AbbVie Ventures and Pfizer R&D Innovate") gave enough context for the model to know exactly which Pfizer entity, and a single search surfaced the Pfizer press release announcing the consolidation into Pfizer Ventures.
+- **What was missing in v0.1:** no explicit handling for "renamed / consolidated" entities — v0.2 adds `canonical_name_alt` and the legacy-entity rule.
+
+### Soft fail — 嘉植基金 (Jiazhifund)
+
+- **Result:** `canonical_name_romanized: Jiazhifund`, `country_code: CN`, `confidence: 0.55`, all URLs null, `alternatives: []`.
+- **What worked:** the romanization "Jiazhifund" lifted cleanly from `deal_context.[0].short_description`. Country/sector populated from deal text.
+- **What didn't:** the fund itself appears genuinely obscure — no Crunchbase, no LinkedIn, no website surfaced. The model correctly flagged for human review rather than guessing.
+- **Note (data-quality, not prompt):** one of the article URLs stored against the canonical_deal_id (`https://www.vbdata.cn/1519057612`) actually covers a *different* company (Panrui Biotechnology). Worth a separate pass to validate `canonical_deal_id` clustering.
+
+### Pass — Capital Venture Investment Fund (looked hard, was easy)
+
+- **Result:** high-confidence Chinese state-owned fund identification — the deal `long_description` for the Yuntongxun deal literally describes the fund as "a 200 billion yuan ($30 billion) vehicle co-launched in 2016 by China Reform Holdings Corporation, Postal Savings Bank of China, China Construction Bank, and Shenzhen Investment Holdings."
+- **Lesson:** the org-level row was noise; the deal context was signal. This is the central reason we ship `deal_context`, not just `fundable_data`.
+
+### Pass — Schestowitz Group (corporate venture, not a pure VC)
+
+- **Result:** `canonical_name: S.Schestowitz Ltd`, `linkedin_url: https://il.linkedin.com/company/s-schestowitz`, `country_code: IL`, `confidence: 0.90`.
+- **What worked:** the Humanz deal `long_description` carried the decisive signal — *"The Schestowitz Group invested after using the platform across its brands for two years"*. That phrase ("its brands") flagged this as a corporate venture arm of a brand-owning business, not a pure VC. Web search instantly returned S.Schestowitz Ltd — Israeli FMCG importer/distributor founded 1954, ~$2B+ in distribution.
+- **Lesson:** the v0.2 prompt's search-strategy step 1 ("scan deal descriptions for descriptive phrases about the investor") was the right move. A description phrase about *what kind* of entity this is can be more decisive than the name itself.
+
+### Pass — Orchid India (canonical-name shift)
+
+- **Result:** `canonical_name: Hornbill Orchid India Fund`, `canonical_name_alt: Orchid India`, `crunchbase_url: https://www.crunchbase.com/organization/hornbill-orchid-india-fund`, `pitchbook_url: https://pitchbook.com/profiles/investor/266944-69`, `country_code: IN`, `confidence: 0.92`.
+- **What worked:** the second deal's description literally names "Hornbill Orchid India Fund" alongside "Orchid India" — confirming the colloquial-vs-canonical relationship. v0.2's `canonical_name_alt` field captures this cleanly. Portfolio overlap (WedMeGood, Tripoto, BlackBuck) corroborated.
+- **Note:** the parent advisory firm is Hornbill Capital Advisers; depending on graph-merge policy you may want to keep Orchid India as a sub-entity of Hornbill rather than collapsing them.
+
+### Pass — Corecam Capital Partners (already in the long_description)
+
+- **Result:** `canonical_name: Corecam Family Office (Corecam Capital Partners Pte Ltd.)`, `domain: corecam.com`, `linkedin_url: https://www.linkedin.com/company/corecam`, `crunchbase_url: https://www.crunchbase.com/organization/corecam-family-office`, `country_code: SG` (HQ; offices also in Zurich + Frankfurt), `confidence: 0.95`.
+- **What worked:** the Cricket One `long_description` calls them "Singapore-based family office Corecam Capital Partners" — full identity in the data already. The Neggst deal disambiguates to "Corecam Capital Partners (Pte Ltd.)" — Singapore Pte Ltd. Web search confirms ~$2.5B AUM, founded 2009.
+- **Lesson:** even for "name-only" Tier B records, the deal `long_description` field often carries the entire identity ready to be lifted. The `fundable_data` row's emptiness does NOT predict difficulty.
+
+### Pass — Eleven Prime (named-founder signal)
+
+- **Result:** `canonical_name: Eleven Prime`, `linkedin_url: https://www.linkedin.com/company/elevenprime`, `crunchbase_url: https://www.crunchbase.com/organization/eleven-prime`, `country_code: US`, `region: California`, `confidence: 0.93`. `reasoning` notes that Bubba Murarka maintains a personal site `bubba.vc` but Eleven Prime has no separate domain — recorded as `domain: null`.
+- **What worked:** the `fundable_data.short_description` named the founder explicitly ("founded by Bubba Murarka"). One search returned the LinkedIn company page + Bubba's personal investor profile listing CircleCI as a portfolio company — corroborating the deal_context.
+- **Note:** real example of an entity that legitimately has no website. The v0.2 prompt's "never invent" rule prevented hallucinating one.
+
+### Pass — Yuan Yi Capital / 远毅资本 (legal_name in row + Chinese name in descriptions)
+
+- **Result:** `canonical_name: Yuanyi Investment Partnership (远毅资本)`, `canonical_name_romanized: Yuanyi Capital`, `legal_name: Guangzhou Yuanyi Investment Partnership (Limited Partnership)` (from fundable_data), `crunchbase_url: https://www.crunchbase.com/organization/yuanyi-investment-partnership`, `country_code: CN`, `region: Guangdong`, `confidence: 0.90`.
+- **What worked:** the org row already had `legal_name`, `country_code`, `region`, AND a `crunchbase_url` — only `domain`/`website`/`linkedin_url` were missing. The deal_context confirmed the Chinese name `远毅资本` plus a healthcare-investing focus (Iron Armour, GrandOmics third-gen sequencing, Kangai Medical clinical nutrition). Web search corroborated CB Insights profile + sector match.
+- **Note:** mild disambiguation challenge — there's at least one other "Yuanyi" fund in China (`源一资本`, different first character). The deal portco set (sequencing + clinical nutrition + heavy-equipment marketplace) was decisive.
+
+### Summary
+
+| Case | Tier | v0.1/v0.2 outcome | New v0.2 protection |
+|---|---|---|---|
+| Gates Frontier | A | ✅ Crunchbase URL recovered | "Prefer entity-own pages over third-party listings" rule |
+| Pfizer R&D Innovate | B | ✅ Resolved to Pfizer Ventures (consolidated 2018) | Added `canonical_name_alt` + legacy/consolidation guidance |
+| 嘉植基金 (Jiazhifund) | sparse | ⚠️ Honest low-confidence soft-fail (`0.55`) | Confidence calibration table makes this behavior explicit |
+| Capital Venture Investment Fund | sparse | ✅ Resolved from `long_description` | Search strategy step 1 codifies "scan deal descriptions first" |
+| Schestowitz Group | B | ✅ Resolved as corporate venture arm of S.Schestowitz Ltd (FMCG) | Description-phrase signal ("its brands") highlighted as decisive |
+| Orchid India | B | ✅ Resolved as Hornbill Orchid India Fund | `canonical_name_alt` captures colloquial→canonical shift |
+| Corecam Capital Partners | B | ✅ Full identity (`corecam.com`) lifted from a `long_description` | Reinforces: even Tier B can be trivial when deal_context is rich |
+| Eleven Prime | A | ✅ LinkedIn URL recovered; no website (legitimately) | "Never invent" rule prevented hallucinating a domain |
+| Yuan Yi Capital / 远毅资本 | A | ✅ Resolved with mild Chinese-name disambiguation | Portco-fingerprint disambiguation (v0.2 step) settled it |
+
+**Hit rate: 8 of 9 tested resolve at confidence ≥ 0.85.** The single soft-fail (Jiazhifund) is genuinely obscure, not a prompt failure. Tier B name-only records resolve about as easily as Tier A — the `fundable_data` row's emptiness is a poor predictor of difficulty; the `long_description` of even *one* deal is usually enough.
+
+**Pattern observation across all 9:** every successful resolution drew on at least one of these signals:
+
+1. A descriptive phrase in `fundable_data.short_description` or `long_description` (Gates Frontier, Eleven Prime, Yuan Yi).
+2. The investor named in canonical / romanized form inside a deal `long_description` (Capital Venture Investment Fund, Corecam, Orchid India, Yuan Yi, Jiazhifund).
+3. A description phrase about *what kind* of entity it is (Schestowitz "across its brands" → corp-venture arm, not a VC).
+4. A founder name (Eleven Prime → Bubba Murarka).
+5. The portco fingerprint disambiguating a common name (Yuan Yi vs other "Yuanyi" funds; the failed Synaire-respiratory-vs-PLA case in v0.1 testing).
+
+If `fundable_data` and `deal_context` between them carry **none** of these five signal types, the case is genuinely unresolvable and should land at `confidence < 0.6`. Jiazhifund is the only example we've seen so far.
+
+## Open questions
+
+- **Web tools.** Does the LLM get web fetch access at enrichment time, or only at human-review time? Affects prompt + cost dramatically — without web access the model is doing pure pattern-matching from prior knowledge, which won't catch China-specific funds or smaller regional firms.
+- **Deal context cost.** Pulling deal + article rows for every sparse org is cheap (we already paginate by org_id), but bloats the prompt for orgs with 18+ deals (Gates Frontier). Should we cap to the top N most-informative deals, or trim by article-presence?
+- **Confidence threshold for auto-merge.** Anything ≥ 0.9 auto-merge with audit trail? 0.7–0.9 queue for human review? < 0.7 mark as `unresolved` and re-try later when more deals accumulate?
+- **Model choice.** Haiku 4.5 for first pass (cheap, fast), escalate to Sonnet 4.6 only on ambiguous cases? Or Opus 4.7 for everything since the volume is small (per-org, not per-row)?
+- **Failure mode logging.** Where do we store the model's `reasoning` + `alternatives` so we can post-mortem the misses? New `fundable_org_enrichment_attempts` table?
+- **Re-run policy.** When new deals land for an unresolved org, is that a trigger to re-enrich? Probably yes — more deal_context = better fingerprint.

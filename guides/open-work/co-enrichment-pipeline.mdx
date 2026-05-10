@@ -1,9 +1,11 @@
 ---
-title: "Co Enrichment Pipeline (Design)"
-description: "On-demand LLM identity-resolution function for sparse fundable_organizations records. No queue, no cron, no triggers — just a function called when more identity data is needed. Status: design locked, ready to build."
+title: "Co Enrichment Pipeline"
+description: "On-demand LLM identity-resolution function for sparse fundable_organizations records. No queue, no cron, no triggers — just a function called when more identity data is needed. Status: built and smoke-tested; one open caveat on :online mode."
 ---
 
-> **Status: design locked. Not yet built.** Scope is intentionally minimal because the broader Fundable → AlloyDB refactor is on the near-term roadmap; the proper queue / trigger / backfill machinery will be designed against that target. This doc covers only what's needed in the short term to call enrichment on demand.
+> **Status: built and smoke-tested (May 2026).** Functions deployed in Xano workspace 3; orchestrator verified end-to-end on 3 known orgs. One open caveat: OpenRouter's `:online` suffix triggers a non-deterministic Xano `ERROR_FATAL` on certain response shapes — see [Open issue: `:online` parser failure](#open-issue-online-parser-failure) below. Workaround in place; lambda-based fix planned.
+
+> Scope is intentionally minimal because the broader Fundable → AlloyDB refactor is on the near-term roadmap; the proper queue / trigger / backfill machinery will be designed against that target. This doc covers only what's needed in the short term to call enrichment on demand.
 
 ## Goal
 
@@ -13,7 +15,7 @@ Resolve a sparse `fundable_organizations` row to canonical identifiers (domain, 
 
 | # | Decision | Choice |
 |---|---|---|
-| 1 | Where do `confidence ≥ 0.85` results land? | **Direct-write** to `fundable_organizations.{domain,linkedin_url,…}` with audit columns (`enrichment_resolved_at`, `enrichment_resolved_by_model`, `enrichment_confidence`). No staging table. |
+| 1 | Where do `confidence ≥ 0.85` results land? | **Direct-write** to `fundable_organizations.{domain,linkedin_url,…}` via per-field `db.edit` (literal field name, variable value). Audit columns deferred — audit lives in the append-only `fundable_organization_enrichment_attempts` log. Rollback via the log: `UPDATE … WHERE id IN (SELECT fundable_org_id FROM attempts WHERE model_id='…' AND outcome='resolved' AND created_at > '…')`. |
 | 2 | Tier-2 (escalation) model | **Deferred** — bake-off `claude-sonnet-4.6:online` vs `gemini-2.5-pro:online` vs `gpt-5:online` later. Pipeline will accept the model id as a config var so it's swappable without code changes. |
 | 3 | Human review surface for `0.6 ≤ conf < 0.85` | **Xano table editor** with a saved view filtered to `status = 'needs_review'`. Zero new code. Reviewer sees attempts log + queue audit, manually approves or edits. |
 | 4 | Pilot scope | **Skipped.** Function exists; called on demand. Real validation happens against the AlloyDB rebuild. |
@@ -92,14 +94,16 @@ For `confidence ≥ 0.85` results, the existing fields (`domain`, `linkedin_url`
 
 Reversibility: `UPDATE fundable_organizations SET domain=null, … WHERE enrichment_resolved_by_model='…' AND enrichment_resolved_at > '…'` rolls back any batch.
 
-## Functions to build
+## Functions built
 
-| Name | Purpose |
-|---|---|
-| `enrichment/build_org_enrichment_context` | ✅ Already built (fn 12980). Assemble YAML context for one org. |
-| `enrichment/classify_signal_tier` | 🆕 Deterministic signal-tier classifier. No LLM call. |
-| `enrichment/run_llm_resolution` | 🆕 Single OpenRouter call given a model id + prompt + payload. Returns parsed JSON + cost/latency metadata. |
-| `enrichment/resolve_org_identity` | 🆕 Orchestrator — ties everything together, writes back, logs attempt. The public entry point. |
+| Name | Function ID | Purpose |
+|---|---|---|
+| `enrichment/build_org_enrichment_context` | **12980** | Assemble YAML context for one org (existing — design + recipe in [Co Enrichment Optimization](/guides/open-work/co-enrichment-optimization)) |
+| `enrichment/classify_signal_tier` | **12981** | Deterministic signal-tier classifier (no LLM call) |
+| `enrichment/run_llm_resolution` | **12983** | Single OpenRouter call given model id + prompt + payload; returns parsed JSON + cost/latency metadata |
+| `enrichment/resolve_org_identity` | **12984** | Orchestrator (public entry point) — ties everything together, writes back, logs attempt |
+
+Plus one auxiliary API endpoint (`enrichment/build_org_enrichment_context`, API ID 8517) wrapping the context-builder for direct invocation outside Xano.
 
 ### `classify_signal_tier` — deterministic
 
@@ -141,44 +145,53 @@ else
 
 Edge: if a non-Latin name has no romanization in any description, Signal 2 will silently miss. Acceptable — those will fall to `portco_only` and pay for the stronger model.
 
-### `run_llm_resolution` — OpenRouter
+### `run_llm_resolution` — OpenRouter via `api.lambda`
 
-Single API call to `https://openrouter.ai/api/v1/chat/completions`. Bearer token from `$env.openRouter`.
+POST to `https://openrouter.ai/api/v1/chat/completions` wrapped in `api.lambda` (Node fetch) rather than `api.request`. **Why a lambda:** Xano's `api.request` JSON response parser intermittently throws an uncatchable `ERROR_FATAL: Error parsing JSON: Syntax error` on OpenRouter `:online` responses — see [Open issue](#open-issue-online-parser-failure). The lambda parses with `JSON.parse` (more forgiving), extracts only the curated fields, and returns scalars across the boundary.
 
 | Input | Type | Notes |
 |---|---|---|
 | `model_id` | text | e.g. `google/gemini-3.1-flash-lite:online` |
-| `system_prompt` | text | the v0.2 prompt from the optimization page |
-| `user_payload_yaml` | text | concatenation of `fundable_data_yaml` + `deal_context_yaml` (with section headers) |
-| `temperature` | decimal | 0.0 — deterministic for identity resolution |
-| `response_format` | text | `json_object` if the model supports it |
+| `system_prompt` | text | v0.2 prompt |
+| `user_payload` | text | concatenation of `fundable_data_yaml` + `deal_context_yaml` |
+| `temperature` | decimal | 0.0 |
+| `timeout_sec` | int | default 180 |
+| `max_tokens` | int | default 4000 |
 
 | Output | Type |
 |---|---|
 | `parsed_json` | json (or null on parse failure) |
-| `raw_response` | text |
+| `raw_response` | text (the model's content string) |
 | `tokens_in` / `tokens_out` | int |
 | `latency_ms` | int |
 | `cost_usd` | decimal |
-| `error` | text \| null |
+| `error` | text \| null — `fetch:…` / `openrouter_parse:…` / `http_<code>` |
+| `http_succeeded` | bool |
 
-Handles HTTP errors, JSON parse failures, schema validation. All failure modes still return cleanly so `resolve_org_identity` can log them.
+Even with the lambda, the `:online` boundary is still flaky — see retry logic in the orchestrator below.
 
 ### `resolve_org_identity` — orchestrator (public entry point)
 
-| Input | Type |
-|---|---|
-| `fundable_org_id` | uuid |
-| `tier1_model_id` | text (default `google/gemini-3.1-flash-lite:online`) |
-| `tier2_model_id` | text (default same as tier1 for now; switch to escalation model later) |
+| Input | Type | Default |
+|---|---|---|
+| `fundable_org_id` | uuid | — |
+| `tier1_model_id` | text | `google/gemini-3.1-flash-lite:online` |
+| `tier2_model_id` | text | `google/gemini-3.1-flash-lite:online` |
+| `prompt_version` | text | `v0.2` (logged with every attempt) |
+| `max_llm_attempts` | int | `3` (retry on ERROR_FATAL — see open issue) |
 
 | Output | Type |
 |---|---|
 | `outcome` | text — `resolved` / `needs_review` / `soft_fail` / `parse_error` / `api_error` |
 | `signal_tier` | text |
+| `signals` | array of signal-type strings (which of the 5 signals fired) |
 | `confidence` | decimal \| null |
-| `resolved_fields` | json — what we wrote back (or would have, for `needs_review`) |
+| `resolved_fields` | json — what we wrote back (or proposed, for `needs_review`) |
 | `attempt_id` | int — FK to the attempts row |
+| `model_used` | text |
+| `llm_attempts` | int — how many LLM attempts the retry loop ran |
+| `last_caught_error` | text \| null — the most recent ERROR_FATAL message, if any |
+| `latency_ms` / `tokens_in` / `tokens_out` / `cost_usd` | metrics from the successful call |
 
 Logic:
 
@@ -186,15 +199,15 @@ Logic:
 2. Call `classify_signal_tier(context)` → tier.
 3. If `tier == "no_signal"`: log attempt with `outcome = soft_fail`, return.
 4. Else: pick `model_id` based on tier (tier1 for `has_name_signal`, tier2 for `portco_only`).
-5. Call `run_llm_resolution(model_id, prompt, payload)`.
-6. If LLM call errors: log attempt with `outcome = api_error`, return.
-7. If JSON parse fails: log attempt with `outcome = parse_error`, return.
-8. Validate confidence: required field, 0..1 numeric.
+5. **Retry loop:** call `run_llm_resolution` inside `try_catch`. On `ERROR_FATAL`, log the caught error and retry. Up to `max_llm_attempts` tries.
+6. If all retries failed: `outcome = api_error`.
+7. If LLM call returned an `error` field: `outcome = api_error`.
+8. If `parsed_json == null` (JSON parse failure): `outcome = parse_error`.
 9. Route by confidence:
-   - `≥ 0.85` → write resolved fields + audit columns to `fundable_organizations`. `outcome = resolved`.
+   - `≥ 0.85` → per-field `db.edit` writes to `fundable_organizations` for each non-empty field. `outcome = resolved`.
    - `0.6..0.85` → do NOT write. `outcome = needs_review`.
    - `< 0.6` → no write. `outcome = soft_fail`.
-10. Log attempt row, return.
+10. Always log attempt row (regardless of outcome).
 
 ## Confidence routing
 
@@ -227,6 +240,36 @@ The pipeline runs on demand. Per-call cost depends on tier:
 
 For a hypothetical 2,360-org one-off backfill at 50/35/15 mix: **~$93 total**. But that backfill is **deferred** (see below). Day-to-day cost is essentially zero — only when callers explicitly invoke the function.
 
+## Open issue: `:online` parser failure
+
+OpenRouter's `:online` suffix (which enables built-in web search) intermittently triggers `ERROR_FATAL: Error parsing JSON: Syntax error` on the lambda→xanoscript boundary. Repro:
+
+- Same input, same prompt: sometimes succeeds, sometimes fails (~50% rate on certain orgs like Pfizer R&D Innovate).
+- The raw OpenRouter response (status 200, parseable by Node's `JSON.parse`) returns successfully — verified by debug API that returns `$api_response` directly.
+- The failure is at Xano's response/lambda parser, not network or OpenRouter.
+- The error is **catchable** by `try_catch` wrapping `function.run` (verified — see retry loop in orchestrator).
+
+### Mitigation in place
+
+1. `run_llm_resolution` uses `api.lambda` instead of `api.request`. The lambda parses with Node's `JSON.parse`, extracts only curated scalar fields (`raw_content`, `tokens_in`, `tokens_out`, `cost_usd`, etc.), and returns no nested objects across the boundary.
+2. `resolve_org_identity` wraps `function.run "enrichment/run_llm_resolution"` in `try_catch` and retries up to `max_llm_attempts` times (default 3, configurable). With a per-attempt failure rate of ~50%, 3 retries gives ~87% reliability; 5 gives ~97%.
+3. The `llm_attempts` field in the response tells callers how many retries it took. Spike in retries → file a follow-up.
+
+### Lessons learned (XanoScript gotchas)
+
+- `db.edit { data = $var }` rejects variable assignments — `data` requires a literal object. Workaround: per-field `db.edit` calls with literal field name + variable value.
+- `db.direct_query { sql = $var }` rejects variable SQL — must be a literal string.
+- `db.direct_query { arg = [a, b] }` doesn't accept arrays for multi-`?` placeholders — only single value.
+- Direct path access (`$x.y.z[0]`) throws on missing fields; `|get:"y.z.0":default` is the safer pattern.
+- `|get` deep paths support array indexing with `.0.`, `.1.`, etc.
+- `ERROR_FATAL: Error parsing JSON: Syntax error` from `api.request` or `api.lambda` IS catchable by `try_catch` around `function.run` — retry works.
+
+### Future improvements
+
+- File with Xano: response-parser fragility on `:online` model responses.
+- Tier-2 model bake-off: claude-sonnet-4.6 / gemini-2.5-pro / gpt-5 on the same 174-org pilot (deferred to AlloyDB).
+- Add an explicit `reviewer_decision` column to the attempts log for the `needs_review` workflow.
+
 ## Deferred for post-AlloyDB
 
 These were on the original full-scope design but are out of scope for this iteration:
@@ -241,12 +284,23 @@ These were on the original full-scope design but are out of scope for this itera
 
 When the AlloyDB rebuild is in motion, design these against the new graph topology rather than retrofitting them onto the Fundable Postgres tables we're about to migrate away from.
 
-## What gets built next
+## How to call it
 
-1. Create `fundable_organization_enrichment_attempts` table.
-2. Add audit columns to `fundable_organizations`.
-3. Build `enrichment/classify_signal_tier`.
-4. Build `enrichment/run_llm_resolution`.
-5. Build `enrichment/resolve_org_identity` (orchestrator).
-6. Smoke-test by calling it on 2-3 known orgs from the [9-case test set](/guides/open-work/co-enrichment-optimization#live-test-results-prompt-v01-web-tools).
-7. Hand off — callers invoke as needed.
+```bash
+# Via the build_org_enrichment_context API + a function.run from another stack,
+# or directly from any XanoScript:
+
+function.run "enrichment/resolve_org_identity" {
+  input = {
+    fundable_org_id: "76af7202-b26d-41c5-81c4-862e874cd047"
+  }
+} as $result
+
+// $result.outcome           → "resolved" | "needs_review" | "soft_fail" | "api_error" | "parse_error"
+// $result.confidence        → 0..1 (or null)
+// $result.resolved_fields   → what was (or would have been) written
+// $result.attempt_id        → FK to the audit row
+// $result.llm_attempts      → how many retries it took
+```
+
+For an `api_error` outcome with `llm_attempts == max_llm_attempts`, the caller can increase `max_llm_attempts` and re-run, or fall back to a non-`:online` model via `tier1_model_id` override.

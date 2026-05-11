@@ -1,0 +1,636 @@
+---
+title: "Database Access & Management"
+description: "How to authenticate to AlloyDB, run migrations, and avoid ownership drift."
+---
+
+This guide is for anyone — current team members, new hires, or future-you in six months — who needs to connect to our AlloyDB instance, run database migrations, or debug queries in production.
+
+It covers **who** can connect, **how** they authenticate, and **why** the setup is more layered than "give the dev a password." If you've ever seen the error `permission denied for table schema_migrations`, this document exists so you don't have to debug it from scratch.
+
+## TL;DR
+
+<CardGroup cols={2}>
+  <Card title="No passwords" icon="key">
+    AlloyDB authenticates everyone via **GCP IAM**. There's no long-lived credential to leak.
+  </Card>
+  <Card title="Impersonate, don't login" icon="user-secret">
+    Humans don't run migrations *as themselves*. They **impersonate** the dedicated service account `orbiter-database-account`.
+  </Card>
+  <Card title="One owner for everything" icon="users-rectangle">
+    All schemas, tables, and indexes are owned by the Postgres group role **`orbiter_migrator`**. The migration SA inherits it automatically.
+  </Card>
+  <Card title="Two grants to onboard" icon="user-plus">
+    Adding a new developer (or a CI runner) is two grants: one in GCP IAM, one in SQL. No ownership migration.
+  </Card>
+</CardGroup>
+
+## Stack & ground rules
+
+We run on **AlloyDB for PostgreSQL** as the operational database. It speaks standard Postgres, so drivers, migrations, and SQL semantics all behave normally — but it adds managed HA, automated backups, IAM auth (the foundation of everything else in this doc), and the feature that decided the choice for us: **first-class vector search**.
+
+<AccordionGroup>
+  <Accordion title="Vector storage & similarity search (pgvector + ScaNN)" icon="vector-square">
+    Embeddings (pitch profiles, investment theses, future feature vectors) live in regular Postgres tables via the `pgvector` extension. We chose AlloyDB over plain Cloud SQL Postgres for **ScaNN** index support — Google's vector index that outperforms `ivfflat` / `hnsw` on the dimensions and corpus sizes we're targeting.
+  </Accordion>
+  <Accordion title="pgvector-go" icon="golang">
+    The Go shim that lets `pgx` / `sqlc` read and write `vector` columns natively as `[]float32` instead of parsing string-encoded vectors.
+  </Accordion>
+  <Accordion title="golang-migrate" icon="arrow-up-right-from-square">
+    Runs schema migrations. Everything in `migrations/` is applied in order via `make migrate-up-local` (Docker pgvector) or `make migrate-up-alloydb` (real AlloyDB through the auth proxy).
+  </Accordion>
+  <Accordion title="sqlc" icon="code">
+    Generates the typed Go query layer from the `.sql` files in each feature's `db/` directory. Run `make sqlc-generate` after editing a query.
+  </Accordion>
+</AccordionGroup>
+
+<Card title="Deep dive: Migrations & sqlc workflow" icon="arrow-right" href="/guides/orbiter-backend/database/migrations">
+  For the full migration authoring workflow, sqlc query generation, and the conventions around `migrations/` and `db/` directories, see the dedicated guide.
+</Card>
+
+### The one hard rule
+
+<Warning>
+**All schema changes go through `migrations/`. No exceptions.**
+
+Do not `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, or otherwise alter schema directly in AlloyDB Studio, `psql`, or anywhere else.
+</Warning>
+
+Three reasons:
+
+1. Migrations are version-controlled, reviewed, and replayable on a fresh database. Manual changes are none of those.
+2. Manual DDL run by a human creates objects owned by that human, not `orbiter_migrator` — that's the exact mechanism for ownership drift this entire setup exists to prevent.
+3. Local Docker, AlloyDB, and any future staging / production database must converge to identical states. The only way to guarantee that is "migrations are the schema, full stop."
+
+Studio is for `SELECT` queries and inspecting state. Anything that changes schema or seed data is a migration.
+
+## Why this is set up the way it is
+
+Three problems we're solving at once:
+
+<Steps>
+  <Step title="No password to leak">
+    If someone exfiltrates a `.env` file with a DB password, the entire database is compromised until rotation. IAM auth uses short-lived tokens minted at connection time. There's no long-lived credential to steal.
+  </Step>
+  <Step title="No ownership drift">
+    When devs run migrations as themselves and tables get created with different owners, `TRUNCATE`, `ALTER TABLE`, and `DROP TABLE` start failing with "permission denied" depending on who's running. Channelling all migrations through a single group role makes ownership stable forever.
+  </Step>
+  <Step title="Painless identity swaps">
+    When we move migrations from a developer's laptop to CI, or replace the migration SA, no objects change hands. The group role stays; only its membership changes.
+  </Step>
+</Steps>
+
+## The model in one picture
+
+```
+                                ┌─────────────────────────────┐
+                                │  orbiter_migrator           │  ← Postgres group role
+                                │  (NOLOGIN — nothing logs    │     OWNS every schema,
+                                │   in as this role directly) │     table, sequence, view
+                                └──────────────┬──────────────┘
+                                               │ membership
+                ┌──────────────────────────────┼────────────────────────────┐
+                │                              │                            │
+                ▼                              ▼                            ▼
+  orbiter-database-account@…       denis@orbiter.io               (future) CI principal
+        (migration SA)               (human IAM user)                (Cloud Build SA, etc.)
+        auto-SET role = migrator     SET role on demand              auto-SET role = migrator
+                ▲                              ▲                            ▲
+                │ tokens minted by IAM         │ logs into Studio /         │ tokens via WIF /
+                │ on every connection          │ proxy as itself            │ Cloud Build native
+                │                              │                            │
+        gcloud impersonation             gcloud login                 CI runner identity
+        from your laptop                 from your laptop
+```
+
+The group role is the durable owner. Every other identity is a *vehicle* that can drive into the group via membership.
+
+## Identities
+
+### Human IAM users
+
+Developers authenticate to AlloyDB with their `@orbiter.io` Google identity. In the AlloyDB Users panel you'll see them listed as:
+
+| Name | Type | AlloyDB roles |
+|---|---|---|
+| `denis@orbiter.io` | IAM | `alloydbiamuser`, `alloydbsuperuser` |
+| `njogu@orbiter.io` | IAM | `alloydbiamuser`, `alloydbsuperuser` |
+
+These accounts are used for:
+
+- **Debugging in AlloyDB Studio** (`SELECT` queries, inspecting state).
+- **Impersonating service accounts** for operations like migrations.
+
+They are **not** used to run migrations directly. See [Login vs. Impersonation](#authentication-login-vs-impersonation) below.
+
+### The migration service account
+
+`orbiter-database-account@orbiter-io.iam.gserviceaccount.com` is a dedicated service account whose only job is to run database migrations.
+
+In AlloyDB it appears as the IAM user `orbiter-database-account@orbiter-io.iam` (AlloyDB trims `.gserviceaccount.com` from SA emails when creating the corresponding Postgres role).
+
+<Info>
+**GCP IAM roles it holds** (granted on the `orbiter-io` project):
+
+- `roles/alloydb.client` — lets it connect to AlloyDB via the proxy.
+- `roles/alloydb.databaseUser` — permits IAM-based DB authentication.
+
+That's all. It does **not** have `editor`, `owner`, or any compute permissions. It cannot SSH into anything, modify firewall rules, or read GCS. It can only authenticate to AlloyDB.
+</Info>
+
+### The `orbiter_migrator` group role
+
+This is a **Postgres role**, not a GCP identity. It's `NOLOGIN`, meaning no one can connect to AlloyDB as `orbiter_migrator` directly — it's a group whose members inherit its privileges.
+
+It owns **every schema and table our migrations create**:
+
+- `public.schema_migrations`
+- `files.*`
+- `outcomes.*`
+- (and every future feature schema, automatically)
+
+Members of `orbiter_migrator` (current state):
+
+- `orbiter-database-account@orbiter-io.iam` (the migration SA)
+- `denis@orbiter.io`
+- `njogu@orbiter.io`
+
+<Note>
+The migration SA has its session role **auto-flipped** to `orbiter_migrator` on every login via `ALTER ROLE … SET role`. Humans are members so they can debug and read everything, but their sessions stay as themselves by default — they don't accidentally create objects under the group name.
+</Note>
+
+## Authentication: login vs. impersonation
+
+There are two ways to authenticate gcloud, and they behave very differently when running migrations.
+
+<Tabs>
+  <Tab title="❌ Direct login (don't use for migrations)">
+    ```bash
+    gcloud auth application-default login
+    ```
+
+    This authenticates ADC as your human Google identity (`denis@orbiter.io`). If you start the AlloyDB Auth Proxy after this:
+
+    - The proxy authenticates to AlloyDB as `denis@orbiter.io`.
+    - `make migrate-up-alloydb` runs all DDL as denis.
+    - Every new table, schema, and sequence is **owned by `denis@orbiter.io`**.
+    - The next time someone else (or CI) runs a migration, they hit `permission denied`, because they don't own the tables denis just created.
+
+    <Warning>
+    This is exactly the bug we set up the system to prevent. Don't do this for migrations.
+    </Warning>
+  </Tab>
+  <Tab title="✅ Impersonation (this is the right one)">
+    ```bash
+    gcloud auth application-default login \
+      --impersonate-service-account=orbiter-database-account@orbiter-io.iam.gserviceaccount.com
+    ```
+
+    This authenticates ADC as your human identity **but** records that ADC should mint tokens for the migration SA. The flow on every connection:
+
+    1. ADC asks Google: "I am denis. Give me a token to act as `orbiter-database-account`."
+    2. Google checks: does denis have `roles/iam.serviceAccountTokenCreator` on that SA? Yes → mints a short-lived token. No → 403.
+    3. Proxy uses that token to connect to AlloyDB as the migration SA.
+    4. Migration SA auto-SETs role to `orbiter_migrator`.
+    5. Every object created is owned by `orbiter_migrator`.
+
+    The audit log shows both layers: "denis impersonated `orbiter-database-account` at 14:32 to do X." You get the convenience of the SA's stable identity with the accountability of knowing which human triggered the action.
+  </Tab>
+</Tabs>
+
+### Why impersonation, not "just use the SA directly"
+
+Service accounts don't have passwords. You can't `gcloud auth login` as an SA. The only ways to authenticate as an SA are:
+
+1. **Impersonation** (humans, dev workstations).
+2. **Workload Identity Federation** (GitHub Actions, GitLab CI).
+3. **Attached service account** (Cloud Run, Cloud Build, GCE).
+
+Impersonation is the cleanest path for local dev because it doesn't require downloading or storing any SA key file (which we never do — long-lived credentials are an attack surface we avoid).
+
+## Why each principal needs its own Token Creator grant
+
+When you grant `roles/iam.serviceAccountTokenCreator` on the migration SA, you do it **per principal**, scoped to **the SA resource**:
+
+- Console → IAM & Admin → Service Accounts → click into `orbiter-database-account` → **Permissions** tab → **+ GRANT ACCESS**.
+- Principal: e.g. `new-teammate@orbiter.io`.
+- Role: `Service Account Token Creator`.
+
+You do **not** grant this at the project level. Here's why:
+
+| Where granted | Effect | Risk |
+|---|---|---|
+| **On the SA itself** | Principal can impersonate **only this one SA** | Minimal |
+| **Project-wide** | Principal can impersonate **every SA in `orbiter-io`** | Includes `orbiter-api`, `orbiter-worker`, future SAs |
+
+<Warning>
+A project-wide grant would let any compromised developer credential impersonate every service account we have — including the API and worker SAs that read/write GCS and publish to Pub/Sub. That's the "keys to the kingdom" pattern. Resource-scoped grants keep blast radius to "this one SA can mint tokens for this one job."
+</Warning>
+
+<Tip>
+Think of it like apartment keys: a master key to the building (project level) vs. a key to apartment 4B (resource level). You give people only the key to the apartment they're allowed into.
+</Tip>
+
+## One-time cluster setup
+
+<Info>
+This section documents the historical setup for reference. If you're spinning up a new AlloyDB cluster, replay these steps in order.
+</Info>
+
+<Steps>
+  <Step title="Create the migration service account">
+    In Console → IAM & Admin → Service Accounts → **+ CREATE SERVICE ACCOUNT**:
+
+    - Name: `orbiter-database-account`
+    - ID: `orbiter-database-account`
+    - Description: `Owns and runs all database migrations`
+
+    Skip the "Grant this SA access to project" step — we grant scoped roles below.
+  </Step>
+
+  <Step title="Grant the SA its AlloyDB roles">
+    In Console → IAM & Admin → IAM → **+ GRANT ACCESS**:
+
+    | Principal | Role |
+    |---|---|
+    | `orbiter-database-account@orbiter-io.iam.gserviceaccount.com` | `roles/alloydb.client` |
+    | `orbiter-database-account@orbiter-io.iam.gserviceaccount.com` | `roles/alloydb.databaseUser` |
+  </Step>
+
+  <Step title="Register the SA as an IAM user in AlloyDB">
+    Console → AlloyDB → cluster → **Users** → **Add user account**:
+
+    - Type: **IAM**
+    - Principal: `orbiter-database-account@orbiter-io.iam.gserviceaccount.com`
+    - Roles: `alloydbiamuser` is sufficient.
+
+    This creates the Postgres role `orbiter-database-account@orbiter-io.iam`.
+  </Step>
+
+  <Step title="Create the orbiter_migrator group role and consolidate ownership">
+    In AlloyDB Studio, connected as a human with `alloydbsuperuser` (e.g. `denis@orbiter.io`), run on the `orbiter` database:
+
+    ```sql
+    -- 1. Create the group role (NOLOGIN = group, no one logs in as it)
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'orbiter_migrator') THEN
+        CREATE ROLE orbiter_migrator NOLOGIN;
+      END IF;
+    END $$;
+
+    -- 2. Grant membership to every principal that should "act as" the migrator.
+    --    Add new SAs / humans here; the swap is one more GRANT line.
+    GRANT orbiter_migrator TO "orbiter-database-account@orbiter-io.iam";
+    GRANT orbiter_migrator TO "denis@orbiter.io";
+    GRANT orbiter_migrator TO "njogu@orbiter.io";
+
+    -- 3. Give the group privileges to own/create objects across schemas.
+    --    GRANT CREATE ON DATABASE is what lets future migrations do CREATE SCHEMA.
+    GRANT CREATE ON DATABASE orbiter TO orbiter_migrator;
+    GRANT CREATE, USAGE ON SCHEMA public   TO orbiter_migrator;
+    GRANT CREATE, USAGE ON SCHEMA files    TO orbiter_migrator;
+    GRANT CREATE, USAGE ON SCHEMA outcomes TO orbiter_migrator;
+
+    -- 4. Auto-SET role for the migration SA. Every session it opens will
+    --    immediately become orbiter_migrator, so any DDL it runs creates
+    --    objects owned by the group.
+    ALTER ROLE "orbiter-database-account@orbiter-io.iam" SET role = 'orbiter_migrator';
+
+    -- 5. Move ownership of any existing objects from the SA to the group.
+    --    Extension-owned objects (google_db_advisor_*, hypopg_*, etc.) are
+    --    skipped automatically.
+    REASSIGN OWNED BY "orbiter-database-account@orbiter-io.iam" TO orbiter_migrator;
+    ```
+
+    <Warning>
+    Run this entire block as a single statement set, in `orbiter` (not `postgres`). Studio wraps multi-statement scripts in a transaction; if any line errors, the whole block rolls back and you'll see no changes.
+    </Warning>
+  </Step>
+
+  <Step title="Grant each developer impersonation rights">
+    For each developer who'll run migrations from their laptop:
+
+    In Console → IAM & Admin → Service Accounts → `orbiter-database-account` → **Permissions** → **+ GRANT ACCESS**:
+
+    - Principal: `<their-email>@orbiter.io`
+    - Role: `Service Account Token Creator`
+
+    (This is **not** done at the project level — see [the previous section](#why-each-principal-needs-its-own-token-creator-grant) for why.)
+  </Step>
+</Steps>
+
+## Daily workflow: running migrations from your laptop
+
+<Steps>
+  <Step title="Authenticate gcloud with impersonation">
+    ```bash
+    gcloud auth application-default login \
+      --impersonate-service-account=orbiter-database-account@orbiter-io.iam.gserviceaccount.com
+    ```
+
+    Browser opens, log in as your human Google account. Done.
+  </Step>
+
+  <Step title="Start the AlloyDB Auth Proxy in a separate terminal">
+    ```bash
+    alloydb-auth-proxy \
+      --address 127.0.0.1 \
+      --port 5434 \
+      --public-ip \
+      --auto-iam-authn \
+      projects/orbiter-io/locations/us-central1/clusters/free-trial-cluster/instances/primary
+    ```
+
+    Wait for `The proxy has started successfully and is ready for new connections!` before proceeding.
+
+    <Tip>
+    The `--auto-iam-authn` flag is load-bearing — it tells the proxy to inject IAM tokens instead of passing through whatever password the client sends.
+    </Tip>
+  </Step>
+
+  <Step title="Check .env">
+    `DB_DSN_ALLOYDB` should be:
+
+    ```bash
+    DB_DSN_ALLOYDB=postgres://orbiter-database-account%40orbiter-io.iam:password@localhost:5434/orbiter?sslmode=disable
+    ```
+
+    Notes on this DSN:
+
+    - The `@` in the username is URL-encoded as `%40`.
+    - `.gserviceaccount.com` is **trimmed** — AlloyDB's Postgres role is `orbiter-database-account@orbiter-io.iam`, not the full email.
+    - The literal word `password` is a no-op placeholder. With `--auto-iam-authn` the proxy ignores it and injects a real IAM token.
+  </Step>
+
+  <Step title="Run the migration">
+    ```bash
+    make migrate-up-alloydb
+    ```
+
+    Done. New objects are owned by `orbiter_migrator` automatically.
+  </Step>
+</Steps>
+
+## Debugging in AlloyDB Studio
+
+Studio uses your **human** IAM identity (`denis@orbiter.io`, `njogu@orbiter.io`). You don't impersonate when using Studio — it authenticates you directly.
+
+This is fine because:
+
+- You're a member of `orbiter_migrator` (granted in setup step 4 above).
+- Postgres roles inherit privileges by default, so you can `SELECT`, `INSERT`, etc. on every table the group owns.
+
+<Warning>
+**Do not run `CREATE TABLE`, `ALTER TABLE`, or any other DDL in Studio.** Your session is acting as you, not as the group, so any objects you create will be owned by you. This re-introduces the mixed-ownership problem and breaks future migrations.
+
+All DDL goes through `migrations/`. Studio is read-only territory.
+</Warning>
+
+If you do accidentally create objects in Studio, you can clean up:
+
+```sql
+-- Move everything owned by you to the group
+REASSIGN OWNED BY "denis@orbiter.io" TO orbiter_migrator;
+```
+
+This is safe and idempotent.
+
+## Adding a new team member
+
+When a new engineer joins, two grants:
+
+<Steps>
+  <Step title="In GCP IAM Console">
+    Service Accounts → `orbiter-database-account` → **Permissions** → **+ GRANT ACCESS**:
+
+    - Principal: `<their-email>@orbiter.io`
+    - Role: `Service Account Token Creator`
+  </Step>
+
+  <Step title="In AlloyDB">
+    Add them as an IAM user in the cluster's Users panel:
+
+    - Type: **IAM**
+    - Principal: `<their-email>@orbiter.io`
+    - Roles: `alloydbiamuser` (minimum), or `alloydbsuperuser` if they need full cluster admin (rare).
+
+    Then in Studio, add them to the migrator group:
+
+    ```sql
+    GRANT orbiter_migrator TO "<their-email>@orbiter.io";
+    ```
+  </Step>
+</Steps>
+
+They can now:
+
+- Authenticate to Studio directly.
+- Impersonate the migration SA and run migrations.
+- Read every app schema by virtue of group inheritance.
+
+## Adding a new feature schema in a migration
+
+When you write a migration that creates a new schema, **also grant the group access to it**. This keeps the grant local to the migration that introduces the schema:
+
+```sql
+CREATE SCHEMA webhooks;
+GRANT CREATE, USAGE ON SCHEMA webhooks TO orbiter_migrator;
+
+CREATE TABLE webhooks.subscriptions (
+  id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id  uuid NOT NULL,
+  ...
+);
+```
+
+The schema and table are owned by `orbiter_migrator` from birth (because the migration runs with `role=orbiter_migrator` thanks to the auto-`SET role`). The explicit `GRANT` on the schema is what makes future `REASSIGN OWNED BY ... TO orbiter_migrator` operations work cleanly if ownership ever needs to be reset.
+
+<Card title="Writing migrations & sqlc queries" icon="arrow-right" href="/guides/orbiter-backend/database/migrations">
+  See the migrations guide for full conventions on authoring SQL migrations, regenerating typed Go queries with sqlc, and naming patterns for `migrations/` and feature `db/` directories.
+</Card>
+
+## Swapping the migration SA later
+
+When we move migrations to CI and create a new SA, e.g. `orbiter-ci-migrator@orbiter-io.iam.gserviceaccount.com`, the swap is:
+
+<Steps>
+  <Step title="In GCP IAM">
+    1. Create the new SA.
+    2. Grant it `roles/alloydb.client` + `roles/alloydb.databaseUser`.
+    3. Grant the CI runner (or WIF principal) `roles/iam.serviceAccountTokenCreator` on the new SA.
+    4. Add the new SA as an IAM user in AlloyDB (type IAM, `alloydbiamuser`).
+  </Step>
+
+  <Step title="In AlloyDB (single migration)">
+    ```sql
+    -- Make it a member of the migrator group
+    GRANT orbiter_migrator TO "orbiter-ci-migrator@orbiter-io.iam";
+
+    -- Auto-SET role on every session
+    ALTER ROLE "orbiter-ci-migrator@orbiter-io.iam" SET role = 'orbiter_migrator';
+
+    -- Optional: remove the old SA's membership once you've cut over
+    -- ALTER ROLE "orbiter-database-account@orbiter-io.iam" RESET role;
+    -- REVOKE orbiter_migrator FROM "orbiter-database-account@orbiter-io.iam";
+    ```
+  </Step>
+</Steps>
+
+<Note>
+No data moves. No ownership changes. The CI SA inherits exactly the same privileges via group membership.
+</Note>
+
+## Verification queries
+
+Drop these into Studio whenever something feels off.
+
+<AccordionGroup>
+  <Accordion title="Who owns what?" icon="user-tag">
+    ```sql
+    SELECT schemaname, tablename, tableowner
+    FROM pg_tables
+    WHERE schemaname NOT IN ('pg_catalog','information_schema')
+    ORDER BY schemaname, tablename;
+    ```
+
+    Every row's `tableowner` should be `orbiter_migrator`. Anything else is ownership drift and a candidate for `REASSIGN OWNED BY`.
+  </Accordion>
+
+  <Accordion title="Who's in the migrator group?" icon="users">
+    ```sql
+    SELECT m.rolname AS member
+    FROM pg_auth_members am
+    JOIN pg_roles m ON m.oid = am.member
+    JOIN pg_roles g ON g.oid = am.roleid
+    WHERE g.rolname = 'orbiter_migrator';
+    ```
+  </Accordion>
+
+  <Accordion title="Does the SA auto-SET role on login?" icon="gear">
+    ```sql
+    SELECT rolname, rolconfig
+    FROM pg_roles
+    WHERE rolname = 'orbiter-database-account@orbiter-io.iam';
+    ```
+
+    `rolconfig` should include `role=orbiter_migrator`. If it doesn't, run:
+
+    ```sql
+    ALTER ROLE "orbiter-database-account@orbiter-io.iam" SET role = 'orbiter_migrator';
+    ```
+  </Accordion>
+
+  <Accordion title="What schemas exist and who owns them?" icon="folder-tree">
+    ```sql
+    SELECT nspname AS schema, pg_get_userbyid(nspowner) AS owner
+    FROM pg_namespace
+    WHERE nspname NOT IN ('pg_catalog','information_schema')
+      AND nspname NOT LIKE 'pg_%';
+    ```
+
+    App schemas should be owned by `orbiter_migrator`. AlloyDB-managed schemas (`google_ml`, `ai`) are owned by `alloydbadmin` — that's correct and required, leave them alone.
+  </Accordion>
+</AccordionGroup>
+
+## Common errors and what they mean
+
+<AccordionGroup>
+  <Accordion title="permission denied for table schema_migrations" icon="triangle-exclamation">
+    Someone ran a migration as an identity that doesn't own `schema_migrations`. Either:
+
+    - The DSN uses the wrong username, or
+    - Auto-`SET role` isn't configured for the principal you're connecting as, or
+    - The table was created by a different identity historically.
+
+    **Fix:**
+
+    ```sql
+    REASSIGN OWNED BY "<the-other-identity>" TO orbiter_migrator;
+    ```
+  </Accordion>
+
+  <Accordion title='must be able to SET ROLE "..."' icon="triangle-exclamation">
+    You're trying to `ALTER OWNER ... TO <role>` but you aren't a member of `<role>`. Postgres requires the new owner to be a role you have rights to act as.
+
+    **Fix:** grant yourself membership first:
+
+    ```sql
+    GRANT <role> TO "<your-iam-identity>";
+    ```
+  </Accordion>
+
+  <Accordion title="must be owner of view google_db_advisor_* / hypopg_*" icon="triangle-exclamation">
+    These are AlloyDB-managed objects. Don't try to reassign them. Filter them out by skipping anything that's part of a Postgres extension:
+
+    ```sql
+    SELECT c.relname
+    FROM pg_class c
+    WHERE NOT EXISTS (
+      SELECT 1 FROM pg_depend d
+      WHERE d.objid = c.oid AND d.deptype = 'e'
+    );
+    ```
+  </Accordion>
+
+  <Accordion title="instance closed the connection" icon="triangle-exclamation">
+    The proxy reached AlloyDB but AlloyDB rejected the auth handshake. Causes, in order of likelihood:
+
+    1. DSN username doesn't match the IAM principal. For SAs, the role name is the email **without** `.gserviceaccount.com`. URL-encode the `@` as `%40`.
+    2. The principal doesn't have `roles/alloydb.databaseUser` at the project level.
+    3. The principal isn't registered as an IAM user in the AlloyDB cluster.
+  </Accordion>
+
+  <Accordion title="password authentication failed" icon="triangle-exclamation">
+    The proxy is running without `--auto-iam-authn`, so it forwarded the literal `password` from the DSN, which AlloyDB rejected. Restart the proxy with `--auto-iam-authn`.
+  </Accordion>
+
+  <Accordion title="permission denied for schema public on REASSIGN OWNED BY" icon="triangle-exclamation">
+    `orbiter_migrator` doesn't yet have `CREATE` on the schemas where the source identity owns objects.
+
+    **Fix:**
+
+    ```sql
+    GRANT CREATE, USAGE ON SCHEMA <each-schema> TO orbiter_migrator;
+    ```
+
+    Then retry the REASSIGN.
+  </Accordion>
+
+  <Accordion title="iam.serviceAccounts.getAccessToken denied" icon="triangle-exclamation">
+    You ran `gcloud auth application-default login --impersonate-service-account=...` but your human account doesn't have `roles/iam.serviceAccountTokenCreator` on the target SA.
+
+    **Fix:** Console → Service Accounts → that SA → Permissions → grant your account `Service Account Token Creator` on that SA specifically.
+  </Accordion>
+</AccordionGroup>
+
+## Glossary
+
+| Term | Meaning |
+|---|---|
+| **ADC** | Application Default Credentials — credentials cached by gcloud at `~/.config/gcloud/application_default_credentials.json`. Used by GCP client libraries (and the AlloyDB proxy) automatically. |
+| **Impersonation** | The act of one identity assuming another's permissions via short-lived tokens. Requires `roles/iam.serviceAccountTokenCreator` on the target. |
+| **Service account (SA)** | A non-human GCP identity. Used by automation (CI, Cloud Run services) and by humans via impersonation. Has no password, only a token-mint protocol. |
+| **IAM auth (AlloyDB)** | AlloyDB authenticates the session against the IAM principal carried in the connection token, instead of a username/password. Enabled by `--auto-iam-authn` on the proxy. |
+| **LOGIN role** | A Postgres role that can authenticate and start a session. Every IAM user maps to one. |
+| **NOLOGIN role** | A Postgres role used only as a group / ownership target. Members inherit its privileges. `orbiter_migrator` is this. |
+| **`ALTER ROLE … SET role`** | A Postgres setting that auto-runs `SET ROLE <other>` at session start. We use it on the migration SA so its sessions always act as `orbiter_migrator`. |
+| **`REASSIGN OWNED BY A TO B`** | Bulk-transfers ownership of every object owned by role A to role B, in the current database. Skips extension-owned objects. |
+| **`alloydbsuperuser`** | AlloyDB's strongest customer-facing role. Strong, but not equivalent to Postgres's true `SUPERUSER` (which AlloyDB does not expose). |
+| **AlloyDB Auth Proxy** | A local process that opens a Postgres-protocol tunnel to AlloyDB, handling encryption and (with `--auto-iam-authn`) IAM token injection. Run it once per dev session. |
+
+## When in doubt
+
+<CardGroup cols={2}>
+  <Card title="Authenticating from your laptop?" icon="laptop">
+    Always use `--impersonate-service-account=orbiter-database-account@orbiter-io.iam.gserviceaccount.com`.
+  </Card>
+  <Card title="Running DDL?" icon="database">
+    Only through `migrations/`, never in Studio.
+  </Card>
+  <Card title="Adding a person or SA?" icon="user-plus">
+    Two grants: token creator on the SA in GCP IAM, group membership in SQL.
+  </Card>
+  <Card title="Seeing a permission error?" icon="circle-question">
+    Check the [Common errors](#common-errors-and-what-they-mean) section. If it's not there, paste the exact error to the team channel.
+  </Card>
+</CardGroup>

@@ -1,0 +1,506 @@
+---
+title: "Migrations & sqlc"
+description: "How we evolve the database schema and generate Go code from SQL."
+---
+
+This document covers how schema changes happen in this codebase and how the typed Go query layer is generated. It is the "what tool does what and why" guide for new contributors writing their first migration.
+
+<Info>
+If you're looking for **who can connect to AlloyDB and how**, see [Database Access & Management](/guides/orbiter-backend/database/database-access). This doc assumes you already have working credentials.
+</Info>
+
+## TL;DR
+
+<CardGroup cols={2}>
+  <Card title="golang-migrate" icon="arrow-up-right-from-square">
+    Applies SQL migration files from `migrations/` in timestamp order.
+  </Card>
+  <Card title="sqlc" icon="code">
+    Generates type-safe Go code from `.sql` query files. Real SQL on disk, real SQL at runtime.
+  </Card>
+  <Card title="No ORM" icon="ban">
+    GORM and Ent are **not used**. We write SQL; the Go layer is generated, not handcrafted.
+  </Card>
+  <Card title="One schema per feature" icon="folder-tree">
+    `files.*`, `outcomes.*`, etc. Each feature owns its migrations, queries, and generated `db/` package.
+  </Card>
+</CardGroup>
+
+## The toolchain in one picture
+
+```
+   migrations/                 internal/features/<feature>/queries/
+   ├─ *_files_001_init.up.sql   ├─ files.sql         ← you write
+   ├─ *_files_002_…             ├─ file_chunks.sql   ← you write
+   └─ *_outcomes_001_…          └─ …
+        │                            │
+        │ applied by                 │ read by
+        │ golang-migrate             │ sqlc
+        ▼                            ▼
+   ┌────────────┐               ┌──────────────────────────────────┐
+   │  AlloyDB   │ ◀── schema ── │  sqlc.yaml                       │
+   │   (live)   │   (read)      │  reads schema from migrations/   │
+   └────────────┘               │  + queries from queries/         │
+                                │  → emits internal/.../db/*.go    │
+                                └──────────────────────────────────┘
+                                            │
+                                            ▼
+                                   internal/features/<feature>/db/
+                                   ├─ models.go            ← generated
+                                   ├─ files.sql.go         ← generated
+                                   ├─ file_chunks.sql.go   ← generated
+                                   └─ db.go                ← generated
+```
+
+<Note>
+`sqlc` reads the same migration files that `golang-migrate` runs against the live database. There is no separate schema definition. **The SQL files are the single source of truth.**
+</Note>
+
+## Why `sqlc` (and not an ORM)
+
+### What `sqlc` is
+
+`sqlc` is a code generator. You write SQL queries in `.sql` files, annotate each one with a name and return shape, and it emits Go functions that execute those exact queries with typed arguments and typed results.
+
+<CodeGroup>
+
+```sql The query you write
+-- name: GetFileByID :one
+SELECT id, file_name, status, created_at
+FROM files.files
+WHERE id = $1;
+```
+
+```go The Go you call
+file, err := queries.GetFileByID(ctx, fileID)
+// fileID is uuid.UUID, file is db.File
+```
+
+</CodeGroup>
+
+No reflection, no DSL, no struct tags. The SQL on disk is the SQL that runs. Postgres sees exactly what you wrote.
+
+### Benefits
+
+| Property | Why it matters |
+|---|---|
+| **Real SQL** | Everything Postgres supports works — CTEs, window functions, `LATERAL` joins, vector operators (`<=>`, `<->`, `<#>`), `JSONB` path queries, `RETURNING`. No "your ORM doesn't support this" moments. |
+| **Compile-time safety** | If you rename a column in a migration, regenerating sqlc fails the build at the call sites that reference the old name. Type mismatches surface during `go build`, not in production. |
+| **Performance** | Generated code uses `pgx/v5` directly. There is no reflection, no query builder overhead, no N+1 surprises. A `GetFileByID` call is essentially the same cost as writing `pgx.QueryRow` by hand. |
+| **Reviewability** | Code review reads as SQL plus Go. Reviewers see exactly which query hits the database. No need to mentally simulate what an ORM would emit. |
+| **Migration-aligned** | `sqlc` reads schema from `migrations/` directly. The generated types always match what the live database actually looks like — schema and code can't drift. |
+| **No runtime schema fiction** | ORMs maintain their own model of the schema and rely on it matching the database. With sqlc the database is the model. |
+
+### Why not an ORM?
+
+<Tabs>
+  <Tab title="Why not GORM">
+    GORM is the most popular Go ORM, and we don't use it. Concretely:
+
+    <AccordionGroup>
+      <Accordion title="No first-class pgvector support" icon="vector-square">
+        GORM has no native handling for `vector` columns, the `<=>` / `<->` / `<#>` distance operators, or vector index hints. You'd be writing `db.Raw("SELECT … <=> ?", vec)` for every similarity query, which is just sqlc with extra steps and no compile-time checking.
+      </Accordion>
+      <Accordion title="No AlloyDB ScaNN awareness" icon="circle-info">
+        ScaNN indexes need specific query shapes (`ORDER BY embedding <=> $1 LIMIT N`) and sometimes index hints to be used by the planner. GORM's generic query builder will not produce these reliably.
+      </Accordion>
+      <Accordion title="Reflection-heavy" icon="gauge-high">
+        Every query reflects on struct tags at runtime to map results. Measurable overhead at the volumes we expect from vector search and chunk-level operations.
+      </Accordion>
+      <Accordion title="Schema drift risk" icon="triangle-exclamation">
+        GORM has an "auto-migrate" feature that mutates the live schema to match Go structs. We never want this on a real database — it bypasses migrations entirely and is the kind of feature that drops a column in prod because someone renamed a Go field.
+      </Accordion>
+      <Accordion title="SQL becomes invisible" icon="eye-slash">
+        The cost of a query is hidden behind chains of `.Where().Joins().Preload(…)`. Hard to grep, hard to review, hard to EXPLAIN.
+      </Accordion>
+    </AccordionGroup>
+  </Tab>
+  <Tab title="Why not Ent">
+    Ent is a schema-first ORM from Facebook/Meta. Closer to sqlc in spirit than GORM, but still wrong for us:
+
+    <AccordionGroup>
+      <Accordion title="Schema DSL, not SQL" icon="code">
+        You define entities in Go, and Ent generates SQL. That's the wrong direction for a codebase whose schema is shaped by Postgres-specific features (per-feature schemas, `vector(768)` columns, partial indexes, `IDENTITY` columns, `GENERATED ALWAYS AS`). Every advanced feature becomes an Ent escape hatch.
+      </Accordion>
+      <Accordion title="Vector types not supported" icon="vector-square">
+        Same story as GORM. There is no `Vector` field type. Embeddings have to round-trip through `Bytes` or `Other` with custom encoding, and similarity queries fall back to raw SQL.
+      </Accordion>
+      <Accordion title="Migration tooling is Ent-specific" icon="wrench">
+        Ent ships its own migration approach (Atlas). Mixing it with `golang-migrate` and Postgres-native tooling adds complexity for no gain on a project this size.
+      </Accordion>
+      <Accordion title="Generated types add a layer" icon="layer-group">
+        Ent's `Client`/`Query` builder is another abstraction over `database/sql`. We want the fewest layers between us and `pgx`.
+      </Accordion>
+    </AccordionGroup>
+  </Tab>
+</Tabs>
+
+### What we lose by not using an ORM
+
+To be fair: an ORM gives you cheap CRUD scaffolding, automatic association management, and "the same code works against any database." We give those up. We pay for that with:
+
+- A handful more `.sql` files per feature (one per logical query group).
+- Explicit FK navigation — you write a join when you need joined data.
+- No backend portability — we're Postgres-only.
+
+<Tip>
+For a backend whose value depends on getting Postgres-native features (vectors, partial indexes, `LISTEN/NOTIFY` later, etc.) right, these are good trade-offs.
+</Tip>
+
+## Repository layout
+
+Each feature follows the same shape:
+
+```
+internal/features/<feature>/
+├─ db/                    ← generated by sqlc — DO NOT edit by hand
+│  ├─ db.go
+│  ├─ models.go
+│  ├─ files.sql.go
+│  └─ …
+├─ queries/               ← you author these
+│  ├─ files.sql
+│  ├─ file_chunks.sql
+│  └─ …
+├─ repo.go                ← thin wrapper around generated db package
+├─ service.go             ← business logic
+├─ handler.go             ← HTTP handlers (api features)
+└─ …
+```
+
+<Info>
+Migrations live at the repo root in `migrations/`, not under any feature folder — `golang-migrate` needs them all in one place and applies them globally in timestamp order. The file name carries the feature association.
+</Info>
+
+## Naming and conventions
+
+<Note>
+Authoritative source: `migrations/CLAUDE.md`. Summary here for orientation.
+</Note>
+
+### Migration file names
+
+```
+{YYYYMMDDHHMMSS}_{feature}_{seq}_{description}.{up,down}.sql
+```
+
+- `feature` matches `internal/features/<feature>` (e.g. `files`, `outcomes`).
+- `seq` is `001`, `002`, `003`… within that feature.
+- Always create matching `up` and `down` files.
+
+Example pair:
+
+```
+20260612091500_files_009_add_thumbnail_url.up.sql
+20260612091500_files_009_add_thumbnail_url.down.sql
+```
+
+### Schemas per feature
+
+- One Postgres schema per feature. `files.*`, `outcomes.*`, etc.
+- Migrations only touch their owning feature's schema (plus extensions in initial migrations like `CREATE EXTENSION IF NOT EXISTS vector`).
+- Cross-feature DDL: split it into two migrations, one per feature.
+
+### Vector & ScaNN
+
+- `CREATE EXTENSION IF NOT EXISTS vector;` is safe everywhere.
+- `alloydb_scann` is AlloyDB-only. Do not include it in code paths that run against local Postgres / CI Docker (`pgvector/pgvector:pg16`).
+- Don't add a ScaNN index until a table has >10K rows. Below that, brute-force `<=>` scans are faster. Add the index in a separate migration once data has accumulated.
+
+### Things not to do
+
+<Warning>
+- **Don't squash migrations.** Always add a new migration on top. Existing migration files are immutable once merged.
+- **Don't reuse a timestamp.** Two migrations with the same prefix is undefined ordering.
+- **Don't put cross-feature DDL in one file.** Even if "it's just one little FK," split it.
+- **Don't edit generated `db/*.go` files by hand.** Regenerate.
+</Warning>
+
+## Workflow: adding a new query
+
+You want a new query: "list pitch profiles created in the last 24h."
+
+<Steps>
+  <Step title="Decide which feature owns it">
+    In this case, `files`.
+  </Step>
+
+  <Step title="Open or create the relevant query file">
+    Open or create the relevant query file under `internal/features/files/queries/`. Group queries by table — `pitch_profiles.sql` if not already present.
+  </Step>
+
+  <Step title="Add the query with sqlc annotations">
+    ```sql
+    -- name: ListRecentPitchProfiles :many
+    SELECT id, file_id, summary, created_at
+    FROM files.pitch_profiles
+    WHERE created_at >= $1
+    ORDER BY created_at DESC
+    LIMIT $2;
+    ```
+
+    Annotation syntax:
+
+    | Suffix | Returns |
+    |---|---|
+    | `:one` | Single row or `pgx.ErrNoRows` |
+    | `:many` | `[]Row` (possibly empty) |
+    | `:exec` | No rows (INSERT/UPDATE/DELETE without RETURNING) |
+    | `:execrows` | Affected row count |
+    | `:execresult` | The raw result (rarely needed) |
+    | `:copyfrom` | Uses `pgx.CopyFrom` for bulk insert |
+  </Step>
+
+  <Step title="Regenerate">
+    ```bash
+    make sqlc-generate
+    ```
+  </Step>
+
+  <Step title="Use the generated function">
+    A new Go function appears in the generated package. Use it:
+
+    ```go
+    profiles, err := repo.queries.ListRecentPitchProfiles(ctx, since, 100)
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+That's the entire loop. No struct tag wrangling, no migration update, no schema mismatch risk.
+</Tip>
+
+## Workflow: adding a new migration
+
+You need a schema change: "add a `thumbnail_url` column to `files.files`."
+
+<Steps>
+  <Step title="Determine the next seq for the feature">
+    Look at existing files — if the latest is `…_files_008_…`, this is `009`.
+  </Step>
+
+  <Step title="Create the up/down pair">
+    Use current UTC timestamp:
+
+    ```bash
+    TS=$(date -u +%Y%m%d%H%M%S)
+    touch migrations/${TS}_files_009_add_thumbnail_url.up.sql
+    touch migrations/${TS}_files_009_add_thumbnail_url.down.sql
+    ```
+  </Step>
+
+  <Step title="Write the up migration">
+    ```sql
+    ALTER TABLE files.files
+      ADD COLUMN thumbnail_url text;
+    ```
+  </Step>
+
+  <Step title="Write the down migration">
+    It should exactly reverse the up:
+
+    ```sql
+    ALTER TABLE files.files
+      DROP COLUMN thumbnail_url;
+    ```
+  </Step>
+
+  <Step title="Apply locally first">
+    Uses the Docker pgvector container from `compose.yml`:
+
+    ```bash
+    make migrate-up-local
+    ```
+  </Step>
+
+  <Step title="Regenerate sqlc if needed">
+    If queries reference the new column:
+
+    ```bash
+    make sqlc-generate
+    ```
+  </Step>
+
+  <Step title="Update callers and commit together">
+    Update query files / handlers that need the new column. Commit migration + generated code + handlers together so reviewers can see the full change set.
+  </Step>
+
+  <Step title="Apply to AlloyDB through the auth proxy">
+    See [Database Access & Management](/guides/orbiter-backend/database/database-access) for proxy + impersonation setup:
+
+    ```bash
+    make migrate-up-alloydb
+    ```
+  </Step>
+</Steps>
+
+### When to use a separate migration for indexes
+
+Indexes — especially vector indexes — can take significant time and hold locks. Don't bundle them with column adds:
+
+- A column add is fast and additive; safe to roll into a feature migration.
+- A `CREATE INDEX` (or worse, `CREATE INDEX CONCURRENTLY` which can't run in a transaction) goes in its own migration.
+
+<Note>
+For ScaNN specifically: wait until the table has actual data, then add the index in a dedicated migration named something like `…_files_NNN_add_pitch_profile_scann_index.up.sql`.
+</Note>
+
+## Workflow: adding a vector column
+
+Two parts: the migration, then the sqlc override.
+
+<Steps>
+  <Step title="Migration">
+    ```sql
+    -- migrations/…_files_010_add_embedding_to_chunks.up.sql
+    ALTER TABLE files.file_chunks
+      ADD COLUMN embedding vector(768);
+    ```
+  </Step>
+
+  <Step title="sqlc.yaml override">
+    Vector columns need an explicit type override so the generated Go uses `pgvector.Vector` instead of `interface{}` or a string. Add to the relevant feature's `overrides:` block in `sqlc.yaml`:
+
+    ```yaml
+    # NOT NULL embedding column → pgvector.Vector
+    - column: "files.file_chunks.embedding"
+      go_type:
+        import: "github.com/pgvector/pgvector-go"
+        type: "Vector"
+
+    # Nullable embedding column → *pgvector.Vector
+    # (requires emit_pointers_for_null_types: true, which we already set)
+    - column: "files.file_chunks.embedding"
+      go_type:
+        import: "github.com/pgvector/pgvector-go"
+        type: "Vector"
+        pointer: true
+    ```
+  </Step>
+
+  <Step title="Regenerate">
+    ```bash
+    make sqlc-generate
+    ```
+
+    In Go you now write embeddings as `pgvector.NewVector(floats)` and read them as `[]float32` via `.Slice()`. No serialization yak-shaving.
+  </Step>
+</Steps>
+
+### Similarity queries
+
+The vector operators (`<=>` cosine distance, `<->` L2 distance, `<#>` inner product) are just operators in the query — sqlc passes them through untouched:
+
+```sql
+-- name: FindSimilarChunks :many
+SELECT id, file_id, content, embedding <=> $1 AS distance
+FROM files.file_chunks
+WHERE embedding IS NOT NULL
+ORDER BY embedding <=> $1
+LIMIT $2;
+```
+
+<Tip>
+Generated function takes `pgvector.Vector` and `int32`, returns rows with a `Distance float64`. Real SQL, real types, zero glue code.
+</Tip>
+
+## `sqlc.yaml` — what to know
+
+Top-level keys per feature bucket:
+
+```yaml
+- engine: "postgresql"
+  queries: "internal/features/<feature>/queries"
+  schema: "migrations"
+  strict_function_checks: true
+  gen:
+    go:
+      package: "db"
+      out: "internal/features/<feature>/db"
+      sql_package: "pgx/v5"
+      emit_pointers_for_null_types: true
+      overrides:
+        - column: "<schema>.<table>.<column>"
+          go_type: …
+```
+
+Key choices:
+
+| Setting | Why |
+|---|---|
+| `schema: "migrations"` | sqlc reads the canonical migration files to learn the schema. Single source of truth. |
+| `sql_package: "pgx/v5"` | We use `pgx`, not `database/sql`. Faster, supports `pgx`-specific features like `CopyFrom`. |
+| `strict_function_checks: true` | Catches calls to nonexistent SQL functions at generation time. |
+| `emit_pointers_for_null_types: true` | Nullable columns become `*T` instead of `pgtype.Null*`. Much nicer at call sites. |
+| `overrides` | Where UUIDs become `google/uuid.UUID` and vector columns become `pgvector.Vector`. |
+
+<Note>
+When you add a new feature, you add a new bucket to `sqlc.yaml` for it.
+</Note>
+
+## When things go wrong
+
+<AccordionGroup>
+  <Accordion title="sqlc generate complains about a missing column" icon="triangle-exclamation">
+    You added a query before adding the migration that creates the column.
+
+    **Fix:** write the migration first, then the query. sqlc reads schema from the migration files, so the column has to exist there before any query can reference it.
+  </Accordion>
+
+  <Accordion title="Generated db/*.go doesn't compile after a schema change" icon="triangle-exclamation">
+    You renamed/removed a column. Generated callers (in `repo.go`, `service.go`, etc.) still reference the old field.
+
+    This is sqlc working correctly — the build break flags every call site that needs updating.
+  </Accordion>
+
+  <Accordion title="A nullable column generated as non-pointer" icon="triangle-exclamation">
+    Confirm `emit_pointers_for_null_types: true` is set for the bucket. If the column was added in a recent migration, the existing `db/` may be stale — run `make sqlc-generate`.
+  </Accordion>
+
+  <Accordion title="Vector column generated as interface{} or a string" icon="triangle-exclamation">
+    Missing override in `sqlc.yaml` for that column. Add it:
+
+    ```yaml
+    - column: "<schema>.<table>.<column>"
+      go_type:
+        import: "github.com/pgvector/pgvector-go"
+        type: "Vector"
+        pointer: true   # only if nullable
+    ```
+  </Accordion>
+
+  <Accordion title="Migration applied locally but not to AlloyDB" icon="triangle-exclamation">
+    `make migrate-up-local` hits the Docker pgvector container only. `make migrate-up-alloydb` is a separate target and requires the auth proxy plus impersonation (see [Database Access & Management](/guides/orbiter-backend/database/database-access)).
+
+    Both must be run when you're ready to ship a schema change.
+  </Accordion>
+
+  <Accordion title='pq: relation "<table>" already exists running migrations' icon="triangle-exclamation">
+    You've applied a migration manually (e.g., copy-pasted DDL into Studio to "just check it works"). Don't do that — see the [Database Access & Management](/guides/orbiter-backend/database/database-access) "one hard rule" section.
+
+    If it already happened, `DROP` the offending object in Studio and re-run `make migrate-up-alloydb` so the migration is properly recorded in `public.schema_migrations`.
+  </Accordion>
+</AccordionGroup>
+
+## Glossary
+
+| Term | Meaning |
+|---|---|
+| **Migration** | A `.up.sql` / `.down.sql` pair in `migrations/`. Applied by `golang-migrate`. Versioned, ordered by timestamp. |
+| **Query file** | A `.sql` file under a feature's `queries/` directory. Read by sqlc, not by `golang-migrate`. Contains annotated queries that become Go functions. |
+| **Annotation** | The `-- name: Foo :one` line above a query. Tells sqlc the function name and return shape. |
+| **Override** | A `sqlc.yaml` mapping from a SQL column to a specific Go type (e.g., `uuid.UUID`, `pgvector.Vector`). |
+| **Bucket** | One entry under `sql:` in `sqlc.yaml`. Each feature has its own bucket so generated code is colocated with the feature. |
+| **ScaNN** | AlloyDB's vector index. Faster than `hnsw` / `ivfflat` at our target dimensions. Add only when a table has >10K rows. |
+| **`pgvector-go`** | The Go shim for `pgvector` types. Provides `Vector` and `HalfVector` types that `pgx` can scan natively. |
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Database Access & Management" icon="key" href="/guides/orbiter-backend/database/database-access">
+    AlloyDB authentication, IAM impersonation, and the `orbiter_migrator` ownership model.
+  </Card>
+  <Card title="Xano Migration plan" icon="route" href="/guides/xano-migration/index">
+    The strategy for transitioning the Orbiter backend from Xano to native Go.
+  </Card>
+</CardGroup>

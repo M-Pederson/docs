@@ -45,6 +45,9 @@ The orchestrator stays best-effort: every new step gets its own `try_catch` and 
 | Schema gaps vs #2811 | Extend the new-company-enrichment LLM schema with `went_public_on` and `stock_link`. Single source of truth in the LLM payload. |
 | Fate of #2811 | Leave it. Not called by v4, not deleted. |
 | Signal NFX storage | New fields on `company_enrich_data`: `signal_nfx_scrape` (raw Firecrawl markdown) and `signal_nfx_json` (LLM-parsed JSON). NOT `permalink_company.signal_page` as originally suggested — pivoted mid-plan. |
+| Fundable-deals staleness gate | Lives inside `mvp/investor/cascade-deal-participants` (#12856) — single source of truth for both company-side (Phase 7) and person-side (Phase 9) callers. |
+| Fundable re-process mode | Trust MERGE idempotency (re-run the same Cypher; node + edges land in place). Verify #12856 uses MERGE everywhere before deploy. Known limitation: won't catch investor *removals* from a deal (rare in Fundable) — only adds and updates. |
+| Staleness check frequency | Runs on every orchestrator invocation. The gate is a cheap SQL timestamp diff and returns "skip" immediately for deals with no Fundable updates since last sync. |
 
 ### v4 step list
 
@@ -60,7 +63,7 @@ The orchestrator stays best-effort: every new step gets its own `try_catch` and 
 | 8 | **Phase 3 — YC** | `mvp/enrich/process-company-phase-3` (#12799) | Always. (Unchanged.) Detects YC deal history, scrapes YC data, cascades to `process-yc-people`. |
 | 9 | **Phase 5 — Fundable backfill** | `mvp/enrich/process-company-phase-5` (#12809) | Always. (Unchanged.) `fundable-lookup` if `company_enrich_data.fundable` empty; writes industries, specialties, descriptions, banner, HQ, founded year, LinkedIn followers, social links. |
 | 10 | **Phase 6 — Fundable link res + financial** | `mvp/enrich/process-company-phase-6` (#12810) | Always. (Unchanged.) Resolves a `fundable_org` by domain when `fundable_org_id` still missing; upserts `company_financial` with `funding_total`, `total_rounds_raised`, `is_public`. |
-| 11 | **Phase 7 — Fundable deals** | `mvp/enrich/process-company-phase-7` (#12813) | Always when a `fundable_org` exists. (Unchanged.) Calls `mvp/funding/add-all-fundable-deals` (#12703). |
+| 11 | **Phase 7 — Fundable deals** (idempotent re-sync) | `mvp/enrich/process-company-phase-7` (#12813) → `mvp/funding/add-all-fundable-deals` (#12703) → `mvp/investor/cascade-deal-participants` (#12856 — **patched with staleness gate**) | Always when a `fundable_org` exists. Phase 7 still iterates every deal for the org (rounds raised + rounds invested in). The staleness gate inside #12856 decides per-deal whether to re-process: skip when `fundable_deals.processed_at >= MAX(deal.updated_at, deal's investments.updated_at, deal's investor-personnel.updated_at)`; re-process otherwise via MERGE. After re-process, write `fundable_deals.processed_at = now`. See "Fundable-deals idempotent re-sync" section below. |
 | 12 | **Resolve company specialties** | `mvp/expertise/resolve-company-specialties` (#12746) | Always. (Unchanged.) Embeds specialties, vector-searches `SubDomainExpertise` nodes, creates `SPECIALIZES_IN` edges. |
 | 13 | **LLM company-about** | `mvp/about/llm-company-about` | Always. (Unchanged.) Builds the polished `about` / `about_500` copy. |
 | 14 | **Add company locations** | `mvp/address/add-company-locations` | Always. (Unchanged.) Promotes best `address_join` to `primary_location`; writes `LOCATED_IN`, `IN_REGION`, `IN_COUNTRY` edges. |
@@ -100,6 +103,40 @@ When the LLM preflight runs (step 2), the model chain is:
 3. **Website scrape + 3rd LLM call (Sonnet 4.6, no `:online`)** — fires when Sonnet's `confidence` is still `< 0.7` AND `master_company.company_domain` is non-empty. Scrapes the homepage + `/about` + `/contact` via Firecrawl, injects the extracted text into a third LLM call as authoritative context, and re-extracts the JSON schema. The LLM still does the structured extraction; the scrape just gives it the source-of-truth content the web grounding missed.
 4. **Accept result, no crash flag** — when the scrape-LLM tier also stays low confidence OR no domain is available, save whatever was returned and continue. Low confidence is information, not failure; downstream consumers can filter on `_meta.confidence`.
 
+### Fundable-deals idempotent re-sync
+
+Fundable updates its underlying tables continuously — new deals land, existing deals get amended, and new investor rows get attached to existing deals (sometimes without bumping the parent deal's `updated_at`). The v4 orchestrator must leave the graph fully in sync with Fundable's current state on every run, not just the first one.
+
+**Mechanism: graduate `fundable_deals.processed_at` from a binary "processed" gate to a staleness comparison.**
+
+Today `fundable_deals.processed_at` is set when `cascade-deal-participants` materializes a deal into the graph; if non-null, the cascade skips that deal forever. That's "process once" — it misses every subsequent Fundable update. The fix: compare timestamps instead of checking for null.
+
+**A deal needs re-processing when any of these are true:**
+
+```sql
+deal.processed_at IS NULL                                                  -- new deal, never processed
+OR deal.updated_at > deal.processed_at                                     -- Fundable updated the deal itself
+OR EXISTS (
+     SELECT 1 FROM fundable_institutional_investments inv
+     WHERE inv.deal_id = deal.id
+       AND inv.updated_at > deal.processed_at                              -- new or updated investor on this deal
+   )
+OR EXISTS (
+     SELECT 1 FROM fundable_institutional_investments_person inv_p
+     JOIN fundable_institutional_investments inv ON inv.id = inv_p.institutional_investment_id
+     WHERE inv.deal_id = deal.id
+       AND inv_p.updated_at > deal.processed_at                            -- new partner link on this investment
+   )
+```
+
+**Where the gate lives:** inside `mvp/investor/cascade-deal-participants` (#12856), at the top of the function before any graph writes. Single source of truth — `process-company-phase-7` (v4 step 11), `process-person-phase-9`, and any future caller all get idempotent re-sync for free.
+
+**Re-process strategy:** trust MERGE idempotency. Re-running the same `MERGE (fr:Funding_Round {id: $dealId}) ... MERGE (org)-[:INVESTED_IN]->(fr)` lands the node + edges in place; no duplicates. After a successful re-process, update `fundable_deals.processed_at = now`.
+
+**Known limitation:** this strategy does not detect investor *removals* from a deal in Fundable (rare). If an `INVESTED_IN` row disappears from `fundable_institutional_investments` between syncs, the corresponding graph edge will remain orphaned. Accept this for v4; revisit if Fundable's investor-removal rate turns out to matter.
+
+**Verification step before deploy:** confirm #12856 uses `MERGE` (not `CREATE`) for every Funding_Round node and every `INVESTED_IN` / `LEAD_INVESTED_IN` / `INVESTMENT_PARTNER_IN` edge. If any `CREATE` slipped in, re-running would create duplicates. The function description claims MERGE everywhere; verify by reading the XanoScript before patching the gate.
+
 ### Dependencies to verify / patch before deploy
 
 - **`thesis/gather-investor-context-v3` (#12911)** — confirm it reads signal data from `company_enrich_data.signal_nfx_json` (new location), not `permalink_company.signal_json` (legacy location). Patch if needed; otherwise the freshly-scraped Signal data won't make it into the thesis build.
@@ -107,6 +144,7 @@ When the LLM preflight runs (step 2), the model chain is:
 - **`mvp/enrich/new-company-enrichment` (#12974)** — extend the system prompt + JSON schema with `went_public_on` and `stock_link`.
 - **`mvp/node/update-company-node` (#4659)** — bump to v1.6, read FalkorDB-bound LLM properties from `company_llm` payload.
 - **`fundable_org` table classification field** — confirm we have a reliable VC-firm boolean (or `entity_type` enum) to drive the `is_vc` decision in step 4. If not, the `is_vc` set in step 4 needs to fall back to the LLM payload's `company_type`.
+- **`mvp/investor/cascade-deal-participants` (#12856)** — verify MERGE is used for every Funding_Round node and every INVESTED_IN / LEAD_INVESTED_IN / INVESTMENT_PARTNER_IN edge before patching the staleness gate. Add the timestamp-comparison gate at the top of the function. Set `fundable_deals.processed_at = now` after a successful re-process.
 
 ### Build sequence
 
@@ -115,6 +153,7 @@ When the LLM preflight runs (step 2), the model chain is:
 3. Build `mvp/investor/get-signal-nfx-data-company` (new). Pattern: Brave URL → Firecrawl scrape → write `signal_nfx_scrape` → LLM parse → write `signal_nfx_json` → `enrich_history_company` row.
 4. Patch `thesis/gather-investor-context-v3` (#12911) to read from `company_enrich_data.signal_nfx_json`.
 5. Bump `mvp/node/update-company-node` (#4659) to v1.6 — read LLM-bound properties from `company_llm`.
+5a. Patch `mvp/investor/cascade-deal-participants` (#12856) with the timestamp-comparison staleness gate. Verify MERGE-everywhere first; then add the gate at the top of the function. After re-process, set `fundable_deals.processed_at = now`.
 6. Build `mvp/enrich/run-base-company-enrich-v4` with the 15-step list above. Keep every step in its own `try_catch`. Maintain the `$hasCrash` flag pattern.
 7. Update Section 11 of `mvp/get-add/master-company` to call v4 instead of v3.5. Leave v3.5 in place for rollback.
 8. Active backfill: enqueue every `master_company` row with empty `company_llm` via `mvp/queue/upsert-enrich-company`. Size worker concurrency to respect OpenRouter and Firecrawl rate limits.

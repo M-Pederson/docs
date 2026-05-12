@@ -1,13 +1,133 @@
 ---
 title: "Run Base Company Enrich"
-description: "The downstream enrichment orchestrator that fires after a new master_company is created — runs all phase functions, resolves specialties, corrects names, adds locations, and syncs the FalkorDB node."
+description: "The downstream enrichment orchestrator that fires after a new master_company is created. v3.5 is in production; v4 (LLM-preflight + Fundable re-lookup + Signal NFX + investment thesis + Exa C-Suite loop) is fully planned below."
 ---
 
-<Note>
-  `mvp/enrich/run-base-company-enrich-v3` (#12814) is the orchestrator that wraps every post-creation enrichment step into a single async call. It's invoked by Section 11 of [`mvp/get-add/master-company`](/guides/open-work/new-company-enrichment) once a new `master_company` row exists. Currently gated behind a `debug.stop` in master-company while the v2.4 pipeline finishes smoke-testing — remove the guard to let it fire.
-</Note>
+<Warning>
+  **v4 refactor — fully planned, not yet built.** All open questions resolved (see the Decisions table). Next: build sequence at the bottom of this page. The Implementation section further down still describes v3.5 production behavior.
+</Warning>
 
-## Implementation
+## Refactor plan — v3.5 → v4
+
+### Goals
+
+1. **Front-load an LLM preflight.** Read `company_enrich_data.company_llm` for the target record. If empty (the common case for any record created before [new-company-enrichment](/guides/open-work/new-company-enrichment) shipped on 2026-05-11), run `mvp/enrich/new-company-enrichment` (#12974) inline and persist the response into `company_enrich_data.company_llm`. If populated, skip.
+2. **Apply the LLM payload to `master_company`** when the LLM was freshly run. Mirrors Section 10a/10b of `mvp/get-add/master-company` — writes industries, specialties, abouts, addresses, contact email/phones, profile URLs (LLM-discovered + Serper-augmented), and LLM-derived scalars. Extracted into a shared helper so master-company's Section 10 and v4 call the same code.
+3. **Fundable re-lookup when `fundable_org_id` is null** after the LLM ran. Use the LLM-discovered profile URLs + domain to re-attempt the `fundable_org` match. On hit, link both directions and set `master_company.is_vc = true` only when the matched `fundable_org` classifies as a VC firm.
+4. **Signal NFX scrape (company-side)** as a new gated step. Guard on `company_enrich_data.signal_nfx_json`. If empty, call a new `mvp/investor/get-signal-nfx-data-company` function (modeled on the person-side #2769) that finds the Signal URL via Brave (#2640), Firecrawls it, stores raw markdown in `company_enrich_data.signal_nfx_scrape`, parses to JSON via LLM (port the prompt from archived #2698), and stores the JSON in `company_enrich_data.signal_nfx_json`.
+5. **Investment thesis build/rebuild.** Once `fundable_org_id` is set (either at orchestrator entry or after the re-lookup step), check `investment_theses` by `master_company_id`. If missing OR last updated more than 30 days ago, call `thesis/build-investment-thesis-in-gcp` (#12978) — the same function for both cases (it uses `db.add_or_edit` internally).
+6. **Get C-Suite & Founders.** Guard on `company_enrich_data.exa_c_suite` presence. If empty, call `mvp/enrich/get-exa-company-c-suite` (#12988), then loop the results and create master_person rows one at a time via `mvp/get-add/master-person`. If populated, skip the entire section (Exa call + loop).
+7. **Delete dead PDL / Enrich Layer / inline name-correction code paths** — already removed in v3.5 (2026-05-11) at the orchestrator level. v4 keeps them out by design.
+8. **Bump `update-company-node` (#4659) to v1.6** to read the LLM-derived FalkorDB-bound properties (`business_model`, `primary_product_name`, `target_customers`, acquisition fields, etc.) from `company_enrich_data.company_llm` so backfilled records get those node properties.
+9. **Extend the new-company-enrichment LLM schema** to include `funding.acquired.went_public_on` (IPO date) and `stock_link` (TradingView URL) so the apply-LLM-payload helper can populate every field the orphaned #2811 (`mvp/revenue/revenue-employees-ownership`) used to write — without ever calling it.
+10. **Cut as a new function** `mvp/enrich/run-base-company-enrich-v4` so v3.5 stays available for rollback. Update Section 11 of `mvp/get-add/master-company` to point to v4 once smoke-tested.
+11. **Active backfill** of every pre-2026-05-11 record with empty `company_llm` via `mvp/queue/upsert-enrich-company` — workers process the queue at a rate that respects OpenRouter and Firecrawl limits.
+
+The orchestrator stays best-effort: every new step gets its own `try_catch` and feeds `$hasCrash` the same way every existing step does.
+
+### Decisions table (locked in)
+
+| Topic | Decision |
+|---|---|
+| LLM-run flag | Presence of `company_enrich_data.company_llm` payload. No new column. |
+| Model tiering on backfill | Same as Section 5 of master-company — Gemini Flash `:online` default, Sonnet 4.6 `:online` escalation when `gemini_confidence < 0.7`. |
+| Serper post-LLM batch | Runs on backfill records the same way it runs on fresh creates. |
+| Apply-LLM-payload structure | Extract Section 10a/10b of master-company into a shared helper (e.g. `mvp/enrich/apply-company-llm-payload`). Both master-company and v4 call it. |
+| Fundable-first records | LLM still runs when `company_llm` is empty, even if `fundable_org_id` is already set. |
+| FalkorDB node properties | Folded into step 13 (`update-company-node` → v1.6 reads the LLM payload). No separate Cypher write in apply-payload step. |
+| Low-confidence chain | Gemini Flash → Sonnet 4.6 escalation → website scrape + 3rd LLM call (Sonnet 4.6 no `:online`) when domain available and Sonnet stayed low → accept result, no crash flag. |
+| Versioning | Cut `mvp/enrich/run-base-company-enrich-v4` as a new function. Preserve v3.5 for rollback. |
+| Backfill rollout | Active via `mvp/queue/upsert-enrich-company`. |
+| Fundable re-lookup → is_vc | Set `is_vc = true` only when matched `fundable_org` classifies as a VC firm. |
+| Investment thesis match key | `investment_theses.master_company_id` (firm-level VC). |
+| Thesis trigger scope | Fires whenever `fundable_org_id` is set by the time the step runs (either originally or via the re-lookup). |
+| Thesis "no record" path | Call `thesis/build-investment-thesis-in-gcp` (#12978) — same function as the stale-thesis rebuild path; it handles both via `db.add_or_edit`. |
+| Schema gaps vs #2811 | Extend the new-company-enrichment LLM schema with `went_public_on` and `stock_link`. Single source of truth in the LLM payload. |
+| Fate of #2811 | Leave it. Not called by v4, not deleted. |
+| Signal NFX storage | New fields on `company_enrich_data`: `signal_nfx_scrape` (raw Firecrawl markdown) and `signal_nfx_json` (LLM-parsed JSON). NOT `permalink_company.signal_page` as originally suggested — pivoted mid-plan. |
+
+### v4 step list
+
+| # | Step | Function | When |
+|---|------|----------|------|
+| 1 | **LLM preflight — read** | (inline) `db.get company_enrich_data WHERE master_company_id = $masterCompanyID` | Always. Loads the row and inspects `company_llm`. |
+| 2 | **LLM preflight — run** | `mvp/enrich/new-company-enrichment` (#12974) | Only when `company_llm` is null/empty. Writes the response into `company_enrich_data.company_llm`. Same tiered model chain as Section 5 of master-company (Gemini → Sonnet → scrape-LLM). |
+| 3 | **Apply LLM payload to master_company** | `mvp/enrich/apply-company-llm-payload` (**NEW** shared helper extracted from master-company Section 10a/10b) | Only when step 2 fired. Writes industries, specialties, about_join, address_join, contact email/phones into the join tables; updates `master_company` scalars (`name`, `headline`, `business_model`, `primary_product_name`, `primary_product_category`, `other_product_names`, `other_product_categories`, `target_customers`, `employees.employee_range`, etc.); writes `company_financial` (`company_type`, `is_public`, `went_public_on`, `ticker`, `stock_label`, `primary_exchange`, `stock_link`, `revenue.revenue_usd`); sets `is_vc = true` if `company_type == "Venture Capital Firm"`; writes profile URLs into `master_link` with `data_source_id: 100`. |
+| 4 | **Refetch master_company + Fundable re-lookup** | (inline + existing `mvp/funding/*` lookup helpers) | Refetch always. Re-lookup branch fires only when `master_company.fundable_org_id IS NULL`. Uses LLM-discovered profile URLs (LinkedIn, Crunchbase, etc.) + the refreshed domain to query `fundable_org` for a match. On hit: write `master_company.fundable_org_id`, write the back-link on the `fundable_org` row, and set `master_company.is_vc = true` only when the matched `fundable_org` classifies as a VC firm. |
+| 5 | **Signal NFX scrape (company-side)** | `mvp/investor/get-signal-nfx-data-company` (**NEW** — modeled on #2769) | Only when `fundable_org_id` is set (originally or after step 4) AND `company_enrich_data.signal_nfx_json` is null/empty. Finds the Signal URL via Brave (#2640 `brave/get-signalnfx_domain`), Firecrawls it (#4515 `mvp/firecrawl/scrape`), writes the raw markdown to `company_enrich_data.signal_nfx_scrape`, parses to JSON via LLM (prompt ported from archived #2698 `archive/investor/parse-signal-nfx-company`), writes JSON to `company_enrich_data.signal_nfx_json`. Wraps in `enrich_history_company` row + `try_catch`. Skipped entirely when `signal_nfx_json` already has data. |
+| 6 | **Investment thesis build/rebuild** | `thesis/build-investment-thesis-in-gcp` (#12978) | Only when `fundable_org_id` is set by this point. Queries `investment_theses WHERE master_company_id = $masterCompanyID`. Three branches: **(a)** no row → call #12978 (creates). **(b)** row exists AND `updated_at` (or `created_at` fallback) more than 30 days old → call #12978 (rebuilds via internal `db.add_or_edit`). **(c)** row exists AND fresh → skip. Note: #12978 internally calls `thesis/gather-investor-context-v3` (#12911) — that function must be patched to read `company_enrich_data.signal_nfx_json` (NEW location), not `permalink_company.signal_json` (OLD), or the freshly-scraped signal data won't make it into the thesis build. |
+| 7 | **Get C-Suite & Founders** | `mvp/enrich/get-exa-company-c-suite` (#12988) + loop → `mvp/get-add/master-person` per result | Only when `company_enrich_data.exa_c_suite` is null/empty. Calls #12988 with `company_name`, `linkedin_url`, `company_domain`, `expand_companies: true`. Stores response in `company_enrich_data.exa_c_suite`. Loops through the matched founders + key employees and creates a master_person for each one via `mvp/get-add/master-person`, one at a time. Skipped entirely when `exa_c_suite` already has data (assumed prior run completed both the call and the loop). |
+| 8 | **Phase 3 — YC** | `mvp/enrich/process-company-phase-3` (#12799) | Always. (Unchanged.) Detects YC deal history, scrapes YC data, cascades to `process-yc-people`. |
+| 9 | **Phase 5 — Fundable backfill** | `mvp/enrich/process-company-phase-5` (#12809) | Always. (Unchanged.) `fundable-lookup` if `company_enrich_data.fundable` empty; writes industries, specialties, descriptions, banner, HQ, founded year, LinkedIn followers, social links. |
+| 10 | **Phase 6 — Fundable link res + financial** | `mvp/enrich/process-company-phase-6` (#12810) | Always. (Unchanged.) Resolves a `fundable_org` by domain when `fundable_org_id` still missing; upserts `company_financial` with `funding_total`, `total_rounds_raised`, `is_public`. |
+| 11 | **Phase 7 — Fundable deals** | `mvp/enrich/process-company-phase-7` (#12813) | Always when a `fundable_org` exists. (Unchanged.) Calls `mvp/funding/add-all-fundable-deals` (#12703). |
+| 12 | **Resolve company specialties** | `mvp/expertise/resolve-company-specialties` (#12746) | Always. (Unchanged.) Embeds specialties, vector-searches `SubDomainExpertise` nodes, creates `SPECIALIZES_IN` edges. |
+| 13 | **LLM company-about** | `mvp/about/llm-company-about` | Always. (Unchanged.) Builds the polished `about` / `about_500` copy. |
+| 14 | **Add company locations** | `mvp/address/add-company-locations` | Always. (Unchanged.) Promotes best `address_join` to `primary_location`; writes `LOCATED_IN`, `IN_REGION`, `IN_COUNTRY` edges. |
+| 15 | **Update company node** | `mvp/node/update-company-node` (#4659) **→ v1.6** | Always. **v1.6 bump:** also reads `company_enrich_data.company_llm` and writes the LLM-derived FalkorDB properties (`business_model`, `primary_product_name`, `primary_product_category`, `other_product_names`, `other_product_categories`, `target_customers`, `is_acquired`, `acquired_by`, `acquired_date`, `acquired_ticker`) onto the Company node. Arrays land as native FalkorDB lists, case-insensitive deduped, as today. |
+
+### #2811 field map — captured by the apply-LLM-payload helper
+
+The orphaned `mvp/revenue/revenue-employees-ownership` (#2811) is not called by v4. Every field it used to write is now sourced from the `company_llm` payload by step 3 of v4:
+
+| Field #2811 wrote | v4 source (in `company_enrich_data.company_llm` payload) |
+|---|---|
+| `master_company.employees.employee_range` | `size.employee_range` |
+| `master_company.employees.employees_citation` / `_url` | `_meta.sources` (filter to LinkedIn-company entries) |
+| `company_financial.company_type` | `company_type` (Public / Former Public / Acquired-by-Public / etc.) |
+| `company_financial.is_public` | derived: `company_type == "Public Company"` |
+| `company_financial.went_public_on` | **NEW** `funding.acquired.went_public_on` (added to LLM schema) |
+| `company_financial.ticker` | top-level `ticker` (e.g. `"NASDAQ:ADBE"`) |
+| `company_financial.stock_label` | top-level `ticker` (same, already exchange-prefixed) |
+| `company_financial.primary_exchange` | parsed from `ticker` prefix |
+| `company_financial.stock_link` | **NEW** `stock_link` (added to LLM schema — TradingView URL) |
+| `company_financial.revenue.revenue_usd` | derived from `revenue.estimate_usd_low` / `estimate_usd_high` |
+| `master_company.is_vc` | `company_type == "Venture Capital Firm"` |
+
+### LLM schema extension (new-company-enrichment)
+
+Two fields to add to the `mvp/enrich/new-company-enrichment` (#12974) JSON schema + system prompt before v4 ships:
+
+- **`funding.acquired.went_public_on`** — IPO date in `YYYY-MM-DD` when the company has gone public. Null otherwise. Sourced from SEC filings, press releases, or the company's investor-relations page.
+- **`stock_link`** — TradingView URL (`https://www.tradingview.com/symbols/{EXCHANGE}-{TICKER}/`) for currently-trading public companies. Null otherwise. Constructible from the top-level `ticker` field; including it explicitly removes ambiguity for the apply-payload helper.
+
+### Low-confidence fallback chain
+
+When the LLM preflight runs (step 2), the model chain is:
+
+1. **Gemini 2.5 Flash `:online`** — default. Cost ~$0.005–$0.015 per call.
+2. **Claude Sonnet 4.6 `:online`** — escalation when `gemini_confidence < 0.7`. Cost ~$0.04–$0.08 per call.
+3. **Website scrape + 3rd LLM call (Sonnet 4.6, no `:online`)** — fires when Sonnet's `confidence` is still `< 0.7` AND `master_company.company_domain` is non-empty. Scrapes the homepage + `/about` + `/contact` via Firecrawl, injects the extracted text into a third LLM call as authoritative context, and re-extracts the JSON schema. The LLM still does the structured extraction; the scrape just gives it the source-of-truth content the web grounding missed.
+4. **Accept result, no crash flag** — when the scrape-LLM tier also stays low confidence OR no domain is available, save whatever was returned and continue. Low confidence is information, not failure; downstream consumers can filter on `_meta.confidence`.
+
+### Dependencies to verify / patch before deploy
+
+- **`thesis/gather-investor-context-v3` (#12911)** — confirm it reads signal data from `company_enrich_data.signal_nfx_json` (new location), not `permalink_company.signal_json` (legacy location). Patch if needed; otherwise the freshly-scraped Signal data won't make it into the thesis build.
+- **`mvp/get-add/master-company` Section 10a/10b** — extract into the shared `mvp/enrich/apply-company-llm-payload` helper. Section 10 should be a thin wrapper around the helper after this refactor.
+- **`mvp/enrich/new-company-enrichment` (#12974)** — extend the system prompt + JSON schema with `went_public_on` and `stock_link`.
+- **`mvp/node/update-company-node` (#4659)** — bump to v1.6, read FalkorDB-bound LLM properties from `company_llm` payload.
+- **`fundable_org` table classification field** — confirm we have a reliable VC-firm boolean (or `entity_type` enum) to drive the `is_vc` decision in step 4. If not, the `is_vc` set in step 4 needs to fall back to the LLM payload's `company_type`.
+
+### Build sequence
+
+1. Extend `mvp/enrich/new-company-enrichment` (#12974) prompt + schema with `went_public_on` and `stock_link`. Smoke-test against a handful of public companies.
+2. Build `mvp/enrich/apply-company-llm-payload` by extracting Section 10a/10b of master-company. Refactor master-company Section 10 to call the helper. Verify behavior is unchanged for fresh creates.
+3. Build `mvp/investor/get-signal-nfx-data-company` (new). Pattern: Brave URL → Firecrawl scrape → write `signal_nfx_scrape` → LLM parse → write `signal_nfx_json` → `enrich_history_company` row.
+4. Patch `thesis/gather-investor-context-v3` (#12911) to read from `company_enrich_data.signal_nfx_json`.
+5. Bump `mvp/node/update-company-node` (#4659) to v1.6 — read LLM-bound properties from `company_llm`.
+6. Build `mvp/enrich/run-base-company-enrich-v4` with the 15-step list above. Keep every step in its own `try_catch`. Maintain the `$hasCrash` flag pattern.
+7. Update Section 11 of `mvp/get-add/master-company` to call v4 instead of v3.5. Leave v3.5 in place for rollback.
+8. Active backfill: enqueue every `master_company` row with empty `company_llm` via `mvp/queue/upsert-enrich-company`. Size worker concurrency to respect OpenRouter and Firecrawl rate limits.
+9. Watch `log_crash` + `enrich_history_company` (success rate, by `data_source_id`) during the burn-down. Pause the queue if crash rate exceeds a threshold.
+10. Once the backlog is drained and v4 has run cleanly against fresh-create traffic for ~1 week, delete v3.5 (#12814).
+
+---
+
+## Current implementation (v3.5)
+
+<Note>
+  `mvp/enrich/run-base-company-enrich-v3` (#12814) is the orchestrator in production today. It's invoked by Section 11 of [`mvp/get-add/master-company`](/guides/open-work/new-company-enrichment) once a new `master_company` row exists. Gated behind a `debug.stop` in master-company while the v2.4 pipeline finishes smoke-testing — remove the guard to let it fire.
+</Note>
 
 <Card icon="play">
 
@@ -17,33 +137,43 @@ mvp/enrich/run-base-company-enrich-v3 — 12814
 
 **Inputs:** `master_company_id` (int), `data_source_id` (int), `cascade_depth` (int).
 **Runtime:** `async-shared` — fired-and-forgotten from the master-company creation flow.
-**Output:** the freshly enriched `master_company` row.
+**Output:** the freshly-loaded `master_company` row (post-orchestrator).
 
 </Card>
 
-## What it runs, in order
+### Step list (v3.5, 2026-05-11)
 
-Each step is wrapped in its own `try_catch`. Failures log to `log_crash` with `function_name: "run-base-company-enrich-v3"` and a `note` identifying the step that crashed; the orchestrator continues to the next step rather than aborting. A `$hasCrash` flag is flipped on any failure and determines the final success/failure history row.
+Each step is wrapped in its own `try_catch`. Failures log to `log_crash` with `function_name: "run-base-company-enrich-v3"` and a `note` identifying the step that crashed; the orchestrator continues to the next step rather than aborting. A `$hasCrash` flag is flipped on any failure and determines the final success/failure history row. The setup row writes `enrich_history_company` with `data_source_id: 101` (Exa).
 
-| # | Step | Function | When it runs |
-|---|------|----------|--------------|
-| 1 | **Phase 1 — PDL** | `mvp/enrich/process-company-phase-1` (#12797) | Skipped when `master_company.fundable_org_id` is set (Fundable beat PDL to the data). Otherwise: refresh PDL data + EL retry if PDL returns a domain redirect. |
-| 2 | **Phase 2 — Enrich Layer** | `mvp/enrich/process-company-phase-2` (#12798) | Skipped when `fundable_org_id` is set. Otherwise: writes EL industries, specialties, about/tagline, banner, HQ address, follower count. |
-| 3 | **Phase 3 — YC** | `mvp/enrich/process-company-phase-3` (#12799) | Always. Detects whether the company has Y Combinator deal history in Fundable; if so, scrapes YC data, writes industries, abouts, locations, links, YC batch + status, and cascades to `process-yc-people`. |
-| 4 | **Phase 5 — Fundable backfill** | `mvp/enrich/process-company-phase-5` (#12809) | Always. Runs `fundable-lookup` if `company_enrich_data.fundable` is empty; writes industries, specialties, descriptions, banner, HQ, founded year, LinkedIn followers, and social links. |
-| 5 | **Phase 6 — Fundable link res + financial** | `mvp/enrich/process-company-phase-6` (#12810) | Always. Resolves a Fundable org by domain when `fundable_org_id` is missing; upserts `company_financial` with `funding_total`, `total_rounds_raised`, `is_public`. |
-| 6 | **Phase 7 — Fundable deals** | `mvp/enrich/process-company-phase-7` (#12813) | Always (when a fundable_org exists). Calls `mvp/funding/add-all-fundable-deals` and writes an `enrich_history_company` row with `data_source_id: 98`. |
-| 7 | **Resolve company specialties** | `mvp/expertise/resolve-company-specialties` (#12746) | Always. Reads `speciality_join`, embeds each specialty, vector-searches FalkorDB `SubDomainExpertise` nodes (`expertise_embedding` index), connects via `SPECIALIZES_IN` edges. Edge weight = `min(round(10 + match_score * 80), 50)`. |
-| 8 | **LLM company-about** | `mvp/about/llm-company-about` | Always. Builds the polished `about` / `about_500` long-form copy from the accumulated about_join rows. |
-| 9 | **Name correction** | (inline) | Always. Picks a canonical `company_name` from `company_enrich_data.people_data_labs.display_name` → falling back to `enrich_layer.name`. **Note:** as of v2.4 of `get-add/master-company`, PDL and EL fields are no longer populated on new records, so this step is now effectively a no-op for fresh creates. Names are already resolved upstream via `$llmData.name` during Section 6 dedup. Kept here for backwards-compat with pre-v2.4 records. |
-| 10 | **Add company locations** | `mvp/address/add-company-locations` | Always. Promotes the best `address_join` row into a `primary_location` and writes the geographic chain into FalkorDB (`LOCATED_IN`, `IN_REGION`, `IN_COUNTRY` edges via #4690 / #4528). |
-| 11 | **Update company node** | `mvp/node/update-company-node` (#4659) | Always. Re-fetches `master_company` + addons (`company_financial`, `master_link:profiles`, investor profile if VC), builds the property map, generates a fresh `name_embedding` from `about_500`, sends a `MATCH ... SET` Cypher to FalkorDB. Arrays land as native FalkorDB lists (post-v1.1) with case-insensitive dedup. |
+| # | Step | Function | When |
+|---|------|----------|------|
+| — | **Setup** (inline) | `db.add enrich_history_company` (`data_source_id: 101`, `processing: true`); load `master_company`. | Always. |
+| 1 | **Exa C-Suite** | `mvp/enrich/get-exa-company-c-suite` (#12988) | Always. Inputs: `company_name`, `linkedin_url`, `company_domain`, `expand_companies: true`. Writes the response (matches, expanded company history, education, costs) to `company_enrich_data.exa_c_suite` when the enrich-data row exists. Followed by a `company_enrich_data` early-return guard — if no row exists, logs `EARLY RETURN` to `log_crash` and returns. |
+| 2 | **Phase 3 — YC** | `mvp/enrich/process-company-phase-3` (#12799) | Always. Detects YC deal history, scrapes YC data, writes industries, abouts, locations, links, YC batch + status, cascades to `process-yc-people` with `cascade_depth`. |
+| 3 | **Phase 5 — Fundable backfill** | `mvp/enrich/process-company-phase-5` (#12809) | Always. Runs `fundable-lookup` if `company_enrich_data.fundable` is empty; writes industries, specialties, descriptions, banner, HQ, founded year, LinkedIn followers, social links. |
+| 4 | **Phase 6 — Fundable link res + financial** | `mvp/enrich/process-company-phase-6` (#12810) | Always. Resolves a `fundable_org` by domain when `fundable_org_id` is missing; upserts `company_financial` with `funding_total`, `total_rounds_raised`, `is_public`. |
+| 5 | **Phase 7 — Fundable deals** | `mvp/enrich/process-company-phase-7` (#12813) | Always when a `fundable_org` exists. Calls `mvp/funding/add-all-fundable-deals` (#12703); walks both rounds-raised and rounds-invested-in via `mvp/investor/cascade-deal-participants`. |
+| 6 | **Resolve company specialties** | `mvp/expertise/resolve-company-specialties` (#12746) | Always. Reads `speciality_join`, embeds each specialty, vector-searches FalkorDB `SubDomainExpertise` nodes, creates `SPECIALIZES_IN` edges (weight = `min(round(10 + match_score * 80), 50)`). |
+| 7 | **LLM company-about** | `mvp/about/llm-company-about` | Always. Builds the polished `about` / `about_500` long-form copy from the accumulated about_join rows. |
+| 8 | **Add company locations** | `mvp/address/add-company-locations` | Always. Promotes the best `address_join` row into a `primary_location`; writes the geographic chain into FalkorDB (`LOCATED_IN`, `IN_REGION`, `IN_COUNTRY` edges via #4690 / #4528). |
+| 9 | **Update company node** | `mvp/node/update-company-node` (#4659) | Always. Re-fetches `master_company` + addons; builds the property map; generates a fresh `name_embedding` from `about_500`; sends a `MATCH … SET` Cypher to FalkorDB. |
+| — | **Finalize** (inline) | Edit `enrich_history_company`: `enrich_success: true` + `processing: false` when `$hasCrash` is false; else `enrich_success: false`. Writes one `qa_passed: true` row to `log_crash` on clean completion. | Always. |
+
+### v3.5 changelog (what's already gone)
+
+- **v3.5 (2026-05-11)** — Removed Phase 1 (PDL, #12797) and Phase 2 (Enrich Layer, #12798) entirely. Removed the PDL/EL-driven inline name-correction step. Added `get-exa-company-c-suite` (#12988) as a new always-on first step. `enrich_history_company.data_source_id` updated from `78` (Base Company Enrich) to `101` (Exa).
+- **v3.4 (2026-04-15)** — Removed stale XanoScript comment about `resolve-company-specialties` wiring.
+- **v3.3 (2026-04-13)** — Also skip Phase 2 (EL) when Fundable data exists.
+- **v3.2 (2026-04-13)** — Skip Phase 1 (PDL) when Fundable data exists (`fundable_org_id` set).
+- **v3.1 (2026-04-13)** — Added `cascade_depth` input passed to `process-yc-people` and `add-all-fundable-deals`.
+
+The `people_data_labs` and `enrich_layer` JSON columns still exist on `company_enrich_data` but are no longer populated by this orchestrator. `get-add/master-company` v2.4 also no longer populates them — the LLM payload (`company_llm`) is the sole semi-structured enrichment source for fresh creates.
 
 ## Final logging
 
 After all steps complete (regardless of how many crashed mid-run):
 
-- `enrich_history_company` row's `enrich_success` is set based on `$hasCrash`: `true` if every step succeeded, `false` otherwise. `data_source_id: 78`.
+- `enrich_history_company` row's `enrich_success` is set based on `$hasCrash`: `true` if every step succeeded, `false` otherwise. `data_source_id: 101`.
 - On clean success, a `log_crash` row is also written with `qa_passed: true` (the only `qa_passed: true` row this orchestrator writes — every other path crashed).
 
 ## Why each step is wrapped in `try_catch`
@@ -71,15 +201,14 @@ conditional {
 }
 ```
 
-A `debug.stop` currently sits just above this conditional in v2.4 of master-company so we can smoke-test new-company-enrichment + Section 10 writes without the downstream orchestrator firing. Remove the `debug.stop` block once you're satisfied with the master-company QA pass.
+A `debug.stop` currently sits just above this conditional in v2.4 of master-company so we can smoke-test new-company-enrichment + Section 10 writes without the downstream orchestrator firing. Remove the `debug.stop` block once you're satisfied with the master-company QA pass. When v4 ships, this trigger gets updated to point at `run-base-company-enrich-v4`.
 
 ## Known characteristics
 
 - **Async, fire-and-forget.** The caller doesn't wait for the orchestrator to finish. Failures only surface via `log_crash`.
-- **PDL/EL phases are dead paths for fresh records.** The Fundable-skip guard means Phases 1 and 2 effectively never fire when the new-company-enrichment pipeline (#12974) handled enrichment upstream — `fundable_org_id` is always set on a fresh v2.4 record. They remain in place for legacy records that pre-date the v2.4 cutover.
-- **The name-correction block is similarly dead** for v2.4 records (sources `company_llm.data.name` upstream means PDL/EL display_name fields are never set). It's idle code rather than broken code — the conditional doesn't fire because the source fields are empty.
-- **Specialties resolution is the biggest external-cost step.** It embeds every distinct specialty (up to 15 per company) and, for unmatched specialties, generates a description via Claude Sonnet 4 before creating the FalkorDB node. Most cost concentrates here.
+- **Specialties resolution is the biggest external-cost step.** It embeds every distinct specialty (up to 15 per company) and, for unmatched specialties, generates a description via Claude Sonnet 4 before creating the FalkorDB node. Most cost concentrates here in v3.5. After v4, the LLM preflight + Signal NFX scrape add ~$0.02–$0.10 per backfill record on top.
+- **Pre-2026-05-11 records will not have `company_llm` or `signal_nfx_json` populated** until v4's active backfill drains the queue. They run on v3.5 today with reduced fidelity (no LLM-derived business_model, target_customers, revenue, employee_range, contact email/phone).
 
 ## Status
 
-**Production**, gated behind `debug.stop` while v2.4 of `mvp/get-add/master-company` is in QA. Phases 1, 2, and the inline name-correction step are vestigial in the new flow — they no longer write anything but remain wired in for legacy data handling and to avoid regressions for callers that still seed PDL/EL records by other paths. Future cleanup: delete the PDL/EL/name-correction blocks once we've confirmed no pre-v2.4 record still depends on them.
+**Production (v3.5).** Gated behind `debug.stop` while v2.4 of `mvp/get-add/master-company` is in QA. The v4 plan above is fully scoped and ready to build — see the Build sequence section for the order of operations.

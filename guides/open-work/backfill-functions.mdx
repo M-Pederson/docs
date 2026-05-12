@@ -1,0 +1,100 @@
+---
+title: "Backfill Functions"
+description: "Inventory of one-shot and queue-driven backfill functions built during the v4 refactor of run-base-company-enrich. None of these have been run against production data yet — they're built in advance so we have a single place to find them when we're ready to drain the legacy backlog."
+---
+
+<Warning>
+  **Nothing on this page has been run against the production backlog.** These functions exist because the v4 refactor of [run-base-company-enrich](/guides/open-work/run-base-company-enrich) needs them available when we eventually drain the pre-2026-05-11 records that don't have `company_llm`, `signal_nfx_json`, or `exa_c_suite` populated. The active backfill rollout is held until v4 ships and has been smoke-tested against fresh-create traffic for ~1 week.
+</Warning>
+
+## Purpose
+
+The v4 refactor introduces several gated enrichment steps that read from columns the legacy pipeline never populated. Once v4 is live, every freshly-created `master_company` row gets those columns filled at create time — but historical records won't, until something explicitly re-runs against them.
+
+This page is the catalog. Anything we build to drain that backlog lands here with:
+
+- the function name + ID
+- what it reads and writes
+- the trigger (cron, queue worker, ad-hoc API, etc.)
+- the safety properties (idempotency, rate limits, where to watch for crashes)
+- explicit status — **not yet running** until checked off
+
+## How records get into the backfill scope
+
+The v4 orchestrator self-heals one record at a time on every invocation. So the "backfill scope" is just: every `master_company` row that v4 hasn't run against yet. Three signals tell us a record needs the v4 pass:
+
+| Signal | Meaning |
+|---|---|
+| `company_enrich_data.company_llm IS NULL` | new-company-enrichment LLM has never run for this record |
+| `company_enrich_data.signal_nfx_json IS NULL` (when `fundable_org_id` is set) | Signal NFX scrape hasn't run; thesis build would have no fresh signal context |
+| `company_enrich_data.exa_c_suite IS NULL` | Exa C-Suite + founder loop hasn't run; master_person rows for founders may be missing |
+
+A record may need any subset of these. v4 gates each step on the corresponding column, so re-running v4 against a record with two of the three already populated only fires the missing step.
+
+## Backfill mechanism (planned)
+
+The backfill rollout uses the **existing enrichment queue** rather than a one-shot script:
+
+```
+1. Identify scope:
+   db.query master_company WHERE EXISTS company_enrich_data row
+                            AND any of (company_llm | signal_nfx_json | exa_c_suite) IS NULL
+
+2. For each row → mvp/queue/upsert-enrich-company
+   (the same function that handles new-create queuing, so workers pick them up via process-company-queue)
+
+3. process-company-queue cron picks one at a time → calls run-base-company-enrich-v4
+   → v4's gated steps run only what's missing
+
+4. Watch log_crash + enrich_history_company.enrich_success for failures
+   Pause the queue if crash rate climbs above a threshold
+```
+
+This mechanism reuses the existing queue + worker infrastructure (`mvp/queue/upsert-enrich-company`, `process-company-queue` cron #127). Nothing new to build for the queue mechanics — just the **scoping function** that enqueues the right records.
+
+## Functions
+
+### scope-and-enqueue-v4-backfill (planned, not built)
+
+**Status:** Not built. Stub here so we know where it'll go.
+
+**Intended behavior:** runs a single `db.query` to find every `master_company` with at least one of `company_llm`, `signal_nfx_json`, or `exa_c_suite` empty on its `company_enrich_data` row. For each match, calls `mvp/queue/upsert-enrich-company`. Returns a count of rows enqueued.
+
+**Inputs:** `batch_size` (int, default 1000) — how many records to enqueue per invocation. Allows phased rollout.
+
+**Where it'll live:** `mvp/backfill/scope-and-enqueue-v4-backfill` (TBD function ID).
+
+**Safety:**
+- `mvp/queue/upsert-enrich-company` is upsert-by-master-company-id, so re-running this function is safe (already-queued records get a `count` bump, not a duplicate row).
+- v4 itself is gated on per-column presence, so a record that's already been partially processed only re-runs the missing steps.
+- `process-company-queue` cron is currently **inactive** (`active = false`); enqueuing without activating the cron lets us pre-stage the work before opening the throttle.
+
+### Rate-limit considerations
+
+When the rollout opens, the worker hits several external services per record. Rough envelope per record:
+
+| Service | Cost when fired | Trigger |
+|---|---|---|
+| OpenRouter (Gemini Flash :online) | ~$0.005–$0.015 | LLM preflight when `company_llm` empty |
+| OpenRouter (Sonnet 4.6 :online) | ~$0.04–$0.08 | Sonnet escalation when Gemini confidence < 0.7 |
+| OpenRouter (Sonnet 4.6 no :online) | ~$0.01–$0.02 | Scrape-grounded third LLM call when domain available |
+| Serper batch | ~$0.007 | Post-LLM profile discovery |
+| Firecrawl (homepage) | ~$0.002 | Low-confidence fallback scrape |
+| Firecrawl (Signal NFX page) | ~$0.002 | `signal_nfx_json` empty AND `fundable_org_id` set |
+| Brave Search | ~$0.005 | Signal NFX URL discovery |
+| Exa Search | ~$0.005 | C-Suite + founder discovery when `exa_c_suite` empty |
+| Anthropic (Signal NFX parser) | ~$0.002 | Parsing scraped markdown to JSON |
+
+**Per-record worst case:** ~$0.08–$0.12. **Typical case (no Sonnet escalation):** ~$0.02–$0.04.
+
+Worker concurrency needs to respect OpenRouter and Firecrawl rate limits — exact numbers TBD when we actually open the queue.
+
+## Status checklist
+
+- [ ] v4 orchestrator shipped + smoke-tested against fresh-create traffic for ~1 week
+- [ ] `scope-and-enqueue-v4-backfill` built
+- [ ] Phased dry-run (1k records) — verify cost-per-record envelope matches estimate
+- [ ] Open the queue with a low worker-concurrency cap
+- [ ] Monitor `log_crash` and `enrich_history_company.enrich_success` rate
+- [ ] Drain the backlog
+- [ ] Retire this page (or move to historical reference)

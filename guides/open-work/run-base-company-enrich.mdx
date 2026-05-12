@@ -1,0 +1,85 @@
+---
+title: "Run Base Company Enrich"
+description: "The downstream enrichment orchestrator that fires after a new master_company is created — runs all phase functions, resolves specialties, corrects names, adds locations, and syncs the FalkorDB node."
+---
+
+<Note>
+  `mvp/enrich/run-base-company-enrich-v3` (#12814) is the orchestrator that wraps every post-creation enrichment step into a single async call. It's invoked by Section 11 of [`mvp/get-add/master-company`](/guides/open-work/new-company-enrichment) once a new `master_company` row exists. Currently gated behind a `debug.stop` in master-company while the v2.4 pipeline finishes smoke-testing — remove the guard to let it fire.
+</Note>
+
+## Implementation
+
+<Card icon="play">
+
+```
+mvp/enrich/run-base-company-enrich-v3 — 12814
+```
+
+**Inputs:** `master_company_id` (int), `data_source_id` (int), `cascade_depth` (int).
+**Runtime:** `async-shared` — fired-and-forgotten from the master-company creation flow.
+**Output:** the freshly enriched `master_company` row.
+
+</Card>
+
+## What it runs, in order
+
+Each step is wrapped in its own `try_catch`. Failures log to `log_crash` with `function_name: "run-base-company-enrich-v3"` and a `note` identifying the step that crashed; the orchestrator continues to the next step rather than aborting. A `$hasCrash` flag is flipped on any failure and determines the final success/failure history row.
+
+| # | Step | Function | When it runs |
+|---|------|----------|--------------|
+| 1 | **Phase 1 — PDL** | `mvp/enrich/process-company-phase-1` (#12797) | Skipped when `master_company.fundable_org_id` is set (Fundable beat PDL to the data). Otherwise: refresh PDL data + EL retry if PDL returns a domain redirect. |
+| 2 | **Phase 2 — Enrich Layer** | `mvp/enrich/process-company-phase-2` (#12798) | Skipped when `fundable_org_id` is set. Otherwise: writes EL industries, specialties, about/tagline, banner, HQ address, follower count. |
+| 3 | **Phase 3 — YC** | `mvp/enrich/process-company-phase-3` (#12799) | Always. Detects whether the company has Y Combinator deal history in Fundable; if so, scrapes YC data, writes industries, abouts, locations, links, YC batch + status, and cascades to `process-yc-people`. |
+| 4 | **Phase 5 — Fundable backfill** | `mvp/enrich/process-company-phase-5` (#12809) | Always. Runs `fundable-lookup` if `company_enrich_data.fundable` is empty; writes industries, specialties, descriptions, banner, HQ, founded year, LinkedIn followers, and social links. |
+| 5 | **Phase 6 — Fundable link res + financial** | `mvp/enrich/process-company-phase-6` (#12810) | Always. Resolves a Fundable org by domain when `fundable_org_id` is missing; upserts `company_financial` with `funding_total`, `total_rounds_raised`, `is_public`. |
+| 6 | **Phase 7 — Fundable deals** | `mvp/enrich/process-company-phase-7` (#12813) | Always (when a fundable_org exists). Calls `mvp/funding/add-all-fundable-deals` and writes an `enrich_history_company` row with `data_source_id: 98`. |
+| 7 | **Resolve company specialties** | `mvp/expertise/resolve-company-specialties` (#12746) | Always. Reads `speciality_join`, embeds each specialty, vector-searches FalkorDB `SubDomainExpertise` nodes (`expertise_embedding` index), connects via `SPECIALIZES_IN` edges. Edge weight = `min(round(10 + match_score * 80), 50)`. |
+| 8 | **LLM company-about** | `mvp/about/llm-company-about` | Always. Builds the polished `about` / `about_500` long-form copy from the accumulated about_join rows. |
+| 9 | **Name correction** | (inline) | Always. Picks a canonical `company_name` from `company_enrich_data.people_data_labs.display_name` → falling back to `enrich_layer.name`. **Note:** as of v2.4 of `get-add/master-company`, PDL and EL fields are no longer populated on new records, so this step is now effectively a no-op for fresh creates. Names are already resolved upstream via `$llmData.name` during Section 6 dedup. Kept here for backwards-compat with pre-v2.4 records. |
+| 10 | **Add company locations** | `mvp/address/add-company-locations` | Always. Promotes the best `address_join` row into a `primary_location` and writes the geographic chain into FalkorDB (`LOCATED_IN`, `IN_REGION`, `IN_COUNTRY` edges via #4690 / #4528). |
+| 11 | **Update company node** | `mvp/node/update-company-node` (#4659) | Always. Re-fetches `master_company` + addons (`company_financial`, `master_link:profiles`, investor profile if VC), builds the property map, generates a fresh `name_embedding` from `about_500`, sends a `MATCH ... SET` Cypher to FalkorDB. Arrays land as native FalkorDB lists (post-v1.1) with case-insensitive dedup. |
+
+## Final logging
+
+After all steps complete (regardless of how many crashed mid-run):
+
+- `enrich_history_company` row's `enrich_success` is set based on `$hasCrash`: `true` if every step succeeded, `false` otherwise. `data_source_id: 78`.
+- On clean success, a `log_crash` row is also written with `qa_passed: true` (the only `qa_passed: true` row this orchestrator writes — every other path crashed).
+
+## Why each step is wrapped in `try_catch`
+
+The orchestrator is designed to be **best-effort**, not all-or-nothing. A failing YC scrape shouldn't block Fundable backfill; a failing `update-company-node` shouldn't block specialties resolution. Every failure surfaces in `log_crash` with the step name, but execution continues. The `$hasCrash` flag at the bottom is the single signal that downstream consumers (or QA dashboards) can use to know "this record finished but with errors — needs review."
+
+## Triggering it
+
+`run-base-company-enrich-v3` is called once, automatically, by Section 11 of `mvp/get-add/master-company` (#12558) immediately after a new `master_company` row is created, unless the caller passed `queue: true` or `cascade_depth > 0` (in which case the record is queued via `mvp/queue/upsert-enrich-company` and a separate worker picks it up later).
+
+```text Section 11 trigger
+conditional {
+  if ($companyAdded && $shouldQueue == false) {
+    function.run "mvp/enrich/run-base-company-enrich-v3" {
+      runtime_mode = "async-shared"
+      input = {
+        master_company_id: $masterCompanyID
+        cascade_depth    : $effectiveDepth
+      }
+    }
+  }
+  elseif ($companyAdded && $shouldQueue) {
+    function.run "mvp/queue/upsert-enrich-company" { ... }
+  }
+}
+```
+
+A `debug.stop` currently sits just above this conditional in v2.4 of master-company so we can smoke-test new-company-enrichment + Section 10 writes without the downstream orchestrator firing. Remove the `debug.stop` block once you're satisfied with the master-company QA pass.
+
+## Known characteristics
+
+- **Async, fire-and-forget.** The caller doesn't wait for the orchestrator to finish. Failures only surface via `log_crash`.
+- **PDL/EL phases are dead paths for fresh records.** The Fundable-skip guard means Phases 1 and 2 effectively never fire when the new-company-enrichment pipeline (#12974) handled enrichment upstream — `fundable_org_id` is always set on a fresh v2.4 record. They remain in place for legacy records that pre-date the v2.4 cutover.
+- **The name-correction block is similarly dead** for v2.4 records (sources `company_llm.data.name` upstream means PDL/EL display_name fields are never set). It's idle code rather than broken code — the conditional doesn't fire because the source fields are empty.
+- **Specialties resolution is the biggest external-cost step.** It embeds every distinct specialty (up to 15 per company) and, for unmatched specialties, generates a description via Claude Sonnet 4 before creating the FalkorDB node. Most cost concentrates here.
+
+## Status
+
+**Production**, gated behind `debug.stop` while v2.4 of `mvp/get-add/master-company` is in QA. Phases 1, 2, and the inline name-correction step are vestigial in the new flow — they no longer write anything but remain wired in for legacy data handling and to avoid regressions for callers that still seed PDL/EL records by other paths. Future cleanup: delete the PDL/EL/name-correction blocks once we've confirmed no pre-v2.4 record still depends on them.

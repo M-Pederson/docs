@@ -98,6 +98,44 @@ Three patches landed today on `mvp/enrich/run-base-company-enrich-v4` (#12992):
 - **Exa C-Suite loop — `deep_research: true`.** Step 7's `get-add/master-person` call now passes `deep_research: true` so Phase 6 of the downstream person orchestrator runs the deep-research path for every Exa-discovered C-suite person. Mirrors the parallel change to `mvp/yc/process-yc-people` v3.0 (YC founders + partner).
 - **Exa C-Suite loop — seed-like inputs.** Same call site now passes `data_source_id: 101` (Exa), `cascade_depth: 0`, `priority_tier: 1`, replacing the prior `data_source_id: <unset>` / `cascade_depth: parent + 1` / `priority_tier: 2`. `cascade_depth: 0` unlocks PDL + Enrich Layer inside `mvp/get-add/master-person` (still used person-side; v3.5 only removed them company-side) and triggers downstream sub-cascades from each C-suite person (past employers, colleagues). Cost-per-company goes up; tradeoff accepted to give Exa-discovered C-suite the same enrichment depth as user-seeded persons.
 
+### Where the funding/investor flow actually lands — relational tables to ignore
+
+A sandbox audit (2026-05-13) of Frame.io's 4 funding rounds confirmed that the v4 → Phase 7 → `add-all-fundable-deals` → `cascade-deal-participants` → `add-fundable-deal-node` / `resolve-investors-edges` chain writes **only to FalkorDB**. Specifically:
+
+- `Funding_Round` nodes (+ `fr.uuid = fundable_deal.id`) — created by `add-fundable-deal-node` (#12701).
+- `RAISED` edge (Company → Funding_Round) — created by the same.
+- `INVESTED_IN` / `LEAD_INVESTED_IN` / `FOLLOW_ON_INVESTED_IN` edges (VC_Firm → Funding_Round) — created by `resolve-investors-edges` (#12702).
+- `INVESTMENT_PARTNER_IN` / `INVESTMENT_PARTNER_AT` edges (Person → Funding_Round / Person → VC_Firm) — same.
+
+**Relational by-products from the chain:**
+
+- `fundable_deals.processed_at` — stamped at end of `cascade-deal-participants`.
+- `fundable_deals.funding_round_node_uuid` — back-reference to the Funding_Round node (same value as `fundable_deal.id`).
+- `fundable_organizations.master_company_id` / `master_company_node_uuid` — back-references when the investor org is resolved.
+- `fundable_people.master_person_id` / `master_person_node_uuid` — back-references for partners + angels.
+- `master_company.is_vc = true` — set when the matched `fundable_organizations.is_investor == true`.
+- `master_person.is_angel = true` — set on angels (and partner persons re-flagged here).
+
+**Tables this flow does NOT write to** — don't expect rows in them after running v4:
+
+| Table | Status | Notes |
+|---|---|---|
+| `company_funding_round` (#201) | **Dead schema for new writes.** Only `merge/helpers/snapshot-company` (#12953) references it (read-only, for merge snapshots). No current enrichment function writes a row here. Legacy from an earlier Crunchbase-era denormalization. | Querying it after v4 returns 0 rows even when FalkorDB has the full funding graph. |
+| `investor_profile_person` (#475) | **Alive but populated by person-side Phase 9**, not by the company-side cascade. `process-person-phase-9` (#12830) does the upsert when a person has angel-investment rows in Fundable. | Will stay empty for angels created by `resolve-investors-edges` until those queued person enrichments actually run and Phase 9 fires for each. Lag is expected. |
+
+**Verifying funding landed for a company:** query FalkorDB:
+
+```cypher
+MATCH (c:Company {uuid: $company_uuid})-[:RAISED]->(fr:Funding_Round)
+OPTIONAL MATCH (investor)-[r:INVESTED_IN|LEAD_INVESTED_IN|FOLLOW_ON_INVESTED_IN]->(fr)
+OPTIONAL MATCH (partner:Person)-[:INVESTMENT_PARTNER_IN]->(fr)
+RETURN fr.funding_type, fr.announced_date, fr.size_usd,
+       collect(DISTINCT investor.name) AS investors,
+       collect(DISTINCT partner.name) AS partners
+```
+
+Don't infer "funding rounds didn't land" from `company_funding_round` being empty — that's expected.
+
 ### #2811 field map — captured by the apply-LLM-payload helper
 
 The orphaned `mvp/revenue/revenue-employees-ownership` (#2811) is not called by v4. Every field it used to write is now sourced from the `company_llm` payload by step 3 of v4:

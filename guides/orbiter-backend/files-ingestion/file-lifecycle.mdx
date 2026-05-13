@@ -1,0 +1,382 @@
+---
+title: "File Lifecycle"
+description: "How a file travels from upload to extracted markdown, classified type, pitch profile vectors, and delivered webhooks."
+---
+
+# File Lifecycle
+
+This document walks through what happens between the moment a file is registered
+with Orbiter and the moment the resulting analysis is delivered to downstream
+systems. It's written for anyone — product, ops, support, or a new engineer on
+day one — who needs to understand the *story* of a file moving through the
+system without reading any Go code.
+
+If you've ever wondered "where in the pipeline is this PDF?" or "why did this
+file show up in Xano 80 seconds after upload?", this is the document that
+explains it.
+
+---
+
+## TL;DR
+
+A file goes through six stages, in this order:
+
+1. **Registered** — the API records the file in the database.
+2. **Extracted** — the worker turns the raw bytes into markdown.
+3. **Classified** — an LLM decides what kind of file it is.
+4. **Profiled** *(decks only)* — a second LLM builds a structured pitch
+   profile with six narratives.
+5. **Embedded** *(decks only)* — the six narratives become six vectors.
+6. **Delivered** — webhooks fire to every system that subscribed to this
+   event.
+
+Between every stage, the system publishes an event. Downstream services can
+subscribe to whichever events matter to them and never need to poll.
+
+A small text file finishes in a few seconds. A 10 MB fundraising deck finishes
+in under a minute. Either way, the steps below are the same.
+
+---
+
+## Stage 1: Registered
+
+A file enters the system through `POST /v1/ingestion/files`. The caller has
+already uploaded the bytes to a Google Cloud Storage bucket and now hands
+Orbiter a pointer to that object plus a small amount of context:
+
+- **`gcs_uri`** — where the file lives in GCS.
+- **`file_source`** — how the file got into the system (`user_upload`, an
+  inbound email attachment, etc.).
+- **`data_source`** — a routing label that downstream consumers use to keep
+  staging and production data separate.
+- Optional Xano keys (`xano_user_id`, `xano_file_id`, `suggestion_request_id`)
+  — echoed back to Xano on every webhook so the result can be matched to the
+  original request.
+
+The API does almost nothing here. It creates a row in the `files.files` table
+with `status = pending`, returns the new file's id to the caller, and emits a
+single event called **`files.uploaded`** with the file's id and GCS URI. The
+caller gets a response in milliseconds; everything else happens asynchronously
+in the background.
+
+If for any reason the event publish fails, the file row is still safely in the
+database — it just won't be processed until the failure is fixed. The system
+is designed never to lose a file because of a transient publish glitch.
+
+---
+
+## Stage 2: Extracted
+
+A worker process — running separately from the API — receives the
+`files.uploaded` event. The first thing it does is look up the object in GCS
+and read its metadata: the original file name, the MIME type, the size, and a
+preview thumbnail URL if one was supplied. These get written back to the file
+row so the UI and any later consumers always have a complete picture.
+
+The worker then flips the status from `pending` to `extracting` and decides
+how to turn the file into text.
+
+### Choosing an extractor
+
+Not every file needs a heavyweight document-understanding service:
+
+- **CSV, JSON, Markdown, plain text** — handled in the worker process itself.
+  No external call. Fastest path.
+- **PDF, DOCX, PPTX, XLSX, HTML, images** — handed off to an external
+  extraction service. Orbiter uses two:
+  - **Firecrawl** — used by default. The worker signs a short-lived GCS URL
+    and Firecrawl downloads the file directly, so the worker never holds the
+    file body in memory. Excellent for small and medium files; the service
+    rejects PDFs larger than around 10 MB.
+  - **Unstructured** — used when a file is too big for Firecrawl (above
+    roughly 9 MB by default, tunable). The worker reads the file body and
+    posts the bytes; slower and more memory-hungry but works on anything.
+
+Either way, the output is the same: a single markdown document representing
+the readable content of the original file. That markdown is saved on the file
+row so every later stage works from a uniform text representation, regardless
+of whether the original was a 60-slide deck or a one-page memo.
+
+### Failure handling
+
+If extraction fails, the file row is marked `failed` with the error message.
+The event will be retried automatically a few times before being parked in a
+dead-letter queue for manual inspection. Almost every transient failure
+(network blip, brief upstream outage, signed-URL race condition) resolves on
+its own through these automatic retries.
+
+---
+
+## Stage 3: Classified
+
+Once markdown is available, the worker runs the **classifier** — a short LLM
+call that reads the document and assigns it a type. The current options
+include:
+
+- `fundraising_deck`
+- `financial_document`
+- `legal`
+- a few others, plus an `unknown` fallback
+
+The classification result is written to the `classification` column on the
+file row.
+
+This step is intentionally **best-effort**. If the classifier fails for any
+reason, the failure is logged but the pipeline continues — the file is fine,
+the classification is just metadata. We'd rather have a usable file with no
+type than no file at all.
+
+The classification is what decides whether the next two stages run. Files that
+are *not* fundraising decks transition straight to `completed` at this point.
+Decks continue on to the profile and embedding stages.
+
+---
+
+## Stage 4: Profiled (fundraising decks only)
+
+When a file classifies as a `fundraising_deck`, the worker transitions the
+status from `extracting` to `embedding` and begins building the **pitch
+profile** — the structured representation of the deck that downstream matching
+systems will use.
+
+The profile is produced by a single LLM call against a strong reasoning model
+(deepseek-v3.2 by default). The model receives the deck's markdown and is
+asked to return:
+
+- About **thirty structured fields** — company name, sector, stage, founding
+  year, headquarters, team size, raise amount, target check size, ARR/MRR,
+  customer count, runway, GTM model, use of capital, prior investors,
+  notable customers, tailwinds, and so on. These are the kind of facts you'd
+  want in a CRM or a deal screen.
+- **Six narratives**, each a paragraph or two of plain English:
+  - **Founder fit** — who the founders are, prior exits, domain expertise.
+  - **Problem & market** — the problem solved, market thesis, customer.
+  - **Competitive moat** — defensibility, network effects, technology.
+  - **Traction & momentum** — revenue, customers, growth signals.
+  - **Business model** — go-to-market motion, pricing, unit economics.
+  - **Expansion roadmap** — geographic, vertical, or product expansion.
+
+Each narrative is written to stand on its own. An investor reading just the
+"founder fit" narrative should understand the team without context from the
+others.
+
+The profile is written to the `pitch_profiles` table. A status column on that
+row tracks its own state (`pending` → `embedding` → `completed`), independent
+of the parent file's status.
+
+Unlike classification, the profile pipeline is **not** best-effort. Vectors
+are load-bearing data — downstream matching can't work without them — so a
+profile failure marks the file row `failed` and lets Pub/Sub retry the whole
+pipeline. By the time a file reaches `completed`, its profile is guaranteed
+to exist.
+
+---
+
+## Stage 5: Embedded (fundraising decks only)
+
+The six narratives are turned into six 768-dimensional vectors in a single
+request to Perplexity's contextualized embedding endpoint. "Contextualized"
+matters here: each narrative's vector "knows" what the other five say,
+because all six are sent together as chunks of one logical document. That
+cross-narrative awareness is what makes downstream semantic matching work
+better than embedding each narrative in isolation.
+
+The six vectors land in the `pitch_profile_narratives` table. Each row carries
+the narrative text, the vector, the embedding model id, and the dimension
+count, so when the embedding model changes later the system knows which rows
+to re-embed.
+
+A small synthesis row is also created with placeholders for later analytics
+(declared vs derived deltas, partner specialisation hints, risk flags). These
+are populated by other features that run on top of the pitch profile.
+
+The pitch profile pipeline ends by publishing a **`pitch_profile.completed`**
+event with the file's id, the profile id, the company name, and the Xano
+routing keys.
+
+---
+
+## Stage 6: Delivered
+
+With every prior stage finished, the worker writes the final state to the
+file row:
+
+- `status = completed`
+- Total wall time logged so the demo dashboard and operators can see how long
+  the whole pipeline took.
+
+Then it emits a **`files.completed`** event carrying the file's id, GCS URI,
+file name, MIME type, size, classification, status, and the Xano routing keys
+echoed back unchanged.
+
+At this point the file's own pipeline is done. Anything that should happen
+"after a file is ready" — notify another system, kick off a thesis match,
+update a CRM — is the job of the webhook fanout.
+
+---
+
+## Webhooks: how downstream systems hear about all this
+
+Two events fired during a successful pipeline can trigger webhooks:
+
+- `files.completed` — fires for every file that finishes the pipeline,
+  regardless of classification.
+- `pitch_profile.completed` — fires only for files that produced a pitch
+  profile (i.e. fundraising decks).
+
+A third event, `theses.completed`, fires from a different feature (investment
+thesis builder) but uses the exact same webhook delivery machinery, so it's
+included here for completeness.
+
+### Subscriptions
+
+A **webhook subscription** is a stored decision that says: "for this event
+type, POST the payload to this URL". Subscriptions live in the
+`webhook_subscriptions` table and have:
+
+- An **event type** they listen for.
+- A **URL** to call.
+- A **secret** used to sign each delivery.
+- An **environment** label (`staging`, `production`) so the same database can
+  fan out to multiple downstream environments without crossing wires.
+- An **enabled** flag so a misbehaving downstream can be paused without
+  deleting the subscription.
+
+There's no limit on how many subscriptions can listen for the same event. If
+you have three Xano endpoints that all care about `files.completed`, you
+create three subscriptions and the system fans out to all three in parallel.
+
+### Fan-out
+
+When a `files.completed` (or `pitch_profile.completed`, or
+`theses.completed`) event arrives at the worker, the **fan-out handler**:
+
+1. Looks up every enabled subscription for that event type.
+2. Inserts one row into the `webhook_deliveries` table per subscription. The
+   row carries the original payload, the subscription id, the event id, and
+   a `status = pending`.
+3. Publishes one `webhooks.delivery.attempt` message per row.
+
+The `webhook_deliveries` table is the durable audit trail. Every webhook
+attempt — including retries — leaves a record there with its outcome,
+attempt count, and last error.
+
+### Delivery
+
+Each `webhooks.delivery.attempt` message triggers the **delivery handler**,
+which:
+
+1. Reads the delivery row and its subscription.
+2. POSTs the payload to the subscription URL with these headers:
+   - `Content-Type: application/json`
+   - `User-Agent: orbiter-webhooks/<version>`
+   - `X-Orbiter-Event` — the event type.
+   - `X-Orbiter-Delivery` — the unique delivery id.
+   - `X-Orbiter-Timestamp` — a Unix timestamp.
+   - `X-Orbiter-Signature` — an HMAC-SHA256 signature over the request body
+     using the subscription's secret. Receivers should verify this header to
+     confirm the request really came from Orbiter.
+3. Inspects the response.
+
+The outcome decides the next state:
+
+- **2xx** — the delivery row is marked `delivered` with a timestamp. Done.
+- **4xx or 5xx** — the row's `attempts` counter is incremented. If the row
+  has retries remaining, status becomes `failed` and Pub/Sub redelivers
+  with exponential backoff. If the row has hit its retry cap, status becomes
+  `dead` and the delivery stops permanently — recovery is now manual.
+
+A typical successful delivery happens within seconds of the source event.
+
+### When deliveries fail
+
+If a downstream system goes offline, Orbiter does not panic and does not
+forget. Each delivery row sits in the database with its full payload. Pub/Sub
+retries the attempt with backoff. When the downstream recovers, the next
+retry lands successfully and the row transitions to `delivered`.
+
+When retries are exhausted, the row goes to `dead`. Dead rows are visible in
+the admin and can be replayed manually once whatever broke is fixed.
+
+---
+
+## How long does this all take?
+
+Roughly, for a fundraising deck PDF:
+
+| File size            | Total wall time              |
+| -------------------- | ---------------------------- |
+| Small (a few MB)     | ~20 seconds                  |
+| Medium (5–9 MB)      | ~30–45 seconds (Firecrawl)   |
+| Large (9 MB+)        | ~2 minutes (Unstructured)    |
+
+The dominant costs are:
+
+1. **Extraction** — Firecrawl ~2 seconds, Unstructured ~60 seconds for a
+   large PDF.
+2. **Pitch-profile LLM call** — ~30–60 seconds depending on deck length.
+
+Everything else (GCS metadata read, classification, embedding, database
+writes, webhook fan-out) is well under two seconds combined.
+
+Non-deck files skip stages 4 and 5 entirely and typically complete in under
+ten seconds.
+
+---
+
+## What happens when something breaks
+
+The pipeline distinguishes between two kinds of failure:
+
+- **Transient** — bad network luck, a brief upstream blip, a momentary
+  contention. The handler returns an error, Pub/Sub redelivers a few times
+  with backoff, and the file usually succeeds on its second or third try.
+  The file row carries the last error so it's diagnosable, but you don't
+  need to do anything.
+- **Permanent** — a fundamentally broken input or configuration: the GCS
+  object doesn't exist, the bucket is in a different project, the file is
+  a corrupt PDF the extractor can't parse, the downstream webhook URL is
+  permanently 404. After a configurable number of attempts (default 5), the
+  message lands in a dead-letter queue and the file row stays in `failed`.
+  An operator can inspect the DLQ, decide whether to fix and replay, and
+  trigger the recovery.
+
+Either way, the file row is *durable*. Files never silently vanish.
+
+---
+
+## Summary, in one diagram
+
+```
+POST /v1/ingestion/files
+  │
+  ▼
+[files row: pending]                                 ─── files.uploaded
+  │
+  ▼ (worker)
+[extracted: markdown stored]                          ─── (no event)
+  │
+  ▼
+[classified: type stored]                             ─── (no event)
+  │
+  ├──(not a deck)──▶ [files row: completed]          ─── files.completed
+  │                                                       │
+  │                                                       ▼
+  │                                                  webhook fan-out → Xano (etc.)
+  │
+  └──(fundraising_deck)──▶
+       [pitch profile: structured fields + 6 narratives]
+                                                     ─── (no event yet)
+       [6 narratives embedded → 6 vectors]
+                                                     ─── pitch_profile.completed
+       [files row: completed]                        ─── files.completed
+                                                          │
+                                                          ▼
+                                                     webhook fan-out → Xano (etc.)
+```
+
+Every arrow marked with an event name represents a Pub/Sub publish that
+other services in the system can subscribe to. Every arrow without one is
+purely internal bookkeeping.
+
+That's the whole story.

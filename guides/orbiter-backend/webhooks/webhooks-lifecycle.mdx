@@ -1,0 +1,443 @@
+---
+title: "Webhooks"
+description: "How Orbiter delivers events to downstream systems — subscriptions, fan-out, signed deliveries, retries, and dead-letter recovery."
+sidebarTitle: "Webhooks"
+---
+
+# Webhooks Lifecycle
+
+This is the third in the lifecycle trilogy: *[File Lifecycle](../files-ingestion/file-lifecycle)*
+covers how files turn into pitch profiles, *[Investment Thesis Lifecycle](../files-ingestion/investment-thesis)*
+covers how investors turn into theses, and this one covers how either of those
+results gets delivered to downstream systems.
+
+If you've ever wondered how Xano hears that a file finished processing,
+why a webhook took two minutes to arrive (or arrived three times), what
+the `X-Orbiter-Signature` header is for, or what happens to a delivery
+when your receiver is down for an hour — this document explains it.
+
+It's written for two audiences:
+
+- **Operators** running Orbiter who need to understand the delivery
+  guarantees and recovery paths.
+- **Integrators** building a webhook receiver who need to know what to
+  expect on the wire.
+
+Both should be able to read it without opening any Go code.
+
+---
+
+## TL;DR
+
+A webhook delivery goes through four stages, in this order:
+
+1. **Subscribed** — a receiver registers a URL it wants events POSTed to.
+2. **Fanned out** — when an event fires, the system finds every matching
+   subscription and creates one delivery row per match.
+3. **Delivered** — each delivery row triggers an HTTP POST to the
+   subscribed URL, signed so the receiver can verify it.
+4. **Retried (or buried)** — non-2xx responses are retried automatically
+   with backoff until they succeed or hit the retry cap and land in a
+   manual-recovery state.
+
+Every delivery is durable. Receivers being slow, broken, or offline
+doesn't lose events — it just defers them.
+
+---
+
+## The three concepts
+
+A clean mental model of the webhook system is three nouns plus one verb:
+
+- **Event** — something happened in Orbiter that downstream systems
+  might care about. Today there are three:
+  - `files.completed` — a file finished its full processing pipeline.
+  - `pitch_profile.completed` — a fundraising deck produced a complete
+    pitch profile.
+  - `theses.completed` — an investment thesis finished building.
+- **Subscription** — a stored decision that says "when *this event type*
+  fires, POST the payload to *this URL*". Subscriptions live in the
+  `webhooks.webhook_subscriptions` table.
+- **Delivery** — a single attempt to actually POST one event to one
+  subscription. Deliveries live in the `webhooks.webhook_deliveries`
+  table. They're the durable audit trail; every retry leaves a row.
+- **Fan-out** *(verb)* — taking one event and creating one delivery row
+  per matching subscription.
+
+You can have many subscriptions for the same event type. One
+`files.completed` event can fan out to three subscriptions, producing
+three deliveries that POST to three different URLs in parallel. That's
+how multiple downstream systems can listen to the same source of truth
+without anyone coordinating.
+
+---
+
+## Stage 1: Subscribed
+
+Subscriptions are managed through five HTTP endpoints under
+`/v1/webhooks/subscriptions`:
+
+| Method | Path                                       | Purpose                            |
+| ------ | ------------------------------------------ | ---------------------------------- |
+| POST   | `/v1/webhooks/subscriptions`               | Create a new subscription.          |
+| GET    | `/v1/webhooks/subscriptions`               | List subscriptions.                 |
+| GET    | `/v1/webhooks/subscriptions/{id}`          | Fetch one subscription.             |
+| PATCH  | `/v1/webhooks/subscriptions/{id}`          | Update url + enabled state.         |
+| DELETE | `/v1/webhooks/subscriptions/{id}`          | Remove a subscription.              |
+| GET    | `/v1/webhooks/event-types`                 | List the event types you can subscribe to. |
+
+A subscription carries:
+
+- **`event_type`** — one of the supported events listed above. Subscriptions
+  match events by exact event-type string; no wildcards.
+- **`url`** — where the POST should go. Must be reachable from Orbiter's
+  worker (so private/localhost URLs only work in local dev).
+- **`secret`** — a string used to sign every delivery to this subscription.
+  Each subscription should have its own secret; never share secrets
+  across receivers.
+- **`environment`** — a label like `staging` or `production`. Stored for
+  bookkeeping; today it's metadata only (the fan-out doesn't filter on
+  it), but it's there so you can keep environments cleanly separated in
+  the same subscription table.
+- **`enabled`** *(boolean)* — `true` by default. Set to `false` to pause
+  a subscription without deleting it: useful when a receiver is
+  misbehaving and you want to stop the bleeding while you investigate.
+
+A subscription created today will fire on the *next* matching event.
+Subscriptions are not retroactive — they don't replay historical events.
+
+---
+
+## Stage 2: Fanned out
+
+Every time the file or thesis pipelines emit one of the supported events,
+a worker process picks it up and runs the **fan-out** step:
+
+1. Look up every **enabled** subscription whose `event_type` matches the
+   event.
+2. For each match, insert one row into `webhooks.webhook_deliveries`
+   with:
+   - the subscription id
+   - the original event payload (verbatim — the bytes are stored, not
+     re-marshalled)
+   - the event's unique id
+   - `status = pending`
+   - `attempts = 0`
+   - a `max_attempts` ceiling (defaults to 5; configurable per
+     deployment).
+3. For each new delivery row, publish a `webhooks.delivery.attempt`
+   message carrying the delivery id.
+
+A few things worth knowing about fan-out:
+
+- **It's idempotent.** The `webhook_deliveries` table has a unique
+  index on `(subscription_id, event_id)`. If the same source event is
+  redelivered (which can happen — Pub/Sub gives at-least-once), the
+  fan-out tries to insert duplicates and the unique index swallows them.
+  No double-creation; no double-billing.
+- **Failure is recoverable.** If the publish of a delivery message fails
+  partway through, the source event NACKs and Pub/Sub redelivers. On the
+  retry, already-created delivery rows are skipped and only the missed
+  publishes get re-issued.
+- **No subscribers? No work.** If no subscription matches an event, the
+  fan-out logs a debug line and acks. No rows created, no messages
+  published.
+
+---
+
+## Stage 3: Delivered
+
+Each `webhooks.delivery.attempt` message triggers the **delivery
+handler**, which is what actually performs the HTTP POST to the
+receiver.
+
+### What gets sent
+
+The request is always:
+
+- **Method**: `POST`
+- **Body**: the verbatim event payload bytes that were stored on the
+  delivery row at fan-out time
+- **Headers**:
+
+| Header                  | Value                                                              |
+| ----------------------- | ------------------------------------------------------------------ |
+| `Content-Type`          | `application/json`                                                 |
+| `User-Agent`            | `orbiter-webhooks/1`                                               |
+| `X-Orbiter-Event`       | the event type, e.g. `files.completed`                             |
+| `X-Orbiter-Delivery`    | the unique delivery id (a UUID; useful for log correlation)        |
+| `X-Orbiter-Timestamp`   | a Unix timestamp at the moment of the POST                         |
+| `X-Orbiter-Signature`   | `sha256=<hex>` — HMAC-SHA256 of the raw body bytes, keyed by the subscription's secret |
+
+The signature prefix (`sha256=`) is intentional: it leaves room to
+upgrade to a stronger HMAC or ed25519 later without breaking receivers
+who hard-coded "sha256=" parsing.
+
+### Verifying the signature (for receivers)
+
+Every receiver should verify the signature on every request. The
+verification is straightforward:
+
+1. Read the raw request body as bytes (**before** any JSON parsing — the
+   signature is over the byte stream, not the parsed JSON).
+2. Compute `HMAC-SHA256(body, your_subscription_secret)` and hex-encode
+   it.
+3. Compare against the `X-Orbiter-Signature` header value (after
+   stripping the `sha256=` prefix) using a constant-time comparison.
+
+A receiver that doesn't verify the signature is open to anyone
+discovering the URL and POSTing arbitrary JSON to it. Always verify.
+
+### Interpreting the response
+
+Whatever the receiver returns is how the delivery handler decides what
+happens to the row:
+
+- **2xx** — Success. The row is marked `delivered` with a timestamp. Done.
+  Pub/Sub acks. The delivery never fires again.
+- **Anything else (4xx, 5xx, network error, timeout)** — Failure. The row's
+  `attempts` counter increments and one of two things happens:
+  - **Attempts remaining** — row status becomes `failed`, the error
+    message is recorded, and the handler NACKs the message. Pub/Sub
+    will redeliver after its backoff window.
+  - **Attempts exhausted** (`attempts >= max_attempts`) — row status
+    becomes `dead` with the last error message recorded, and the handler
+    acks (so Pub/Sub stops redelivering forever). The delivery is now in
+    manual-recovery territory.
+
+The retry behaviour is provided entirely by Pub/Sub at the
+infrastructure level, not by application code. Backoff defaults to
+~10 s on the first retry and grows exponentially up to ~10 min. The
+total elapsed time across all five attempts is roughly 20 minutes
+before a misbehaving receiver lands a delivery in `dead`.
+
+### Idempotency on the receiver side
+
+Because deliveries can retry, the same payload can land at your
+receiver multiple times. Receivers should be **idempotent**: re-handling
+the same `X-Orbiter-Delivery` id (or the same `event_id` inside the
+payload) should not produce duplicate effects. The simplest pattern is
+to record handled delivery ids and short-circuit duplicates.
+
+---
+
+## Stage 4: Retried (or buried)
+
+The system tries hard not to lose deliveries. Three layers of recovery
+stack on top of each other:
+
+### Layer 1: automatic retry (5 attempts)
+
+Pub/Sub redelivers `webhooks.delivery.attempt` messages with exponential
+backoff. Most transient failures — a brief downstream outage, a
+momentary network blip, a deploy in progress at the receiver — resolve
+within the five-attempt window without any human involvement.
+
+Every retry increments `attempts` on the delivery row and updates
+`last_error` with whatever the most recent failure was. You can watch a
+row recover by querying it during the retry window:
+
+```sql
+SELECT id, status, attempts, last_error, created_at, delivered_at
+FROM webhooks.webhook_deliveries
+WHERE id = '<delivery_id>';
+```
+
+### Layer 2: manual retry
+
+Once a delivery is `dead`, the automatic retry loop stops. To get the
+delivery to fire again — say, after you've fixed the receiver — call:
+
+```
+POST /v1/webhooks/deliveries/{id}/retry
+```
+
+This resets the delivery's attempt counter, transitions it back to
+`pending`, and re-publishes the delivery message. The next attempt
+runs through the normal delivery handler exactly as if it were the
+first attempt.
+
+You can also list deliveries by status to find rows that need attention:
+
+```
+GET /v1/webhooks/deliveries?status=dead
+GET /v1/webhooks/deliveries?status=failed
+```
+
+### Layer 3: dead-letter queue (optional, recommended)
+
+For deliveries whose source message keeps failing in ways that aren't
+recoverable through retry — bad payloads, deserialisation errors,
+infrastructure issues — Pub/Sub can be configured to forward the
+message to a dead-letter topic after the attempt cap is hit. Inspecting
+the DLQ lets you see *what kind* of failure is occurring at the
+infrastructure layer (versus at the receiver layer).
+
+Setting up the DLQ is a one-time infrastructure step on the Pub/Sub
+subscription, not something the application controls. See the
+`deploy-gcp.md` doc for the gcloud commands.
+
+---
+
+## The event payloads
+
+Each event type has its own payload shape. The signature, headers,
+and retry behaviour are the same across all three; only the body differs.
+
+### `files.completed`
+
+Fires once per file at the end of the processing pipeline.
+
+```json
+{
+  "file_id": "019e2153-c107-7505-b8e8-d9f71b13c53c",
+  "gcs_uri": "https://storage.googleapis.com/orbiter-staging/.../6qhbd.pdf",
+  "file_name": "6qhbd.pdf",
+  "mime_type": "application/pdf",
+  "size_bytes": 9720132,
+  "classification": "fundraising_deck",
+  "status": "completed",
+  "data_source": "staging",
+  "xano_user_id": 37,
+  "xano_file_id": 12345,
+  "suggestion_request_id": 67890
+}
+```
+
+The `xano_*` and `suggestion_request_id` fields are present only if the
+file was created with those values. They're echoed back unchanged so the
+receiver can route the result to the right place in its own data model.
+
+### `pitch_profile.completed`
+
+Fires once per fundraising deck after the profile + 6 narrative vectors
+are written.
+
+The payload carries the file id, the profile id, the company name and
+sector pulled from the profile, and the same Xano routing keys echoed
+back. See `internal/features/files/filespub/events.go` for the full
+field list — but in spirit it's a sibling of `files.completed` for
+deck-specific data.
+
+### `theses.completed`
+
+Fires once per investment thesis build (only on a fresh build; cache
+hits do *not* refire). Payload carries the thesis id, owner key (one
+of `master_person_id` or `master_company_id`), firm name, investor
+type, declared and derived summaries, and the data source.
+
+---
+
+## How long does delivery take?
+
+For a healthy receiver responding quickly:
+
+| Path                              | Total wall time |
+| --------------------------------- | --------------- |
+| Source event → fan-out enqueued   | < 100 ms        |
+| Fan-out enqueued → delivery sent  | < 1 s typically |
+| Successful POST round-trip        | depends on receiver — usually 100–500 ms |
+
+For a receiver that's slow or returns 5xx, the retry schedule dominates:
+
+| Attempt | Approximate time after the previous one |
+| ------- | ---------------------------------------- |
+| 2nd     | ~10 s                                   |
+| 3rd     | ~30 s                                   |
+| 4th     | ~2 min                                  |
+| 5th     | ~5 min                                  |
+| (then `dead`) | ~20 min total elapsed              |
+
+Slow receivers are themselves the most common cause of "where is my
+webhook?". Watch `attempts` on the delivery row to see what's happening.
+
+---
+
+## What happens when something breaks
+
+The webhook pipeline distinguishes between two kinds of failure, in the
+same pattern as the file and thesis pipelines:
+
+- **Transient** — the receiver responded with a 5xx, a 408, a network
+  timeout. Pub/Sub redelivers automatically with backoff. Most of the
+  time these recover on their own; you'll see `attempts` climb on the
+  row and then `status` flip to `delivered`.
+- **Permanent** — the receiver consistently returns 4xx (bad payload,
+  missing required field, authentication failure). All five attempts
+  fail, the row lands in `dead`, and recovery is manual via the
+  `/retry` endpoint after you've fixed whatever was wrong.
+
+There's a subtle but important point about 4xx specifically: they
+*should* be permanent (the receiver is saying "your request is
+malformed"), so retrying them five times is technically wasted effort.
+A future improvement is to short-circuit retries on 4xx and mark the
+row `dead` immediately, but as of today they go through the normal
+retry loop along with 5xx. The trade-off favours simplicity over a
+small amount of extra wasted POSTs.
+
+What is *not* possible:
+
+- A delivery is never silently dropped. Every event that fans out
+  produces a durable row, and every row ends in either `delivered`
+  or `dead`. You can audit the entire history at any time.
+- A subscription is never silently disabled. If a receiver is
+  misbehaving, you have to mark `enabled = false` (or DELETE the
+  subscription) deliberately.
+
+---
+
+## Operational observability
+
+A healthy webhook system is one where you can answer these questions in
+under a minute:
+
+| Question                                                       | Where to look                                                          |
+| -------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| How many deliveries are currently in `dead`?                   | `SELECT count(*) FROM webhooks.webhook_deliveries WHERE status='dead'` |
+| Which subscription is producing all the dead rows?             | `SELECT subscription_id, count(*) FROM webhooks.webhook_deliveries WHERE status='dead' GROUP BY 1 ORDER BY 2 DESC` |
+| What's the latest error for a stuck delivery?                  | `SELECT last_error FROM webhooks.webhook_deliveries WHERE id = ...`     |
+| What did the request body actually contain?                    | `SELECT payload FROM webhooks.webhook_deliveries WHERE id = ...`        |
+| Did Orbiter even *try* to deliver this event yet?              | `GET /v1/webhooks/deliveries?status=pending`                            |
+
+Treat the deliveries table as your debug surface. Every claim about
+"did this fire?" is one query away.
+
+---
+
+## Summary, in one diagram
+
+```
+       source pipeline (files / outcomes)
+                  │
+                  ▼
+        emits e.g. files.completed
+                  │
+                  ▼
+      ┌─────────────────────────────┐
+      │  webhooks fan-out handler   │
+      │  - list enabled subs        │
+      │  - insert N delivery rows   │
+      │  - publish N delivery msgs  │
+      └─────────────────────────────┘
+                  │
+       ┌──────────┼──────────┐
+       ▼          ▼          ▼
+   delivery   delivery   delivery
+   #1         #2         #3
+       │          │          │
+       ▼          ▼          ▼
+   POST URL_1  POST URL_2  POST URL_3
+   (signed)    (signed)    (signed)
+       │          │          │
+       ├──2xx──▶ delivered (done)
+       │
+       └──non-2xx──▶ retry (up to 5×)
+                       │
+                       ├──eventually 2xx──▶ delivered
+                       │
+                       └──exhausted──────▶ dead
+                                              │
+                                              └──manual: POST /retry
+```
+
+That's the whole story.

@@ -1,0 +1,387 @@
+---
+title: "Investment Thesis Lifecycle"
+description: "How Orbiter turns an investor's public statements and portfolio history into a 12-narrative, vector-searchable thesis."
+---
+
+# Investment Thesis Lifecycle
+
+This document explains what happens when Orbiter builds an **investment
+thesis** for an investor — a venture-capital partner or a firm. It's the
+sibling document to *[File Lifecycle](./file-lifecycle)*: where that one
+explains how Orbiter turns a startup's pitch deck into structured data, this
+one explains how Orbiter turns an investor's public footprint and portfolio
+history into the matching structured data on the other side.
+
+The two are designed to be paired. A pitch profile describes "what this
+company is offering". An investment thesis describes "what this investor is
+looking for". Matching them is what produces the introduction
+recommendations downstream — but that's a separate document.
+
+If you've ever wondered what's in a thesis row, why it has *twelve*
+narratives instead of six, what "declared vs derived" means, or why a
+build sometimes finishes in three seconds and sometimes takes forty —
+this is the document that explains it.
+
+---
+
+## TL;DR
+
+A thesis build goes through five stages, in this order:
+
+1. **Requested** — the API receives a build request for a specific
+   investor.
+2. **Freshness-checked** — if a recent thesis already exists, return it
+   from cache and skip everything below.
+3. **Extracted (twice, in parallel)** — two LLM calls produce a *declared*
+   view and a *derived* view of the investor's strategy.
+4. **Embedded** — the resulting twelve narratives become twelve vectors in
+   a single Perplexity request.
+5. **Delivered** — the row is marked `ready` and a `theses.completed`
+   event fans out to every subscribed webhook.
+
+A fresh-hit build returns in milliseconds. A full rebuild typically
+finishes in 20–40 seconds.
+
+---
+
+## Why two views? Declared vs derived
+
+The whole structure of a thesis pivots on a single observation about how
+investors talk about themselves:
+
+> **What an investor *says* they invest in is not always what their
+> *portfolio* shows they actually invest in.**
+
+That gap — between stated strategy and revealed behaviour — is the
+interesting signal. It's where partner specialisation hides, where a fund's
+thesis drift shows up before the press release, and where a co-investor
+syndicate's actual taste shows through.
+
+So Orbiter builds **two parallel views** of every investor:
+
+- **Declared** — what the investor publicly states. Built from their firm
+  bio, fund description, partner statements, and any other public signal
+  about what they say they invest in.
+- **Derived** — what their portfolio actually demonstrates. Built from
+  their deal history, portfolio companies, co-investor patterns, and the
+  shape of their cheque sizes.
+
+Each view is produced by its own LLM call, against its own prompt, looking
+at its own slice of the gathered context. Each view answers the same six
+questions (the *dimensions*; we'll get to those). At the end you have
+twelve narratives covering the same six dimensions twice — once from each
+perspective — and a `declared_vs_derived_delta` field that highlights
+where the two disagree.
+
+---
+
+## Stage 1: Requested
+
+A build is triggered by `POST /v1/outcomes/investment-thesis/build`. The
+request body identifies the investor and supplies all the data the LLMs
+need to work with:
+
+- **`master_person_id`** *or* **`master_company_id`** — exactly one. A
+  thesis can be owned by a partner (a person) or by a firm (a company),
+  never both. This is the *owner key*; theses are unique-per-owner.
+- **`context`** — a JSON payload containing every relevant fact the
+  upstream system (typically Xano) has gathered about this investor:
+  firm info, fund info, public statements, deal history, portfolio
+  companies, co-investors, etc. The payload is opaque to Orbiter; the
+  prompts decide what to read out of it.
+- **`data_source`** — a routing label (`staging`, `production`, etc.) that
+  downstream consumers use to keep environments separate.
+- **`force`** *(optional)* — when `true`, skip the freshness check and
+  rebuild from scratch even if a recent thesis already exists.
+
+The API hands the request to the worker. From here on, every step is
+internal to the worker process.
+
+---
+
+## Stage 2: Freshness check
+
+Building a thesis is *expensive* — two LLM calls plus an embedding call
+plus database writes adds up to tens of seconds and a non-trivial amount
+of money. Most callers don't actually need a fresh build every time; they
+just need a *recent* one.
+
+So before doing any work, the worker looks up the existing thesis row for
+this owner and asks one question: **is its `last_validated_date` within
+the configured freshness window?** (Default 30 days; tunable per
+deployment.)
+
+- If yes, the existing thesis is returned immediately. Nothing else runs.
+  Builds against a fresh row complete in single-digit milliseconds.
+- If no, or if the caller passed `force: true`, the worker drops any prior
+  row for this owner (so the new build owns the unique-per-owner index)
+  and continues to stage 3.
+
+This is what makes a separate `GET /v1/outcomes/investment-thesis/freshness`
+endpoint useful: callers can ask "is this thesis fresh?" without paying
+for a rebuild. If the answer is no, *then* they call `build`.
+
+---
+
+## Stage 3: Extracted (declared and derived, in parallel)
+
+Two LLM calls now run **concurrently**. They don't depend on each other —
+each reads its own slice of the context payload — so running them in
+parallel halves the wall time of the most expensive stage.
+
+### The declared call
+
+Looks at the public-statement parts of the context (firm info, fund info,
+partner bios, written theses) and asks: *what does this investor say they
+look for?*
+
+The response is a structured JSON object containing:
+
+- **A firm name and investor type** (canonicalised — the LLM normalises
+  variants like "VC", "Venture Fund", "Seed Fund" into one of an
+  enumerated set).
+- **A short declared summary** — a paragraph or two capturing the
+  investor's stated strategy.
+- **Six narratives**, each a paragraph or two of plain English (more on
+  the six in a moment).
+
+### The derived call
+
+Looks at the portfolio side of the context (deal history, portcos,
+co-investors) and asks: *what does this investor's behaviour reveal about
+what they actually invest in?*
+
+The response is also a structured JSON object, containing:
+
+- **A short derived summary**.
+- **Six narratives** matching the declared ones dimension by dimension.
+- **A pile of behavioural fields** that don't have a declared counterpart:
+  frequent co-investors, sector evolution over time, recent 36-month
+  focus, deal-size statistics, geographic distribution, partner
+  specialisation hints, syndicate tier estimate, thesis drift signals,
+  and the `declared_vs_derived_delta` itself.
+
+### The six dimensions
+
+Both views answer the same six questions, and they intentionally match
+the dimensions used in pitch profiles so that thesis vectors and pitch
+vectors live in the same comparable space:
+
+| Dimension              | What it covers                                                  |
+| ---------------------- | --------------------------------------------------------------- |
+| **founder_fit**        | The kind of founders the investor backs / a founder type.       |
+| **problem_market**     | Problem domains / market theses the investor focuses on.        |
+| **competitive_moat**   | What kind of defensibility appeals (network effects, tech, etc.) |
+| **traction_momentum**  | Stage / traction expectations (early, post-revenue, scaling).   |
+| **business_model**     | GTM patterns and business-model preferences.                    |
+| **expansion_roadmap**  | Geographic / vertical / product-expansion appetites.            |
+
+Six dimensions × two views = **twelve narratives** for a complete thesis.
+
+### Empty-portfolio safety net
+
+A thin investor — say, a brand-new fund with no deal history yet — can
+produce a derived call with mostly empty fields. Orbiter substitutes a
+placeholder string for any empty narrative so the embed step downstream
+always sees twelve non-empty inputs and produces a complete row. The
+placeholder is a recognisable sentinel; downstream consumers can treat it
+as "no signal" without crashing.
+
+### What gets written to the database before embedding
+
+The two LLM results, plus a small `deal_stats` block computed from the
+raw deal history, are written onto the thesis row immediately after the
+LLM calls finish:
+
+- **Layer 1: rich fields** — declared summary, derived summary, firm name,
+  investor type, all the behavioural fields from the derived call, plus
+  computed deal counts and totals.
+- **Layer 3: synthesis stub** — `declared_vs_derived_delta`,
+  `implicit_lenses`, `thesis_drift_signals`, `partner_specialization`,
+  `syndicate_tier`, plus placeholders for `risk_flags` and
+  `confidence_scores` that later analytics can populate.
+
+Both layers are written *before* embedding. That means even if the
+embedding call or the narrative insert fails for some reason, the row is
+already queryable for everything that doesn't need vectors. Vectors are
+nice-to-have for the surrounding data; the rich fields are useful on their
+own.
+
+---
+
+## Stage 4: Embedded
+
+The twelve narratives are sent to Perplexity's contextualised embedding
+endpoint in a single request. "Contextualised" matters: each of the twelve
+narratives is treated as a chunk of one logical document, so every
+vector "knows" what the other eleven say. That cross-narrative awareness
+is what makes a `traction_momentum` declared vector meaningfully
+distinguishable from a `traction_momentum` derived vector for the same
+investor, even though both are talking about the same person at the same
+moment.
+
+Each narrative ends up as a 768-dimensional vector (Matryoshka-truncated
+from the model's native 2560 — a balance between accuracy and storage).
+The vectors are written to `outcomes.investment_thesis_narratives`, one
+row per dimension-per-source. Each row stores the narrative text, the
+vector, the source (`declared` or `derived`), the dimension, the model
+id, and the dimension count, so when the embedding model changes later
+the system knows which rows need re-embedding.
+
+The output dimension is configurable per deployment but **must match**
+the pitch profile pipeline's embedding dimension. Otherwise thesis
+vectors and pitch vectors live in incomparable spaces and matching
+breaks.
+
+---
+
+## Stage 5: Delivered
+
+With the rich fields, synthesis stub, and twelve narrative rows in place,
+the worker marks the thesis row `ready` and stamps `last_validated_date`
+with today's date. That timestamp is what powers the freshness check on
+the next build for this owner.
+
+It then publishes a **`theses.completed`** event carrying:
+
+- The thesis id.
+- The owner key (whichever of `master_person_id` or `master_company_id`
+  is set).
+- The data source.
+- The firm name and investor type from the LLM (canonical, not the
+  initial hint pluck).
+- The declared and derived summaries.
+
+The event goes to the same `files-events` topic as the file-lifecycle
+events. The webhooks worker is subscribed to `theses.completed` and fans
+out to every enabled subscription for that event type, exactly the way
+it fans out `files.completed` and `pitch_profile.completed`. See
+*[File Lifecycle](./file-lifecycle)* for the webhook delivery details
+— it's the identical machinery.
+
+---
+
+## How long does this all take?
+
+| Path                    | Total wall time            |
+| ----------------------- | -------------------------- |
+| Fresh hit (cache)       | < 50 ms                    |
+| Cold rebuild            | 20–40 seconds              |
+| Cold rebuild, slow LLM  | up to ~60 seconds          |
+
+The dominant cost in a cold rebuild is the LLM calls. Running declared
+and derived in parallel means total wall time is roughly the *max* of
+the two, not the sum:
+
+- **Declared call** — small input, smaller output. Typically 8–15
+  seconds.
+- **Derived call** — bigger input (full portfolio), bigger output (more
+  fields). Typically 20–35 seconds.
+- **Embedding** — one Perplexity call, ~1–2 seconds.
+- **Database writes** — combined, well under 500 ms.
+
+Anything outside that envelope is usually upstream provider latency on a
+specific LLM call; the extractor retries transient provider errors
+automatically.
+
+---
+
+## What happens when something breaks
+
+The pipeline distinguishes between two kinds of failure, the same way
+the file pipeline does:
+
+- **Transient** — a brief provider outage, a 504 from OpenRouter, a
+  Perplexity rate-limit retry. The extractor retries the failing LLM
+  call automatically (with backoff) before giving up. Most builds that
+  *would* have failed once get through on the second or third internal
+  attempt without you ever seeing it.
+- **Permanent** — a malformed context payload, an LLM consistently
+  returning non-JSON, a configuration error. The thesis row is marked
+  `failed` with the error message and the API returns 500. The row
+  stays in the database for inspection and can be retried by calling
+  `build` again with `force: true`.
+
+Two important details:
+
+- The thesis row is created **before** the LLM calls run. If the LLM
+  calls fail, the row exists in `failed` state with the error message
+  — a useful audit trail.
+- The rich fields and synthesis stub are written **before** the embed
+  step. If embedding or narrative insertion fails, the row still has
+  every non-vector field populated; only the twelve narrative rows are
+  missing. A retry will refill those without rebuilding the rest.
+
+This layered durability is intentional. A thesis pipeline that "fails"
+usually leaves something useful behind.
+
+---
+
+## What's in a complete thesis row?
+
+After a successful build, the `outcomes.investment_theses` row for an
+owner carries:
+
+- **Identity**: thesis id, owner key, firm name, investor type, data
+  source, status, last validated date.
+- **Layer 1 (rich fields)**: declared summary, derived summary, deal
+  stats (count, total raised, average deal size), frequent co-investors,
+  sector evolution timeline, recent 36-month focus, deal-size stats,
+  geographic distribution.
+- **Layer 3 (synthesis stub)**: declared-vs-derived delta, implicit
+  lenses, thesis drift signals, partner specialisation, syndicate tier
+  estimate.
+- **The original context snapshot**: the raw JSON payload the call was
+  built from, stored so the build can be re-run later against an updated
+  prompt without asking upstream to regather the same data.
+
+And alongside it, in `outcomes.investment_thesis_narratives`, **twelve
+narrative rows** — six declared + six derived — each with its text and
+its vector.
+
+That's a complete thesis: queryable from many angles, comparable to a
+pitch profile in the same vector space, and durable in the database with
+a snapshot of the inputs it was built from.
+
+---
+
+## Summary, in one diagram
+
+```
+POST /v1/outcomes/investment-thesis/build
+  │
+  ▼
+[freshness check]
+  │
+  ├── (fresh) ──▶ return cached thesis ───────── (no event)
+  │
+  └── (stale or force=true) ──▶
+        │
+        ▼
+   [thesis row: building]
+        │
+        ├──▶ declared LLM ──┐
+        │                   │
+        ├──▶ derived  LLM ──┴── (parallel) ──▶ 12 narratives
+        │
+        ▼
+   [rich fields + synthesis stub written]
+        │
+        ▼
+   [12 narratives embedded → 12 vectors]
+        │
+        ▼
+   [12 narrative rows inserted]
+        │
+        ▼
+   [thesis row: ready, last_validated_date stamped]   ─── theses.completed
+                                                            │
+                                                            ▼
+                                                       webhook fan-out → Xano (etc.)
+```
+
+Every arrow marked with an event name represents a publish that other
+services in the system can subscribe to. Everything else is internal
+bookkeeping.
+
+That's the whole story.

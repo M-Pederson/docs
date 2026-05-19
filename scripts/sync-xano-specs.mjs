@@ -349,30 +349,42 @@ function updateDocsJson(navGroups, dryRun) {
   let apiTab = tabs.find((t) => t.tab === "API Reference");
 
   if (!apiTab) {
-    apiTab = { tab: "API Reference", groups: [] };
+    apiTab = { tab: "API Reference", pages: [] };
     tabs.push(apiTab);
   }
 
-  // Keep the intro group
-  const introGroup = apiTab.groups?.find(
-    (g) => g.group === "API Documentation"
+  const existing = apiTab.pages || apiTab.groups || [];
+  const introGroup = existing.find((g) => g.group === "API Documentation");
+  const otherEntries = existing.filter(
+    (g) => g.group !== "API Documentation" && g.group !== "Xano"
   );
 
-  apiTab.groups = [
+  apiTab.pages = [
     introGroup || {
       group: "API Documentation",
       pages: ["api-reference/introduction"],
     },
-    ...navGroups,
+    {
+      group: "Xano",
+      expanded: false,
+      pages: navGroups,
+    },
+    ...otherEntries,
   ];
+
+  delete apiTab.groups;
 
   if (!dryRun) {
     writeFileSync(DOCS_JSON_PATH, JSON.stringify(docsJson, null, 2) + "\n");
     console.log("\n✓ Updated docs.json");
   } else {
     console.log("\n📋 docs.json navigation preview:");
+    console.log(`  Xano (collapsed): ${navGroups.length} nested groups`);
     for (const g of navGroups) {
-      console.log(`  ${g.group}: ${g.pages.length} pages`);
+      console.log(`    ${g.group}: ${g.pages.length} pages`);
+    }
+    for (const g of otherEntries) {
+      console.log(`  ${g.group} (preserved)`);
     }
   }
 }

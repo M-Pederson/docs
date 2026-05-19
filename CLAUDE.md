@@ -11,7 +11,7 @@ When creating API documentation for a new group:
 1. **List API groups:** `listAPIGroups` (workspace_id: 3) to find the group ID and canonical
 2. **List endpoints:** `listAPIs` with the group's `apigroup_id`
 3. **Get swagger spec:** `getApiGroupSwagger` for full endpoint details (inputs, outputs, auth)
-4. Create MDX files under `api-reference/{group-name}/`
+4. Create MDX files under `api-reference/xano/{group-name}/`
 5. Add the group to `docs.json` navigation under the "API Reference" tab
 
 ## Base URL Format
@@ -113,8 +113,8 @@ New API groups go under the "API Reference" tab:
 {
   "group": "Group Name",
   "pages": [
-    "api-reference/{group-name}/endpoint-1",
-    "api-reference/{group-name}/endpoint-2"
+    "api-reference/xano/{group-name}/endpoint-1",
+    "api-reference/xano/{group-name}/endpoint-2"
   ]
 }
 ```
@@ -129,7 +129,7 @@ New API groups go under the "API Reference" tab:
 
 ## File Conventions
 
-- Directory per API group: `api-reference/{group-name}/`
+- Directory per API group: `api-reference/xano/{group-name}/`
 - Kebab-case filenames: `login-clerk.mdx`, `add-local-timezone.mdx`
 - Match endpoint names where possible
 - Include realistic example values in request/response examples

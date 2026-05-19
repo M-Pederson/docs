@@ -1,0 +1,289 @@
+---
+title: "collection-questions API"
+description: "Step-by-step walkthrough of POST /collection-questions (Xano API #8007) — the endpoint that turns a user query + pre-selected graph nodes into a persisted collection_question with an LLM answer, response nodes, and relationship paths."
+---
+
+<Note>
+  **Working doc.** This page is the canonical reference while we debug and optimise API 8007. It is updated as we change the function.
+</Note>
+
+## At a glance
+
+<Card icon="globe">
+
+```
+POST V2 Collections /collection-questions — API 8007
+```
+
+**Public HTTP endpoint.** Auth = user (auth source 125). Lives in API group **V2 Collections** (id 348, canonical `U_4ewelb`).
+
+</Card>
+
+**Base URL**
+
+```url
+https://xh2o-yths-38lt.n7c.xano.io/api:U_4ewelb/collection-questions
+```
+
+**Inputs**
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `collection_id` | `int` (FK → `collection`) | yes | Which collection this question belongs to. |
+| `query` | `text` (trimmed) | yes | The user's natural-language question. |
+| `selected_nodes` | `text[]` (trimmed) | no | Pre-selected FalkorDB node UUIDs — these are the **graph context** for the answer. No vector search. |
+| `team_ids` | `int[]` (nullable) | no | Extra source person UUIDs to include when finding relationship paths. |
+| `deep_research` | `bool` | no | Stored on the debug log row; doesn't currently change branching. |
+
+**Response** — `$ragResponse`, shaped roughly as:
+
+```json
+{
+  "answer": "string",
+  "response_nodes": ["uuid", ...],
+  "nodes": [ /* enriched with paths */ ],
+  "edges": [ /* from FalkorDB */ ],
+  "collection_question": 12345
+}
+```
+
+## Step-by-step
+
+### 1. Log the inbound request
+
+Adds a row to `log_debug_sematic_query` with the raw inputs (user, query, collection, selected_nodes, deep_research, team_ids) — diagnostic only, used for usage analytics and replay.
+
+### 2. Pin the LLM model
+
+Sets `$varModel = "qwen/qwen3-vl-235b-a22b-instruct"`. Single line, easy lever to swap models during testing.
+
+### 3. Trace A — parse-time sanity check
+
+Writes `trace-A-after-varModel` to `error_log_table`. If this row is missing for a given run, the function aborted at parse time before any logic ran.
+
+### 4. Fetch the graph context from FalkorDB
+
+<Card icon="cloud-arrow-up">
+
+```
+mvp/falkor/send-cypher-with-uuids
+```
+
+Called with `{node_uuids: $input.selected_nodes}`. Returns the raw FalkorDB response — the nodes the user already picked plus their immediate edges. **No vector search** runs here; selection is upstream.
+
+</Card>
+
+Result is captured as `$response`.
+
+### 5. Trace B — FalkorDB returned
+
+Writes `trace-B-after-falkor` to `error_log_table`. If A is present but B is missing, the failure is in FalkorDB or its wrapper function.
+
+### 6. Normalise the FalkorDB response
+
+Inline JS lambda (`$cypherResponse`). Does three things:
+
+1. **Unwrap** — if the FalkorDB function returned a string or a `{data: [...]}` envelope, dig through to the underlying `{nodes, edges}` object.
+2. **Dedupe nodes** — build a `nodesMap` keyed by `uuid`, merging nodes from the top-level `nodes` array with the `head_node` / `tail_node` shoulders on each edge. Avoids duplicates and fills in missing `name` / `display_label` from whichever source has them.
+3. **Re-shape edges** — keep only the properties Orbiter cares about (`uuid`, `name`, `description`, `fact`, `weight`, `type`).
+
+`deriveLabel()` picks the first node label that isn't the generic `Entity`.
+
+### 6.5 — Strip `Film_TV_Award` nodes (context optimisation)
+
+**Why this exists.** For people like cinematographers, FalkorDB returns hundreds of `Film_TV_Award` nodes — one per (film × critics-circle × year). Each one carries a `description` like *"1917. . Genres: . Award: BAFTA Awards: Best Cinematography (2020) [Winner]"*. The same information is already encoded on the **edges** between the `Person` and each `Film_TV_Award`, e.g. *"Roger Deakins won Best Cinematography for 1917"*. Keeping both blows up the YAML context by ~80% with zero new information for the LLM.
+
+**What this lambda does.** Drops `Film_TV_Award` nodes from `$cypherResponse.nodes`. Edges are untouched — their descriptions still tell the LLM what was won or nominated, and which film it was for. Path-finding (step 7) and answer-node validation (step 14.9) automatically benefit: award UUIDs can no longer leak into `response_nodes`, and we don't waste path queries trying to route to awards.
+
+```javascript
+// Strip award nodes — their information lives on the edges to them ("X won Y
+// for Film Z"). Keeping the nodes too is pure context bloat.
+let response = $var.cypherResponse;
+const DROP_LABELS = new Set(['Film_TV_Award']);
+return {
+  nodes: (response.nodes || []).filter(n => !DROP_LABELS.has(n.display_label)),
+  edges: response.edges || []
+};
+```
+
+Captured as `$cypherResponse` (overwrites the previous value, so all downstream steps see the trimmed graph). Add other noise labels to `DROP_LABELS` as we find them.
+
+### 6.6 — Dedupe edges by JSON serialization (context optimisation)
+
+**Why this exists.** After step 6.5 strips the award nodes, the edges array still contains massive duplication — the same fact awarded by 10+ different critics circles produces 10+ edges with identical `description: "Roger Deakins won Best Cinematography for 1917"`. Plus every `WORKED_ON` / `HAS_EXPERTISE` edge serialises identically (no description, just `{weight, type}`), so 50+ identical rows for one person collapse to zero new information. None of this duplication helps the LLM — once it has read the fact once, repeating it adds noise.
+
+**What this lambda does.** Filters `$cypherResponse.edges` by full `JSON.stringify(edge)` — any edge whose serialised form has been seen is dropped. Survives:
+- Award edges with different descriptions (e.g., *"Best Cinematography for 1917"* vs *"Best Cinematography in a Theatrical Feature Film for 1917"*) — distinct strings, both kept.
+- The single canonical `WORKED_ON` / `HAS_EXPERTISE` row per unique edge shape.
+
+```javascript
+let response = $var.cypherResponse;
+const seen = new Set();
+const deduped = (response.edges || []).filter(e => {
+  const key = JSON.stringify(e);
+  if (seen.has(key)) return false;
+  seen.add(key);
+  return true;
+});
+return {
+  nodes: response.nodes || [],
+  edges: deduped
+};
+```
+
+Captured as `$cypherResponse` (overwrites again, so downstream — path merge, YAML encode, final response — sees the deduped graph).
+
+**Trade-off note.** Because the normalise lambda in step 6 strips `head_node`/`tail_node` UUIDs from edges, the LLM already can't tell which person a description-less `WORKED_ON` edge belongs to. Collapsing those to one canonical row loses no LLM-visible information. Frontend consumers of the final API response that iterated `$ragResponse.edges` will see fewer rows — generally a win for graph rendering, but worth a glance if anything downstream counted edges.
+
+### 7. Pick target UUIDs for path-finding
+
+Inline JS lambda (`$nodeUuids`). Filters out `SubDomainExpertise` and `DomainExpertise` — those are taxonomy nodes, not meaningful path destinations — and returns the remaining UUIDs.
+
+### 8. Build source UUIDs
+
+Inline JS lambda (`$allSourceUuids`). Combines `$auth.node_uuid` with the user's `team_ids`, dedupes so the user isn't doubled.
+
+### 9. Fetch relationship paths from FalkorDB
+
+<Card icon="cloud-arrow-up">
+
+```
+mvp/falkor/send-cypher-with-paths
+```
+
+Called with `{source_uuids: $allSourceUuids, target_uuids: $nodeUuids}`. Returns the shortest relationship paths from every source person to every target node. Captured as `$pathsResult` for merging in step 16.
+
+</Card>
+
+### 10. YAML-encode the context for the prompt
+
+`$context = $cypherResponse|yaml_encode`. YAML is more LLM-friendly than JSON here — less syntactic noise inside the prompt window.
+
+### 11. Build the LLM prompt
+
+`util.template_engine` produces a prompt with:
+
+- A `<system>` block telling the LLM to extract factual answers only from `<context>`.
+- The YAML-encoded `<context>`.
+- The user's `<question>` from `$input.query`.
+- A strict `<rules>` block — most importantly, rule 2: **`response_nodes` should hold UUIDs of nodes that represent the answer, not the subject of the question** ("Where is Resend HQ'd?" → return San Francisco's UUID, not Resend's).
+- Few-shot `<examples>` driving the same point home.
+- Output must be minified JSON: `{"answer":"…","response_nodes":["…", …]}`.
+
+### 12. Initialise `$ragResponse` to a safe default
+
+`{answer: null, response_nodes: []}`. Lets the persist + merge steps downstream still run even if the entire LLM block throws or returns garbage.
+
+### 13. Log the pre-LLM trace
+
+Writes `[trace] reached pre-LLM section, about to enter try_catch` to `error_log_table` with the cypher context size and prompt size. If this row is absent, the failure is upstream (FalkorDB or the normalise lambdas).
+
+### 14. The LLM call — inside `try_catch`
+
+The whole LLM section is wrapped in `try_catch` so unexpected envelope errors (e.g. Xano's `Unable to locate var: llmResult.response.result.choices...` when OpenRouter returns a 200 with a non-standard body) don't crash the API.
+
+**Inside `try`:**
+
+1. **Log trace** — `[trace] entered try block, about to call OpenRouter` with the model name.
+
+2. **Attempt 1** — `api.request` to `https://openrouter.ai/api/v1/chat/completions`. Body: `model`, `messages` (single `system` message holding the full prompt), `max_tokens: 2048`, `temperature: 0.2`. Timeout 60s. Auth via `$env.openRouter`.
+
+3. **Attempt 2** — if `$llmResult.response.status != 200`, retry the same call.
+
+4. **Attempt 3** — if still not 200, retry one more time.
+
+5. **All 3 failed → deep-research fallback.** Creates a `discover` row with `"No results found in the Orbiter.io Universe. Initiating Deep Research ..."`, a `discover_question` row, fires a realtime update on the `discover` channel, and **returns `""` immediately**.
+
+6. **JSON-encode the result** — `$llmResultStr = $llmResult|json_encode`. Xano's path tracer can't follow nested property access through a string, so this decouples the downstream lambda from `$llmResult`'s structure (this was the root cause of an earlier `Unable to locate var:` crash).
+
+7. **Extract message content** — JS lambda parses `$llmResultStr` and walks `response.result.choices[0].message.content`, returning `null` if any step is unexpected. Captured as `$llmRaw`.
+
+8. **Strip markdown + parse JSON** — JS lambda removes any ` ```json ` fencing or stray backticks, regex-matches the first `{…}` or `[…]` blob, and `JSON.parse`s it. Captured as `$ragResponse` (overwrites the default).
+
+9. **Validate `response_nodes`** — JS lambda builds a set of valid UUIDs from `$cypherResponse.nodes` and filters `$ragResponse.response_nodes` to drop any UUIDs the LLM hallucinated. Falls back to `{answer:'', response_nodes:[]}` if the LLM output isn't an object.
+
+10. **Empty answer → deep-research fallback.** If `$ragResponse.response_nodes` is empty after validation, same discover + discover_question + realtime + early-return sequence as step 14.5.
+
+**Inside `catch`:** logs the exception to `error_log_table` with the model name, selected-nodes count, and team_ids — and lets execution continue (because `$ragResponse` has its safe default).
+
+### 15. Merge path data onto each node
+
+Inline JS lambda (`$mergedResponse`). For each node in `$cypherResponse.nodes`:
+
+- **Self** (`uuid === $auth.node_uuid`) — `paths: [], paths_processing: false`.
+- **Everyone else** — attach `paths`, an array of person-entries computed from `$pathsResult`:
+  - Group raw path rows by `nodeUuid`, then by `personUuid`.
+  - Drop any path with `total_weight > MAX_WEIGHT (55)` — filters out weak/distant connections.
+  - For each person, prefer a **direct** path (`hops <= 1`) if one exists; otherwise emit up to 5 unique **connector** entries (each connector is a `Person` node sitting on the path, with `via` listing the intermediate hops).
+  - Mark each non-self node `paths_processing: true` — the real-time UI uses this to show a spinner until step 21 finishes.
+
+### 16. Splice merged nodes + edges back into the response
+
+`$ragResponse |set:"nodes":$mergedResponse.nodes |set:"edges":$mergedResponse.edges`. Now `$ragResponse` carries `{answer, response_nodes, nodes, edges}`.
+
+### 17. Persist the `collection_question`
+
+<Card icon="database">
+
+```
+collection_question
+```
+
+`db.add` creates the row holding the question, the LLM answer, `user_id`, `collection_id`, and `processing: true`. Captured as `$collectionQuestionRecord`.
+
+</Card>
+
+### 18. Persist one `collection_question_node` per answer node
+
+<Card icon="database">
+
+```
+collection_question_node
+```
+
+For each UUID in `$ragResponse.response_nodes`, look up the matching node in `$ragResponse.nodes` and switch on its `display_label`:
+
+| `display_label` | Column |
+|---|---|
+| `Person` | `person_node_uuid` |
+| `Company` | `company_node_uuid` |
+| `School` | `company_node_uuid` *(note: routed to company column)* |
+| `Funding_Round` | `funding_round_uuid_` |
+| `Film_TV` | `film_tv_uuid` |
+| `Film_TV_Award` | `film_tv_award_uuid` |
+
+Each row also stores `label`, `paths` (from step 15), `added_by_user_id = $auth.id`, and the parent `collection_question_id`.
+
+</Card>
+
+### 19. Attach the question ID to the response
+
+`$ragResponse |set:"collection_question":$collectionQuestionRecord.id`.
+
+### 20. Post-response async work
+
+Runs inside `util.post_process` so the user gets their response immediately:
+
+1. `db.edit collection_question` flips `processing: false` on the row.
+2. `function.run "mvp/realtime/send-realtime"` pushes the updated record on the `discover` channel so the frontend can lift its spinner.
+3. <Card icon="layer-group">
+
+   ```
+   mvp/paths/create-discover-path-v2
+   ```
+
+   Called with `{discover_id: $collectionQuestionRecord.id}`. Resolves and writes the long-form path graph in the background.
+
+   </Card>
+
+### 21. Return
+
+`response = $ragResponse`.
+
+## Open questions / debug notes
+
+- **Diagnostic spam.** Steps 3, 5, 13, and 14.1 write to `error_log_table` on every call. Useful while we stabilise; should be gated behind a debug flag once we're confident.
+- **`School` routing.** Step 18 sends `School` nodes to `company_node_uuid` — confirm that's intentional, or whether `collection_question_node` needs a dedicated `school_node_uuid` column.
+- **`deep_research` is unused.** It's logged in step 1 but never branched on. Either wire it into the deep-research fallback path (step 14.5 / 14.10) or drop it from the input.
+- **Three identical retry blocks.** Steps 14.2–14.4 copy-paste the same 60s OpenRouter call. Could collapse into a single `loop` with a retry counter for readability — though the current form makes each attempt easy to spot in a trace.
+- **`paths_processing: true` is a lie if step 20.3 is async.** The merged response says paths are still being computed, but `create-discover-path-v2` overwrites them later. Worth a doc comment explaining who flips it back to `false`.

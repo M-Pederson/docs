@@ -1,0 +1,103 @@
+---
+title: "Company Social Insights"
+description: "Storage schema and LLM context encoding for company-level social presence data captured via the Social Insights enrichment prompt."
+---
+
+<Note>
+Open work — current design for how Orbiter persists company-level social signal and re-injects it as context into downstream enrichment and agent prompts. Format conventions may evolve as the dataset scales.
+</Note>
+
+## Overview
+
+The Social Insights enrichment produces three outputs per company: a dense prose array of durable signals (`insights`), a structured recent-activity layer (`latest_activity`), and a discovery list of new profile URLs (`profile_urls`). This page documents how those three are stored on `master_company` and re-encoded for LLM context downstream.
+
+## Schema on `master_company`
+
+```sql
+social_insights              text[]      -- array of dense prose strings
+social_latest_activity       jsonb       -- array of {date, platform, actor, summary, signal}
+social_profile_urls          text[]
+social_insights_captured_at  timestamptz -- batch freshness, not per-insight
+social_insights_version      smallint    -- bump when prompt schema changes
+```
+
+## Why `insights` stays flat
+
+`insights` is a flat `text[]` rather than a structured object array, intentionally.
+
+- Each insight is already entity-rich, dimension-aware prose — wrapping it in `{claim, dimension, evidence}` triples token cost when injected as LLM context, with no real downstream gain.
+- LLMs parse flat bullet lists faster than nested JSON.
+- YAML encoding stays clean for direct prompt injection.
+- The prose itself carries dimension cues (X account, hiring, funding, comms style), so models can categorize on read without explicit tags.
+
+## Why `latest_activity` is structured
+
+`latest_activity` is `jsonb` because the fields are too operationally useful to flatten back into prose:
+
+- **Recency filtering.** `WHERE (entry->>'date')::date > now() - interval '14 days'` for "what's happened this week" prompts.
+- **Decay scoring.** Recency-weighted signal injection needs `date` as a real value, not a substring.
+- **Platform-conditional injection.** A sales prompt may only want X and LinkedIn activity; a competitive-intel prompt may want everything.
+- **Actor pivots.** Filtering to founder/exec activity vs marketing-handle activity is a common cut.
+
+The shape of each entry:
+
+```json
+{
+  "date": "2026-05-08",
+  "platform": "X",
+  "actor": "Josh Diamond, CEO",
+  "summary": "Posted a 12-tweet thread announcing HBO as a flagship customer with a 40-second screen-recorded demo of the org graph.",
+  "signal": "Highest engagement on the founder's account in 2026 (~2.1k likes, ~380 reposts). Quote-tweeted by John Traver. Signals a shift from build-in-public to logo-drop trophy posts."
+}
+```
+
+## LLM context encoding pattern
+
+When re-injecting social insights into a downstream prompt, encode as YAML. `insights` becomes a bullet list; `latest_activity` becomes pipe-separated one-liners.
+
+```yaml
+social_insights:
+  - Casper's X account @Casper maintains a long-running irreverent, meme-native tone exemplified by its Shorty Award-winning 'Tweeting Mattress' presence.
+  - Following Carpenter Co.'s October 2024 acquisition, Casper shifted from independent DTC to a hybrid retail model under President Mike McQuiston.
+
+social_latest_activity:  # YYYY-MM-DD | platform | actor | summary | signal
+  - 2026-05-08 | X | Casper marketing | Sleep Week 20% off promo launched | Cross-channel co-amp with Target, retail-first signal
+  - 2026-04-22 | LinkedIn | Mike McQuiston, President | Post on Sleep Shop expansion | Modest engagement, McQuiston solidifying as public face
+
+social_profile_urls:
+  - https://www.linkedin.com/company/casper-sleep
+  - https://x.com/Casper
+```
+
+The pipe-separated one-liner for `latest_activity` is significantly more token-efficient than nested YAML or JSON, and downstream models parse it cleanly. If a prompt only needs recent activity, slice the array in Xano before encoding.
+
+## Refresh strategy
+
+`latest_activity` is a rolling ~60-day window — replace wholesale on each enrichment run, since stale entries drop out by definition.
+
+`insights` is durable signal and should not churn. Use an embedding-similarity dedupe via pgvector on each refresh: embed new insights, compare against existing, and append only the genuinely new ones. A hard-won insight from three months ago shouldn't get erased because the model happens not to surface it on this run.
+
+## Future: pgvector retrieval layer
+
+At current scale, the full `insights` array fits in context. As the dataset grows and prompts start hitting context budget, the next move is to embed each insight individually:
+
+```sql
+create table company_insight (
+  id            bigserial primary key,
+  company_id    bigint references master_company(id),
+  text          text not null,
+  embedding     vector(1536),
+  captured_at   timestamptz not null default now(),
+  source_run_id bigint
+);
+
+create index on company_insight using hnsw (embedding vector_cosine_ops);
+```
+
+Then do top-k retrieval against the downstream prompt being built, injecting only the most semantically relevant N insights per company. Trivial to add when budget pressure shows up; overkill today.
+
+## Open questions
+
+- Should `social_insights_version` be a per-company column or a separate `enrichment_run` table tracking prompt versions across runs?
+- Where does the dedupe threshold sit on cosine similarity — 0.92? 0.95? Needs calibration against the first batch of real refresh runs.
+- Whether to add a `signal_strength` field to `latest_activity` entries (low/medium/high/viral) for ranking, or keep that prose inside the `signal` field as today.

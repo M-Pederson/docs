@@ -1,0 +1,425 @@
+---
+title: "CI/CD & Deployments"
+description: "The three GitHub Actions workflows, how they authenticate to GCP with keyless Workload Identity Federation, and the service-account model behind them."
+sidebarTitle: "CI/CD & Deployments"
+---
+
+This document covers how `orbiter-backend` tests, deploys, and publishes its
+API docs through **GitHub Actions** — and, just as importantly, *how those
+workflows authenticate to Google Cloud without a single long-lived key*.
+
+If you've ever wondered "why are there two service accounts," "what is this
+`GCP_WIF_PROVIDER` string," or "why did my deploy say `denied to <user>`,"
+this document exists so you don't have to reverse-engineer it.
+
+## TL;DR
+
+<CardGroup cols={2}>
+  <Card title="Three workflows" icon="diagram-project">
+    CI gates pull requests; Deploy migrates the database and rolls out Cloud Run; Docs Sync ships the OpenAPI spec to Mintlify.
+  </Card>
+  <Card title="Auth is keyless" icon="key">
+    No service-account JSON keys exist anywhere. GitHub proves its identity with a short-lived OIDC token, and GCP exchanges it for temporary credentials via **Workload Identity Federation (WIF)**.
+  </Card>
+  <Card title="Two service accounts" icon="user-shield">
+    Least-privilege. One only touches the database (`orbiter-database-account`); one only deploys (`github-deployer`). Neither can do the other's job.
+  </Card>
+  <Card title="Config in environments" icon="sliders">
+    GCP config lives in GitHub *environment* variables, scoped per environment (`production`, `dev`). The only *secret* is the docs-repo PAT.
+  </Card>
+</CardGroup>
+
+## The three workflows
+
+| Workflow | File | Trigger | Job in one line |
+|---|---|---|---|
+| **CI** | `.github/workflows/ci.yml` | PR → `main`/`dev` | Lint, build, unit tests. No cloud access. |
+| **Deploy** | `.github/workflows/deploy.yml` | push → `main`/`dev`, or manual | Migrate AlloyDB, then build + deploy Cloud Run. |
+| **Docs Sync** | `.github/workflows/sync-openapi-to-docs.yml` | push → `main` touching `api/**`, or manual | Bundle the OpenAPI spec and open a PR in the docs repo. |
+
+The split is deliberate: CI runs on **untrusted PR code** and therefore holds
+**no credentials at all**; Deploy runs only **after** code lands on a protected
+branch and is the only workflow that can touch GCP.
+
+## 1. CI — `ci.yml`
+
+Runs on every pull request into `main` or `dev`. Two parallel jobs:
+
+- **`lint`** — `golangci-lint` (pinned to **v2.12.2**, matching
+  `GOLANGCI_LINT_VERSION` in the `Makefile`) via `golangci-lint-action@v8`.
+- **`test`** — `go build ./...` then `go test ./... -short` (unit tests; no
+  database required).
+
+```yaml
+on:
+  pull_request:
+    branches: [main, dev]
+
+permissions:
+  contents: read          # read-only — no secrets, no cloud
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true # a new push to the PR cancels the old run
+```
+
+<Note>
+CI carries **zero credentials** by design. It runs code from forks and
+untrusted branches, so anything it could leak, it doesn't have. All GCP access
+lives in `deploy.yml`, which only runs post-merge.
+</Note>
+
+To reproduce CI locally, run `make lint` and `make test`. The linter must be
+v2 — run `make tools` once to install the pinned version (a stale v1
+`golangci-lint` on your `PATH` will report different results).
+
+## 2. Deploy — `deploy.yml`
+
+Runs on push to `main` or `dev` (and manually via **Run workflow**). It does
+two things, in order, **as two separate jobs**:
+
+1. **`migrate`** — connects to AlloyDB through the Auth Proxy and runs
+   `make migrate-up-alloydb`. This is a **gate**: if it fails, nothing deploys.
+2. **`build-deploy`** — builds the `api` and `worker` images, pushes them to
+   Artifact Registry, and rolls out both Cloud Run services.
+
+### Branch → environment
+
+```yaml
+environment: ${{ github.ref_name == 'main' && 'production' || 'dev' }}
+```
+
+A push to `main` runs against the **`production`** environment; any other
+branch (e.g. `dev`) runs against **`dev`**. Because the GCP config lives in
+*environment-scoped* variables (see [Configuration](#configuration)), the same
+workflow code deploys to a different GCP project per branch — no duplicated
+YAML.
+
+### Why migrate *before* deploy
+
+Migrations run first, and that's only safe because **our migrations are
+additive**. Additive schema (new tables/columns) is forward-compatible with
+the *old* code still running, and the *new* image needs the new columns — so
+"migrate, then swap the image" never leaves a running service pointed at a
+schema it doesn't understand.
+
+<Warning>
+The day a **destructive** migration lands (drop/rename a column or table),
+this ordering breaks — the old code would hit the dropped object in the window
+between migrate and deploy. At that point switch to an **expand/contract**
+rollout (add new, deploy code that uses both, then remove old in a later
+release).
+</Warning>
+
+### Concurrency
+
+```yaml
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+```
+
+Per-branch: two pushes to `main` serialize (never racing the migration step),
+but a `dev` deploy and a `prod` deploy run independently. Running deploys are
+never cancelled mid-flight.
+
+<Note>
+`build-deploy` is currently disabled with `if: false` while we confirm that no
+existing Cloud Build / Cloud Run GitHub pipeline is already deploying these
+services. With it disabled, pushes run **migrations only**. Re-enable by
+deleting the `if: false` line once the deploy path is confirmed to be the only
+one.
+</Note>
+
+### What it deploys
+
+Images are tagged with the commit SHA and pushed to Artifact Registry; the
+Cloud Run deploy only changes `--image`, so existing env vars and Secret
+Manager bindings on the service are preserved.
+
+| Setting | Value |
+|---|---|
+| Artifact Registry repo (`AR_REPO`) | `cloud-run-source-deploy` |
+| API service (`API_SERVICE`) | `orbiter-backend-git` |
+| Worker service (`WORKER_SERVICE`) | `orbiter-backend-worker` |
+| Region | `us-central1` |
+
+## 3. Docs Sync — `sync-openapi-to-docs.yml`
+
+Runs when something under `api/**` changes on `main` (or manually). It:
+
+1. Bundles the multi-file spec (`api/openapi.yaml` + feature fragments) into one
+   flat file with `redocly bundle`, then lints it.
+2. Checks out the **docs repo** (`M-Pederson/docs`) using the `DOCS_REPO_TOKEN`
+   secret.
+3. Copies the bundled spec in, and **opens a PR** (never pushes to the docs
+   repo's `main` directly — branch protection + a review pass stay intact
+   before Mintlify republishes).
+
+### Idempotency
+
+The PR step compares the freshly-bundled spec against the docs repo's `main`:
+
+```bash
+if git diff --quiet; then echo "nothing to sync"; exit 0; fi
+```
+
+- **No change vs. `main`** → exits cleanly, no PR.
+- **Spec changed** → opens a PR on a branch named for the source commit SHA.
+
+<Note>
+The diff is against the docs repo's **`main`**, not against any open PR. So if a
+previous sync PR is still **unmerged**, `main` is behind and a re-run will try
+to sync again. Merge the open PR first; then runs with no spec change correctly
+no-op.
+</Note>
+
+This is the **only** workflow that uses a secret, because writing to a *different*
+repository can't use WIF — see below for why.
+
+## Authentication: Workload Identity Federation
+
+The Deploy workflow needs to act as a GCP service account, but **we never
+create or store service-account keys** — they're long-lived secrets that leak,
+get committed, and never rotate. Instead we use **Workload Identity Federation**:
+GitHub proves who it is with a short-lived token, and GCP trades that for
+temporary credentials.
+
+### The flow
+
+```
+GitHub Actions job
+   │  1. asks GitHub's OIDC provider for an ID token.
+   │     Claims include: repository, repository_owner, sub, ref, ...
+   ▼
+google-github-actions/auth@v2
+   │  2. sends that token to GCP STS, naming our WIF provider.
+   ▼
+WIF provider (orbiter-github-provider)
+   │  3. verifies issuer + attribute condition
+   │       (assertion.repository_owner == 'M-Pederson').
+   │  4. maps token claims → Google attributes (attribute.repository, ...).
+   ▼
+Service account impersonation
+   │  5. the federated identity impersonates the target SA, allowed by the
+   │     roles/iam.workloadIdentityUser binding on that SA.
+   ▼
+Short-lived GCP access token  →  used by the proxy / gcloud for ~1 hour
+```
+
+No step involves a stored credential. The trust is: *"GitHub tokens from
+M-Pederson repos may impersonate these specific service accounts."*
+
+### The pool and provider
+
+| Thing | Value |
+|---|---|
+| Project | `orbiter-io` (number `20506320032`) |
+| Pool | `orbiter-github-actions-pool` |
+| Provider | `orbiter-github-provider` |
+| Issuer | `https://token.actions.githubusercontent.com` |
+| Attribute condition | `assertion.repository_owner == 'M-Pederson'` |
+| Attribute mapping | `google.subject=assertion.sub`, `attribute.repository=assertion.repository`, `attribute.repository_owner=assertion.repository_owner` |
+
+The value you put in the `GCP_WIF_PROVIDER` variable is the provider's **resource
+name** (no `https://iam.googleapis.com/` prefix):
+
+```
+projects/20506320032/locations/global/workloadIdentityPools/orbiter-github-actions-pool/providers/orbiter-github-provider
+```
+
+<Note>
+There are three look-alike identifiers. Only the first goes in `GCP_WIF_PROVIDER`:
+
+- `projects/.../providers/orbiter-github-provider` — the provider (use this).
+- `principalSet://.../attribute.repository/...` — an IAM binding for *all*
+  identities matching an attribute (used in "Grant Access").
+- `principal://.../subject/...` — a *single* identity. Not used here.
+</Note>
+
+### Two layers of restriction
+
+These are independent and both matter:
+
+- **Provider condition** (`repository_owner == 'M-Pederson'`) — who may enter
+  the pool *at all*. Org-wide, so one provider serves every repo in the org.
+- **Per-SA binding** (`roles/iam.workloadIdentityUser`) — which pool identities
+  may impersonate *a given service account*. This is where we scope tightly.
+
+## Service accounts
+
+Two accounts, each doing exactly one job. **What differs is their IAM roles,
+not (necessarily) their WIF repo scope.**
+
+| | `orbiter-database-account` | `github-deployer` |
+|---|---|---|
+| **Job it does** | Run database migrations (migrate job) | Build + deploy Cloud Run (build-deploy job) |
+| **GCP IAM roles** | `roles/alloydb.client`, `roles/alloydb.databaseUser` | `roles/run.admin`, `roles/artifactregistry.writer`, `roles/iam.serviceAccountUser` |
+| **Database access?** | Yes — owns the `orbiter_migrator` model | **None** |
+| **WIF binding scope** | `attribute.repository = M-Pederson/orbiter-backend` (this repo only) | `attribute.repository_owner = M-Pederson` (any org repo) |
+| **Workflow variable** | `GCP_MIGRATE_SA` | `GCP_DEPLOY_SA` |
+
+Both service accounts need a `roles/iam.workloadIdentityUser` binding (the
+"Grant Access" step on the pool) — that's what lets GitHub impersonate them.
+
+**Why the different WIF scopes?** Only `orbiter-backend` ever runs database
+migrations, so the migration SA is locked to that one repo. The deployer is
+meant to be reused (frontend, other services), so it's scoped to the whole org.
+
+<Info>
+`orbiter-database-account` is the **same** service account documented in
+[Database Access & Management](/guides/orbiter-backend/database/database-access) — it owns the `orbiter_migrator` group role
+and every schema. The only thing CI adds is a WIF binding so GitHub Actions can
+impersonate it, exactly like a developer does with `--impersonate-service-account`
+locally. It gains **no new GCP powers** from this.
+</Info>
+
+## Configuration
+
+### Environment variables (GitHub)
+
+Set these under **Settings → Environments → `production`** (and `dev` when that
+target exists) → **Environment variables**. Environment-scoping is what lets
+`production` and `dev` point at different GCP projects with identical workflow
+code.
+
+| Variable | Used by | Value |
+|---|---|---|
+| `GCP_WIF_PROVIDER` | both | `projects/20506320032/locations/global/workloadIdentityPools/orbiter-github-actions-pool/providers/orbiter-github-provider` |
+| `GCP_MIGRATE_SA` | migrate | `orbiter-database-account@orbiter-io.iam.gserviceaccount.com` |
+| `GCP_DEPLOY_SA` | build-deploy | `github-deployer@orbiter-io.iam.gserviceaccount.com` |
+| `GCP_PROJECT_ID` | build-deploy | `orbiter-io` |
+| `GCP_REGION` | build-deploy | `us-central1` |
+| `AR_REPO` | build-deploy | `cloud-run-source-deploy` |
+| `ALLOYDB_INSTANCE_URI` | migrate | `projects/orbiter-io/locations/us-central1/clusters/free-trial-cluster/instances/primary` |
+| `ALLOYDB_DATABASE` | migrate | `orbiter` |
+| `ALLOYDB_IAM_USER` | migrate | `orbiter-database-account%40orbiter-io.iam` |
+
+<Warning>
+`ALLOYDB_IAM_USER` is the SA email with `.gserviceaccount.com` stripped **and
+the `@` URL-encoded as `%40`** — a raw `@` breaks the connection DSN. To test
+**migrations only**, you need just the five `migrate`-column variables above;
+the deploy ones aren't read by that job.
+</Warning>
+
+### Secrets
+
+| Secret | Used by | What it is |
+|---|---|---|
+| `DOCS_REPO_TOKEN` | Docs Sync | A PAT (or fine-grained token) with **Contents: write** + **Pull requests: write** on `M-Pederson/docs`. |
+
+<Note>
+Docs Sync needs a token, not WIF, because WIF authenticates to **GCP**, not to
+**another GitHub repo**. The token must belong to an account (or be a
+fine-grained token approved by the org) that has **write access to the docs
+repo** — a token whose owner lacks write returns `403 denied to <user>`,
+regardless of repo visibility. Fine-grained tokens scoped to an org sit in a
+**Pending** state until an org owner approves them.
+</Note>
+
+## One-time GCP setup
+
+Replay these (Console or `gcloud`) to bootstrap a fresh project. Values below
+use the real `orbiter-io` setup.
+
+<Steps>
+<Step title="Enable APIs">
+
+```bash
+gcloud services enable \
+  iamcredentials.googleapis.com sts.googleapis.com \
+  artifactregistry.googleapis.com run.googleapis.com \
+  --project=orbiter-io
+```
+
+</Step>
+<Step title="Create the Workload Identity pool + GitHub provider">
+
+```bash
+gcloud iam workload-identity-pools create orbiter-github-actions-pool \
+  --location=global --display-name="GitHub Actions" --project=orbiter-io
+
+gcloud iam workload-identity-pools providers create-oidc orbiter-github-provider \
+  --location=global \
+  --workload-identity-pool=orbiter-github-actions-pool \
+  --issuer-uri="https://token.actions.githubusercontent.com" \
+  --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.repository_owner=assertion.repository_owner" \
+  --attribute-condition="assertion.repository_owner == 'M-Pederson'" \
+  --project=orbiter-io
+```
+
+</Step>
+<Step title="Create the deploy SA and grant its roles">
+
+The migration SA (`orbiter-database-account`) already exists — see
+[Database Access & Management](/guides/orbiter-backend/database/database-access). Only the deployer is new:
+
+```bash
+gcloud iam service-accounts create github-deployer \
+  --display-name="GitHub Actions deployer" --project=orbiter-io
+
+for ROLE in roles/run.admin roles/artifactregistry.writer roles/iam.serviceAccountUser; do
+  gcloud projects add-iam-policy-binding orbiter-io \
+    --member="serviceAccount:github-deployer@orbiter-io.iam.gserviceaccount.com" \
+    --role="$ROLE"
+done
+```
+
+</Step>
+<Step title="Bind each SA to the pool (who may impersonate it)">
+
+```bash
+POOL="projects/20506320032/locations/global/workloadIdentityPools/orbiter-github-actions-pool"
+
+# Migration SA — only orbiter-backend may impersonate it.
+gcloud iam service-accounts add-iam-policy-binding \
+  orbiter-database-account@orbiter-io.iam.gserviceaccount.com \
+  --role=roles/iam.workloadIdentityUser \
+  --member="principalSet://iam.googleapis.com/${POOL}/attribute.repository/M-Pederson/orbiter-backend" \
+  --project=orbiter-io
+
+# Deploy SA — any repo in the org may impersonate it.
+gcloud iam service-accounts add-iam-policy-binding \
+  github-deployer@orbiter-io.iam.gserviceaccount.com \
+  --role=roles/iam.workloadIdentityUser \
+  --member="principalSet://iam.googleapis.com/${POOL}/attribute.repository_owner/M-Pederson" \
+  --project=orbiter-io
+```
+
+</Step>
+<Step title="Set the GitHub environment variables">
+
+Add the variables from [Configuration](#configuration) under the `production`
+environment (and `dev` later). No secrets needed except `DOCS_REPO_TOKEN` for
+Docs Sync.
+
+</Step>
+</Steps>
+
+## Running a workflow
+
+- **Push** to `main` or `dev` triggers CI (on PRs) and Deploy (on push). Docs
+  Sync triggers only when `api/**` changes on `main`.
+- **Manually:** Actions tab → pick the workflow → **Run workflow**
+  (`workflow_dispatch`). Useful for testing migrations without a code change.
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `auth failed ... must specify exactly one of "workload_identity_provider" or "credentials_json"` | The `vars.GCP_*` resolved empty | The environment variables aren't set (or are set on the wrong environment/scope). Add them under the environment the job uses. |
+| `Permission ... denied to <user>` on the docs push | `DOCS_REPO_TOKEN` belongs to an account without **write** on the docs repo | A PAT can't exceed its owner's access — use a token owned by a write-capable account, or have the org approve the fine-grained token. |
+| Fine-grained token stuck **Pending** | Org requires approval for tokens accessing its repos | An org owner approves it under Org → Settings → Personal access tokens → Pending requests. |
+| Deploy creates a *new* Cloud Run service | `API_SERVICE`/`WORKER_SERVICE` don't match the existing service names | Set them to the real names (`orbiter-backend-git`, `orbiter-backend-worker`). |
+| `permission denied for schema public` during migrate | The migration SA isn't in `orbiter_migrator` / lacks DDL grants | See [Database Access & Management](/guides/orbiter-backend/database/database-access) — the SA must be a member of the migrator group with the schema grants. |
+| Docs Sync opens a PR even with no spec change | A previous sync PR is unmerged, so docs `main` is behind | Merge the open PR; subsequent no-change runs then no-op. |
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Database Access & Management" icon="database" href="/guides/orbiter-backend/database/database-access">
+    The `orbiter_migrator` ownership model and the migration service account this CI reuses.
+  </Card>
+  <Card title="Migrations & sqlc" icon="arrow-up-right-from-square" href="/guides/orbiter-backend/database/migrations">
+    How schema changes happen — the migrations the Deploy workflow runs before rolling out Cloud Run.
+  </Card>
+</CardGroup>

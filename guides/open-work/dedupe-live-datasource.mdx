@@ -1,0 +1,316 @@
+---
+title: "Dedupe Live Datasource"
+description: "Hunting for duplicate rows across master_* tables in the live data source and tracking what we can lock down with unique indexes."
+---
+
+## Overview
+
+TODO
+
+## MASTER COMPANY
+
+Audit of the `master_company` table (ID `142`) in workspace 3, live data source, on 2026-05-19.
+
+### Table snapshot
+
+| Property | Value |
+|---|---|
+| Table ID | `142` |
+| Workspace | `3` (OrbiterV2) |
+| Total rows (live) | 11,183 |
+
+### `company_domain` schema
+
+| Property | Value |
+|---|---|
+| Type | `text` |
+| Style | `single` |
+| Nullable | `true` |
+| Default | `""` (empty string) |
+| Required | `false` |
+| Validators | `trim: true` |
+
+### Existing indexes
+
+None of the current indexes cover `company_domain`.
+
+| Index | Type | Fields |
+|---|---|---|
+| `1339908e` | primary | `id` |
+| `411a6c94` | btree | `created_at desc` |
+| `2fa41e7d` | fuzzy search (english) | `company_name` |
+
+### Duplicate scan
+
+**Zero exact duplicates** on `company_domain` in live — both case-sensitive and case-insensitive checks across all 10,689 non-empty domain values return unique. Also checked for `www.`-prefix soft dupes (e.g. `acme.com` vs `www.acme.com`): zero matches.
+
+| Bucket | Count |
+|---|---|
+| Rows with a domain | 10,689 |
+| Rows with `""` (empty string) | 492 |
+| Rows with `NULL` | 2 |
+| Distinct non-empty domains | 10,689 |
+| Duplicate domain groups | 0 |
+
+### Can we add a unique index on `company_domain`?
+
+**Not as-is.** No real duplicates block it, but two structural issues do:
+
+1. **492 rows with empty-string `company_domain`.** Postgres unique indexes treat `""` as a value (not NULL), so 492 rows colliding on `""` would fail the constraint.
+2. **Default is `""` and column is nullable.** Three viable fixes:
+    - Update the 492 empty-string rows to `NULL`, drop the `""` default, then add a plain `UNIQUE` btree on `company_domain`. Postgres allows multiple NULLs in a unique index, so the empties stay valid.
+    - Add a **partial unique index**: `UNIQUE (company_domain) WHERE company_domain <> '' AND company_domain IS NOT NULL`. Lets the empties stay as `""`.
+    - Add a **functional unique index on `lower(company_domain)`** if we want case-insensitivity enforced going forward (today it doesn't matter — no case-variant dupes exist).
+
+**Recommendation:** clean the 492 empty-strings → `NULL`, then add a regular unique btree on `company_domain`. The data is already clean enough to support it immediately after that one-step normalization.
+
+<Warning>
+**TODO — add unique index later.** Not executed yet. Before adding the index: null-out the 492 empty-string `company_domain` rows and re-run this audit to confirm zero new dupes have landed. Then create a unique btree on `company_domain` in workspace 3 / live.
+</Warning>
+
+### Malformed `company_domain` audit
+
+Scanned all 11,183 rows. Of the 10,689 with a non-empty value, only **23 (0.22%)** are not in clean `host.tld` shape. No protocol prefixes, no `www.`, no query strings, no whitespace, no `@`, no comma/pipe smush.
+
+| Issue | Count |
+|---|---|
+| `has_path` (e.g. `linkedin.com/company/...`) | 19 |
+| `has_uppercase` | 3 |
+| `has_port` / stored error message | 1 |
+| All other buckets | 0 |
+
+#### `has_path` — 19 rows
+
+| id | company_name | company_domain |
+|---|---|---|
+| 67 | KPMG UK | `kpmg.com/uk` |
+| 77 | Lloyd Greif Center for Entrepreneurial Studies — USC Marshall | `marshall.usc.edu/institutes-and-centers/lloyd-greif-center-for-entrepreneurial-studies` |
+| 1119 | Mascot Network | `web.archive.org/web/20001019064001/mascotnetwork.com` |
+| 1474 | `linkedin_com/company/youngglobalchangers` | `linkedin.com/company/youngglobalchangers` |
+| 1651 | Monitor Deloitte | `deloitte.com/global/en/services/consulting/services/strategy-analytics-manda.html` |
+| 2032 | LODESTAR Corporation | `linkedin.com/company/9655` |
+| 3290 | University of Buenos Aires | `agro.uba.ar/en/front` |
+| 3575 | UCL | `ucl.ac.uk/pharmacy` |
+| 4350 | Sword Group | `linkedin.com/company/sword-group` |
+| 4640 | Plumtree Software | `en.wikipedia.org/wiki/plumtree_software` |
+| 5817 | Siemens PLM Software (inactive) | `siemens.com/plm` |
+| 7966 | University of Minnesota | `z.umn.edu/9gi` |
+| 7971 | Washington Army National Guard | `mil.wa.gov/army-guard` |
+| 7973 | Puget Sound Naval Shipyard | `navsea.navy.mil/home/shipyards/psns-imf` |
+| 8409 | Rabo Securities | `linkedin.com/company/1969` |
+| 8839 | Stripe Sports | `podcasts.apple.com/us/podcast/stripe-sports/id1451691290` |
+| 8976 | `gov_ca_gov/home_php` | `gov.ca.gov/home.php` |
+| 10151 | Move The Needle Recruiting | `linkedin.com/in/daylan-swedlow-95859127` |
+| 10198 | AMA Marist University | `linktr.ee/amamarist` |
+
+#### `has_uppercase` — 3 rows
+
+| id | company_name | company_domain |
+|---|---|---|
+| 4694 | Alsop Louie Partners | `GILMAN.` |
+| 7162 | Cake Technologies | `theCAKEapp.com` |
+| 10477 | Monitor Group | `CBSNews.com` |
+
+#### Stored error message — 1 row
+
+| id | company_name | company_domain |
+|---|---|---|
+| 10935 | Mercury | `[Line 16:Char 9] Error parsing domain: Domain name label can only contain alphanumeric characters or dashes.` |
+
+This row literally has a Xano function-stack **error message** persisted as data. Trace back to whichever enrichment function emitted it — the catch path is writing the error string into the domain column.
+
+#### Notable corruptions to investigate beyond a simple cleanup
+
+- **id 1474** — `company_name` itself is `linkedin_com/company/youngglobalchangers` (the bad URL leaked into the name field too).
+- **id 8976** — same pattern, `company_name = gov_ca_gov/home_php`.
+- **id 4694** — `GILMAN.` is a truncated/garbage write (trailing dot, no TLD).
+
+<Note>
+**Cleanup executed 2026-05-19** — all 23 rows patched via `patchTableContentBulk` against `master_company` in workspace 3 / live. Result: `success_total: 23, error: []`.
+
+| Action | Count |
+|---|---|
+| Set `company_domain = NULL` | 12 |
+| Stripped path / fixed casing | 11 |
+
+LinkedIn-only and other no-real-domain rows (Wikipedia, archive.org, podcasts.apple.com, linktr.ee, LinkedIn `/in/` person URL) were nulled rather than coerced to `linkedin.com` to avoid creating new dupes on a shared domain. Re-enrich with Exa later to recover real domains where possible.
+</Note>
+
+<Warning>
+**Still to do — bonus findings from verification:**
+1. **Pipeline still running.** The catch-path that wrote the Xano error string into `company_domain` may still be live. Trace it before re-enrichment to prevent recurrence.
+2. **id 10935** — `company_domain` is now NULL, but the row has two other unaddressed problems:
+   - The `logo` field still contains the error string baked into a logo.dev URL: `https://img.logo.dev/[Line 16:Char 9] Error parsing domain: ...`.
+   - The `company_name` is `Mercury` but LinkedIn (`/company/mentorpreneurs`) and the about text say this is actually **Mentorpreneur**. Per cleanup policy we left names alone — but this row needs a re-enrich or manual fix. (A real **Mercury** the fintech exists at id 4988 with `mercury.com` — unaffected.)
+3. **ids 1474 and 8976 fixed 2026-05-19** — names rewritten to `Young Global Changers` (1474) and `Office of Governor Arnold Schwarzenegger` (8976) based on the LinkedIn URL each row carried. id 8976's `logo` URL also de-pathed to `https://img.logo.dev/gov.ca.gov?...`.
+4. **Trace the URL-slug-to-name fallback.** Both fixed rows had the same fingerprint: source URL slugified (`.` → `_`, path slash preserved) and written into `company_name`. Grep the enrichment code for whatever fallback does that — it's still in production.
+5. **Add a write-time validator** on `company_domain` matching `^[a-z0-9.-]+\.[a-z]{2,}$` so this drift can't return once the unique index is in place.
+</Warning>
+
+## MASTER PERSON
+
+Audit of the `master_person` table (ID `139`) in workspace 3, live data source, on 2026-05-20.
+
+### Table snapshot
+
+| Property | Value |
+|---|---|
+| Table ID | `139` |
+| Workspace | `3` (OrbiterV2) |
+| Total rows (live) | 5,413 |
+
+### `linkedin_url` schema
+
+| Property | Value |
+|---|---|
+| Type | `text` |
+| Style | `single` |
+| Nullable | `true` |
+| Default | `""` (empty string) |
+| Required | `false` |
+| Validators | `trim: true` |
+
+### Existing indexes
+
+None of the current indexes cover `linkedin_url` — same as `master_company`.
+
+| Index | Type | Fields |
+|---|---|---|
+| `1339908e` | primary | `id` |
+| `411a6c94` | btree | `created_at desc` |
+
+### Duplicate scan — exact `linkedin_url`
+
+**Zero exact duplicates** on `linkedin_url`, both case-sensitive and case-insensitive, across all 4,804 populated rows.
+
+| Bucket | Count |
+|---|---|
+| Rows with a `linkedin_url` | 4,804 |
+| Rows with `NULL` | 609 |
+| Rows with `""` (empty string) | 0 |
+| Distinct non-null URLs (case-sensitive) | 4,804 |
+| Duplicate URL groups | 0 |
+
+### Duplicate scan — canonical form
+
+Exact matching is too strict: `https://www.linkedin.com/in/bizstone` and `https://linkedin.com/in/bizstone` are the same person but two rows. After normalizing (lowercase, strip protocol, strip leading `www.`, strip query/fragment, strip trailing slash):
+
+| Bucket | Count |
+|---|---|
+| Distinct canonical forms | 4,797 |
+| Canonical-duplicate groups | 7 |
+| Rows involved in canonical dupes | 14 |
+
+All 7 groups are the same pattern — a `www.` row paired with a no-`www.` row for the same person:
+
+| Canonical | id (a) | id (b) | name |
+|---|---|---|---|
+| `linkedin.com/in/bizstone` | 138 | 5270 | Biz Stone |
+| `linkedin.com/in/kortina` | 4636 | 4900 | Andrew Kortina |
+| `linkedin.com/in/wlessin` | 4644 | 4903 | Sam Lessin |
+| `linkedin.com/in/alex-maccaw-ab592978` | 4850 | 5186 | Alex Maccaw / Alex MacCaw |
+| `linkedin.com/in/zachweinberg` | 4867 | 5219 | Zach Weinberg |
+| `linkedin.com/in/zawadzinski` | 5046 | 5256 | Maciej Zawadzinski |
+| `linkedin.com/in/julian-shapiro` | 5282 | 5312 | Julian Shapiro |
+
+### Duplicate scan — same first + last name
+
+Looser signal — catches rows that are clearly the same person despite different LinkedIn URLs (e.g. a person re-enriched under a different LinkedIn handle), plus genuine homonyms.
+
+**66 groups, 163 rows** match by `(lower(first_name), lower(last_name))`. Group-size distribution: 47 pairs, 12 triples, 3 quads, 3 quintuples, 1 sextuple.
+
+| Category | Groups | What it means |
+|---|---|---|
+| `same_url_diff_rows` | 6 | Same canonical URL — overlap with the canonical scan above. |
+| `different_urls` | 26 | Both rows have a populated URL but they differ — true duplicates from re-enrichment OR homonyms. Needs human review. |
+| `mixed_null_and_url` | 8 | One row has a URL, the other is `NULL`. High-confidence merge candidates. |
+| `all_null` | 26 | Neither side has a URL — mostly test data (`Anonymous`, `Rick`, `Katelyn`, etc.) and the `Dan@Citrinevc.com` artefact (an email landed in the name field). Low-signal. |
+
+#### `different_urls` — 26 groups to review
+
+Largest cluster is **Andy Powell × 6** (ids 4587, 4830, 4832, 4834, 4836, 4838) — six distinct LinkedIn handles for the same first+last. Same shape for **Luca Moretto × 5**, **Todd Goldberg × 5**, **Monique Woods × 4**, **Johannes Metzler × 4**. Plus 21 pairs: Ryan Petersen, Dayna Grayson, John Traver, Jaap Haemers, Armen Vidian, Jason Chan, Brian Smith, Stephane Lavallee, David Campbell, Michael Wang, Adam Hunke, Emery Wells, Artemis Llamosi, Salvatore Galvano, Calvin French-Owen, Amber Atherton, Ali Partovi, Hadi Partovi, Alex McCaw, Julian Shapiro, Xiangyu Ouyang.
+
+A handful are clearly bad data, not homonyms:
+- **id 825 "Dayna Grayson"** has `linkedin_url = .../in/justinklein` — the URL belongs to a different person entirely (Justin Klein).
+- **id 5223 "Amber Atherton"** has `name = "Amber Atherton - Executive Producer at Mother London - LinkedIn"` — the LinkedIn search result page title leaked into the name field.
+- **id 5141 "Ryan Tedder"** has the same fingerprint — `name = "Ryan Tedder - Retail Sales Manager at UNIQLO - LinkedIn"`.
+- **id 1034 "Drew Wilson"** has `linkedin_url = .../in/drew—wilson` (em-dash, not hyphen) — invalid slug.
+
+#### `mixed_null_and_url` — 8 groups
+
+These are the cleanest merge candidates. The non-null row carries the data; the null row is a stub:
+
+| Name | ids |
+|---|---|
+| Dylan Johnson | 1017 (url), 1063 (null) |
+| Darren Goldberg | 1018 (url), 1118 (null) |
+| Drew Wilson | 1034 (url, em-dash), 4368 (null) |
+| Nir Israeli | 1193 (url), 3353 (null) |
+| Christopher Campbell | 1906 (url), 3372 (null) |
+| John Ryan | 2775 (null), 4097 (url) |
+| Ryan Tedder | 4816 (null), 5139 (url), 5141 (url, polluted name) |
+| Kevin Hart | 4887 (null), 5249 (url) |
+
+### Can we add a unique index on `linkedin_url`?
+
+**Not as-is.** Three blockers:
+
+1. **14 rows in 7 canonical-duplicate groups.** They pass the literal unique constraint today (the strings differ by `www.`) but they're the same person — adding a unique index now locks in the duplication. Fix the 7 groups first.
+2. **609 `NULL` rows.** These are fine for a unique index (Postgres allows multiple NULLs), but only if the column actually stays `NULL` — the schema default is `""`, so any new row inserted without `linkedin_url` set will collide on `""` immediately.
+3. **URL shape drift.** 4,191 rows use `https://www.linkedin.com/...`, 609 use `https://linkedin.com/...`, 2 use `https://uk.linkedin.com/...`, 1 uses `http://linkedin.com/...`, 1 uses `http://uk.linkedin.com/...`. The canonical scan above only matched the first two; the country-subdomain rows can hide more dupes.
+
+**Recommendation:**
+1. Merge the 7 canonical-duplicate groups (keep one row, redirect any FKs from the other, delete the loser).
+2. Merge the 8 `mixed_null_and_url` groups.
+3. Triage the 26 `different_urls` groups manually — these need a human (or a fuzzy/LLM match) to call true-dupe vs. homonym.
+4. Normalize the surviving URLs to one canonical form (`https://www.linkedin.com/in/{slug}`, lowercased, no query, no trailing slash, no country subdomain).
+5. Change the default from `""` to `NULL` so newly-inserted blank rows don't all collide.
+6. Add a **functional unique btree on `lower(linkedin_url)`** (or a partial `UNIQUE (linkedin_url) WHERE linkedin_url IS NOT NULL`) so the normalization holds.
+
+### Malformed `linkedin_url` audit
+
+Unlike `master_company.company_domain` (canonical is bare `host.tld`), the canonical form here is the full `https://www.linkedin.com/in/{slug}` URL. So "malformed" means deviations from that shape — not the presence of `https://` itself.
+
+| Issue | Count | Notes |
+|---|---|---|
+| Missing `www.` | 609 | `https://linkedin.com/in/...` — silently breaks exact-match dedupe. |
+| `http://` instead of `https://` | 2 | ids 4604-area (combined with country-subdomain below). |
+| Country subdomain (`uk.linkedin.com`) | 3 | 2 https, 1 http. |
+| `/company/` path on a person row | 5 | ids 662, 1659, 1903, 3293, 4918 — wrong page type. |
+| Query string (`?originalSubdomain=`, `?viewAsMember=`) | 4 | ids 158, 310, 601, 1903. |
+| Trailing slash | 0 | |
+| Whitespace | 0 | |
+| Fragment | 0 | |
+| Error-message string baked into URL | 0 | The catch-path bug from `master_company` did **not** infect this column. |
+| Emoji in slug | 1 | id 5313 (`Julian Alexander`) — `…julian-alexander-%F0%9F%8C%80-…` (globe emoji). Valid LinkedIn slug; flag, don't fix. |
+
+The 23 rows the brute-force scan flagged as `has_uppercase` are all false positives: they're percent-encoded UTF-8 sequences (`%C3%A9` for `é`, etc.) where the literal hex digits happen to be uppercase. No row has a real uppercase character in the URL.
+
+#### `/company/` rows — 5 rows
+
+These are person rows whose `linkedin_url` points at a company page instead of a person profile. They likely got their URL field overwritten by a company enrichment step.
+
+| id | name | linkedin_url |
+|---|---|---|
+| 662 | Clem Delangue | `https://linkedin.com/company/11193683` |
+| 1659 | Tim Draper | `https://linkedin.com/company/drapertv` |
+| 1903 | Frederik Bender | `https://linkedin.com/company/piur-imaging-gmbh/?viewAsMember=true` |
+| 3293 | Diku Mandavia | `https://linkedin.com/company/deepsight-technology` |
+| 4918 | Wesscosoft Technologies (note: `name` is a company, not a person) | `https://www.linkedin.com/company/wesscosoft-technologies-private-limited` |
+
+id 4918 is doubly broken — a company landed in `master_person` and got a `/company/` URL.
+
+#### Query-string rows — 4 rows
+
+| id | linkedin_url |
+|---|---|
+| 158 | `https://www.linkedin.com/in/david-v%C3%A9lez-1004875/?originalSubdomain=br` |
+| 310 | `https://www.linkedin.com/in/sergio-p%C3%A9rez-merino-a492652/?originalSubdomain=es` |
+| 601 | `https://www.linkedin.com/in/philipp-werner/?originalSubdomain=de` |
+| 1903 | `https://linkedin.com/company/piur-imaging-gmbh/?viewAsMember=true` |
+
+All four are safe to strip — `originalSubdomain` is a LinkedIn redirect hint, `viewAsMember` is a UI toggle. id 1903 also needs the `/company/` fix.
+
+<Warning>
+**TODO — no cleanup executed yet for `master_person`.** The audit above is read-only. Before any unique index goes on this column, the merge work (7 canonical + 8 mixed-null + 26 different-URL same-name groups) and the URL normalization both need to ship. The `/company/` and query-string rows are easy one-shot patches; the same-name merges are the heavy lift.
+</Warning>

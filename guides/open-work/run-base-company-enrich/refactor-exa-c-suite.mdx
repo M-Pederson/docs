@@ -1,0 +1,181 @@
+---
+title: "Refactor Exa C-Suite"
+description: "Refactor of Section 7 (Exa C-Suite & Founders loop) inside mvp/enrich/run-base-company-enrich-v4 (#12992)."
+---
+
+<Note>
+  Scratch page. Capture the refactor scope, decisions, and step list for Section 7 here.
+</Note>
+
+<Note>
+  **Built 2026-05-14.** Section 7 of `mvp/enrich/run-base-company-enrich-v4` (#12992) now runs the full inline pipeline below for every Exa match. New shared helper `mvp/get-add/master-person-from-exa` (#12997) handles the master_person upsert. Both functions are published to sandbox. Test by triggering v4 against a master_company with `exa_c_suite` cleared, then inspect: `master_person` rows for the c-suite people (linkedin_url, current_title, master_company_id, visibility=true), `work_experience` rows tagged `data_source_id=101`, FalkorDB `WORKS_AT`/`FOUNDED` edges, `about_person` rows with Exa bios, `profile_enrichment_job` rows kicked off, and `queue_enrich_person` rows with `priority_tier=4`.
+</Note>
+
+## Build instructions
+
+### Context
+
+- **Function:** `mvp/enrich/run-base-company-enrich-v4` (#12992)
+- **Group:** `add new exa person` — visual-builder group wrapping the per-match logic inside Section 7's `foreach ($exaMatches) { each as $match }` loop
+- **Loop state at this point:** we have already decided we're going to add this Exa person as a `master_person`. The call site is `function.run "mvp/get-add/master-person"`. We still need to derive the right `title` to pass for this person *at the company we're currently enriching*.
+
+### Goal
+
+For the current `$match` (one Exa person from `exa_c_suite.matches[]`), find the workHistory entry representing the person's **current role** (whichever company that's at — not necessarily the master_company we're enriching), and derive both `$currentTitle` and a resolved `master_company_id` for that current company.
+
+### Test case
+
+- **Master company we're enriching:** Frame.io (`$input.master_company_id`)
+- **Exa person:** Samantha Gioia — workHistory has multiple Frame.io entries, but the entry with `dates.to == null` is `Technical Product Manager` at Frame.io.
+- **Expected:** `$currentTitle = "Technical Product Manager"`. Resolve Frame.io's domain via `company.website` → call `mvp/get-add/master-company` → get master_company_id (likely the same as `$input.master_company_id`). Write that id + the title onto master_person.
+
+### Steps to derive `$currentTitle` and the current `master_company_id`
+
+1. **Read workHistory.** Pull `$match.entities.0.properties.workHistory` (array of `{dates: {from, to}, title, company: {id, name, website, linkedinUrl, ...}, location}`).
+2. **Find the current-role entry.** Scan for the entry where `entry.dates.to == null` (no end date = currently held). This is the person's current job, **regardless of which company it's at** — Exa C-suite results sometimes surface people whose current role is at a different company than the one we're enriching.
+   - If exactly one entry has `dates.to == null`: that's `$currentEntry`.
+   - If multiple have `dates.to == null` (rare — concurrent positions): take the one with the latest `dates.from`.
+   - If zero have `dates.to == null` (person has only past roles): `$currentTitle` stays null, the master_person row gets no `current_title` / `master_company_id` fill from this path. Still proceed with steps 2–7 (biography, avatar, work_experience writes, etc.).
+3. **Extract domain from the current-role company's website.** `$currentEntry.company.website` → strip protocol + www + trailing slash to get bare domain (`https://katabatic.tv` → `katabatic.tv`). Regex: `^https?:\/\/(?:www\.)?([^\/\s]+)`.
+4. **Resolve to a master_company.** Call `function.run "mvp/get-add/master-company"` with the derived domain (and any other fields it expects). Returns a `master_company_id` for the current-role company. Store as `$currentCompanyId`.
+5. **Set `$currentTitle`.** From `$currentEntry.title`.
+6. **Use these on the master_person row** (in the upsert helper):
+   - `master_person.master_company_id` ← `$currentCompanyId` (the resolved id from step 4 — may or may not equal `$input.master_company_id`)
+   - `master_person.current_title` ← `$currentTitle`
+
+### Person enrichment strategy — locked in
+
+- **We are NOT calling `mvp/get-add/master-person` from this loop.** That function re-runs the full add+enrich cascade (PDL, Enrich Layer, deep-research, etc.) and we don't want that cost/latency on every Exa C-suite hit when we already have rich data in hand.
+- **Use the Exa data directly to enrich the person inline.** Within the `add new exa person` group, for each `$match`:
+  1. Upsert a `master_person` row (and linked `master_email` / `master_link` / `master_company_person` rows as needed) using fields derived from the Exa payload — `$match.title` (display name), `$match.entities.0.properties.location`, `$match.url` (LinkedIn), `$currentTitle`, plus the company-link edge tying them to `$input.master_company_id` with the title attached. **Set `visibility: true`** on the new master_person row (confirmed field name on schema #139) — Exa-discovered C-suite are public-facing identities, so they should be surfaceable in profile/search results from the moment they're created.
+  2. **Add biography rows from Exa.** Call `function.run "mvp/bios/add-person-biography"` (#2536) **twice** — once per Exa source. Both calls use:
+     - `master_person_id`: from step 1
+     - `data_source_id`: `101` (Exa)
+
+     With different `biography` inputs per call:
+
+     | Call | `biography` input |
+     |---|---|
+     | **2a — highlight** | `$match.highlights.0` (first/most-relevant highlight string Exa surfaced for this person — typically a markdown-formatted bio excerpt) |
+     | **2b — summary** | `$match.summary` (the longer LLM-summarized professional bio at the top of each match; includes current role, full work history, education, location) |
+
+     #2536 handles its own dedup (md5 hash on cleaned text), emoji-strip, URL-only guard, and empty-input guard — safe to call unconditionally on both. If either field is empty/missing, #2536 will short-circuit on its empty-biography validation; no need to gate the calls from the caller side. The hash-based dedup also prevents a duplicate row if `highlights.0` and `summary` happen to be identical (rare).
+  3. **Resolve the avatar.**
+     - Call `function.run "mvp/enrich/find-avatar"` (#12846) with the master_person identifiers as input. Capture the response as `$avatarResult`.
+     - Call `function.run "mvp/avatar/replace-avatar"` passing `avatar: $avatarResult.avatar` (or whatever the avatar field is named on #12846's response — verify before wiring) along with the `master_person_id`.
+  4. **Write `work_experience` rows from `workHistory[]`.** After master_person + avatar are done, loop over `$match.entities.0.properties.workHistory` and insert one `work_experience` row per entry into table `work_experience` (#147).
+     - **Order the loop master_company-matches first.** Process every entry where `entry.company.name|icontains:$masterCompany.company_name` first (the matching entries can be multiple — a single person may have held multiple positions at the same company; write a row for each), then process the remaining entries.
+     - **Field mapping (verified against schema #147):**
+
+       | `work_experience` field | Source |
+       |---|---|
+       | `master_person_id` | from step 1 (just-created master_person) |
+       | `master_company_id` | `$input.master_company_id` **on matching-company rows only**; leave default on non-matching rows (downstream "link work history to master_companies" pass will resolve those) |
+       | `first_name` | first token of `$match.title` (Exa puts the person's display name here, e.g. `"Samantha Gioia"` → `Samantha`) |
+       | `last_name` | remainder of `$match.title` after first token (`Gioia`) |
+       | `title` | `entry.title` |
+       | `company_name` | `entry.company.name` |
+       | `company_domain` | **domain extracted from `entry.company.website`.** `https://katabatic.tv` → `katabatic.tv`. Strip `https?://`, strip leading `www.`, strip trailing slash and any path. Regex: `^https?:\/\/(?:www\.)?([^\/\s]+)` — take group 1. Null if `entry.company.website` is null. |
+       | `company_linkedin_url` | `entry.company.linkedinUrl` (now populated thanks to the #12988 fix above) |
+       | `start_year` / `start_month` / `start_day` | parse `entry.dates.from` (ISO format, can be `YYYY-MM-DD`, `YYYY-MM`, or `YYYY`). Split on `-`: 3 parts → all three populated; 2 parts → year + month, day blank; 1 part → year only. Schema fields are text, so store as zero-padded strings (`"01"`, not `1`). |
+       | `end_year` / `end_month` / `end_day` | same parser, against `entry.dates.to`. If `entry.dates.to` is null, leave all three blank and set `current: true` (see below). |
+       | `current` | `true` if `entry.dates.to == null`, else `false` |
+       | `location` | `entry.location` |
+       | `data_source_id` | `101` (Exa — same data_source_id v4 uses for Exa-attributed `enrich_history_company` rows) |
+
+     - **Do NOT write `entry.company.description`.** That field is multi-KB scraped LinkedIn/Crunchbase prose (news headlines, company updates, workforce breakdowns). Skip it entirely — `work_experience.description` stays default-empty.
+     - **Skip these schema fields** (not relevant to Exa-sourced rows): `main` (deprecated), `person_permalink`, `organization_permalink`, `linkedin_company_id` (deprecated), `edge_uuid` (set by downstream FalkorDB edge-creation pass), `triples_created_at` (set by triples pass), `description`.
+  5. Optionally persist the raw `$match` payload to `person_enrich_data.exa_data` (or equivalent column) so the next enrichment pass has it locally and doesn't re-call Exa.
+  6. **Kick off async deep-research bio — LAST step in the loop.** Call `function.run "mvp/deep-research/deep-person-basic"` (#12833) with the just-created `master_person_id`. Placed at the end on purpose so every other write (work_experience, optional `person_enrich_data` payload, etc.) has landed before #12833 reads master_person + addons to build the deep-research context.
+     - **Call shape:** `function.run "mvp/deep-research/deep-person-basic" { input = { master_person_id: $newPerson.id } }`. The function takes a single int input. No need to capture/use the response inline — it's a fire-and-kickoff (returns the `profile_enrichment_job` row after the external service accepts the job).
+     - **What it does downstream:** #12833 reads master_person + addons (master_company, certifications, work_experience), YAML-encodes them as context, formats a long system prompt, then calls `mvp/enrich/deep-research-person-or-company` (#12747). #12747 fires a POST to the `orbiter-enrich` Cloud Run service and inserts a row into `profile_enrichment_job` (#686) with `processing: true` and the returned `job_id`.
+     - **Completion is async via webhook.** When the Cloud Run job finishes (typically 30s – several minutes), it POSTs to `webhooks/enrich-profile` (endpoint #8303), which updates the `profile_enrichment_job` row, writes the parsed biography array to `master_person.deep_bio`, runs `mvp/bios/add-person-biography` (the same #2536 we already called inline) with the joined biography, runs `mvp/bios/create-llm-person-bios`, runs `mvp/social/social-insights/get-social-insights`, and runs `mvp/node/update-person-node`. We don't need to wire any of that here — it all happens off the webhook.
+     - **Cost flag.** Model is `moonshotai/kimi-k2.6:online` with up to 16K output tokens + parallel web search — roughly **$0.10–$0.50 per person**. At ~6 c-suite hits per company × the full backfill queue, this becomes the dominant per-company cost of the v4 changes. Open question: gate this call (e.g., skip when `master_person.deep_bio` is already populated from a prior pass, or skip on `cascade_depth > 0`, or only run for the top N matches by some confidence signal).
+- **Then queue for additional enrichment.** After the inline upsert, enqueue this `master_person_id` via the person-enrichment queue (likely `mvp/queue/upsert-enrich-person` — verify exact function name) so downstream workers run the deeper person flow (PDL backfill, Signal NFX person side, master-person v2 enrich, etc.) asynchronously.
+- **Queue priority.** Set the queue priority **one tier below** the priority we use for investors (so investor enrichment stays ahead of these C-suite additions in the worker queue). Look up the investor tier value in the relevant queue function before wiring; pass `priority_tier: <investor_tier> + 1` (or whatever the queue's "lower priority" convention is — investigate whether higher numbers = lower priority or the inverse).
+
+### Open questions (resolve before building)
+
+- ~~**Company match strictness.**~~ ✅ **Decided:** case-insensitive substring (`|icontains`) on `entry.company.name` vs. `$masterCompany.company_name`. Revisit only if false positives surface in QA.
+- **No-match fallback (workHistory has zero entries at master_company).** Three options: (a) still enrich the person inline using Exa's top-level fields but skip the company-link edge / `$currentTitle`, (b) fall back to Exa's top-level `match.title` (which is the *display name*, not a job title — probably wrong), or (c) skip this person entirely and log `log_crash` with `note: "Exa match had no workHistory at master_company"`. Lean: **(a)** — keep the person, drop the title. Confirm.
+- **Exact queue function + priority field.** Need to confirm: the canonical person-side queue function name (e.g., `mvp/queue/upsert-enrich-person`?), the investor priority tier value currently in use, the direction of priority numbering (higher = sooner, or lower = sooner?), and the parameter name on the queue function (`priority_tier`? `priority`?).
+- **Inline person upsert helper.** Should we extract the "upsert master_person from an Exa match" logic into a new shared helper (e.g., `mvp/enrich/upsert-person-from-exa`) so the same routine can be reused if/when other steps need it, or inline it directly in v4's group? Lean: extract — Section 7 stays readable and the helper is testable in isolation.
+
+## Upstream improvement — populate `linkedinUrl` + `website` in #12988
+
+<Note>
+  **Built 2026-05-14.** Both fixes below are live on `mvp/enrich/get-exa-company-c-suite` (#12988). Test by running v4 against a master_company with `exa_c_suite` cleared, then inspect `company_enrich_data.exa_c_suite.matches[*].entities[0].properties.workHistory[*].company` — `linkedinUrl` and `website` should be populated on enriched companies (was null on every row pre-fix). Note: `educationHistory[*].institution.linkedinUrl` now uses the `/school/` form for schools/universities thanks to the unified regex.
+</Note>
+
+`mvp/enrich/get-exa-company-c-suite` (#12988) currently returns `linkedinUrl: null` and `website: null` on every enriched company inside `workHistory[*].company` and `educationHistory[*].institution`, even when `expand_companies: true`. Both fields *exist* in the response shape — they're just always null. Two bugs in the post-processing lambdas:
+
+### Bug 1 — `linkedinUrl` regex matches the wrong path segment
+
+In the "Build enriched lookup list" lambda, the LinkedIn URL is derived from the Exa company ID like this:
+
+```js
+const m = id.match(/library\/company\/([^\/?#]+)/);
+if (m && m[1]) linkedinUrl = 'https://linkedin.com/company/' + m[1];
+```
+
+But the actual Exa company IDs use the `organization` segment, not `company`:
+
+```
+https://exa.ai/library/organization/jfjgkbqvgr9   ← Shepherd Center
+https://exa.ai/library/organization/k7t465sztky   ← Google
+https://exa.ai/library/organization/0jtkn73hfcj   ← Frame.io
+```
+
+The regex never matches → `linkedinUrl` stays null on every row.
+
+**Fix options (pick one):**
+
+- **(a)** Swap the regex literal `company` → `organization`. Minimal change; assumes the `<slug>` portion of Exa's URI always matches the LinkedIn company slug (true in the samples we've seen but not guaranteed by Exa).
+- **(b) (Recommended)** Parse the LinkedIn URL out of the markdown `text` body Exa returns. The scraped company summary reliably contains a line like `- LinkedIn: linkedin.com/company/shepherd-center`. Regex against `text` for `LinkedIn:\s*(linkedin\.com\/(?:company|school)\/[^\s\n]+)` and prefix `https://`. Handles both companies (`/company/`) and educational institutions (`/school/`) in one shot — important because the same lambda enriches both `workHistory[].company` and `educationHistory[].institution`.
+
+Lean: do **(b)**, fall back to **(a)** when `text` is empty or the line isn't present.
+
+### Bug 2 — `website` source is the wrong field
+
+The lambda asks `/contents` for `extras: { links: 5 }` and then picks the first http link that isn't `linkedin.com` or `exa.ai`. The problem: Exa's `extras.links` returns links *found inside the scraped content* (related companies, citations, references on the LinkedIn page) — not the company's homepage. For a LinkedIn-page scrape, the company's own homepage rarely surfaces there, which is why `website` is null.
+
+The homepage *is* reliably present in the markdown `text` body, as a line like `- Homepage: shepherd.org`.
+
+**Fix:** parse `text` for the `Homepage:` line. Regex something like `Homepage:\s*([^\s\n]+)` against `text`, then prefix `https://` if the captured value doesn't already start with `http`. Drop the `extras.links` strategy entirely (saves a per-row token cost on the `/contents` call too — can drop `extras: { links: 5 }` from the request body).
+
+### Edge cases to handle in the parser
+
+- `text` is empty / missing for a given company (Exa hasn't indexed it). Both fields stay null — acceptable.
+- `text` contains `Homepage:` but the value is a relative path, slack channel, or some other non-URL (rare but seen in malformed scrapes). After regex capture, validate that the value looks like a domain (`/^[a-z0-9.-]+\.[a-z]{2,}$/i`) before prefixing `https://`. If invalid, leave `website` null.
+- Multiple `LinkedIn:` lines (some scrapes include a personal LinkedIn for the founder + a company LinkedIn). Take the first match — Exa's markdown puts the company LinkedIn at the top of the Company Details section.
+
+### Out of scope for this improvement
+
+- Validating that the derived `linkedinUrl` actually resolves to a real LinkedIn page (would require an HTTP HEAD per company — too expensive).
+- Resolving `website` against a canonical domain registrar (subdomains vs apex). Take whatever Exa printed in the Homepage line; downstream consumers can normalize.
+
+## Reference
+
+### company_enrich_data.exa_c_suite
+
+<Accordion title="Example payload (Frame.io / Adobe — sandbox capture)">
+```json
+{"cost":{"total":0.011,"search":{"neural":0.007},"summary":0.004},"slug":"","matches":[{"id":"https://exa.ai/library/person/kz3skkb6v9w","url":"https://linkedin.com/in/jennabilotta","title":"Jenna Bilotta","author":"Exa","summary":"Professional bio for Jenna Bilotta\n\nCurrent role:\n- Head Of Product - Frame.io at Adobe (since July 2024)\n\nFull work history (roles, companies, dates):\n- Head Of Product, Frame.io at Adobe — July 2024 to present\n- SVP Product User Experience, LaunchDarkly — February 2023 to July 2024\n- VP Of Product Design, LaunchDarkly — April 2022 to February 2023\n- Mentor, First Round Capital — August 2019 to June 2024\n- Senior Director Of Design, Growth, Shopify — June 2021 to December 2021\n- VP Of Product Design, Freemium (Previously Premium), Spotify — February 2020 to June 2021\n\nPrior roles and context:\n- Experience spanning product leadership, design leadership, growth UX leadership at major tech companies; entrepreneur and organizational leader with emphasis on customer and employee happiness.\n\nEducation:\n- (Not provided in the source content)\n\nNotable achievements / highlights:\n- Led product and design initiatives at Frame.io under Adobe to build the platform for creative collaboration\n- Held senior product/design leadership roles at LaunchDarkly, Shopify, Spotify\n- Active mentor in venture ecosystem (First Round Capital) supporting early-stage technology entrepreneurs\n- Demonstrated ability to scale teams (e.g., Growth UX team at Shopify) and drive cross-functional product strategy\n\nLocation:\n- Atlanta, Georgia, United States\n\nConnections/followers:\n- 500 connections; 2,810 followers\n\nNote: Education details were not included in the provided content.","publishedDate":"2026-04-09T04:08:00.000Z"},{"id":"https://exa.ai/library/person/p6f7b6dm7sl","url":"https://linkedin.com/in/samanthagioia","title":"Samantha Gioia","author":"Exa","summary":"Professional bio: Samantha Gioia\n\nCurrent role:\n- Technical Product Manager, Frame.io (Adobe Company), New York, NY (Jan 2026 – Present)\n\nFull work history (companies and dates):\n- Frame.io (Adobe Company) — Technical Product Manager (Jan 2026 – Present)\n- Frame.io (Adobe Company) — IT System Administrator (Apr 2020 – Present)\n- Adobe — Collaboration Security Technical Product Manager (Aug 2023 – Jan 2026)\n- Frame.io (Adobe Company) — Information Systems Engineer (Nov 2021 – Apr 2025)\n- Frame.io (Adobe Company) — Information Systems Engineer (Nov 2021 – Sep 2023)\n- Frame.io (Adobe Company) — Senior IT System Administrator (Apr 2021 – Feb 2022)\n- Industrious — IT Manager (Jan 2018 – Apr 2020)\n- Fullscreen, Inc — NYC IT Engineer (Jan 2015 – Oct 2017)\n\nEducation:\n- [Not provided in the excerpt]\n\nNotable achievements (based on provided content):\n- Progressed from IT/System roles into Technical Product Management at Frame.io and Adobe.\n- Experience spanning engineering/IT operations and product leadership within Frame.io and Adobe.\n- Worked across multiple geographies and contributed to teams in product, engineering, and security collaboration.\n\nLocation:\n- United States (New York, NY area)\n\nNotes:\n- The profile lists 18+ years of experience.\n- Specific education details are not included in the provided text.","publishedDate":"2026-04-01T05:31:50.000Z"},{"id":"https://exa.ai/library/person/3myyhlklfmq","url":"https://linkedin.com/in/derek-schweickart-4680977","title":"Derek Schweickart","author":"Exa","summary":"Professional bio for Derek Schweickart\n\nCurrent role:\n- Team Lead, Camera To Cloud at Adobe (May 2023 – Present)\n\nFull work history with companies and dates:\n- Team Lead, Camera To Cloud, Adobe — May 2023 to Present\n- Senior Workflow Architect, Innovation, Adobe — Nov 2021 to May 2023\n- Senior Workflow Architect, Frame.io — May 2020 to Nov 2021\n- Film Director, A Journey Home Film LLC — Jan 2012 to Present\n- Post Production Supervisor, Cameron Pace Group — Feb 2008 to Mar 2013\n- Digital Technician, The Camera House — Sep 2004 to Sep 2005\n\nEducation:\n- (Not provided in the source material)\n\nNotable achievements:\n- Led product team building frame.io Camera to Cloud (C2C) at Adobe\n- Built and supported innovative cloud workflows for video production and C2C adoption\n- Repeated leadership roles in post production and workflow architecture across Frame.io and Adobe\n\nLocation:\n- Ossining, New York, United States\n\nConnections/affiliations:\n- 460+ connections; 468 followers on LinkedIn\n- Experience across Adobe, Frame.io, and camera-to-cloud ecosystems\n\nAdditional context:\n- Industry focus includes camera to cloud workflows, post production supervision, stereoscopic/3D workflows, and cloud-based production tooling\n- Active in content creation and directing through Film Director role in New York","publishedDate":"2026-03-13T06:39:41.000Z"},{"id":"https://exa.ai/library/person/52xk387qqcj","url":"https://linkedin.com/in/donnellyjoe","title":"Joe Donnelly","author":"Exa","summary":"Professional bio for Joe Donnelly\n\nCurrent role:\n- Senior Software Engineer, Frame.io (Adobe) | New York City metropolitan area | since Nov 2021\n\nFull work history (companies and dates):\n- Frame.io (Adobe) — Senior Software Engineer (Current): Nov 2021 – Present, New York, NY\n- Frame.io — Senior Frontend Engineer: Jul 2020 – Nov 2021, New York, NY\n- Huge — Senior Engineer: Jul 2015 – May 2020, Brooklyn, NY\n- Publicis — Senior Developer: Feb 2013 – Jul 2015, New York, NY\n- Draftfcb — Developer: May 2012 – Feb 2013, New York, NY\n- JUICE Pharma Worldwide — Interactive Developer: Jul 2011 – May 2012, New York, NY\n\nEducation:\n- (Not provided in the source content)\n\nNotable achievements:\n- Progressed from frontend-focused roles to senior software engineering at Frame.io/Adobe.\n- Extensive experience across advertising, pharma/healthcare, and design/creative software domains.\n- Demonstrated tenure with multiple NYC-based tech and creative agencies, contributing across engineering and technical departments.\n\nLocation:\n- New York City metropolitan area, United States\n\nNote: Education details were not included in the provided data. If you'd like, share education history and I can add it to the bio.","publishedDate":"2026-04-19T08:52:04.000Z"}],"matchCount":4,"expansionCost":{"total":0.029,"contents":{"text":0.029}}}
+```
+</Accordion>
+
+<Note>
+  Showing top-level shape (`cost`, `slug`, `matches[]`, `matchCount`, `expansionCost`) and each match's `id` / `url` / `title` / `author` / `summary` / `publishedDate`. The raw payload also embeds per-match `entities[].properties` (full `workHistory` + `educationHistory` with company description prose) and `highlights[]` — kept out of this scratch page because they're 100k+ tokens each and not relevant to the Section 7 refactor scope. Pull the full raw blob from `company_enrich_data.exa_c_suite` in Xano sandbox if needed.
+</Note>
+
+### :company_enrich_data1.exa_c_suite.matches.0
+
+<Accordion title="Single match — full payload (Samantha Gioia)">
+```json
+{"id":"https://exa.ai/library/person/p6f7b6dm7sl","url":"https://linkedin.com/in/samanthagioia","title":"Samantha Gioia","author":"Exa","summary":"Professional bio: Samantha Gioia\n\nCurrent role:\n- Technical Product Manager, Frame.io (Adobe Company), New York, NY (Jan 2026 – Present)\n\nFull work history (companies and dates):\n- Frame.io (Adobe Company) — Technical Product Manager (Jan 2026 – Present)\n- Frame.io (Adobe Company) — IT System Administrator (Apr 2020 – Present)\n- Adobe — Collaboration Security Technical Product Manager (Aug 2023 – Jan 2026)\n- Frame.io (Adobe Company) — Information Systems Engineer (Nov 2021 – Apr 2025)\n- Frame.io (Adobe Company) — Information Systems Engineer (Nov 2021 – Sep 2023)\n- Frame.io (Adobe Company) — Senior IT System Administrator (Apr 2021 – Feb 2022)\n- Industrious — IT Manager (Jan 2018 – Apr 2020)\n- Fullscreen, Inc — NYC IT Engineer (Jan 2015 – Oct 2017)\n\nEducation:\n- [Not provided in the excerpt]\n\nNotable achievements (based on provided content):\n- Progressed from IT/System roles into Technical Product Management at Frame.io and Adobe.\n- Experience spanning engineering/IT operations and product leadership within Frame.io and Adobe.\n- Worked across multiple geographies and contributed to teams in product, engineering, and security collaboration.\n\nLocation:\n- United States (New York, NY area)\n\nNotes:\n- The profile lists 18+ years of experience.\n- Specific education details are not included in the provided text.","entities":[{"id":"https://exa.ai/library/person/p6f7b6dm7sl","type":"person","version":1,"properties":{"name":"Samantha Gioia","lastName":"Gioia","location":"United States","firstName":"Samantha","workHistory":[{"dates":{"to":"2017-10-01","from":"2015-01-01"},"title":"NYC IT Engineer","company":{"id":"https://exa.ai/library/organization/wvk1jwf1f5g","name":"Fullscreen, Inc","website":null,"description":"Fullscreen — Advertising Services. ~81 employees, $80M revenue. HQ Playa Vista, CA. Parent: Otter Media. Acquired StageBloc (2016), Rooster Teeth (2014), McBeard (2015), Reelio (2018), ScrewAttack (2014). Tech stack incl. google ads, react, salesforce, ruby."},"location":"Greater New York City Area"},{"dates":{"to":"2026-01-01","from":"2023-08-01"},"title":"Collaboration Security Technical Product Manager","company":{"id":"https://exa.ai/library/organization/vlxpvn66k8f","name":"Adobe","website":null,"description":"Adobe (ADBE) — Software Development. ~49,595 employees, $23.8B revenue, founded 1982. HQ San Jose, CA. Public (NASDAQ:ADBE), IPO 1986. Stock $517.78."},"location":"New York, United States"},{"dates":{"to":"2011-02-01","from":"2009-09-01"},"title":"Assistant","company":{"id":null,"name":"Peri's Bookkeeping Service"},"location":null},{"dates":{"to":null,"from":"2020-04-01"},"title":"IT System Administrator","company":{"id":"https://exa.ai/library/organization/0jtkn73hfcj","name":"Frame.io","website":null,"description":"Frame.io (Frame.io, Inc) — Software Development. ~53 employees, $20M revenue, founded 2014. HQ New York, NY. Acquired by Adobe (2021-08-19) for $1.275B. Video review + collaboration platform."},"location":"New York, United States"},{"dates":{"to":null,"from":"2020-04-01"},"title":"Technical Product Manager","company":{"id":"https://exa.ai/library/organization/0jtkn73hfcj","name":"Frame.io","website":null,"description":"Frame.io — Software Development, NY. Acquired by Adobe 2021."},"location":"New York, United States"},{"dates":{"to":null,"from":"2020-04-01"},"title":"Senior Information Technology System Administrator","company":{"id":"https://exa.ai/library/organization/0jtkn73hfcj","name":"Frame.io","website":null,"description":"Frame.io — Software Development, NY. Acquired by Adobe 2021."},"location":"New York, New York, United States"},{"dates":{"to":null,"from":"2020-04-01"},"title":"Information Systems Engineer","company":{"id":"https://exa.ai/library/organization/0jtkn73hfcj","name":"Frame.io","website":null,"description":"Frame.io — Software Development, NY. Acquired by Adobe 2021."},"location":null},{"dates":{"to":"2014-07-01","from":"2013-04-01"},"title":"IT Associate","company":{"id":"https://exa.ai/library/organization/6qb8kd5v7pb","name":"SoulCycle","website":null,"description":"SoulCycle Inc. (SLCY) — Wellness and Fitness Services. ~677 employees, $125M revenue, founded 2006. HQ New York, NY. Parent: Equinox Fitness."},"location":"Greater New York City Area"},{"dates":{"to":"2008-01-01","from":"2007-01-01"},"title":"Office Of Special Events","company":{"id":"https://exa.ai/library/organization/hh2wwvlbb75","name":"Hiram College","website":null,"description":"Hiram College — Higher Education. ~307 employees, $44.8M revenue, founded 1850. HQ Hiram, OH. Private college."},"location":null},{"dates":{"to":"2025-04-01","from":"2021-11-01"},"title":"Information Systems Engineer","company":{"id":null,"name":"Frame.io an Adobe Company"},"location":"New York, New York, United States"},{"dates":{"to":"2009-09-01","from":"2008-06-01"},"title":"Specialist","company":{"id":"https://exa.ai/library/organization/yxdlj7dpkrg","name":"Apple Retail","website":null,"description":"Apple (AAPL) — Computers and Electronics Manufacturing. ~128,990 employees, $416B revenue, founded 1976. HQ Cupertino, CA. Public (NASDAQ:AAPL)."},"location":null},{"dates":{"to":"2005-08-01","from":"2005-06-01"},"title":"Library Clerk","company":{"id":"https://exa.ai/library/organization/cyq77y23ftf","name":"Littler Mendelson","website":null,"description":"Littler (Littler Mendelson P.C.) — Law Practice. ~1,938 employees, $649M revenue, founded 1942. HQ San Francisco, CA. Largest global employment + labor law practice."},"location":null},{"dates":{"to":"2013-04-01","from":"2010-10-01"},"title":"Senior Macintosh Technician","company":{"id":"https://exa.ai/library/organization/22pjh52cbpg","name":"WPP","website":null,"description":"WPP (WPP.L) — Advertising Services. ~4,356 employees, £13.55B revenue. HQ London, UK. Public (LSE:WPP)."},"location":null},{"dates":{"to":"2020-04-01","from":"2018-01-01"},"title":"IT Manager","company":{"id":"https://exa.ai/library/organization/kx4qvtw13zb","name":"Industrious","website":null,"description":"Industrious — Hospitality / coworking. ~581 employees, $113M revenue, founded 2012. HQ New York, NY. Acquired by CBRE Group (2025-01-14) for $400M."},"location":"Greater New York City Area"},{"dates":{"to":"2016-01-01","from":"2014-09-01"},"title":"IT Consultant","company":{"id":"https://exa.ai/library/organization/msh7d92yqq2","name":"Tri-State College Of Acupuncture","website":null,"description":"Tri-State College of Acupuncture — Alternative Medicine educational institution. NY, United States."},"location":null}],"educationHistory":[{"dates":{"to":"2008","from":"2005"},"degree":"BA, Political Science, Art History","institution":{"id":"https://exa.ai/library/organization/hh2wwvlbb75","name":"Hiram College","website":null,"description":"Hiram College — Higher Education. ~307 employees, $44.8M revenue, founded 1850. HQ Hiram, OH."}}]}}],"highlights":["# Samantha Gioia\n[...]\nFrame.io an Adobe Company | Technical Product Manager | IT Problem Solver|\n[...]\nTechnical Product Manager at Frame.io\n[...]\nToday is the first day of a new chapter. After eight years with Frame.io and Adobe,\n[...]\n'm re-entering the freelance writing world."],"publishedDate":"2026-04-01T05:31:50.000Z","highlightScores":[]}
+```
+</Accordion>
+
+<Note>
+  Company `description` fields condensed (one-line summary kept, full marketing/news prose dropped — each was 5–15 KB of public LinkedIn/Crunchbase scrape). The `highlights[]` array truncated to first entry. Everything else (dates, titles, location strings, ids, urls, education) is verbatim from the raw `matches[0]` capture.
+</Note>

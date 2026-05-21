@@ -1,6 +1,6 @@
 ---
 title: "Company Enrichment Phases"
-description: "The company waterfall — from a single domain to a fully enriched master_company, plus run-base-company-enrich-v3 phases."
+description: "The company waterfall — from a single domain to a fully enriched master_company, plus run-base-company-enrich-v4's 15-step gated pipeline."
 ---
 
 The company waterfall begins when any function calls `mvp/get-add/master-company`. This page walks through the full flow using **resend.com** as the running example. See [Core Concepts](/guides/enrichment/waterfall/core-concepts) for shared mechanics (cascade depth, priority tiers, queue tables).
@@ -13,7 +13,7 @@ The company waterfall begins when any function calls `mvp/get-add/master-company
 mvp/get-add/master-company — #12558
 ```
 
-**Current version:** v1.9 (2026-04-13) — removed deprecated `funding_round_data_raw` write. See function description in Xano for the full changelog (v1.5 through v1.9).
+**Current version:** v2.6 (2026-05-12) — Section 11 dispatch switched from `run-base-company-enrich-v3` (#12814, deprecated) to `run-base-company-enrich-v4` (#12992). v2.5 (2026-05-12) extracted Section 10a/10b + the inline `company_financial` create into the shared helper `mvp/enrich/apply-company-llm-payload` (#12989). v2.4 (2026-05-11) removed PDL and Enrich Layer entirely — `new-company-enrichment` (#12974) is now the sole semi-structured LLM enrichment. Section numbers were re-ordered: 5 = LLM, 6 = post-LLM dedup, 7 = alt-domain dedup, 8 = Fundable, 10 = create, 11 = dispatch.
 
 Called with:
 ```json
@@ -28,7 +28,7 @@ Called with:
 
 ---
 
-## Phase 1: Input Cleanup (Sections 2a-2d)
+## Phase 1: Input Cleanup (Section 2)
 
 ```mermaid
 graph LR
@@ -46,147 +46,190 @@ The raw input is normalized:
 
 ---
 
-## Phase 2: Dedup Cascade (Sections 3 → 5 → 7 → 8)
+## Phase 2: Quick Check + Kill Switch (Sections 3 + 4)
 
-Before creating anything, the function runs a **four-layer dedup check** to find existing records:
+Before any LLM call, the function runs a fast-exit dedup and the kill-switch check:
 
 ```mermaid
 graph TD
-    A["Section 3: Quick Check<br/>profile_url → master_link"] -->|not found| B
-    B["Section 5: Post-Fundable<br/>resolved domain<br/>original domain<br/>known URLs via master_link"] -->|not found| C
-    C["Section 7: Post-Enrichment<br/>PDL/EL enriched URLs<br/>post-resolution domain"] -->|not found| D
-    D["Section 8: Alt Domains<br/>PDL alternative_domains"] -->|not found| E["Section 9: Create"]
+    A["Section 3: Quick Check<br/>profile_url → master_link"] -->|found| R["Return existing<br/>master_company"]
+    A -->|not found| B["Section 4: Kill switch<br/>local-only lookup if active"]
+    B -->|active + miss| Z["Return empty"]
+    B -->|inactive| C["Section 5: LLM"]
+```
+
+- **Section 3**: Look up the incoming `profile_url` in `master_link`. If it already points to a `master_company`, return immediately — no LLM, no Fundable, no external calls.
+- **Section 4**: Read the `kill_switch_company` env var. When the switch is on, the function still answers from local rows but writes zero external-API requests.
+
+---
+
+## Phase 3: LLM Enrichment (Section 5)
+
+```text
+mvp/enrich/new-company-enrichment — #12974
+```
+
+**Current version:** v1.4 (2026-05-12). Two-stage company enrichment:
+
+1. **Stage 1** — LLM enrichment via OpenRouter (Gemini Flash `:online` by default; escalates to Claude Sonnet 4.6 `:online` when overall confidence < 0.7).
+2. **Stage 2** — Deterministic profile discovery via Serper. Batch `site:` search across LinkedIn, X/Twitter, Facebook, Instagram, YouTube, Crunchbase, Wellfound. Merged into `data.profiles` after canonical-URL filtering.
+
+The system prompt mirrors [`/guides/open-work/new-company-enrichment`](/guides/open-work/new-company-enrichment) in the Mintlify docs. Response shape: `{ data, model_used, escalated, gemini_confidence }`.
+
+The LLM call now runs **before** the Fundable lookup so any LinkedIn / Crunchbase URLs the LLM discovers can feed Fundable's matcher.
+
+Recent versions added `went_public_on` (IPO date) + `stock_link` (TradingView URL) (v1.4), tightened profile filtering at both prompt and merge layers (v1.3), strengthened profile-verification (v1.2), and added `is_school` boolean (v1.1).
+
+---
+
+## Phase 4: Post-LLM Dedup + Fundable (Sections 6 → 7 → 8)
+
+```mermaid
+graph TD
+    A["Section 6: Post-LLM Dedup<br/>resolved domain<br/>original domain<br/>known URLs via master_link"] -->|not found| B
+    B["Section 7: Alt-Domain Dedup<br/>+ classify LLM profile URLs"] -->|not found| C
+    C["Section 8: Fundable (BigQuery)<br/>+ post-Fundable dedup"] -->|not found| D["Section 10: Create"]
 
     A -->|found| R["Return existing<br/>master_company"]
     B -->|found| R
     C -->|found| R
-    D -->|found| R
 ```
 
-Each check queries `master_company` by domain or `master_link` by URL. If a match is found at any layer, the existing company is returned immediately — no new record is created.
+Each dedup layer queries `master_company` by domain or `master_link` by URL. If a match is found at any layer, the existing company is returned immediately.
 
-For `resend.com`, assuming it's the first time:
-1. **Section 3**: No `master_link` for `linkedin.com/company/resend` yet
-2. **Section 5**: No `master_company` with `company_domain = resend.com` yet
-3. **Section 7**: PDL/EL enriched URLs checked — still nothing
-4. **Section 8**: PDL `alternative_domains` checked — still nothing
-5. Falls through to **Section 9: Create**
+**Fundable** (Section 8) is our own BigQuery dataset — zero external-API cost. The `fundable_org_id` it returns is written onto `master_company` and reused everywhere downstream (Phase 5, Phase 7, Signal NFX, investment thesis).
 
----
-
-## Phase 3: External API Enrichment (Sections 4, 6)
-
-Between dedup layers, external APIs are called to gather data:
-
-```mermaid
-graph TD
-    A["Section 4: Fundable (BigQuery)"] --> B{Fundable data found?}
-    B -->|Yes| C["Skip PDL + EL<br/>Save API credits"]
-    B -->|No| D["Section 6: PDL Company Enrich<br/>api.peopledatalabs.com"]
-    D --> E["Section 6: Enrich Layer<br/>LinkedIn or domain lookup"]
-```
-
-**Fundable** (Section 4) always runs first — it's our own BigQuery dataset, zero external API cost. If Fundable returns data for `resend.com`, PDL and Enrich Layer are skipped entirely (v1.7 optimization).
-
-**When `cascade_depth > 0`**: Both PDL and Enrich Layer are skipped regardless. The entity is created from Fundable data + input params only.
+**When `cascade_depth > 0`**: the entity still goes through all sections, but Section 11 forces it into the queue regardless of the `queue` input.
 
 For `resend.com` at depth 0 with no Fundable match:
 
 | API | Endpoint | Data Retrieved |
 |-----|----------|----------------|
-| **Fundable** | BigQuery | domain, company name, LinkedIn, Crunchbase, Pitchbook, funding rounds, founded date |
-| **PDL** | `/v5/company/enrich?website=resend.com` | display_name, profiles, alternative_domains, industry, size, website |
-| **Enrich Layer** | `company-linkedin` or `company-domain` | name, industry, categories, specialties, description, HQ address, banner image |
+| **new-company-enrichment** | OpenRouter (Gemini Flash / Claude Sonnet) + Serper | display_name, legal_name, aliases, profiles, industry, size, headquarters, other_locations, financial signals, summary, headline |
+| **Fundable** | BigQuery | `fundable_org_id`, company name, LinkedIn, Crunchbase, Pitchbook, funding rounds, founded date |
 
 ---
 
-## Phase 4: Record Creation (Section 9)
+## Phase 5: Record Creation (Section 10)
 
-With all enrichment data gathered and no existing match found:
+With LLM + Fundable data gathered and no existing match found:
 
 ```mermaid
 graph TD
-    A["db.add master_company<br/>name, domain, logo, LinkedIn, flags"] --> B["db.add company_enrich_data<br/>Store raw company_llm + Fundable"]
-    B --> C["mvp/enrich/apply-company-llm-payload #12989<br/>(shared helper — see Note)"]
-    C --> D["add-company-node #2600<br/>Create FalkorDB graph node"]
-    D --> E["Section 10c: Process Fundable Data<br/>Industries, descriptions, founded year,<br/>LinkedIn followers, social links"]
+    A["db.add master_company<br/>name, domain, logo, LinkedIn, flags,<br/>fundable_org_id"] --> B["db.add company_enrich_data<br/>Store company_llm + Fundable"]
+    B --> C["apply-company-llm-payload #12989<br/>(shared helper)"]
+    C --> D["add-company-node #2600<br/>Create FalkorDB Company node"]
+    D --> E["Process Fundable Data<br/>Industries, descriptions, founded year,<br/>LinkedIn followers, social links"]
 ```
 
 For `resend.com`, this creates:
-- **master_company** record with `company_name: "Resend"`, `company_domain: "resend.com"`, logo from logo.dev
-- **company_enrich_data** storing the raw `company_llm` payload + Fundable response
+- **master_company** record with `company_name: "Resend"`, `company_domain: "resend.com"`, logo from logo.dev, `fundable_org_id` if Fundable matched
+- **company_enrich_data** storing `company_llm` (full LLM payload) + `fundable` (BigQuery response or `"no_data"`)
 - **company_financial** (created inside the helper) with `company_type`, `is_public`, `ticker`, `stock_label`, `primary_exchange`, `stock_link`, `went_public_on`, `funding_total`, `revenue`
 - **master_link** entries for LinkedIn, Crunchbase, domain, plus every LLM-discovered + Serper-augmented social URL (`data_source_id: 100`)
-- **Industries and specialties** from the LLM payload (`industry.primary` / `industry.secondary` / `tags`) plus Fundable
-- **About/descriptions** from LLM `headline` + `summary`, plus Fundable
+- **Industries and specialties** from the LLM payload (`industry.primary` / `industry.secondary` / `tags`) + Fundable
+- **About/descriptions** from LLM `headline` + `summary` + Fundable
 - **HQ address** + **other office locations** from the LLM `headquarters` + `other_locations` blocks
 - **Contact email + phone** from LLM `email_address` / `phone_number`
 - **Company node** in the FalkorDB graph (after the helper has populated the relational tables)
 
 <Note>
-**v2.5 (2026-05-12)** — Section 10a (Associate Links) + Section 10b (Process LLM Enrich) + the inline `db.add company_financial` create were extracted into `mvp/enrich/apply-company-llm-payload` (#12989). The helper is now the single source of truth for "translate `company_enrich_data.company_llm` into relational tables." Both fresh creates (here) and the upcoming `run-base-company-enrich-v4` step 3 (backfilled records) call the same helper. Section 10c (Fundable processing) stays inline because it reads from `company_enrich_data.fundable`, not `company_llm`.
-
-As of v1.9 (2026-04-13), the deprecated `funding_round_data_raw` field write was removed — funding data flows exclusively through `add-all-fundable-deals` and the Fundable deal nodes.
+**Single source of truth for LLM → relational mapping.** `mvp/enrich/apply-company-llm-payload` (#12989) is called from two places: here (Section 10b/c on fresh creates) and from `run-base-company-enrich-v4` Step 3 (backfilled records whose LLM payload was just freshly populated). The helper is idempotent — scalar writes use `first_notempty` so existing values are preserved, and `is_school` / `is_vc` only ever escalate to true.
 </Note>
 
 ---
 
-## Phase 5: Enrichment Dispatch (Section 11)
+## Phase 6: Enrichment Dispatch (Section 11)
 
 The final routing decision depends on cascade depth and queue flag:
 
 ```mermaid
 graph TD
-    A{cascade_depth == 0<br/>AND queue == false?} -->|Yes| B["Enrich immediately<br/>run-base-company-enrich-v3 #12814<br/>(async)"]
+    A{cascade_depth == 0<br/>AND queue == false?} -->|Yes| B["Enrich immediately<br/>run-base-company-enrich-v4 #12992<br/>(async-shared)"]
     A -->|No| C{Already in queue?}
     C -->|Yes| D["Bump count<br/>Upgrade priority_tier if better"]
-    C -->|No| E["db.add queue_enrich_company<br/>cascade_depth, priority_tier,<br/>source_function, source_entity_id"]
+    C -->|No| E["queue/upsert-enrich-company<br/>cascade_depth, priority_tier,<br/>source_function, source_entity_uuid"]
 ```
 
-For `resend.com` at depth 0: **immediate enrichment** fires asynchronously. This triggers the full company enrichment pipeline (LLM bios, social scraping, website analysis, etc.).
-
-For a depth-1 company discovered during person enrichment: **queued** with the source function and priority tier recorded.
+For `resend.com` at depth 0 with `queue: false`: **immediate enrichment** fires asynchronously via `run-base-company-enrich-v4`. For a depth-1 company discovered during person enrichment: **queued** with the source function, source entity (id + uuid + type), and priority tier recorded via `mvp/queue/upsert-enrich-company`.
 
 <Info>
-v1.8 (2026-04-13) fixed a bug where `$companyAdded` was never set to true, so enrichment/queue never fired on fresh creates. All new companies now correctly reach Section 11.
+A `!debug.stop` line still sits in front of the dispatch (kept from v2.4's sandbox-smoke gating). The `!` prefix disables it; remove the `!` to gate `run-base-company-enrich-v4` again during a future debug session.
 </Info>
 
 ---
 
-## Phase 6: Name Correction (Section 12)
-
-A final pass checks if PDL returned a `display_name` that differs from the current `company_name`. If so, the canonical PDL name wins. This catches cases where the input name was informal or incomplete.
-
----
-
-## run-base-company-enrich-v3 Phases
+## run-base-company-enrich-v4 — 15-Step Gated Orchestrator
 
 ```text
-mvp/enrich/run-base-company-enrich-v3 — #12814
+mvp/enrich/run-base-company-enrich-v4 — #12992
 ```
 
-**Current version:** v3.5 (2026-05-11) — **Removed Phase 1 (PDL) and Phase 2 (Enrich Layer) entirely.** Removed the PDL/EL-driven name-correction step. Added `mvp/enrich/get-exa-company-c-suite` #12988 as a new always-on first step that writes Exa founder/key-employee results to `company_enrich_data.exa_c_suite`. `enrich_history_company.data_source_id` updated from `78` (Base Company Enrich) to `101` (Exa) — the orchestrator's history row is now tagged by primary external source. v3.4 (2026-04-15) removed stale XanoScript comment about `resolve-company-specialties` wiring. v3.1 (2026-04-13) added `cascade_depth` input passed to `process-yc-people` and `add-all-fundable-deals`.
+**Current version:** v4 (2026-05-12, last modified 2026-05-14). Replaced `run-base-company-enrich-v3` (#12814, deprecated). Input/output contract identical to v3.5.
 
-The orchestrator runs these steps in order. Every step is wrapped in its own `try_catch` — failures append a `log_crash` row with `note: "CRASH: {step}"` and flip `$hasCrash = true`, but later steps still run. The final `enrich_history_company` row records `enrich_success: true` only when no step crashed.
+Every step is wrapped in its own `try_catch` — failures append a `log_crash` row with `note: "CRASH: {step}"` and flip `$hasCrash = true`, but later steps still run. The orchestrator opens with a **60-second debounce** (skip + log if a prior run for the same `master_company_id` with `data_source_id: 78` fired within the last 60s — prevents duplicate `enrich_history_company` rows from back-to-back triggers). Setup writes one base `enrich_history_company` row (`data_source_id: 78`, `processing: true`) and exits early with `EARLY RETURN: no company_enrich_data row` when the company has no enrich-data row yet.
 
 | # | Step | What It Does |
 |:-:|------|-------------|
-| — | **Setup** (inline) | `db.add enrich_history_company` (`data_source_id: 101`, `processing: true`); load `master_company`. |
-| 1 | **get-exa-company-c-suite** #12988 | **Exa founder + key-employee search.** Always runs. Inputs: `master_company.company_name`, `linkedin_url`, `company_domain`, `expand_companies: true`. Writes the response (matches, expanded company history, education, costs) to `company_enrich_data.exa_c_suite` when the enrich-data row exists. Followed by the `company_enrich_data` early-return guard — if no enrich-data row exists, logs `EARLY RETURN` to `log_crash` and returns. |
-| 2 | **process-company-phase-3** #12799 — YC (v1.1) | YC detection/scrape + YC data processing + `process-yc-people` (receives `cascade_depth` so YC batch-mates inherit the tree). |
-| 3 | **process-company-phase-5** #12809 — Fundable backfill | Lookup + industries + abouts + address + links + follower counts from Fundable. |
-| 4 | **process-company-phase-6** #12810 — Link res + financial | Canonicalize profile URLs; populate `company_financial`. |
-| 5 | **process-company-phase-7** #12813 — Deals (v1.1) | Calls `add-all-fundable-deals` #12703 (v2.0, 2026-04-19). Walks **both** `fundable_deals WHERE organization_id=X` (rounds this org raised) **and** `fundable_institutional_investments WHERE organization_id=X` (rounds this org invested in), routing each through `mvp/investor/cascade-deal-participants` #12856 — single source of truth for deal cascade shared with `process-person-phase-9` v3.0. Creates Funding_Round nodes, RAISED + INVESTED_IN / LEAD_INVESTED_IN / INVESTMENT_PARTNER_IN edges, and writes the IPO/exit signal to `company_financial.is_public` on the target org. |
-| 6 | **resolve-company-specialties** #12746 | Reads specialties from `speciality_join`, embeds each, vector-searches against `SubDomainExpertise` nodes, matches or creates new nodes, creates `SPECIALIZES_IN` FalkorDB edges (weight = `min(round(10 + match_score*80), 50)`). Writes new `SubDomainExpertise` nodes back to `sub_domain_expertise` table. |
-| 7 | **llm-company-about** (`mvp/about/llm-company-about`) | LLM-generated company description → `master_company.company_about`. |
-| 8 | **add-company-locations** (`mvp/address/add-company-locations`) | Resolve HQ + office addresses and write to location tables. |
-| 9 | **update-company-node** (`mvp/node/update-company-node`) | FalkorDB Company node property sync (final graph pass). |
-| — | **Finalize** (inline) | Edit `enrich_history_company`: `enrich_success: true` + `processing: false` if no crashes; else `enrich_success: false`. Writes one `qa_passed: true` row to `log_crash` on clean completion. |
+| — | **Debounce + Setup** (inline) | 60s debounce check on `enrich_history_company`. Then `db.add enrich_history_company`, load `master_company` + `company_enrich_data`, guard early-return when enrich-data row missing. |
+| 1+2 | **LLM preflight** | When `company_enrich_data.company_llm.data` is empty, run `mvp/enrich/new-company-enrichment` (#12974) and write the response onto `company_enrich_data.company_llm`. Logs an extra `enrich_history_company` row with `data_source_id: 100`. Sets `$llmRan = true` only when this path fires. |
+| 3 | **Apply LLM payload** | Only when `$llmRan` is true. Calls `mvp/enrich/apply-company-llm-payload` (#12989) — shared helper that fans the LLM payload out to `master_company`, `company_financial`, industries, specialties, links, abouts, addresses, contacts. Same helper used by fresh creates in `get-add/master-company`. |
+| 4 | **Fundable re-lookup** | Only when `master_company.fundable_org_id` is null. Tries `fundable_organizations` by domain → LinkedIn (LLM-discovered) → Crunchbase (LLM-discovered). On match: write `fundable_org_id` back, mirror `master_company_id` + `master_company_node_uuid` onto the Fundable row, and set `master_company.is_vc = true` when the Fundable row is an investor. |
+| 5 | **Signal NFX scrape** | Only when `fundable_org_id` set AND `signal_nfx_json` empty AND `is_vc`. Calls `mvp/investor/get-signal-nfx-data-company` (#12991). |
+| 6 | **Investment thesis** | Only when `fundable_org_id` set AND `is_vc` AND (no `investment_theses` row OR `updated_at` > 30 days old). Calls `thesis/build-investment-thesis-in-gcp` (#12978). |
+| 7 | **Get C-Suite & Founders via Exa** | Only when `company_enrich_data.exa_c_suite` empty. Calls `mvp/enrich/get-exa-company-c-suite` (#12988) with `expand_companies: true`. For each match: `mvp/get-add/master-person-from-exa` (#12997) → biographies (highlights + summary) → `mvp/enrich/find-avatar` + `replace-avatar` (when action == `"updated"`) → loop `workHistory` and `db.add work_experience` rows (matching the master company name flags the row to the current `master_company_id`) → `mvp/edges/create-work-edges` → `mvp/deep-research/deep-person-basic` → `mvp/queue/upsert-enrich-person` (tier 4, `deep_research: false`). |
+| 8 | **process-company-phase-3** #12799 — YC (v1.1) | YC detection/scrape + YC data processing + `process-yc-people` (receives `cascade_depth` so YC batch-mates inherit the tree). |
+| 9 | **process-company-phase-5** #12809 — Fundable backfill | Lookup + industries + abouts + address + links + follower counts from Fundable. |
+| 10 | **process-company-phase-6** #12810 — Link res + financial | Canonicalize profile URLs; populate `company_financial`. |
+| 11 | **process-company-phase-7** #12813 — Deals (v1.1) | Calls `add-all-fundable-deals` #12703 (v2.0). Walks **both** `fundable_deals WHERE organization_id=X` (rounds this org raised) **and** `fundable_institutional_investments WHERE organization_id=X` (rounds this org invested in), routing each through `mvp/investor/cascade-deal-participants` #12856 (v1.2, 2026-05-12 — staleness-gated re-cascade). Creates Funding_Round nodes, RAISED + INVESTED_IN / LEAD_INVESTED_IN / INVESTMENT_PARTNER_IN edges, and writes the IPO/exit signal to `company_financial.is_public` on the target org. |
+| 12 | **resolve-company-specialties** #12746 | Reads specialties from `speciality_join`, embeds each, vector-searches against `SubDomainExpertise` nodes, matches or creates new nodes, creates `SPECIALIZES_IN` FalkorDB edges (weight = `min(round(10 + match_score*80), 50)`). Writes new `SubDomainExpertise` nodes back to `sub_domain_expertise` table. |
+| 13 | **llm-company-about** (`mvp/about/llm-company-about`) | LLM-generated company description → `master_company.company_about`. |
+| 14 | **add-company-locations** (`mvp/address/add-company-locations`) | Resolve HQ + office addresses and write to location tables. |
+| 15 | **update-company-node** #4659 (v1.6) | FalkorDB Company-node property sync. v1.6 reads `company_enrich_data.company_llm.data` and writes `business_model`, `primary_product_name` / `_category`, `other_product_names` / `_categories`, `target_customers`, `is_acquired`, `acquired_by`, `acquired_date`, `acquired_ticker`, plus `went_public_on` + `stock_link` (sourced from `company_financial`). |
+| — | **Finalize** (inline) | Edit `enrich_history_company`: `enrich_success: true` + `processing: false` if no crashes; else `enrich_success: false` + `data_source_id: 101`. Writes one `qa_passed: true` row to `log_crash` on clean completion. |
 
 <Note>
-**v3.5 removed PDL + Enrich Layer + name correction.** Prior versions ran `process-company-phase-1` (PDL, fn 12797) and `process-company-phase-2` (Enrich Layer, fn 12798) at the top of the orchestrator — both are gone. The inline name-correction step that resolved `master_company.company_name` from `company_enrich_data.people_data_labs.display_name` (with EL fallback) was also removed. The `people_data_labs` and `enrich_layer` JSON columns still exist on `company_enrich_data` but are no longer being populated by this orchestrator. Note: `get-add/master-company` still calls PDL + Enrich Layer at initial create time — only the post-create orchestrator was changed.
+**v4 vs v3.5 — what's new.** v4 adds five gated pre-phase steps (LLM preflight → apply payload → Fundable re-lookup → Signal NFX → investment thesis → Exa C-Suite + person loop) in front of the existing v3 phase chain. The phase chain itself (steps 8–15 above) is structurally identical to v3.5 — same per-step `try_catch`, same `data_source_id` tagging, same finalize. v3.5 had a single always-on Exa step at the top (`#12988` writing to `exa_c_suite`); v4 promotes that into a full create-person sub-loop. PDL + Enrich Layer were already gone in v3.5 — v4 inherits that.
 </Note>
 
+---
+
+## Active pipeline functions
+
+Every function in the live company waterfall, grouped by role.
+
+### Quick copy — entry + orchestration
+
+```text
+mvp/get-add/master-company             #12558
+mvp/enrich/run-base-company-enrich-v4  #12992
+mvp/enrich/apply-company-llm-payload   #12989
+mvp/enrich/new-company-enrichment      #12974
+mvp/queue/upsert-enrich-company        (queue dispatcher)
+```
+
+### Quick copy — v4 gated steps (pre-phase)
+
+```text
+mvp/enrich/get-exa-company-c-suite          #12988
+mvp/get-add/master-person-from-exa          #12997
+mvp/investor/get-signal-nfx-data-company    #12991
+mvp/investor/parse-signal-nfx-company       #12990
+thesis/build-investment-thesis-in-gcp       #12978
+```
+
+### Quick copy — phase chain (steps 8–15)
+
+```text
+mvp/enrich/process-company-phase-3   #12799
+mvp/enrich/process-company-phase-5   #12809
+mvp/enrich/process-company-phase-6   #12810
+mvp/enrich/process-company-phase-7   #12813
+mvp/funding/add-all-fundable-deals   #12703
+mvp/investor/cascade-deal-participants #12856
+mvp/expertise/resolve-company-specialties #12746
+mvp/node/update-company-node         #4659
+```
 
 ---
 
@@ -196,43 +239,55 @@ Here's what happens end-to-end when `resend.com` enters as a seed entity:
 
 ```
 Depth 0: resend.com
-├── get-add/master-company (immediate enrichment)
-│   └── run-base-company-enrich-v3 (async)
-│       ├── LLM bios, social scraping, website analysis
-│       └── Discovers people (founders, executives)
-│           ├── get-add/master-person (cascade_depth: 1)
-│           │   └── Queued to queue_enrich_person (tier 1)
-│           │       └── When processed:
-│           │           ├── resolve-edges-work discovers employers
-│           │           │   └── get-add/master-company (cascade_depth: 2)
-│           │           │       └── Queued to queue_enrich_company (tier 2)
-│           │           └── resolve-investors-edges discovers VCs
-│           │               └── get-add/master-company (cascade_depth: 2)
-│           │                   └── Queued to queue_enrich_company (tier 2)
-│           └── Discovers investors
-│               └── get-add/master-person (cascade_depth: 1)
-│                   └── Queued to queue_enrich_person (tier 3)
+├── get-add/master-company
+│   ├── Section 3: profile_url quick check → miss
+│   ├── Section 4: kill switch off
+│   ├── Section 5: new-company-enrichment (LLM + Serper)
+│   ├── Sections 6–8: dedup → Fundable lookup
+│   ├── Section 10: db.add master_company + company_enrich_data
+│   │              + apply-company-llm-payload (relational fanout)
+│   │              + add-company-node (FalkorDB)
+│   └── Section 11: dispatch async run-base-company-enrich-v4
+│
+└── run-base-company-enrich-v4 (async)
+    ├── Step 1+2: LLM already populated by get-add → skipped
+    ├── Step 3:   skipped (only fires when LLM just ran)
+    ├── Step 4:   Fundable re-lookup if fundable_org_id null
+    ├── Steps 5–6: Signal NFX + investment thesis (VC-only, gated)
+    ├── Step 7:   Exa C-Suite — for each founder/key employee
+    │             → master-person-from-exa (cascade_depth: 0)
+    │                ├── bios, avatar, work_experience rows
+    │                ├── create-work-edges (HAS_WORKED_AT)
+    │                └── upsert-enrich-person (tier 4)
+    ├── Steps 8–11: YC, Fundable backfill, Link res, Deals
+    │              └── add-all-fundable-deals v2.0 → cascade-deal-participants
+    │                  per round → Funding_Round nodes + RAISED + INVESTED_IN
+    │                  + LEAD_INVESTED_IN + INVESTMENT_PARTNER_IN edges
+    │                  → portfolio cos + investors queued at depth 1
+    ├── Steps 12–13: specialties, company-about
+    ├── Steps 14–15: locations, FalkorDB Company node sync
+    └── Finalize: enrich_history_company.enrich_success = true
 ```
 
-Each hop increments `cascade_depth`. External APIs are only called at depth 0 during the `get-add` phase. Deeper entities rely on Fundable data and input params, then get fully enriched when the queue processes them.
+Each cascade hop increments `cascade_depth`. External APIs are called at depth 0 during both `get-add` (LLM + Fundable) and the orchestrator's pre-phase steps (Exa, Signal NFX, investment thesis). Deeper entities go straight to the queue and get fully enriched when their cron processes them.
 
 ---
 
 ## Cascade Example: Person Investor at Depth 0 (Full Bloom-Out)
 
-Here's what happens when a person who invested in a company enters as a seed entity. The bloom-out spans two CRON cycles: Phase 9 fires the cascade helper for each of the person's angel investments immediately, then SpaceX's own enrichment later discovers every other round it raised.
+Here's what happens when a person who invested in a company enters as a seed entity. The bloom-out spans two CRON cycles: Phase 9 fires the cascade helper for each of the person's angel investments immediately, then the portfolio companies' own enrichment later discovers every other round they raised.
 
 ```
 Depth 0: Person (investor)
 ├── get-add/master-person (immediate enrichment)
-│   └── run-base-person-enrich (all 12 phases, async)
+│   └── run-base-person-enrich (all phases, async)
 │       ├── Phase 3: Process PDL → identifies current employer
 │       │   └── get-add/master-company (cascade_depth: 0, queue: false)
-│       │       └── Immediate enrich
+│       │       └── Immediate enrich via run-base-company-enrich-v4
 │       │
 │       └── Phase 9 (v3.0): Investor Pipeline + Deal Cascade
-│           └── Fundable data contains: Person invested in SpaceX Series C (2021)
-│               └── foreach angel investment → cascade-deal-participants #12856
+│           └── Fundable data: Person invested in SpaceX Series C (2021)
+│               └── foreach angel investment → cascade-deal-participants #12856 (v1.2)
 │                   ├── SpaceX portfolio co (cascade_depth: 1, tier 2) → queue_enrich_company
 │                   ├── IPO signal → company_financial.is_public (if SpaceX exits)
 │                   ├── Funding_Round node + RAISED edge (this round only, for now)
@@ -242,10 +297,10 @@ Depth 0: Person (investor)
 │                       └── VC partners (institutional_investments_person)
 │                           → queue_enrich_person (tier 2)
 │
-│       └── When SpaceX processes via CRON → run-base-company-enrich-v3
-│           └── Phase 7: add-all-fundable-deals v2.0 (target-side + investor-side)
+│       └── When SpaceX processes via CRON → run-base-company-enrich-v4
+│           └── Step 11: add-all-fundable-deals v2.0 (target-side + investor-side)
 │               └── cascade-deal-participants on EACH SpaceX round
-│                   ├── Series A (2005), Series B (2008), Series C, Series D, … [all rounds]
+│                   ├── Series A (2005), Series B (2008), C, D, … [all rounds]
 │                   └── Each round:
 │                       ├── Funding_Round node + RAISED edge
 │                       ├── All co-investors on that round
@@ -262,9 +317,9 @@ Depth 0: Person (investor)
 ```
 
 **Impact Analysis:**
-- **Depth 0 cost**: 1 person (all phases, PDL + EL + external APIs)
+- **Depth 0 cost**: 1 person (all phases, external APIs)
 - **Depth 1 cost**: Portfolio companies (tier 2) + co-angels (tier 3) + VC firms (tier 2) + VC partners (tier 2) surfaced directly by Phase 9's cascade helper — queued, process when CRON runs
 - **Depth 2 cost**: When each depth-1 portfolio co processes, `add-all-fundable-deals` v2.0 surfaces every round it raised + every investor on those rounds — ~5-10 investor companies and ~30-50 investor people per portfolio co, all queued at tier 2
 - **Total entities created**: ~40-60 companies + people from a single person seed
-- **API spend**: Only depth 0 person calls external APIs; all depth-1 and depth-2 entities use Fundable data only until their turn in the queue
-- **Idempotency**: Queue upsert semantics mean the same VC firm surfacing via a co-angel AND via a portfolio co gets one queue entry with `count` incremented and best-tier held
+- **API spend**: Only depth 0 person calls external APIs; all depth-1 and depth-2 entities use Fundable + cached LLM payloads until their turn in the queue
+- **Idempotency**: Queue upsert semantics mean the same VC firm surfacing via a co-angel AND via a portfolio co gets one queue entry with `count` incremented and best-tier held. `cascade-deal-participants` v1.2 adds a staleness gate so a deal only re-cascades when the underlying Fundable rows have actually changed.

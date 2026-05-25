@@ -1,10 +1,10 @@
 ---
 title: "Person Enrichment Cascade"
-description: "Four-tier fallback waterfall (PDL → Hunter → EnrichLayer → Exa) for resolving a master_person from sparse inputs — especially email-only seeds where PDL returns 404."
+description: "Four-tier fallback waterfall (PDL → RocketReach → EnrichLayer → Exa) for resolving a master_person from sparse inputs — especially email-only seeds where PDL returns 404."
 ---
 
 <Note>
-Lives entirely inside `mvp/get-add/master-person` (#12553). Shipped 2026-05-24 as v3.8 → v3.10. The tiers are gated such that each cheaper provider runs first and the next only fires when the cheaper one failed to surface a `linkedin_url`. Every API response is stashed onto `person_enrich_data` so downstream phases can re-process without re-paying.
+Lives entirely inside `mvp/get-add/master-person` (#12553). Shipped 2026-05-24 as v3.8 → v3.12. The tiers are gated such that each cheaper provider runs first and the next only fires when the cheaper one failed to surface a `linkedin_url`. Every API response is stashed onto `person_enrich_data` so downstream phases can re-process without re-paying.
 </Note>
 
 ## Why this exists
@@ -23,7 +23,7 @@ PDL  ($input.email + name + linkedin if any)
  └─ status 404 ─┐
                 │
                 ▼
-Tier 2 — Hunter.io /v2/combined/find  (gate: linkedin_url empty AND email present)
+Tier 2 — RocketReach /api/v2/person/lookup  (gate: linkedin_url empty AND email present)
   ├─ returns linkedin → set $linkedinUrl  ─────────┐
   └─ no linkedin                                    │
         │                                           │
@@ -40,7 +40,7 @@ Tier 3 — EnrichLayer /v2/profile/resolve/email     │
    (no linkedin, name from email)      (gate: $linkedinUrl present)
 ```
 
-Each tier only fires when the prior tier didn't resolve a `linkedin_url`. The Exa block is reused unmodified — it's still gated on `$linkedinUrl|is_empty == false`, so whether the URL came from `$input.links`, Hunter, or EnrichLayer doesn't matter.
+Each tier only fires when the prior tier didn't resolve a `linkedin_url`. The Exa block is reused unmodified — it's still gated on `$linkedinUrl|is_empty == false`, so whether the URL came from `$input.links`, RocketReach, or EnrichLayer doesn't matter.
 
 ## Tier-by-tier
 
@@ -55,21 +55,24 @@ GET https://api.peopledatalabs.com/v5/person/enrich
 
 Stored at `person_enrich_data.people_data_labs`.
 
-### Tier 2 — Hunter.io Combined Enrichment
+### Tier 2 — RocketReach Person Lookup
 
-**Function:** `mvp/enrich/get-hunter-combined` (#13032)
-**Env var:** `$env.HUNTER_IO`
+**Function:** `mvp/enrich/get-rocketreach-person` (#13032)
+**Env var:** `$env.ROCKET_REACH`
 **Gate:** `$api1.status == 404 && $linkedinUrl is empty && $input.email|first is non-empty`
 
 ```
-GET https://api.hunter.io/v2/combined/find?email={email}&api_key={key}
+GET https://api.rocketreach.co/api/v2/person/lookup?email={email}
+  Header: Api-Key: {key}
 ```
 
-Returns person object (name, location, employment, **linkedin handle**, twitter/github/facebook handles, phone) plus a company object (industry, HQ, size, revenue, tech stack, funding). Hunter's `linkedin` field may be a bare handle (`"johndoe"`), a `/in/handle` path, or a full URL — the helper normalizes all three to `https://www.linkedin.com/in/{slug}`.
+Returns a rich profile keyed off the email — `linkedin_url` (already a full URL, no reassembly needed), `name`, `current_title`, `current_employer` (+ `current_employer_domain` / `_website` / `_linkedin_url` / `_industry`), `location` / `city` / `region` / `country`, `profile_pic`, `phones[]`, `emails[]`, `job_history[]`, `education[]`, `skills[]`, plus a `links` object of social profiles.
 
-404 from Hunter is a clean miss — no charge, no error log.
+The killer feature versus Hunter.io: **RocketReach resolves on both personal and work emails.** No classify-email_v2 gate is needed — Tier 2 fires unconditionally on any PDL-404 + email-present seed. RocketReach uses `Api-Key:` header auth (not `Authorization: Bearer`).
 
-Stored at `person_enrich_data.hunter` (json, added in v3.9).
+404 from RocketReach is a clean miss — no error log.
+
+Stored at `person_enrich_data.rocket_reach` (json, added in v3.9 as `hunter`, renamed in v3.12).
 
 ### Tier 3 — EnrichLayer Reverse Email Lookup
 
@@ -82,7 +85,7 @@ GET https://enrichlayer.com/api/v2/profile/resolve/email
   ?email={email}&lookup_depth=deep&enrich_profile=enrich
 ```
 
-The `lookup_depth=deep` parameter is what makes EnrichLayer a useful Tier 3 — it goes beyond their cache and runs heuristic resolution, which is specifically recommended for work emails (the case where Hunter often whiffs). `enrich_profile=enrich` then inlines the cached LinkedIn profile data, so we get both the resolved URL AND the profile payload in one round-trip.
+The `lookup_depth=deep` parameter is what makes EnrichLayer a useful Tier 3 — it goes beyond their cache and runs heuristic resolution. `enrich_profile=enrich` then inlines the cached LinkedIn profile data, so we get both the resolved URL AND the profile payload in one round-trip.
 
 The helper extracts `response.result.profile`, which has the same shape as `api/enrich_layer/person-linkedin` — meaning downstream code that already knows how to consume `enrich_layer_data` can consume this too. We rebuild the URL from `public_identifier` (`https://www.linkedin.com/in/{slug}`) and assign it to `$linkedinUrl`.
 
@@ -111,7 +114,7 @@ Stored at `person_enrich_data.exa` (json, added in v3.8).
 | `people_data_labs` | PDL `/v5/person/enrich` envelope | Always (cascade_depth == 0) |
 | `enrich_layer_data` | EL `/v2/profile/{linkedin_url}` | When linkedin_url present (any tier) |
 | `enrich_layer_email` | EL `/v2/profile/resolve/email` profile | Tier 3 — PDL 404 + no linkedin upstream |
-| `hunter` | Hunter `/v2/combined/find` envelope | Tier 2 — PDL 404 + email present |
+| `rocket_reach` | RocketReach `/api/v2/person/lookup` profile | Tier 2 — PDL 404 + email present |
 | `exa` | Exa `/search` matched object | Tier 4 — PDL 404 + linkedin URL (from any tier) |
 
 All five columns are `json`, `nullable: false`, default `""`. The writes happen at two persist sites:
@@ -121,31 +124,31 @@ All five columns are `json`, `nullable: false`, default `""`. The writes happen 
 
 ## Resilience
 
-Every tier is wrapped in its own `try_catch`. A vendor outage on Hunter doesn't block EnrichLayer; an EnrichLayer failure doesn't block Exa. Failures write a `log_crash` row with the email/url payload and continue.
+Every tier is wrapped in its own `try_catch`. A vendor outage on RocketReach doesn't block EnrichLayer; an EnrichLayer failure doesn't block Exa. Failures write a `log_crash` row with the email/url payload and continue.
 
 ## What's NOT in the cascade
 
 - **No name/phone-only resolution.** All three new tiers require an email. A phone-only seed still falls back to the thin-record path.
-- **No second-pass.** Tiers don't retry. If Hunter returns a linkedin URL that's actually wrong, Exa happily searches for it and we end up with a polluted `master_person.linkedin_url`. Watch `log_crash` for "PDL 404 ... fallback threw" rows in the first weeks of production traffic.
-- **No company-side cascade.** Hunter's `combined/find` returns rich company data but we don't currently feed it to `get-add/master-company`. The `hunter.company.*` fields sit in `person_enrich_data.hunter` for later use.
+- **No second-pass.** Tiers don't retry. If RocketReach returns a linkedin URL that's actually wrong, Exa happily searches for it and we end up with a polluted `master_person.linkedin_url`. Watch `log_crash` for "PDL 404 ... fallback threw" rows in the first weeks of production traffic.
+- **No company-side cascade.** RocketReach returns `current_employer_domain` / `_linkedin_url` / `_industry` but we don't currently feed those to `get-add/master-company`. The fields sit in `person_enrich_data.rocket_reach` for later use.
 
 ## Files touched
 
 | File | Change |
 |---|---|
-| `mvp/get-add/master-person` (#12553) | v3.7 → v3.10 — adds `$exaProfile`, `$hunterProfile`, `$elProfile` init vars, three new conditional fallback blocks in Section 3, five gated persist blocks across Sections 7 + 9 |
-| `mvp/enrich/get-hunter-combined` (#13032, new) | Wraps Hunter `/v2/combined/find`; normalizes the linkedin handle to a full URL |
+| `mvp/get-add/master-person` (#12553) | v3.7 → v3.12 — adds `$exaProfile`, `$rocketReachProfile`, `$elProfile` init vars, three new conditional fallback blocks in Section 3, five gated persist blocks across Sections 7 + 9. v3.12 swaps Hunter→RocketReach and drops the classify-email gate. |
+| `mvp/enrich/get-rocketreach-person` (#13032) | v2.0 — RocketReach `/api/v2/person/lookup` wrapper (Api-Key header auth). Replaced the v1.0 Hunter `/v2/combined/find` wrapper. |
 | `mvp/enrich/get-exa-profile` (#12936, existing) | No change — reused unmodified for Tier 4 |
 | `api/enrich_layer/person-email` (#12734, existing) | No change — reused unmodified for Tier 3 |
 | `mvp/enrich/process-person-exa-profile` (#13031, new) | Phase-4b helper — processes the Exa stash into bios, avatar, work_experience rows |
 | `mvp/enrich/run-base-person-enrich` (#12554) | v3.5 — adds Phase 4b call between Phase 4 (EL processing) and Phase 5 (Fundable) |
-| `person_enrich_data` table | New columns: `hunter`, `enrich_layer_email` |
+| `person_enrich_data` table | New columns: `rocket_reach` (renamed from `hunter` in v3.12), `enrich_layer_email` |
 
 ## Env vars required
 
 | Var | Used by |
 |---|---|
 | `PEOPLE_DATA_LABS` | Tier 1 (existing) |
-| `HUNTER_IO` | Tier 2 (added 2026-05-24) |
+| `ROCKET_REACH` | Tier 2 (added 2026-05-24; replaced `HUNTER_IO_COMBINED`) |
 | `ENRICH_LAYER` | Tier 3 + the existing linkedin-url EL call |
 | `exa` | Tier 4 (existing, used by `get-exa-profile`) |

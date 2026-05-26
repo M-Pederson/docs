@@ -1,6 +1,6 @@
 ---
 title: "Person Pipeline Polish"
-description: "How mvp/get-add/master-person (#12553) resolves a person, with the v3.21 RocketReach → EnrichLayer fallback refactor."
+description: "How mvp/get-add/master-person resolves a person, plus the v3.21 EnrichLayer fallback and the 3-function refactor (mvp/get-add/master-person-new)."
 ---
 
 ## TL;DR
@@ -8,6 +8,8 @@ description: "How mvp/get-add/master-person (#12553) resolves a person, with the
 `#12553 mvp/get-add/master-person` is the canonical entry point for getting (or creating) a `master_person`. It calls People Data Labs first; if PDL returns a 404 it falls back to **EnrichLayer**. The fallback is intentionally lightweight — only a LinkedIn URL and avatar are pulled into the initial flow. The full EnrichLayer payload is stashed on `person_enrich_data.enrich_layer_data` and processed downstream by `#12554 / run-base-person-enrich`.
 
 RocketReach was removed entirely in v3.21.
+
+A **phase-split refactor** of the same function is now live as `mvp/get-add/master-person-new` (#13039). It calls two new helpers — cascade-person-data (#13037) and match-master-person (#13038) — and is a drop-in swap once verified per caller. See [Phase-split refactor](#phase-split-refactor) below.
 
 ## Cascade order (cascade_depth == 0)
 
@@ -101,9 +103,96 @@ This only affects email writes; link/phone writes still use `$input.source` (wit
 
 Pass `hold_downstream: true` to skip both the direct `run-base-person-enrich` async dispatch and the queue path. A `qa_passed` row is logged to `log_crash` noting the skip. Use this to run #12553 in isolation while step-debugging — the master_link triggers (Twitter / LinkedIn scrapers) will still fire though, since they're table-level.
 
+## Phase-split refactor
+
+`mvp/get-add/master-person-new` (#13039) is a behaviourally-identical sibling that splits #12553 into three functions. Same input/response shape; callers can swap when ready.
+
+### Why split?
+
+The original #12553 is ~2100 lines because it does cascade + resolution + creation + write loops inline. The split isolates the two pieces most likely to be reused or reasoned about independently:
+
+- **Cascade** — pure data fetch. Returns one structured object. Now reusable from #12554 or backfills.
+- **Resolution** — pure id lookup. Now testable in isolation against any link/email/phone set.
+- **Orchestrator** — gets thinner (kill-switch + fundable + creation + write loops only).
+
+### The three artifacts
+
+<Card icon="cloud-arrow-up">
+
+```
+mvp/enrich/cascade-person-data — 13037
+```
+
+PDL → EnrichLayer → Exa. No DB writes (except a `log_crash` row on a caught exception). Returns the raw payloads plus shortcut fields the orchestrator needs:
+
+- `pdl` — full PDL response, status preserved
+- `el` — full EnrichLayer profile (or null)
+- `el_linkedin_url` — constructed `https://www.linkedin.com/in/{public_identifier}` (or null)
+- `el_profile_pic` — `profile_pic_url` from EL (or null)
+- `exa` — full Exa profile (or null)
+- `linkedin_url` — best available URL after the cascade (input or EL-discovered)
+- `input_email_source` — `"People Data Labs"` / `"Enrich Layer"` / null
+
+</Card>
+
+<Card icon="filter">
+
+```
+mvp/resolve/match-master-person — 13038
+```
+
+Resolution. Takes `links`, `emails`, `phone_numbers`, optional `first_name` / `last_name` / `linkedin_url`. Walks four lookups in order and returns the first match:
+
+1. `master_link.link_url` (after URL normalization)
+2. `master_email.email_address`
+3. `master_phone.phone_number` — with name-aware match (first OR last name must agree) and phone-conflict detection
+4. `master_person.linkedin_url` direct match (catches persons with linkedin_url set but no master_link row)
+
+Returns `{master_person_id, match_via, status, message, formatted_phones}`. Formats phones internally via `mvp/phones/llm-phone-format` and returns the formatted list so the orchestrator doesn't double-LLM.
+
+</Card>
+
+<Card icon="play">
+
+```
+mvp/get-add/master-person-new — 13039
+```
+
+Thin orchestrator. Same input/response as #12553. Calls #13037 + #13038, keeps kill-switch + fundable lookup + creation + write loops inline.
+
+</Card>
+
+### New observability: match_via
+
+The existing-person `log_crash` row in #13039 now carries `data.match_via` showing exactly which key resolved the person:
+
+| `match_via` value              | Meaning                                                          |
+| ------------------------------ | ---------------------------------------------------------------- |
+| `master_link`                  | A normalized URL in the input set already existed in master_link |
+| `master_email`                 | An email in the input set already existed in master_email        |
+| `master_phone`                 | A formatted phone matched AND first/last name agreed             |
+| `master_person.linkedin_url`   | Fallback — only the direct master_person row had this URL        |
+| `null`                         | No match → new person path                                       |
+
+This is for `log_crash` analysis; query `data.match_via` to see which resolution path is doing the work in production.
+
+### Migration
+
+Both `#12553` (v3.21) and `#13039` (v1.0) are live and behaviourally identical. To migrate a caller:
+
+1. Run #13039 with `hold_downstream: true` first — compare resulting `master_person` row, `master_link` rows, and `log_crash` audit against #12553.
+2. Once parity is verified, switch the caller's `function.run` from `mvp/get-add/master-person` → `mvp/get-add/master-person-new`.
+3. After all callers have moved, retire #12553.
+
+### Caveats
+
+- Cascade calls all happen in one sub-function, so latency is the same (PDL still synchronous, EL still synchronous on PDL 404).
+- The split adds two `function.run` hops vs. inline — negligible in practice for the kind of workloads this function handles.
+- `match-master-person` no longer skips formatting once a match is found; it always formats every supplied phone (because the caller still needs the formatted list for write loops). One extra LLM phone-format call in the rare case where the FIRST phone matches and there are more phones to process. Acceptable.
+
 ## Where the work moves next
 
-After #12553 returns, `#12554 / run-base-person-enrich` does the heavy lifting:
+After #12553 (or #13039) returns, `#12554 / run-base-person-enrich` does the heavy lifting:
 
 - Read `person_enrich_data.enrich_layer_data` and process experiences, education, biography, recommendations.
 - Backfill work-experience joins, education joins.
@@ -119,7 +208,37 @@ The `#12554` migration to mirror this RR → EL rewrite is pending and tracked s
 mvp/get-add/master-person — 12553
 ```
 
-This function. Public entry point. v3.21 RocketReach → EnrichLayer fallback.
+Original entry point. v3.21 RocketReach → EnrichLayer fallback.
+
+</Card>
+
+<Card icon="play">
+
+```
+mvp/get-add/master-person-new — 13039
+```
+
+Phase-split sibling. Drop-in swap candidate.
+
+</Card>
+
+<Card icon="cloud-arrow-up">
+
+```
+mvp/enrich/cascade-person-data — 13037
+```
+
+Phase 1 helper. PDL → EL → Exa cascade. Pure data fetch.
+
+</Card>
+
+<Card icon="filter">
+
+```
+mvp/resolve/match-master-person — 13038
+```
+
+Phase 2 helper. Existence resolution + phone formatting.
 
 </Card>
 
@@ -139,7 +258,7 @@ Downstream enrichment orchestrator. Reads `person_enrich_data.enrich_layer_data`
 mvp/avatar/replace-avatar — 237
 ```
 
-Priority-based avatar replacement. Called from #12553 in Sections 7 + 9 with `source="Enrich Layer"` when EL returned a `profile_pic_url`.
+Priority-based avatar replacement. Called from #12553 and #13039 with `source="Enrich Layer"` when EL returned a `profile_pic_url`.
 
 </Card>
 

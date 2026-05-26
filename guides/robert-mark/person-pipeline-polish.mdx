@@ -1,6 +1,154 @@
 ---
 title: "Person Pipeline Polish"
-description: "Placeholder."
+description: "How mvp/get-add/master-person (#12553) resolves a person, with the v3.21 RocketReach → EnrichLayer fallback refactor."
 ---
 
-TODO
+## TL;DR
+
+`#12553 mvp/get-add/master-person` is the canonical entry point for getting (or creating) a `master_person`. It calls People Data Labs first; if PDL returns a 404 it falls back to **EnrichLayer**. The fallback is intentionally lightweight — only a LinkedIn URL and avatar are pulled into the initial flow. The full EnrichLayer payload is stashed on `person_enrich_data.enrich_layer_data` and processed downstream by `#12554 / run-base-person-enrich`.
+
+RocketReach was removed entirely in v3.21.
+
+## Cascade order (cascade_depth == 0)
+
+```
+mvp/format/name-format
+   │
+   ▼
+mvp/stop/check-kill-switch-v2   ── if ON, local-only lookup, no API calls
+   │
+   ▼
+People Data Labs  /v5/person/enrich   (api1)
+   │
+   │  if api1.status == 404
+   ▼
+EnrichLayer fallback (Tier 2)
+   ├── email present       → #12734 api/enrich_layer/person-email
+   └── elseif linkedin     → #12612 api/enrich_layer/person-linkedin
+   │
+   │  if PDL still 404 AND we now have a linkedin URL
+   ▼
+mvp/enrich/get-exa-profile   (Exa Tier 3)
+```
+
+## Why two EnrichLayer entry points
+
+The two helpers return the **same profile shape**, so downstream code is identical — only the lookup key differs.
+
+<Card icon="cloud-arrow-up">
+
+```
+api/enrich_layer/person-email — 12734
+```
+
+Reverse Email Lookup (EnrichLayer `/v2/profile/resolve/email`). Used when the caller supplied an email but PDL had no record for it.
+
+</Card>
+
+<Card icon="cloud-arrow-up">
+
+```
+api/enrich_layer/person-linkedin — 12612
+```
+
+Profile lookup by LinkedIn URL (EnrichLayer `/v2/profile`). Used when the caller already had a LinkedIn URL but PDL 404'd on it.
+
+</Card>
+
+## What #12553 extracts vs. defers
+
+Only two fields are consumed by #12553 itself:
+
+| EL field            | Used for                                          |
+| ------------------- | ------------------------------------------------- |
+| `public_identifier` | Construct `https://www.linkedin.com/in/{id}` URL  |
+| `profile_pic_url`   | Avatar via `#237 mvp/avatar/replace-avatar`       |
+
+Everything else (`experiences`, `education`, `summary`, `headline`, recommendations, activities, etc.) is **persisted but not processed**. It lands on:
+
+<Card icon="database">
+
+```
+person_enrich_data.enrich_layer_data — table 500
+```
+
+JSON column on the `person_enrich_data` row keyed by `master_person_id`. #12554 reads this in its EL phase.
+
+</Card>
+
+## Source attribution
+
+The `source` text written to `master_link`, `master_email`, and `master_avatar` follows this routing inside #12553:
+
+| Source value         | When                                                                                  |
+| -------------------- | ------------------------------------------------------------------------------------- |
+| `"People Data Labs"` | URL came from PDL `profiles[]`, OR caller-supplied URL is also in PDL response       |
+| `"Enrich Layer"`     | URL or avatar came from EL fallback (`#12734` or `#12612`)                            |
+| `$input.source`      | Caller-supplied URL not confirmed by any enrichment provider                          |
+| `null`               | Cascade ran but nothing resolved (cascade_depth > 0 or both APIs returned nothing)    |
+
+Order matters because `create-master-link` dedups on URL. EL links are written **first** in Sections 7 + 10, then `$inputLinks`, then `$pdlLinks` — so EL wins attribution when a URL appears in multiple sources.
+
+`$inputEmailSource` is the email-specific override:
+
+- PDL initial status ≠ 404 → `"People Data Labs"`
+- PDL was 404 + EL returned a linkedin → `"Enrich Layer"`
+- Otherwise → `null`
+
+This only affects email writes; link/phone writes still use `$input.source` (with the v3.20 per-URL override for links).
+
+## hold_downstream for QA
+
+Pass `hold_downstream: true` to skip both the direct `run-base-person-enrich` async dispatch and the queue path. A `qa_passed` row is logged to `log_crash` noting the skip. Use this to run #12553 in isolation while step-debugging — the master_link triggers (Twitter / LinkedIn scrapers) will still fire though, since they're table-level.
+
+## Where the work moves next
+
+After #12553 returns, `#12554 / run-base-person-enrich` does the heavy lifting:
+
+- Read `person_enrich_data.enrich_layer_data` and process experiences, education, biography, recommendations.
+- Backfill work-experience joins, education joins.
+- Run #13031 (Exa expand), #13033 (was RocketReach phase — now retired), and downstream avatar / link enrichment phases.
+
+The `#12554` migration to mirror this RR → EL rewrite is pending and tracked separately.
+
+## Related artifacts
+
+<Card icon="play">
+
+```
+mvp/get-add/master-person — 12553
+```
+
+This function. Public entry point. v3.21 RocketReach → EnrichLayer fallback.
+
+</Card>
+
+<Card icon="play">
+
+```
+mvp/enrich/run-base-person-enrich — 12554
+```
+
+Downstream enrichment orchestrator. Reads `person_enrich_data.enrich_layer_data` to process the rest of the EL payload.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+mvp/avatar/replace-avatar — 237
+```
+
+Priority-based avatar replacement. Called from #12553 in Sections 7 + 9 with `source="Enrich Layer"` when EL returned a `profile_pic_url`.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+mvp/link/create-master-link
+```
+
+Master-link upsert (dedups on normalized URL). EL-discovered links are written first so they win attribution.
+
+</Card>

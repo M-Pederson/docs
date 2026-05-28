@@ -30,6 +30,8 @@ RETURN count(r) AS deleted_count
 
 Takes LLM-identified expertise, vector-searches against existing nodes, matches or creates new nodes, and connects the person via HAS_EXPERTISE edges.
 
+**Active implementation:** `resolve-person-expertise-v2 — #12926` — adds `r.weight` to every edge (v5 Cyphers below). v1 (#12668) is preserved for reference.
+
 ```text
 mvp/expertise/resolve-person-expertise — #12668
 ```
@@ -52,7 +54,7 @@ RETURN node.uuid AS uuid, node.name AS name,
 When an existing expertise node matches above the similarity threshold:
 
 ```cypher
-// Version v4
+// Version v5 — adds r.weight (resolve-person-expertise-v2 #12926)
 MATCH (p:Entity:Person {uuid: "{{$input.person_node_uuid}}"})
 MATCH (e:Entity {uuid: "{{$var.bestUuid}}"})
 MERGE (p)-[r:HAS_EXPERTISE]->(e)
@@ -64,6 +66,7 @@ ON CREATE SET
   r.depth = "{{$var.item.depth}}",
   r.recency = "{{$var.item.recency}}",
   r.match_score = {{$var.bestScore}},
+  r.weight = {{$var.edgeWeight}},
   r.match_type = "matched"
 ON MATCH SET
   r.evidence = r.evidence + " | " + "{{$var.cleanEvidence}}",
@@ -81,12 +84,15 @@ ON MATCH SET
     WHEN r.recency = "recent" OR "{{$var.item.recency}}" = "recent" THEN "recent"
     ELSE "historical"
   END,
-  r.match_score = CASE WHEN {{$var.bestScore}} < r.match_score THEN {{$var.bestScore}} ELSE r.match_score END
+  r.match_score = CASE WHEN {{$var.bestScore}} < r.match_score THEN {{$var.bestScore}} ELSE r.match_score END,
+  r.weight = CASE WHEN {{$var.edgeWeight}} < r.weight THEN {{$var.edgeWeight}} ELSE r.weight END
 RETURN p.uuid AS person_uuid, e.uuid AS expertise_uuid,
        e.name AS expertise_name
 ```
 
-ON MATCH merge logic: `depth` keeps strongest (creator > expert > practitioner > familiar), `recency` keeps most current (current > recent > historical), `confidence` keeps max numeric value.
+ON MATCH merge logic: `depth` keeps strongest (creator > expert > practitioner > familiar), `recency` keeps most current (current > recent > historical), `confidence` keeps max numeric value, `weight` keeps minimum (lower = stronger match).
+
+`$var.edgeWeight` is pre-computed before the Cypher call: `Math.min(Math.round(10 + (bestScore * 80)), 50)`. Range: 10 (perfect match) → ~46 (threshold edge).
 
 ### CREATE New SubDomainExpertise Node
 
@@ -111,7 +117,7 @@ RETURN s
 Connects person to the newly created SubDomainExpertise node:
 
 ```cypher
-// Version v4
+// Version v5 — adds r.weight (resolve-person-expertise-v2 #12926)
 MATCH (p:Entity:Person {uuid: "{{$input.person_node_uuid}}"})
 MATCH (e:Entity:SubDomainExpertise {uuid: "{{$var.newNodeUuid}}"})
 MERGE (p)-[r:HAS_EXPERTISE]->(e)
@@ -123,6 +129,7 @@ ON CREATE SET
   r.depth = "{{$var.item.depth}}",
   r.recency = "{{$var.item.recency}}",
   r.match_score = {{$var.safeScore}},
+  r.weight = {{$var.edgeWeight}},
   r.match_type = "created"
 ON MATCH SET
   r.evidence = r.evidence + " | " + "{{$var.cleanEvidence}}",
@@ -140,10 +147,13 @@ ON MATCH SET
     WHEN r.recency = "recent" OR "{{$var.item.recency}}" = "recent" THEN "recent"
     ELSE "historical"
   END,
-  r.match_score = CASE WHEN {{$var.safeScore}} < r.match_score THEN {{$var.safeScore}} ELSE r.match_score END
+  r.match_score = CASE WHEN {{$var.safeScore}} < r.match_score THEN {{$var.safeScore}} ELSE r.match_score END,
+  r.weight = CASE WHEN {{$var.edgeWeight}} < r.weight THEN {{$var.edgeWeight}} ELSE r.weight END
 RETURN p.uuid AS person_uuid, e.uuid AS expertise_uuid,
        e.name AS expertise_name
 ```
+
+For created edges, `$var.safeScore` defaults to `1` when no vector match was found, so `edgeWeight` is always `50` (max) for new nodes.
 
 ---
 
@@ -297,4 +307,115 @@ ON MATCH SET
   r.match_score = CASE WHEN {{$var.safeScore}} < r.match_score THEN {{$var.safeScore}} ELSE r.match_score END
 RETURN c.uuid AS company_uuid, e.uuid AS expertise_uuid,
        e.name AS expertise_name
+```
+
+---
+
+## mvp/expertise/backfill-has-expertise-weight — #13043
+
+One-shot backfill that stamps `r.weight` on all existing `HAS_EXPERTISE` graph edges written before `resolve-person-expertise-v2` (#12926) added the property. Also repairs any `person_has_expertise` (table 711) rows where `weight = 0`. Safe to re-run — the `WHERE r.weight IS NULL` guard means already-patched edges are skipped.
+
+```text
+mvp/expertise/backfill-has-expertise-weight — #13043
+```
+
+### Backfill Graph Edge Weights
+
+Single bulk Cypher — all unweighted edges in one pass, no looping:
+
+```cypher
+// Version v1
+MATCH (p:Entity:Person)-[r:HAS_EXPERTISE]->(e:Entity)
+WHERE r.weight IS NULL
+WITH r,
+  CASE
+    WHEN r.match_score IS NULL THEN 50
+    WHEN toInteger(round(10 + r.match_score * 80)) > 50 THEN 50
+    ELSE toInteger(round(10 + r.match_score * 80))
+  END AS computed_weight
+SET r.weight = computed_weight
+RETURN count(r) AS updated
+```
+
+Edges with `match_score IS NULL` (created branch, no vector hit) get `weight = 50`. All others derive weight from stored `match_score` using the standard formula. After the graph pass, the function loops through `person_has_expertise` rows where `weight = 0` and applies the same formula via `match_score`.
+
+---
+
+## enrich/create-expertise-edge-description-from-graph — #13019
+
+Reads all structured properties from a live `(Person)-[HAS_EXPERTISE]->(Entity)` edge plus the expertise node's generic description, then calls Gemini Flash Lite to write a 15–30 word person-specific sentence. Returns the description string. Keyed on `(person_uuid, expertise_uuid)` — HAS_EXPERTISE edges carry no `r.uuid`.
+
+```text
+enrich/create-expertise-edge-description-from-graph — #13019
+```
+
+### Fetch Edge Properties
+
+Built via `api.lambda` to avoid the `util.template_engine` `.name`/`.tld` autolinker:
+
+```cypher
+// Version v1
+MATCH (p:Person {uuid: $personUuid})-[e:HAS_EXPERTISE]->(x:Entity {uuid: $expertiseUuid})
+RETURN p.name AS person_name,
+       x.name AS expertise_name,
+       x.display_label AS expertise_label,
+       x.description AS expertise_description,
+       e.identified_as AS identified_as,
+       e.evidence AS evidence,
+       e.signal_type AS signal_type,
+       e.depth AS depth,
+       e.recency AS recency,
+       e.confidence AS confidence,
+       e.match_type AS match_type,
+       e.match_score AS match_score,
+       e.weight AS weight
+LIMIT 1
+```
+
+---
+
+## enrich/write-expertise-edge-description-to-graph — #13020
+
+Wraps #13019. Checks `description_generated_at` guard first — no-op if already set. On success writes `r.description` and `r.description_generated_at` to the edge. Called inline from `resolve-person-expertise-v2` (#12926) after every MERGE so new edges get descriptions immediately. Backfill for pre-existing edges is handled by task #176 via #13021.
+
+```text
+enrich/write-expertise-edge-description-to-graph — #13020
+```
+
+### Check Guard
+
+```cypher
+// Version v1
+MATCH (p:Person {uuid: $personUuid})-[e:HAS_EXPERTISE]->(x:Entity {uuid: $expertiseUuid})
+RETURN e.description_generated_at AS ts, e.description AS description
+```
+
+### Write Description
+
+```cypher
+// Version v1
+MATCH (p:Person {uuid: $personUuid})-[e:HAS_EXPERTISE]->(x:Entity {uuid: $expertiseUuid})
+SET e.description = $description,
+    e.description_generated_at = $now
+RETURN e.description AS description
+```
+
+---
+
+## tool/backfill-expertise-edge-descriptions — #13021
+
+Batch drainer for edges missing `description_generated_at`. Safe to call repeatedly — each call fetches the next `limit` undone edges and processes them via #13020. Per-edge errors are caught, logged to `log_crash`, and skipped so one failure doesn't stall the batch. Task #176 (`backfill-expertise-edge-descriptions`) calls this every 5 min at `limit: 30`.
+
+```text
+tool/backfill-expertise-edge-descriptions — #13021
+```
+
+### Fetch Undone Edges
+
+```cypher
+// Version v1
+MATCH (p:Person)-[e:HAS_EXPERTISE]->(x:Entity)
+WHERE e.description_generated_at IS NULL
+RETURN p.uuid AS person_uuid, x.uuid AS expertise_uuid
+LIMIT $limit
 ```

@@ -1,254 +1,293 @@
 ---
 title: "Person Pipeline Polish"
-description: "How mvp/get-add/master-person resolves a person, plus the v3.21 EnrichLayer fallback and the 3-function refactor (mvp/get-add/master-person-new)."
+description: "How #13039 mvp/get-add/master-person-new resolves or creates a master_person — every function in the call graph, in order."
 ---
 
 ## TL;DR
 
-`#12553 mvp/get-add/master-person` is the canonical entry point for getting (or creating) a `master_person`. It calls People Data Labs first; if PDL returns a 404 it falls back to **EnrichLayer**. The fallback is intentionally lightweight — only a LinkedIn URL and avatar are pulled into the initial flow. The full EnrichLayer payload is stashed on `person_enrich_data.enrich_layer_data` and processed downstream by `#12554 / run-base-person-enrich`.
+`#13039 mvp/get-add/master-person-new` is the **canonical entry point** for getting (or creating) a `master_person`. It hands off to three sub-functions and a downstream enrichment orchestrator:
 
-RocketReach was removed entirely in v3.21.
+| Stage | Function | Purpose |
+| --- | --- | --- |
+| 1. Enrichment cascade | `#13037 mvp/enrich/cascade-person-data` | PDL → EnrichLayer → PDL retry → Exa. Pure data fetch. |
+| 2. Resolution | `#13038 mvp/resolve/match-master-person` | 4-tier dedup against existing tables. |
+| 3. Downstream enrichment | `#13040 mvp/enrich/enrich-master-person` | Phase-based orchestrator (PDL backfill, EL processing, Exa, RocketReach, Fundable, bio, work_experience, avatar, temp-name resolution). **Replaces the retired `#12554 run-base-person-enrich`.** |
 
-A **phase-split refactor** of the same function is now live as `mvp/get-add/master-person-new` (#13039). It calls two new helpers — cascade-person-data (#13037) and match-master-person (#13038) — and is a drop-in swap once verified per caller. See [Phase-split refactor](#phase-split-refactor) below.
+Three additional flourishes layered on top:
 
-## Cascade order (cascade_depth == 0)
+- **Pre-API local dedup** (v1.6) — checks `master_link` / `master_email` / `master_person.linkedin_url` against inputs **before** any external API is called. On hit: attach inputs to existing person, return. Saves PDL + EL calls on repeat-person lookups.
+- **PDL retry via EL LinkedIn URL** (v1.1 cascade) — if PDL email lookup 404s but EL surfaces a LinkedIn URL, the cascade retries PDL with that URL.
+- **FullEnrich async fallback** (v1.2 / #13036) — when EL via email path returns no LinkedIn URL, dispatches `#13036` async. Webhook `#8594` writes the result back into `person_enrich_data.full_enrich`.
 
-```
-mvp/format/name-format
-   │
-   ▼
-mvp/stop/check-kill-switch-v2   ── if ON, local-only lookup, no API calls
-   │
-   ▼
-People Data Labs  /v5/person/enrich   (api1)
-   │
-   │  if api1.status == 404
-   ▼
-EnrichLayer fallback (Tier 2)
-   ├── email present       → #12734 api/enrich_layer/person-email
-   └── elseif linkedin     → #12612 api/enrich_layer/person-linkedin
-   │
-   │  if PDL still 404 AND we now have a linkedin URL
-   ▼
-mvp/enrich/get-exa-profile   (Exa Tier 3)
-```
-
-## Why two EnrichLayer entry points
-
-The two helpers return the **same profile shape**, so downstream code is identical — only the lookup key differs.
-
-<Card icon="cloud-arrow-up">
+## Architecture at a glance
 
 ```
-api/enrich_layer/person-email — 12734
+caller
+  │
+  ▼
+#13039 mvp/get-add/master-person-new      ← entry point
+  │
+  ├── #4617 check-kill-switch-v2          ← stop if over limit
+  ├── #2649 name-format                   ← LLM split of full_name
+  │
+  ├── [pre-API local dedup (v1.6)]
+  │     ├── master_link lookup
+  │     ├── master_email lookup
+  │     └── master_person.linkedin_url lookup
+  │           HIT → attach inputs, return
+  │
+  ├── #13037 cascade-person-data          ← PDL → EL → PDL retry → Exa
+  │     ├── PDL  /v5/person/enrich
+  │     ├── #12734 EL /v2/profile/resolve/email
+  │     ├── #12612 EL /v2/profile (linkedin lookup)
+  │     ├── PDL  /v5/person/enrich  (retry with EL linkedin)
+  │     └── #12936 get-exa-profile        (Tier 3)
+  │
+  ├── #13038 match-master-person          ← 4-tier dedup
+  │     ├── master_link.link_url
+  │     ├── master_email.email_address
+  │     ├── master_phone.phone_number (name-aware)
+  │     ├── master_person.linkedin_url
+  │     └── #2540 llm-phone-format        (internal)
+  │
+  ├── [existing-person path]              ← if match_via != null
+  │     ├── #2784 add-person-email
+  │     ├── #2541 create-master-link
+  │     ├── #2783 add-person-phone
+  │     ├── #237 replace-avatar (EL avatar if any)
+  │     └── return existing master_person
+  │
+  ├── [new-person path]                   ← if no match
+  │     ├── db.add master_person
+  │     ├── #2601 add-person-node         (FalkorDB graph node)
+  │     ├── #12820 set-person-names       (first/middle/last writes)
+  │     ├── db.edit person_enrich_data
+  │     ├── #2784 add-person-email ×N
+  │     ├── #2541 create-master-link ×N
+  │     ├── #2783 add-person-phone ×N
+  │     ├── #237 replace-avatar (EL avatar if any)
+  │     ├── #12793 link-fundable-person   (if fundable match)
+  │     │
+  │     ├── if needs_full_enrich:
+  │     │     #13036 full-enrich-reverse-email-lookup (async)
+  │     │       ↓ FullEnrich's webhook (later)
+  │     │     #8594 webhook/contact-finished
+  │     │       → person_enrich_data.full_enrich
+  │     │
+  │     └── return new master_person
+  │
+  └── post-resolution dispatch
+        ├── #13040 enrich-master-person   ← async-shared, NEW PERSON only,
+        │                                   shouldQueue == false
+        ├── upsert-enrich-person          ← async queue (shouldQueue == true)
+        └── log_crash "new person created"
 ```
 
-Reverse Email Lookup (EnrichLayer `/v2/profile/resolve/email`). Used when the caller supplied an email but PDL had no record for it.
+## Inside #13039 — execution flow
 
-</Card>
+The orchestrator runs in a strict order. Earlier stops are cheaper.
 
-<Card icon="cloud-arrow-up">
+### 1. Boilerplate + name parsing
+
+- Insert `log_enrichment_person` audit row (`$errorLog`).
+- If `full_name` is provided → `#2649 mvp/format/name-format` (LLM split).
+- Pull a candidate LinkedIn URL out of `input.links` (`array.find icontains:"linkedin.com"`).
+
+### 2. Kill switch
+
+- Call `#4617 mvp/stop/check-kill-switch-v2`.
+- **If ON**: do a local-only lookup across `master_link`, `master_email`, `master_phone`, `master_person.linkedin_url`. If a match exists, return it. Otherwise log a `kill_switch_blocked_people` row and return null. **No external APIs called.**
+
+### 3. Pre-API local dedup (v1.6)
+
+The fastest cache lookup. Skips the cascade entirely when:
+
+- Any `input.links` matches `master_link.link_url` (after URL normalization)
+- Any `input.email` matches `master_email.email_address`
+- The extracted `$linkedinUrl` matches `master_person.linkedin_url` directly
+
+On hit: attach the new `input.email` / `input.links` / `input.phone_numbers` via `#2784 / #2541 / #2783`, write a `log_crash` row with `match_via`, and return. Phones are **not** checked here — that would need `#2540 mvp/phones/llm-phone-format`, which is too expensive for a pre-flight.
+
+### 4. Cascade (#13037)
+
+Runs only when pre-dedup misses AND `cascade_depth == 0`. Pure data fetch — no DB writes except a `log_crash` on a caught exception.
 
 ```
-api/enrich_layer/person-linkedin — 12612
+PDL /v5/person/enrich (email + first/last + linkedin if any)
+  │
+  │  if pdl.status == 404  ($pdlEmail404 = true)
+  ▼
+EnrichLayer (Tier 2)
+  ├── email present       → #12734 api/enrich_layer/person-email  ($usedElEmail = true)
+  └── elseif linkedin     → #12612 api/enrich_layer/person-linkedin
+  │
+  │  if EL returned a public_identifier OR linkedin_profile_url → $elLinkedinUrl
+  ▼
+PDL retry  /v5/person/enrich  (profile = $elLinkedinUrl)
+  │  promote retry → $pdl iff status == 200 AND likelihood > 5
+  │
+  │  if $pdlEmail404 AND linkedin available AND $pdl.data still empty
+  ▼
+#12936 mvp/enrich/get-exa-profile  (Exa Tier 3)
+  │
+  │  if $usedElEmail AND $elLinkedinUrl is empty
+  ▼
+needs_full_enrich = true   (caller dispatches FullEnrich post person_enrich_data create)
 ```
 
-Profile lookup by LinkedIn URL (EnrichLayer `/v2/profile`). Used when the caller already had a LinkedIn URL but PDL 404'd on it.
+The cascade returns one object with: `pdl`, `pdl_status`, `pdl_email_404`, `el`, `el_linkedin_url`, `el_links` (linkedin + twitter + facebook URLs deduped), `el_profile_pic`, `exa`, `linkedin_url`, `input_email_source`, `needs_full_enrich`.
 
-</Card>
+### 5. Resolution (#13038)
 
-## What #12553 extracts vs. defers
+After cascade collects all known links/emails/phones, `#13038 mvp/resolve/match-master-person` walks four lookups in order and returns the first match:
 
-Only two fields are consumed by #12553 itself:
+1. `master_link.link_url` (after URL normalization)
+2. `master_email.email_address`
+3. `master_phone.phone_number` — with **name-aware** match (first OR last name must agree) and phone-conflict detection
+4. `master_person.linkedin_url` — direct fallback (catches persons that have `linkedin_url` set but no `master_link` row)
 
-| EL field            | Used for                                          |
-| ------------------- | ------------------------------------------------- |
-| `public_identifier` | Construct `https://www.linkedin.com/in/{id}` URL  |
-| `profile_pic_url`   | Avatar via `#237 mvp/avatar/replace-avatar`       |
+Returns `{master_person_id, match_via, status, message, formatted_phones}`. Formats every phone via `#2540 mvp/phones/llm-phone-format` internally so the orchestrator doesn't double-LLM.
 
-Everything else (`experiences`, `education`, `summary`, `headline`, recommendations, activities, etc.) is **persisted but not processed**. It lands on:
+### 6. Existing-person path (match_via != null)
 
-<Card icon="database">
+Attach new inputs + enrichment-discovered data to the matched person, then return.
+
+- `#2784 add-person-email` for input emails (with `orbiter_verified`) + PDL-discovered emails
+- `#2541 create-master-link` for EL links (`source: "Enrich Layer"`), input links (per-URL source override), PDL links (`source: "People Data Labs"`)
+- `#2783 add-person-phone` for input phones + PDL phones
+- `db.edit person_enrich_data` to merge in `exa` + `enrich_layer_data`
+- `#237 replace-avatar` if EL surfaced a `profile_pic_url`
+- `log_crash` with `qa_passed: true, match_via: <key>` for observability
+- `upsert-enrich-person` queue dispatch if `queue: true` or `cascade_depth > 0`
+- **return** — function exits here
+
+### 7. New-person path (no match)
+
+- `db.add master_person` (placeholder name if EL/PDL produced none)
+- `#2601 mvp/node/add-person-node` — creates the FalkorDB graph node
+- `#12820 mvp/format/set-person-names` — single writer for first/middle/last/suffix/nickname
+- `db.edit person_enrich_data` to seed `people_data_labs`, `exa`, `enrich_layer_data`
+- `#237 replace-avatar` if EL surfaced a `profile_pic_url`
+- `db.add enrich_history_person` rows — one per source that returned data (`"People Data Labs"` + `"Enrich Layer"`)
+- **FullEnrich dispatch** — see next section
+- Attach all input + PDL emails/links/phones via the helper functions
+- `#12793 mvp/fundable/link-fundable-person` if a `fundable_people` row matched
+
+### 8. Downstream enrichment dispatch (post-create)
+
+After the new person is committed:
+
+| Condition | Action |
+| --- | --- |
+| `input.hold_downstream == true` | Log skip, do nothing (interactive QA mode). |
+| `personAdded && !shouldQueue` | **`debug.stop` halts the function**, then would dispatch `#13040 mvp/enrich/enrich-master-person` async-shared. |
+| `personAdded && shouldQueue` | `upsert-enrich-person` writes a queue row instead. |
+
+`shouldQueue = $input.queue OR cascade_depth > 0`.
+
+## FullEnrich async tier
+
+When the cascade reports `needs_full_enrich: true` (EL via email path returned no LinkedIn URL), `#13039` dispatches `#13036` after the `person_enrich_data` row is created.
+
+### Trigger condition
+
+All three must be true:
+
+- `cascadeResult.needs_full_enrich == true`
+- `input.email|first` is non-empty
+- `personEnrichData.id` resolved (the Section 9 `db.edit person_enrich_data as $personEnrichData` returned a row)
+
+This fires only on the **new-person creation path**. Existing-person matches do not dispatch FullEnrich.
+
+### Call flow
 
 ```
-person_enrich_data.enrich_layer_data — table 500
+#13039 (after person_enrich_data created)
+  │  needs_full_enrich == true
+  ▼
+function.run "enrich/full-enrich-reverse-email-lookup"  (async-shared)
+  │   input: { email, person_enrich_data_id, data_source }
+  │
+  ▼
+#13036  POST https://app.fullenrich.com/api/v2/contact/reverse/email/bulk
+        ── webhook_url    = $env.FULL_ENRICH_WEBHOOK_URL
+        ── name           = "ped__{id}__{data_source}__{email}"
+        ── custom         = { person_enrich_data_id, data_source }
+  │
+  │   (returns immediately with FullEnrich's enrichment_id)
+  ▼
+… time passes (seconds to minutes) …
+  │
+  ▼
+FullEnrich POST → api:8hTTyqsU/webhook/contact-finished  (#8594)
+  │
+  │   per item:
+  │     1. read custom.person_enrich_data_id (fall back to name parse)
+  │     2. read custom.data_source
+  │     3. if data_source matches a known label ("live"/"staging"/"sandbox")
+  │           → db.set_datasource { value = "<literal>" }
+  │     4. db.edit person_enrich_data { full_enrich: item } by id
+  │     5. fallback: db.edit email_enrich_fallback by input.email
+  │
+  ▼
+person_enrich_data.full_enrich  (json column on table 500)
 ```
 
-JSON column on the `person_enrich_data` row keyed by `master_person_id`. #12554 reads this in its EL phase.
+### Why async + threaded data_source?
 
-</Card>
+FullEnrich's API is **asynchronous** — POSTing returns an `enrichment_id` immediately, the profile arrives via webhook (typically seconds to minutes). Blocking the orchestrator on it would wreck p95 latency.
 
-## Source attribution
+FullEnrich's webhook is a fresh HTTP request that defaults to the `live` data source. When `#13039` is called in sandbox / staging, the dispatch threads the `data_source` value through `custom`, and the webhook calls `db.set_datasource` with a literal `"live"` / `"staging"` / `"sandbox"` per branch (Xano won't accept a `$var` reference there). Without this, sandbox QA's writebacks would land in live.
 
-The `source` text written to `master_link`, `master_email`, and `master_avatar` follows this routing inside #12553:
+## Source attribution rules
 
-| Source value         | When                                                                                  |
-| -------------------- | ------------------------------------------------------------------------------------- |
-| `"People Data Labs"` | URL came from PDL `profiles[]`, OR caller-supplied URL is also in PDL response       |
-| `"Enrich Layer"`     | URL or avatar came from EL fallback (`#12734` or `#12612`)                            |
-| `$input.source`      | Caller-supplied URL not confirmed by any enrichment provider                          |
-| `null`               | Cascade ran but nothing resolved (cascade_depth > 0 or both APIs returned nothing)    |
+The `source` text written to `master_link`, `master_email`, `master_phone`, `master_avatar` records where each row originated.
 
-Order matters because `create-master-link` dedups on URL. EL links are written **first** in Sections 7 + 10, then `$inputLinks`, then `$pdlLinks` — so EL wins attribution when a URL appears in multiple sources.
+| Source value         | When                                                                                       |
+| -------------------- | ------------------------------------------------------------------------------------------ |
+| `"People Data Labs"` | URL came from PDL `profiles[]`, OR caller-supplied URL also appears in PDL response       |
+| `"Enrich Layer"`     | URL or avatar came from EL fallback (`#12734` or `#12612`)                                 |
+| `$input.source`      | Caller-supplied data not confirmed by any enrichment provider                              |
+| `null`               | Cascade ran but nothing resolved (`cascade_depth > 0` or both APIs returned nothing)       |
+
+EL links are written **first** in the create-master-link loops (sections 7 + 10), so EL wins attribution when a URL appears in multiple sources (because `#2541 create-master-link` dedups on normalized URL).
 
 `$inputEmailSource` is the email-specific override:
 
 - PDL initial status ≠ 404 → `"People Data Labs"`
 - PDL was 404 + EL returned a linkedin → `"Enrich Layer"`
-- Otherwise → `null`
+- Otherwise → null
 
-This only affects email writes; link/phone writes still use `$input.source` (with the v3.20 per-URL override for links).
+This only affects email writes; link/phone writes still use `$input.source`.
 
-## hold_downstream for QA
+## `source` vs `data_source` (the confusingly-similar inputs)
 
-Pass `hold_downstream: true` to skip both the direct `run-base-person-enrich` async dispatch and the queue path. A `qa_passed` row is logged to `log_crash` noting the skip. Use this to run #12553 in isolation while step-debugging — the master_link triggers (Twitter / LinkedIn scrapers) will still fire though, since they're table-level.
+| Input | Type | What it's for | Where it goes |
+| --- | --- | --- | --- |
+| `source` | `text` | **Business attribution.** Values like `"People Data Labs"`, `"Hubspot"`, `"User Input"`. | Written to `master_link.source`, `master_email.source`, `master_phone.source`. |
+| `data_source` | `text` | **Xano database environment selector.** Values `"live"` / `"staging"` / `"sandbox"`. | Never written to any business table; only echoed to FullEnrich's webhook so it can `db.set_datasource` before writing the FullEnrich payload back. |
 
-## Phase-split refactor
+These never overlap. `source` could be `"People Data Labs"` while `data_source` is `"sandbox"`.
 
-`mvp/get-add/master-person-new` (#13039) is a behaviourally-identical sibling that splits #12553 into three functions. Same input/response shape; callers can swap when ready.
+## `orbiter_verified` flag
 
-### Why split?
+When the caller passes `orbiter_verified: true`, **only the user-supplied input emails** get marked `master_email.orbiter_verified = true`. PDL-discovered emails always stay `false` (they aren't user-verified). Wired through `#2784 mvp/email/add-person-email` v1.2.
 
-The original #12553 is ~2100 lines because it does cascade + resolution + creation + write loops inline. The split isolates the two pieces most likely to be reused or reasoned about independently:
+## `hold_downstream` for QA
 
-- **Cascade** — pure data fetch. Returns one structured object. Now reusable from #12554 or backfills.
-- **Resolution** — pure id lookup. Now testable in isolation against any link/email/phone set.
-- **Orchestrator** — gets thinner (kill-switch + fundable + creation + write loops only).
+Pass `hold_downstream: true` to skip BOTH the direct `#13040` async dispatch AND the queue path. A `qa_passed` row is logged to `log_crash` noting the skip. Use this to run `#13039` in isolation while step-debugging — note that `master_link` table-level triggers (Twitter / LinkedIn scrapers) will still fire because those are table-level.
 
-### The three artifacts
+## Functions #13039 calls directly
 
-<Card icon="cloud-arrow-up">
-
-```
-mvp/enrich/cascade-person-data — 13037
-```
-
-PDL → EnrichLayer → Exa. No DB writes (except a `log_crash` row on a caught exception). Returns the raw payloads plus shortcut fields the orchestrator needs:
-
-- `pdl` — full PDL response, status preserved
-- `el` — full EnrichLayer profile (or null)
-- `el_linkedin_url` — constructed `https://www.linkedin.com/in/{public_identifier}` (or null)
-- `el_profile_pic` — `profile_pic_url` from EL (or null)
-- `exa` — full Exa profile (or null)
-- `linkedin_url` — best available URL after the cascade (input or EL-discovered)
-- `input_email_source` — `"People Data Labs"` / `"Enrich Layer"` / null
-
-</Card>
-
-<Card icon="filter">
-
-```
-mvp/resolve/match-master-person — 13038
-```
-
-Resolution. Takes `links`, `emails`, `phone_numbers`, optional `first_name` / `last_name` / `linkedin_url`. Walks four lookups in order and returns the first match:
-
-1. `master_link.link_url` (after URL normalization)
-2. `master_email.email_address`
-3. `master_phone.phone_number` — with name-aware match (first OR last name must agree) and phone-conflict detection
-4. `master_person.linkedin_url` direct match (catches persons with linkedin_url set but no master_link row)
-
-Returns `{master_person_id, match_via, status, message, formatted_phones}`. Formats phones internally via `mvp/phones/llm-phone-format` and returns the formatted list so the orchestrator doesn't double-LLM.
-
-</Card>
-
-<Card icon="play">
-
-```
-mvp/get-add/master-person-new — 13039
-```
-
-Thin orchestrator. Same input/response as #12553. Calls #13037 + #13038, keeps kill-switch + fundable lookup + creation + write loops inline.
-
-</Card>
-
-### New observability: match_via
-
-The existing-person `log_crash` row in #13039 now carries `data.match_via` showing exactly which key resolved the person:
-
-| `match_via` value              | Meaning                                                          |
-| ------------------------------ | ---------------------------------------------------------------- |
-| `master_link`                  | A normalized URL in the input set already existed in master_link |
-| `master_email`                 | An email in the input set already existed in master_email        |
-| `master_phone`                 | A formatted phone matched AND first/last name agreed             |
-| `master_person.linkedin_url`   | Fallback — only the direct master_person row had this URL        |
-| `null`                         | No match → new person path                                       |
-
-This is for `log_crash` analysis; query `data.match_via` to see which resolution path is doing the work in production.
-
-### Migration
-
-Both `#12553` (v3.21) and `#13039` (v1.0) are live and behaviourally identical. To migrate a caller:
-
-1. Run #13039 with `hold_downstream: true` first — compare resulting `master_person` row, `master_link` rows, and `log_crash` audit against #12553.
-2. Once parity is verified, switch the caller's `function.run` from `mvp/get-add/master-person` → `mvp/get-add/master-person-new`.
-3. After all callers have moved, retire #12553.
-
-### Caveats
-
-- Cascade calls all happen in one sub-function, so latency is the same (PDL still synchronous, EL still synchronous on PDL 404).
-- The split adds two `function.run` hops vs. inline — negligible in practice for the kind of workloads this function handles.
-- `match-master-person` no longer skips formatting once a match is found; it always formats every supplied phone (because the caller still needs the formatted list for write loops). One extra LLM phone-format call in the rare case where the FIRST phone matches and there are more phones to process. Acceptable.
-
-## Where the work moves next
-
-After #12553 (or #13039) returns, `#12554 / run-base-person-enrich` does the heavy lifting:
-
-- Read `person_enrich_data.enrich_layer_data` and process experiences, education, biography, recommendations.
-- Backfill work-experience joins, education joins.
-- Run #13031 (Exa expand), #13033 (was RocketReach phase — now retired), and downstream avatar / link enrichment phases.
-
-The `#12554` migration to mirror this RR → EL rewrite is pending and tracked separately.
-
-## Related artifacts
-
-<Card icon="play">
-
-```
-mvp/get-add/master-person — 12553
-```
-
-Original entry point. v3.21 RocketReach → EnrichLayer fallback.
-
-</Card>
-
-<Card icon="play">
-
-```
-mvp/get-add/master-person-new — 13039
-```
-
-Phase-split sibling. Drop-in swap candidate.
-
-</Card>
+Cards for every `function.run` inside `#13039`. Listed alphabetically by name.
 
 <Card icon="cloud-arrow-up">
 
 ```
-mvp/enrich/cascade-person-data — 13037
+enrich/full-enrich-reverse-email-lookup — 13036
 ```
 
-Phase 1 helper. PDL → EL → Exa cascade. Pure data fetch.
-
-</Card>
-
-<Card icon="filter">
-
-```
-mvp/resolve/match-master-person — 13038
-```
-
-Phase 2 helper. Existence resolution + phone formatting.
-
-</Card>
-
-<Card icon="play">
-
-```
-mvp/enrich/run-base-person-enrich — 12554
-```
-
-Downstream enrichment orchestrator. Reads `person_enrich_data.enrich_layer_data` to process the rest of the EL payload.
+Async FullEnrich dispatcher. Called only on the new-person path when cascade reports `needs_full_enrich: true`. Encodes `person_enrich_data_id` + `data_source` into both `custom` and FullEnrich's `name` field so webhook `#8594` can route the writeback.
 
 </Card>
 
@@ -258,16 +297,317 @@ Downstream enrichment orchestrator. Reads `person_enrich_data.enrich_layer_data`
 mvp/avatar/replace-avatar — 237
 ```
 
-Priority-based avatar replacement. Called from #12553 and #13039 with `source="Enrich Layer"` when EL returned a `profile_pic_url`.
+Priority-based avatar replacement. Called with `source: "Enrich Layer"` when EL returned a `profile_pic_url`.
 
 </Card>
 
 <Card icon="wrench">
 
 ```
-mvp/link/create-master-link
+mvp/email/add-person-email — 2784
 ```
 
-Master-link upsert (dedups on normalized URL). EL-discovered links are written first so they win attribution.
+Adds an email to `master_email` (dedups). Accepts `source` (provenance) + `orbiter_verified` (bool, v1.2). Both flags written to the row on insert.
 
 </Card>
+
+<Card icon="cloud-arrow-up">
+
+```
+mvp/enrich/cascade-person-data — 13037
+```
+
+PDL → EnrichLayer → PDL retry → Exa cascade. Pure data fetch (no DB writes except `log_crash` on exception). Returns `pdl`, `pdl_status`, `pdl_email_404`, `el`, `el_linkedin_url`, `el_links`, `el_profile_pic`, `exa`, `linkedin_url`, `input_email_source`, `needs_full_enrich`.
+
+</Card>
+
+<Card icon="play">
+
+```
+mvp/enrich/enrich-master-person — 13040
+```
+
+**Downstream enrichment orchestrator.** Phase-based (PDL backfill, EL processing, Exa, RocketReach, Fundable, biography, work_experience, avatar, temp-name resolution). Called async-shared from `#13039` once a new master_person is created and `shouldQueue == false`. **Replaces the retired `#12554 run-base-person-enrich`.**
+
+</Card>
+
+<Card icon="wrench">
+
+```
+mvp/format/name-format — 2649
+```
+
+LLM-powered split of `full_name` into `first_name` / `middle_name` / `last_name` / `suffix` / `nickname`. Called early in `#13039` so the cascade has structured name parts to pass to PDL.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+mvp/format/set-person-names — 12820
+```
+
+**Single writer** for `master_person.first_name` / `middle_name` / `last_name` / `suffix` / `nickname`. Avoids the Xano input-name-collision bug that v3.3 / v3.4 of `#12553` were created to fix.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+mvp/fundable/link-fundable-person — 12793
+```
+
+Links a `fundable_people` row to the new `master_person` by setting `fundable_people.master_person_id`. Fires only when a fundable match was found earlier in the flow.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+mvp/link/create-master-link — 2541
+```
+
+Master-link upsert (dedups on normalized URL). Per-domain branches: LinkedIn (triggers `scrapecreator-person-linkedin` + sets `master_person.linkedin_url`), Twitter / X (triggers `scrape-twitter-person`), Crunchbase (triggers `add-person-permalink`), YouTube (triggers `scrapecreator-person-youtube`), Facebook, IMDB.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+mvp/node/add-person-node — 2601
+```
+
+Creates the FalkorDB graph node for the new master_person. Placeholder avatar if needed. v1.6 uses `MERGE` keyed on `master_person_id` (idempotent on retries).
+
+</Card>
+
+<Card icon="wrench">
+
+```
+mvp/phone/add-person-phone — 2783
+```
+
+Adds a phone to `master_phone` (dedups). Accepts `source` for provenance.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+mvp/phones/llm-phone-format — 2540
+```
+
+LLM-powered phone normalization → E.164 + local display. Called internally by `#13038 match-master-person` so phone matches survive format variation.
+
+</Card>
+
+<Card icon="clock-rotate-left">
+
+```
+mvp/queue/upsert-enrich-person
+```
+
+Idempotent writer for `queue_enrich_person`. Called when `queue: true` or `cascade_depth > 0` instead of the direct `#13040` dispatch. Bumps count + upgrades priority_tier if already queued.
+
+</Card>
+
+<Card icon="filter">
+
+```
+mvp/resolve/match-master-person — 13038
+```
+
+4-tier dedup resolver: `master_link.link_url` → `master_email.email_address` → `master_phone.phone_number` (name-aware) → `master_person.linkedin_url` direct. Returns `{master_person_id, match_via, status, message, formatted_phones}`.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+mvp/stop/check-kill-switch-v2 — 4617
+```
+
+Returns `true` if `master_person` count exceeds the configured limit. When ON, `#13039` does a local-only lookup with no external API calls — existing persons returned, new persons blocked into `kill_switch_blocked_people`.
+
+</Card>
+
+## Sub-functions called by the cascade (#13037)
+
+These run inside `#13037`, not directly from `#13039`, but listed here so the full call graph is visible.
+
+<Card icon="cloud-arrow-up">
+
+```
+api/enrich_layer/person-email — 12734
+```
+
+Reverse Email Lookup (EnrichLayer `/v2/profile/resolve/email`). Returns the whole `response.result` (top-level `url` / `linkedin_profile_url` / `twitter_profile_url` / `facebook_profile_url` + nested `profile.public_identifier` / `profile.profile_pic_url`).
+
+</Card>
+
+<Card icon="cloud-arrow-up">
+
+```
+api/enrich_layer/person-linkedin — 12612
+```
+
+Profile lookup by LinkedIn URL (EnrichLayer `/v2/profile`). Used when the cascade has a LinkedIn URL but PDL 404'd on it.
+
+</Card>
+
+<Card icon="cloud-arrow-up">
+
+```
+mvp/enrich/get-exa-profile — 12936
+```
+
+Exa Tier 3. Fires only when PDL's email lookup 404'd AND a LinkedIn URL is available AND the PDL retry didn't surface data.
+
+</Card>
+
+## Webhook on the FullEnrich return path
+
+<Card icon="globe">
+
+```
+webhook/contact-finished — 8594
+```
+
+FullEnrich webhook receiver (API group `Full Enrich`, canonical `8hTTyqsU`). Per item:
+1. Read `custom.person_enrich_data_id` (falls back to parsing `name`).
+2. Read `custom.data_source` → literal-dispatch `db.set_datasource` (live / staging / sandbox).
+3. `db.edit person_enrich_data { full_enrich: item }` by id.
+4. Fallback: `db.edit email_enrich_fallback` by `input.email` (preserves the `#13035` test-runner path).
+
+Returns `matched_ped` + `matched_eef` counters so you can verify which route a batch took.
+
+</Card>
+
+## Tables touched
+
+<Card icon="database">
+
+```
+master_person — 139
+```
+
+Canonical person record. `#13039` creates a row on the new-person path; existing-person path returns the matched id.
+
+</Card>
+
+<Card icon="database">
+
+```
+master_email — 155
+```
+
+Per-email row, `master_person_id` foreign key. Carries `source` + `orbiter_verified`.
+
+</Card>
+
+<Card icon="database">
+
+```
+master_link — 166
+```
+
+Per-URL row, `master_person_id` foreign key. Carries `source`, `service`, `service_label`, `icon_url`.
+
+</Card>
+
+<Card icon="database">
+
+```
+master_phone
+```
+
+Per-phone row. Carries `source` + name fields used in #13038's name-aware match.
+
+</Card>
+
+<Card icon="database">
+
+```
+person_enrich_data — 500
+```
+
+JSON staging table keyed on `master_person_id`. Columns: `people_data_labs`, `enrich_layer_data`, `exa`, `full_enrich`, `linkedin_profile`, plus several legacy columns. Read by `#13040` for phase-based downstream processing.
+
+</Card>
+
+<Card icon="database">
+
+```
+log_crash — 542
+```
+
+Audit + debug log. Every section of `#13039` writes either a `qa_passed: true` row on success or a crash row on exception. Query by `function_name` / `master_person_id` / `data.match_via`.
+
+</Card>
+
+<Card icon="database">
+
+```
+log_enrichment_person — 579
+```
+
+Step-by-step status trail per `#13039` invocation. `stack_status` text is updated at each section boundary ("begin person enrich" → "name format done" → "BEGIN cascade" → "cascade done" → ... → "Person NODE Added!!" or "pre-API dedup hit — skipped cascade").
+
+</Card>
+
+## Observability — `match_via`
+
+Every `log_crash` row from a successful dedup carries `data.match_via` showing exactly which key resolved the person:
+
+| `match_via` value              | Meaning                                                                                       |
+| ------------------------------ | --------------------------------------------------------------------------------------------- |
+| `master_link`                  | A normalized URL in input matched an existing `master_link` row.                              |
+| `master_email`                 | An email in input matched an existing `master_email` row.                                     |
+| `master_phone`                 | A formatted phone matched AND first/last name agreed.                                          |
+| `master_person.linkedin_url`   | Fallback — only the direct `master_person.linkedin_url` column held the URL (no master_link). |
+| `null`                         | No match → new person created.                                                                |
+
+Pre-API dedup hits log with the same `match_via` keys but `note: "pre-API dedup hit — skipped cascade"`.
+
+## Version timeline
+
+| Function     | Version | Behaviour                                                                                                          |
+| ------------ | ------- | ------------------------------------------------------------------------------------------------------------------ |
+| `#12553`     | v3.21   | Original entry point. RocketReach → EnrichLayer refactor. Still live for callers not yet migrated.                  |
+| `#13039`     | v1.0    | Initial phase-split extract — behaviourally identical to `#12553` v3.21.                                            |
+| `#13039`     | v1.1    | `enrich_history_person` rows split per-source (`"People Data Labs"` / `"Enrich Layer"`); `data_source_id` dropped.  |
+| `#13039`     | v1.2    | Async FullEnrich dispatch when cascade reports `needs_full_enrich`.                                                 |
+| `#13039`     | v1.3    | `data_source` input added (threads to `#13036` for webhook routing).                                                |
+| `#13039`     | v1.4    | Drops `data_source_id` input (table 161 deprecated). Adds `orbiter_verified` bool input.                            |
+| `#13039`     | v1.5    | Consumes cascade's `el_links` array directly — writes linkedin + twitter + facebook URLs as master_link.            |
+| `#13039`     | v1.6    | **Pre-API local dedup** between kill switch and cascade. Saves PDL+EL calls on repeat-person lookups.               |
+| `#13039`     | (live)  | `#12554` swapped out for `#13040` in the downstream-enrichment dispatch.                                            |
+| `#13037`     | v1.1    | Adds PDL retry via EL-derived LinkedIn URL + `needs_full_enrich` flag + `pdl_email_404` field.                      |
+| `#13037`     | v1.2    | New EL response shape — extracts URL with precedence `linkedin_profile_url` → `url` → `profile.public_identifier`.  |
+| `#13037`     | v1.3    | Returns `el_links` array (all EL-discovered URLs, deduped).                                                         |
+| `#13036`     | v1.3    | Encodes id + data_source in both `name` (`ped__{id}__{data_source}__{email}`) and `custom`.                          |
+| `#8594`      | v1.5    | Literal-per-branch `db.set_datasource` dispatch (live / staging / sandbox).                                          |
+| `#2784`      | v1.2    | Added `orbiter_verified` input; written to `master_email.orbiter_verified`.                                          |
+
+## Migration from #12553
+
+`#12553` v3.21 and `#13039` v1.0 were drop-in identical. **`#13039` v1.1+ has diverged**:
+
+1. New PDL retry path
+2. FullEnrich async fallback
+3. `el_links` array writing all EL-discovered links (not just linkedin)
+4. Pre-API local dedup
+5. `#13040` downstream replacing `#12554`
+
+To migrate a caller:
+
+1. Run `#13039` with `hold_downstream: true` first — compare `master_person`, `master_link` rows, and `log_crash` audit against `#12553`. Expect divergence on email-only inputs where PDL 404s and EL has no LinkedIn (`#13039` additionally writes a `person_enrich_data.full_enrich` row when FullEnrich's webhook lands).
+2. Once parity is verified, switch the caller's `function.run` from `mvp/get-add/master-person` → `mvp/get-add/master-person-new`.
+3. After all callers have moved, retire `#12553`.
+
+## Caveats
+
+- Cascade calls happen in one sub-function, so synchronous latency is the same as inline. The v1.1 PDL retry adds one extra synchronous PDL call when EL produced a LinkedIn URL.
+- `#13038 match-master-person` always formats every supplied phone via `#2540` (it doesn't skip once a match is found, because the caller still needs the formatted list for downstream writes).
+- FullEnrich is asynchronous: `person_enrich_data.full_enrich` is populated **after** `#13039` returns. Anything that needs the FullEnrich payload must read from the table or be triggered by a table trigger, not by `#13039`'s synchronous response.
+- Existing-person matches (Section 7) do **not** dispatch FullEnrich. Re-runs against an existing person re-attach inputs but don't refresh FullEnrich.

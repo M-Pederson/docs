@@ -1,0 +1,552 @@
+---
+title: "Enrich Pass Webhook"
+description: "Receiver for FullEnrich async callbacks. FullEnrich is the last-resort reverse-email vendor — it only runs when PDL AND EnrichLayer have both failed to resolve a master_person from an email-only seed. The webhook must wait for any in-flight enrichment orchestrator (#13040) to finish on the same person before processing FullEnrich's response, then apply the data via a new helper (process-full-enrich)."
+---
+
+<Note>
+**Status as of end of session 2 (2026-05-30) — fully shipped + validated.**
+
+✅ All design questions answered, all code deployed, end-to-end validated in sandbox.
+✅ Production incident (Carl Bressler → Robert Boulos data corruption) cleaned up — see [Production incident](#production-incident--carl-bressler--robert-boulos-data-corruption-2026-05-30).
+✅ FullEnrich integration is functionally working: dispatch → callback → wait → process → master_person populated correctly. LIVE Robert Boulos unaffected.
+
+**Currently deployed versions:** webhook v1.8, `process-full-enrich` v1.2, orchestrators v3.8, `#13039` v1.7, `#12997` v1.3, runtime_metadata table seeded across all data sources.
+
+**Pick up here in the next session — top priorities:**
+
+1. **Re-verify `process-full-enrich` v1.1 work_experience dedup** actually no-ops on duplicates. Sandbox Carl (`master_person.id=1`) has 30 work_experience rows from the pre-v1.1 run. Re-invoke `process-full-enrich(master_person_id=1)` in sandbox and confirm the count stays at 30.
+2. **Re-verify `#12997` v1.3 LinkedIn URL normalization.** Sandbox has two Carl rows (id=1 with `www.`, id=34 without). Delete id=34 + dependents, re-trigger a flow that surfaces Carl via Exa — expectation: matches id=1, no new row.
+3. **Patch `#12553`** with the same v1.7-style data_source auto-detect as `#13039`. Webhook v1.8 guard protects production from broken dispatches in the meantime.
+4. **Step (h)** of process-full-enrich — iterate non-`professional_network` social_profiles entries when a sample with twitter/github/etc appears.
+
+See [Pending verification + remaining work](#pending-verification--remaining-work) below for the full checklist with table/function IDs.
+</Note>
+
+## TL;DR
+
+FullEnrich (fullenrich.com) is a reverse-email-lookup vendor. We use it as a **last-resort tier** in the person enrichment cascade — fired only when PDL and EnrichLayer have both failed to produce a LinkedIn URL for an email-only seed.
+
+Because the FullEnrich API is async (bulk endpoint that POSTs results back to a webhook minutes-to-days later), the response arrives **after** `mvp/get-add/master-person` (#12553) has already created the master_person and kicked off the downstream orchestrator `#13040 mvp/enrich/enrich-master-person`. By the time FullEnrich's callback lands here, three things may be true simultaneously:
+
+1. The `master_person` exists.
+2. `#13040` may still be in flight, mid-phase, writing to overlapping rows (master_link, work_experience, biography, avatar, master_person.linkedin_url).
+3. FullEnrich finally has data that should be applied to those same rows.
+
+**The webhook's job is therefore three steps:**
+
+1. **Stash** the FullEnrich payload onto `person_enrich_data.full_enrich` by id. (Done today, v1.6.)
+2. **Wait** for `#13040` to finish processing this master_person, so we don't race against the orchestrator. (**Not yet built — proposed v1.7.**)
+3. **Process** the FullEnrich payload into `master_link` / `avatar` / `biography` / `work_experience` / `master_email` / `master_phone` / social links via a new helper, `mvp/enrich/process-full-enrich`. (**Not yet built.**)
+
+## When FullEnrich gets called
+
+`#13036 mvp/enrich/full-enrich-reverse-email-lookup` is the dispatch function. Today it's wired up so that it fires when:
+
+- `mvp/get-add/master-person` (#12553) is invoked with an email-only seed (no LinkedIn URL upstream)
+- PDL returns 404 on the email
+- EnrichLayer's email-path fallback (#12734) returns no LinkedIn URL either
+- We have an email but still no usable identity
+
+`#13036` then POSTs the email to FullEnrich's bulk reverse-email endpoint with a `name` and `custom` carrier encoding `person_enrich_data_id` + `data_source`, plus our webhook URL. FullEnrich returns an `enrichment_id` immediately. The actual lookup happens on FullEnrich's side, often delayed.
+
+<Note>
+**To verify before building:** the exact gate logic in `#12553` v3.21 — confirm that `#13036` is dispatched only when both PDL + EL have failed, not on every email-only seed. The polish doc (`person-pipeline-polish.mdx`) says "when EL via email path returns no LinkedIn URL, dispatches #13036 async" — this matches the desired behavior. If the gate is currently broader, we'll narrow it as part of this work.
+</Note>
+
+## The race condition
+
+```
+T=0    #12553 creates master_person M (or matches an existing one)
+T=0    #12553 dispatches #13036 (FullEnrich bulk POST, returns immediately)
+T=0    #12553 dispatches #13040 async-shared (downstream orchestrator)
+
+T+1s   #13040 Phase 0 starts (PDL backfill)
+T+5s   #13040 Phase 4b (Exa processing) — writes master_link, biography, work_experience
+T+8s   #13040 Phase 5 (Fundable) — writes more
+T+10s  ...
+
+T+30s  ←── FullEnrich callback arrives at this webhook
+            (in this window, #13040 may still be writing to M)
+```
+
+Without a guard, the webhook + `process-full-enrich` would write to `master_link` / `work_experience` / `master_email` etc. while `#13040` is concurrently writing to the same rows. Three failure modes:
+
+1. **Duplicate inserts** — both processes insert "current title at current employer" biographies / work_experience entries from different sources.
+2. **Overwrite races** — both set `master_person.linkedin_url`, last write wins. If FullEnrich's URL is wrong, we get polluted state.
+3. **Avatar/url thrash** — `master_person.avatar` flip-flops between Exa's image and FullEnrich's image.
+
+These are all *avoidable* by simply waiting for #13040 to finish before applying FullEnrich's data.
+
+## Proposed v1.7 flow
+
+```
+POST /webhook/contact-finished
+ │
+ ▼
+For each item in $input.data:
+  1. Resolve $personEnrichDataId from custom.person_enrich_data_id
+     (fallback: name-parse, same as v1.6)
+  2. db.set_datasource per branch (same as v1.6)
+  3. db.edit person_enrich_data { full_enrich: $item }       ←── STASH (v1.6 behavior)
+  4. db.get person_enrich_data → $masterPersonId              ←── NEW
+  5. Wait for orchestrator (poll enrich_history_person)       ←── NEW (see below)
+  6. function.run "mvp/enrich/process-full-enrich" {          ←── NEW
+       input = { master_person_id: $masterPersonId }
+     }
+
+  processed++
+```
+
+### Step 5: Wait for orchestrator (locked-in design)
+
+**Decision (2026-05-30):** Use `enrich_history_person.processing` flag, keyed by `master_person_id + source == "Master Person Enrich"`. Webhook polls directly — **no cron**.
+
+The orchestrator (`#13040`) gets two small additions:
+
+1. **At the very top of `mvp/enrich/enrich-master-person`** (right after the `master_person` guard, before any phase fires) — upsert an `enrich_history_person` row:
+   - `master_person_id = $input.master_person_id`
+   - `source = "Master Person Enrich"`
+   - `processing = true`
+   - `updated_at = now`
+2. **At the very end** (after the "all phases passed" `log_crash` block, in BOTH success and failure exit paths) — set the same row's `processing = false`.
+
+This replaces the current `data_source_id == 79` keyed upsert in #13040's setup block. The text-based `source` field is more readable and decouples the orchestrator from the `data_source` lookup table.
+
+The webhook then polls this exact row:
+
+```
+db.query enrich_history_person {
+  where = master_person_id == $masterPersonId AND source == "Master Person Enrich"
+  return = {type: "single"}
+} as $history
+
+If ($history is empty OR $history.processing == false):
+  → proceed to process-full-enrich
+Else:
+  → sleep N seconds, re-query, repeat until processing == false (or timeout)
+```
+
+### Wait policy (locked-in)
+
+| Setting | Value |
+| --- | --- |
+| Poll interval | **5 seconds** (fixed) |
+| Hard cap | **30 minutes** (orchestrator's worst-case runtime is ~30 min; typical is 1–10 min) |
+| Behavior on cap | Proceed to `process-full-enrich` anyway, write `log_crash` row with `note: "wait-for-orchestrator timed out at 30min"` |
+| Behavior when no `enrich_history_person` row exists at first poll | Wait **30 seconds grace** (give orchestrator dispatch time to land), then proceed if still absent |
+
+### Wait mechanism (verified 2026-05-30)
+
+XanoScript has **native `while` + `util.sleep`** constructs — no `api.lambda` setTimeout hack needed. Verified via POC API `test/while-sleep` (function `#13048`):
+
+```xanoscript
+var $startedMs { value = now|to_int }
+var $deadlineMs { value = $startedMs + 1800000 }   // 30 min cap
+var $graceMs { value = $startedMs + 30000 }        // 30s grace for missing row
+var $done { value = false }
+var $timedOut { value = false }
+
+while (`$done == false`) {
+  each {
+    db.query enrich_history_person {
+      where = $db.enrich_history_person.master_person_id == $masterPersonId && $db.enrich_history_person.source == "Master Person Enrich"
+      return = {type: "single"}
+    } as $history
+
+    conditional {
+      if ($history|is_empty) {
+        // No row yet — orchestrator may not have started. Grace window.
+        conditional {
+          if (`(now|to_int) > $graceMs`) {
+            var.update $done { value = true }       // give up waiting, proceed
+          } else {
+            util.sleep { value = 5 }
+          }
+        }
+      }
+
+      elseif ($history.processing == false) {
+        var.update $done { value = true }           // orchestrator finished, proceed
+      }
+
+      elseif (`(now|to_int) >= $deadlineMs`) {
+        var.update $done { value = true }
+        var.update $timedOut { value = true }       // hit 30 min cap, proceed anyway
+      }
+
+      else {
+        util.sleep { value = 5 }
+      }
+    }
+  }
+}
+
+conditional {
+  if ($timedOut == true) {
+    db.add log_crash {
+      data = {
+        function_name: "webhook/contact-finished"
+        master_person_id: $masterPersonId
+        note: "wait-for-orchestrator timed out at 30min — proceeding to process-full-enrich anyway"
+      }
+    }
+  }
+}
+```
+
+**Runtime verification results:**
+
+| Test | Expected | Actual elapsed | Result |
+| --- | --- | --- | --- |
+| 3 iter × 1s sleep | ~3s | 3.01s | ✅ |
+| 6 iter × 5s sleep | ~30s | 30.10s | ✅ |
+| 1 iter × 60s sleep | ~60s | 60.06s | ✅ — Xano holds requests open beyond 60s |
+| 1 iter × 180s sleep | ~180s | 180.04s | ✅ — clean response at 3min, no 504 / timeout |
+
+**XanoScript syntax notes (gotchas from the docs):**
+
+- The `while` condition uses **backticks around the expression**: `` while (`$count < $target`) `` — not bare parentheses.
+- Inside `while`, the body lives in an `each { ... }` block.
+- Same backtick convention for any expression that needs runtime re-evaluation (e.g. `value = \`$count + 1\``).
+
+### Webhook-timeout caveat (FullEnrich's HTTP client)
+
+Xano lets us hold the request open indefinitely. The harder constraint is **FullEnrich's HTTP client timeout** — if their side gives up before our wait completes, they'll retry the callback, causing duplicate webhook invocations.
+
+We don't know FullEnrich's exact timeout (likely 30s or 60s). Two mitigations:
+
+1. **`process-full-enrich` MUST be rigorously idempotent.** Each helper (`create-master-link`, `add-person-biography`, etc.) should upsert / no-op on existing rows. Duplicate invocations cost cycles, not correctness.
+2. **Common-case observation:** FullEnrich's bulk reverse-email lookup takes minutes-to-hours on their side, while the orchestrator finishes in 1–10 min. So in the **typical case**, by the time the callback arrives, the orchestrator is already done — wait loop exits in 1 iteration (~5s). The 30-min cap only matters for the rare "FullEnrich-faster-than-orchestrator" race.
+
+If duplicate webhooks become a real problem in practice, the fallback design is to invert: webhook returns 200 immediately after stashing, then orchestrator's end-of-pipeline step also runs `process-full-enrich` if `person_enrich_data.full_enrich` is non-empty. That deferred-by-orchestrator approach was Option C in the original Q1 question; we'd revisit if needed.
+
+## process-full-enrich (new helper)
+
+A new function — **not** a port of the retired `#13033 process-person-rocket-reach`. The field mapping differs significantly (see [Response shape](#fullenrich-response-shape-verified-against-one-real-sample)). Sketch:
+
+```
+function "mvp/enrich/process-full-enrich" {
+  input { int master_person_id, int? cascade_depth? }
+
+  stack {
+    db.get person_enrich_data by master_person_id → $ped
+    var $full = $ped.full_enrich
+    var $profile = $full|get:"profile":{}
+
+    if ($profile|is_empty) → log "FullEnrich returned no profile" + return
+
+    // (a) backfill master_person.linkedin_url
+    //     from $profile.social_profiles.professional_network.url
+    //     when master_person.linkedin_url is empty
+
+    // (b) master_link insert
+    //     create-master-link { link_url: $profile.social_profiles.professional_network.url,
+    //                          source: "FullEnrich" }
+
+    // (c) [SKIPPED v1] avatar — FullEnrich does not return one in known samples
+
+    // (d) biography add
+    //     add-person-biography {
+    //       title: $profile.employment.current.title,
+    //       company: $profile.employment.current.company.name,
+    //       data_source_id: 103
+    //     }
+
+    // (e) work_experience iter
+    //     foreach $profile.employment.all[]:
+    //       resolve company via mvp/get-add/master-company
+    //         (preferring company.domain → company.social_profiles.professional_network.url → company.name)
+    //       insert work_experience row with data_source_id: 103,
+    //         carrying title, seniority, start_at, end_at, is_current
+
+    // (f) emails iter — gate on $full.contact_info.emails[] being populated
+    //     foreach email → add-person-email { source: "FullEnrich" }
+
+    // (g) phones iter — gate on $full.contact_info.phones[] being populated
+    //     foreach phone → add-person-phone { source: "FullEnrich" }
+
+    // (h) social links iter
+    //     foreach key in $profile.social_profiles (except professional_network):
+    //       create-master-link { link_url: ...url, source: "FullEnrich" }
+  }
+}
+```
+
+Idempotent on re-runs. Each sub-step in its own try_catch — one bad job_history entry doesn't poison the rest.
+
+## Artifacts (current + proposed)
+
+<Card icon="globe">
+
+```
+Full Enrich → webhook/contact-finished — API 8594
+```
+
+**Public HTTP endpoint** — POST receiver for FullEnrich's async callback. v1.6 stashes payload only. v1.7 (proposed) adds wait + process step. Lives in `Full Enrich` API group (id `1280`, canonical `8hTTyqsU`). Unauthenticated.
+
+</Card>
+
+<Card icon="play">
+
+```
+mvp/enrich/full-enrich-reverse-email-lookup — 13036
+```
+
+**Dispatch function** (already exists, v1.3). POSTs to FullEnrich's bulk reverse-email endpoint. Returns immediately with `enrichment_id`. Caller is `mvp/get-add/master-person` (#12553) when PDL + EL both fail on an email-only seed.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+mvp/enrich/process-full-enrich — TO BE BUILT
+```
+
+**New helper (proposed).** Mirrors the retired `#13033 process-person-rocket-reach`. Reads `person_enrich_data.full_enrich`, applies into master_link / avatar / biography / work_experience / emails / phones / social links. Called from the webhook after the orchestrator-wait completes.
+
+</Card>
+
+<Card icon="database">
+
+```
+person_enrich_data
+```
+
+**Stash target** (unchanged). The webhook writes the raw FullEnrich response here; `process-full-enrich` reads from here.
+
+</Card>
+
+<Card icon="database">
+
+```
+enrich_history_person  (read for race-condition guard — NEW)
+```
+
+**Read-only in webhook.** Track of when the orchestrator started/finished for a given master_person. Used by Step 5 (wait) of the proposed v1.7 webhook flow. May require an orchestrator-side change to set a `completed_at` timestamp on success (see Open Questions).
+
+</Card>
+
+<Card icon="database">
+
+```
+data_source — new row: id=103, source="FullEnrich"
+```
+
+Required so `process-full-enrich` can attribute biography / work_experience / master_link rows correctly. (No avatar provenance — FullEnrich doesn't return one.)
+
+</Card>
+
+## Open questions
+
+### All questions decided (2026-05-30)
+
+| # | Question | Decision |
+| --- | --- | --- |
+| Q1 | Wait mechanism | **Poll-in-webhook.** No cron. Webhook blocks until orchestrator finishes (or times out). |
+| Q2 | "Done" signal | **`enrich_history_person.processing == false`**, keyed by `master_person_id + source == "Master Person Enrich"`. Orchestrator gets a new end-of-pipeline step to flip `processing = false`. |
+| Q3 | Timeout policy | **30 min cap, proceed + `log_crash`.** Orchestrator can run up to ~30 min in the rare worst case. On timeout, fire `process-full-enrich` anyway and log loudly. |
+| Q3.b | Poll interval | **5s fixed.** Up to 360 polls over the 30 min cap. Trivial load (indexed single-row lookup). |
+| Q4 | Early-arrival (no row yet) | **Wait 30s grace, then proceed.** Handles both "orchestrator about to start" and "orchestrator never dispatched". |
+| Q5 | Data source ID for FullEnrich | **Add `id = 103` source = "FullEnrich"** to the `data_source` table. Next sequential ID; mirrors how RocketReach (102, now orphan) was set up. |
+| Q6 | FullEnrich response shape | **Inspected.** See [Response shape](#fullenrich-response-shape-verified-against-one-real-sample) section below for the locked-in field mapping. |
+| Q7 | Backfill across already-stashed rows | **Yes** — `process-full-enrich` fires whenever `person_enrich_data.full_enrich` is non-empty, regardless of how it got there. Idempotent. Matches the Phase 4b (Exa) pattern. |
+
+## FullEnrich response shape (verified against one real sample)
+
+Sampled the only non-empty `person_enrich_data.full_enrich` row across 80+ rows (ped_id=2). FullEnrich's response shape is **substantially different** from the retired RocketReach helper — process-full-enrich is a re-mapping, not a port.
+
+### Top-level keys
+
+```
+full_enrich = {
+  input:        { email: "..." },               // echoed back
+  custom:       { person_enrich_data_id, data_source },  // our carrier
+  profile:      { ...rich profile object },      // present when FullEnrich resolved
+  contact_info: {}                               // empty in this sample (TBD: when populated?)
+}
+```
+
+`profile` is empty `{}` when FullEnrich couldn't resolve the email. `contact_info` is empty in the resolved-profile sample we have — its purpose / population conditions need verification at build time (likely linked to FullEnrich's separate Phone Finder API).
+
+### `full_enrich.profile` field mapping
+
+| Source field | Action in `process-full-enrich` | Notes |
+| --- | --- | --- |
+| `profile.social_profiles.professional_network.url` | **Backfill** `master_person.linkedin_url` when empty; **insert** into `master_link` via `create-master-link` with `source = "FullEnrich"` | Canonical LinkedIn URL — **already a full URL, no reassembly needed**. Different from RocketReach's flat `linkedin_url`. |
+| `profile.social_profiles.professional_network.handle` | Could be stored / used as a slug for reassembly fallback | Optional |
+| `profile.full_name` / `first_name` / `last_name` | Name fallback in Section 9 fullName chain (PDL → EL → FullEnrich → input) | Only meaningful for new-person path |
+| `profile.employment.current` (single object) | **Add biography** row: `{title} at {company.name}`, `data_source_id = 103` | The `current` field is a single position object, not an array. |
+| `profile.employment.all[]` (array of 18 in sample) | **Iterate** → resolve company via `get-add/master-company` (using `company.domain`, `company.name`, `company.social_profiles.professional_network.url`) → insert `work_experience` row | Each entry has `title`, `company` (rich), `start_at`, `end_at`, `seniority`, `is_current`. |
+| `profile.educations[]` | TBD — write to `master_person_education` or similar if such a table exists. Otherwise skip. | Each: `{degree, end_at, start_at, school_name}` |
+| `profile.skills[]` (array of strings) | TBD — likely skip for v1. Skill table integration is out of scope for FullEnrich tier. | Skills are noisy. |
+| `profile.location.country` / `country_code` | Skip for v1 (matches "no location handling yet" caveat in person-enrichment-cascade doc). | Country-only granularity — not as rich as RocketReach. |
+| `profile.social_profiles.{other_platforms}` (only `professional_network` present in sample) | If other keys exist → iterate → `create-master-link` for each `.url` | TBD: what other platforms appear (twitter? github? facebook?) — verify on a different sample. |
+
+### `full_enrich.contact_info` — intentionally unused
+
+The reverse-email endpoint we call (`/api/v2/contact/reverse/email/bulk`) **never populates** `contact_info`. Populating it would require FullEnrich's separate **Phone & Email Finder** add-on — different endpoint, different credits.
+
+And we don't actually need it. **The LinkedIn URL is the only field we need from FullEnrich.** Once `master_person.linkedin_url` is backfilled in step (a), downstream enrichment (Exa, PDL-by-linkedin, ScrapeCreators via `create-master-link`'s domain hook) picks up emails, phones, biographies, and more via the LinkedIn path.
+
+`process-full-enrich` v1.2 removed the aspirational `(f)` emails and `(g)` phones blocks accordingly. Task #15 (verify `contact_info` shape) is **WONTFIX** for the same reason.
+
+### Fields NOT returned (vs RocketReach)
+
+- **Avatar / profile image** — not present in the sample's `profile`. `master_person.avatar` will NOT be backfilled from FullEnrich (unlike the retired RocketReach helper that wrote from `raw.profile_pic`).
+- **City / region** — only `location.country` + `country_code` available. No granular location.
+- **Direct `linkedin_url` field** — must go through `social_profiles.professional_network.url`.
+
+## Context for future agents
+
+**Workspace:** Xano workspace `id=3` (Orbiter v2).
+
+**Frequently referenced tables:**
+
+| Table | id | Notes |
+| --- | --- | --- |
+| `master_person` | 139 | Primary person record |
+| `master_link` | 166 | LinkedIn/twitter/etc social URLs |
+| `work_experience` | 147 | Job history rows |
+| `about_person` | 365 | Biography records (hash-deduped) |
+| `person_enrich_data` | 500 | Per-source enrichment stash. `full_enrich` json field is the FullEnrich payload. |
+| `enrich_history_person` | 160 | Orchestrator state (used by webhook wait loop). Source-keyed in v3.8+. |
+| `data_source` | 161 | Vendor lookup (row 103 = "FullEnrich") |
+| `runtime_metadata` | 733 | New — `{key:"data_source_name", value:<live\|staging\|sandbox>}` per data source |
+
+**Frequently referenced functions / APIs:**
+
+| Artifact | id | Version | Role |
+| --- | --- | --- | --- |
+| Webhook `webhook/contact-finished` (group "Full Enrich" 1280, canonical `8hTTyqsU`) | API 8594 | v1.8 | FullEnrich callback receiver, wait + process |
+| `mvp/enrich/process-full-enrich` | 13049 | v1.1 | Applies FullEnrich payload to master_person (dedup-safe) |
+| `mvp/enrich/enrich-master-person` | 13040 | v3.8 | Active orchestrator (was #12554 v3.8 retired predecessor) |
+| `mvp/enrich/full-enrich-reverse-email-lookup` | 13036 | v1.3 | Dispatcher to FullEnrich bulk endpoint |
+| `mvp/get-add/master-person-new` | 13039 | v1.7 | Caller — auto-detects data_source via `runtime_metadata` |
+| `mvp/get-add/master-person` | 12553 | v3.21 | Older sibling — **NOT YET patched with v1.7-style auto-detect.** Webhook v1.8 guard protects production. Apply the same edit when convenient. |
+| `mvp/get-add/master-person-from-exa` | 12997 | v1.3 | LinkedIn URL normalization (canonical with `www.`) |
+
+## Pending verification + remaining work
+
+These items survived the previous session and want a future agent's attention. Roughly in order of value.
+
+1. **Re-verify `process-full-enrich` v1.1 work_experience dedup actually no-ops on duplicates.** Sandbox `master_person.id=1` (Carl Bressler) has 30 work_experience rows from the pre-dedup test run. To validate: re-invoke `mvp/enrich/process-full-enrich` with `master_person_id=1` in sandbox. Expected: count of work_experience rows for that master_person_id stays at 30 (no new rows added). Check via `searchTableContent` on table 147 with `{master_person_id: 1}`.
+
+2. **Re-verify `#12997` v1.3 LinkedIn URL normalization.** Sandbox has two Carl rows because v1.0–v1.2 didn't normalize `www.`: `id=1` (FullEnrich, with `www.`), `id=34` (Exa, without `www.`). Trigger another Exa C-Suite enrichment that surfaces Carl, OR delete sandbox `master_person.id=34` and re-run the full Carl flow — expectation: single Carl row, no duplicate.
+
+3. ~~**Task #15 — `contact_info` shape verification.**~~ **WONTFIX (v1.2).** The reverse-email endpoint never populates `contact_info`, and the LinkedIn URL is all we actually need from FullEnrich — downstream Exa/PDL/EL handle emails/phones via the LinkedIn path. `process-full-enrich` v1.2 removed the (f) and (g) blocks.
+
+4. **Patch `#12553`** with the same v1.7 marker-table fallback that `#13039` got. Webhook v1.8 guard protects production from broken dispatches in the meantime, but #12553 is still a live caller of #13036.
+
+5. **Step (h) of `process-full-enrich` — additional social_profiles platforms (twitter/github/etc).** Currently deferred to a no-op comment. Implement when a sample callback shows platforms beyond `professional_network` in `profile.social_profiles`.
+
+6. **Drop "proposed" markers in this doc and finalize.** This is task #16 from the build plan. Most of the work landed already; just a polish pass.
+
+## FullEnrich HTTP-retry observation (not a blocker, worth tracking)
+
+FullEnrich's HTTP client times out (~30–60s) before our webhook's 95–180s wait+process cycle completes. They retry the callback 3–5x per email. v1.8's safety guard + v1.1's dedup + master_link/about_person's existing hash-dedup mean retries are now idempotent: each retry no-ops on the same data. If retry pressure becomes a problem in production, the fallback design is to invert the webhook (return 200 immediately after stash, have the orchestrator end-step trigger process-full-enrich) — described as Option C in the original Q1 design question.
+
+## Implementation plan
+
+All questions decided. Build order — each step is independently committable.
+
+| # | Step | Risk | Status |
+| --- | --- | --- | --- |
+| 1 | Add `data_source` row `id=103, source="FullEnrich"` | Low | ✅ Deployed 2026-05-30 |
+| 2 | Verify XanoScript supports `while` + blocking sleep. Confirmed `while` + `util.sleep` (native, no api.lambda needed). Tested up to 180s held requests. | Medium | ✅ Deployed 2026-05-30 |
+| 3 | Update orchestrators (`#13040` + retired `#12554`): switch enrich_history_person key from `data_source_id == 79` to `source == "Master Person Enrich"`; add end-of-pipeline `processing = false` step that runs regardless of `$hasCrash`. Both bumped to v3.8. | Medium | ✅ Deployed 2026-05-30 |
+| 4 | Build `mvp/enrich/process-full-enrich` (new helper). Test in isolation against ped_id=2 (the known good sample) | Medium — careful field mapping per [Response shape](#fullenrich-response-shape-verified-against-one-real-sample) | ⚠️ Built (#13049 v1.0) — isolation test **aborted**; ped_id=2 sample is misaligned (Leon Silverman payload routed onto Mark Pederson's master_person row, almost certainly an early manual test callback). Validation deferred to Step 6 end-to-end. See [Step 4 details](#step-4--process-full-enrich-built-but-not-yet-isolation-tested). |
+| 5 | Update webhook v1.6 → v1.7: add Step 4 (resolve master_person_id from person_enrich_data), Step 5 (wait loop), Step 6 (call process-full-enrich) | Medium — wait-loop XanoScript pattern verified | ✅ Deployed 2026-05-30 |
+| 6 | Validate end-to-end with a real email-only seed that fails PDL + EL: confirm webhook arrives, waits, processes, and `master_person` has correct master_link / bio / work_experience rows | High — full integration | pending |
+| 7 | Inspect a real callback with non-empty `contact_info` (when found) to verify the emails/phones mapping (currently hypothesized) | Low (read-only) | pending |
+| 8 | Update this doc with final v1.7 details (drop "proposed" markers, fold in any deviations from this plan) | Low | pending |
+
+### Production incident — Carl Bressler → Robert Boulos data corruption (2026-05-30)
+
+End-to-end test on Carl Bressler exposed a routing bug in `#13039` (`mvp/get-add/master-person-new`). The function accepted `data_source` as an optional input that callers were expected to pass when running in non-default data sources. The sandbox dispatch invoked it without that input, so `#13036` was called with `data_source: null`. FullEnrich's callback then arrived at the webhook with empty `custom.data_source`, fell through the per-branch `db.set_datasource` conditional, and **wrote to LIVE's `person_enrich_data.id=3` row (Robert Boulos, real Orbiter user) instead of sandbox's row**.
+
+Compounded by FullEnrich's HTTP client retrying — their timeout is shorter than the v1.7 webhook's 95–180s wait+process cycle — the callback fired 5 times, each one adding fresh contaminated rows. Final damage on Robert: 60 fake `work_experience` rows (Carl's job history at MovieLabs, Hallstone Ventures, etc.), 1 `about_person` biography ("Co Executive Producer / Founder at Stealth Startup"), and Carl's FullEnrich payload pinned to Robert's enrich row. **All cleaned up** via `deleteTableContentBulk` + `deleteTableContentItem` + wiping `full_enrich`. master_link was protected by `create-master-link`'s built-in dedup — no contamination there.
+
+Fix shipped in two parts:
+
+**Webhook v1.8 — emergency safety guard.** Refuses any callback item with empty `custom.data_source`. Logs to `log_crash`, returns ok=true (so FullEnrich stops retrying), counts as `refused_no_data_source` in the response. Stopped the bleeding within seconds.
+
+**`#13039` v1.7 — data_source auto-detect via marker table.** New table `runtime_metadata` (id=733) with schema `{id, key, value, updated_at}` and a `UNIQUE` btree on `key`. Each data source holds its own copy of one row: `{key:"data_source_name", value:"live"}` (or staging/sandbox). At FullEnrich dispatch time, `#13039` now:
+
+1. Prefers caller-supplied `$input.data_source` if non-empty (explicit override still wins).
+2. Otherwise queries `runtime_metadata where key=="data_source_name"` and uses `value` as the data source.
+3. Failed lookups `log_crash` and pass empty — webhook v1.8 will then refuse it. Belt and braces.
+
+`#12553 mvp/get-add/master-person` (the older sibling) was **not yet updated** — webhook v1.8's guard provides safety until it's patched the same way.
+
+### Step 5 — webhook v1.7 deployed (2026-05-30)
+
+The FullEnrich webhook now extends v1.6's stash with the wait + process steps. New per-item logic after the existing `db.edit person_enrich_data { full_enrich: $item }`:
+
+1. `db.get person_enrich_data by id → $masterPersonId` (resolve target person)
+2. If `$masterPersonId > 0`:
+   - **Wait loop:** native XanoScript `while` + `util.sleep 5`, polling `enrich_history_person where master_person_id == X && source == "Master Person Enrich"`. Exits when `processing == false`, or 30s grace expires with no row, or 30 min cap hit.
+   - **Process:** `function.run "mvp/enrich/process-full-enrich"` with master_person_id (and cascade_depth: 0).
+3. Each guard wrapped in `try_catch`. Wait-loop failures don't block processing (log_crash + proceed). Process failures log_crash but don't fail the webhook response.
+
+**New response counters:**
+
+```json
+{
+  "ok": true,
+  "id": "...",
+  "status": "...",
+  "items": 1,
+  "matched_ped": 1,    // items stashed onto person_enrich_data
+  "processed": 1,      // items successfully applied via process-full-enrich
+  "wait_timeouts": 0,  // items where wait hit the 30 min cap
+  "skipped": 0         // items with no resolvable person_enrich_data_id
+}
+```
+
+**Smoke tests (2026-05-30):**
+
+| Test | Payload | Response | Result |
+| --- | --- | --- | --- |
+| Empty data array | `data: []` | `items:0, matched_ped:0, processed:0, skipped:0` | ✅ |
+| Item with no `custom.person_enrich_data_id` and `name` not matching `ped__*` | One bare item | `items:1, matched_ped:0, processed:0, skipped:1` | ✅ |
+
+These confirm v1.7 parses and routes correctly; end-to-end behavior (actual wait + process) lands in Step 6.
+
+### Step 4 — process-full-enrich built but not yet isolation-tested
+
+**Function:** `mvp/enrich/process-full-enrich` (#13049, v1.0). XanoScript parsed cleanly via `createFunction`. Mirrors the structure of `#13031 mvp/enrich/process-person-exa-profile` (the Phase 4b helper) so the per-step `try_catch` pattern, `master_company` resolution, and `work_experience` row insertion are battle-tested approaches.
+
+**Why isolation testing was skipped:** the only `person_enrich_data` row with non-empty `full_enrich` (ped_id=2) is **misaligned data**. Its `master_person_id` field points at id=2 (Mark Pederson), but the `full_enrich.profile` is for `leon.d.silverman@gmail.com` (a different person — Leon Silverman, Venture Partner at Hallstone Ventures). Almost certainly an early manual test callback that built the payload with `custom.person_enrich_data_id="2"` regardless of the real email.
+
+Running the function against this row would have:
+- Overwritten `master_person.linkedin_url` for Mark with `linkedin.com/in/leonsilverman`
+- Added "Venture Partner at Hallstone Ventures" biography to Mark's record
+- Inserted 18 work_experience rows (MovieLabs, Disney, etc.) — all for Leon — onto Mark's profile
+
+**Validation is deferred to Step 6 (end-to-end test)** where we'll deliberately construct an email-only seed that fails PDL + EnrichLayer, watch FullEnrich → webhook → process-full-enrich, then verify the resulting master_person matches the seed identity.
+
+### Misaligned ped_id=2 cleanup — done 2026-05-30
+
+The Leon Silverman `full_enrich` payload misaligned onto Mark Pederson's `person_enrich_data` row was cleared via `updateTableContentItem` setting `full_enrich = {}`. All other fields on the row (people_data_labs, enrich_layer_data, etc.) preserved intact. Safe to run process-full-enrich backfill sweeps now.
+
+### Step 3 — orchestrator v3.8 details (deployed)
+
+Both `mvp/enrich/enrich-master-person` (#13040) and the retired predecessor `mvp/enrich/run-base-person-enrich` (#12554) updated to v3.8. Changes:
+
+- **Setup block:** `db.query enrich_history_person` (debounce + upsert) now keys on `source == "Master Person Enrich"` instead of `data_source_id == 79`. New rows created via `db.add` set BOTH `data_source_id: 79` (backward compat) AND `source: "Master Person Enrich"` (new primary key).
+- **End-of-pipeline marker (new):** after Phase 12 and before the "all phases passed" success block, a new `try_catch` block re-queries `enrich_history_person` by `(master_person_id, source == "Master Person Enrich")` and flips `processing = false`. Runs **regardless of `$hasCrash`** — so crashed orchestrations don't leave the flag stuck. The re-query (vs reusing `$enrichHistoryBase`) is intentional: if the setup block crashed, `$enrichHistoryBase` may not have been bound.
+
+Existing `enrich_history_person` rows from past runs that don't have `source` set are now functionally orphaned (the new queries won't find them). Acceptable — they're historical records, not load-bearing. Possible future migration: backfill `source = "Master Person Enrich"` on rows where `data_source_id == 79`.
+
+## Version history (v1.6 deployed, v1.7 proposed)
+
+| Version | Date | Change |
+| --- | --- | --- |
+| v1.0 | 2026-05-26 | Initial — wrote only to `email_enrich_fallback` by email. |
+| v1.1 | 2026-05-26 | Primary route is now `person_enrich_data` via `custom.person_enrich_data_id`. `email_enrich_fallback` retained for legacy callers. |
+| v1.2 | 2026-05-26 | TEMPORARY DEBUG — `log_crash` the raw `$item` + parsed `$pedId` on every call. |
+| v1.3 | 2026-05-26 | Dual carrier (custom + name) + `data_source` override via `db.set_datasource`. Debug `log_crash` still active. |
+| v1.4 | 2026-05-27 | Wrap `db.set_datasource` in `try_catch`. Drop `data_source` from name-parse fallback. |
+| v1.5 | 2026-05-27 | `db.set_datasource` needs LITERAL value; per-branch conditional dispatch over (live / staging / sandbox). |
+| v1.6 | 2026-05-30 | Drop `email_enrich_fallback` branch and table (vendor-validation pass complete). Drop the DEBUG `log_crash`. No-id callbacks now `skipped`+`ok=true`. |
+| **v1.7 (proposed)** | TBD | **Add wait-for-orchestrator + process-full-enrich step.** Webhook stops being a pure stash receiver; now ends with the FullEnrich payload fully applied to the master_person.|

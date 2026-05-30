@@ -1,10 +1,14 @@
 ---
 title: "Person Enrichment Cascade"
-description: "Four-tier fallback waterfall (PDL → RocketReach → EnrichLayer → Exa) for resolving a master_person from sparse inputs — especially email-only seeds where PDL returns 404 or returns 200 with no work history."
+description: "Fallback waterfall (PDL → EnrichLayer → Exa) for resolving a master_person from sparse inputs — especially email-only seeds where PDL returns 404 or returns 200 with no work history."
 ---
 
 <Note>
-Two functions cooperate on this cascade. `mvp/get-add/master-person` (#12553) runs the synchronous tiers needed to land a clean `master_person` row (linkedin_url + name). `mvp/enrich/run-base-person-enrich` (#12554) then fires Phase 4b (Exa) and Phase 4c (RocketReach) which fully process the stashed payloads into bios, avatar, work_experience, social links, emails, and phones. Every API response is stashed onto `person_enrich_data` so downstream phases can re-process without re-paying.
+Two functions cooperate on this cascade. `mvp/get-add/master-person` (#12553) runs the synchronous tiers needed to land a clean `master_person` row (linkedin_url + name). `mvp/enrich/enrich-master-person` (#13040) / `mvp/enrich/run-base-person-enrich` (#12554, retired predecessor) then fires Phase 4b (Exa) which fully processes the stashed Exa payload into bios, avatar, and work_experience. Every API response is stashed onto `person_enrich_data` so downstream phases can re-process without re-paying.
+</Note>
+
+<Note>
+**2026-05-30 — RocketReach retired.** The Tier 2 RocketReach `/api/v2/person/lookup` call and the Phase 4c RocketReach processing helper (#13033) were both removed. Function `mvp/get-add/master-person` v3.21 (2026-05-26) had already replaced the RocketReach tier with an EnrichLayer fallback gated on PDL 404 (email path → #12734, linkedin path → #12612). The downstream orchestrators (#13040 + #12554) dropped Phase 4c in v3.7. The detail of the v3.21 EnrichLayer fallback's gate logic isn't fully captured below — refer to #12553's docstring for canonical behavior. Tier numbering has been compacted (old Tier 3 → Tier 2, old Tier 4 → Tier 3).
 </Note>
 
 ## Why this exists
@@ -16,42 +20,30 @@ Before v3.8, a PDL 404 or PDL-with-no-experience produced a junk placeholder row
 ## The cascade
 
 ```
-mvp/get-add/master-person (#12553)
-─────────────────────────────────
+mvp/get-add/master-person (#12553) — v3.21
+──────────────────────────────────────────
 PDL call 1   ($input.email + name + linkedin if any)
  │
  ├─ status 200 with work_history ─────► proceed normally
  │
- └─ status 404  OR  no work_history ──► (email present?)
-                                          │
-                                          ▼
-              Tier 2 — RocketReach /api/v2/person/lookup
-                ├─ returns linkedin → set $linkedinUrl ──► PDL call 2 (with linkedin)
-                │                                              │
-                │                                              ▼
-                │                                          proceed with richer PDL data
-                └─ no linkedin
-                      │
-                      ▼ (only if $api1.status is still 404 + linkedin empty)
-              Tier 3 — EnrichLayer /v2/profile/resolve/email
-                ├─ public_identifier → build linkedin URL → set $linkedinUrl
-                └─ no linkedin
-                      │
-                      ▼ (only if $api1.status is still 404 + linkedin present)
-              Tier 4 — Exa get-exa-profile
+ └─ status 404 ──► (which input do we have?)
+                    ├─ email present → Tier 2a — EnrichLayer /v2/profile/resolve/email (#12734)
+                    └─ no email, but linkedin present → Tier 2b — EnrichLayer /v2/profile (#12612)
+                    │
+                    ▼ (if $api1.status is still 404 AND linkedin present)
+                  Tier 3 — Exa get-exa-profile (#12936)
 
-mvp/enrich/run-base-person-enrich (#12554)
-──────────────────────────────────────────
-Phase 4b — process Exa stash (#13031)
-Phase 4c — backfill (if PDL=404 + rocket_reach empty + email)
-          + process RocketReach stash (#13033)
+mvp/enrich/enrich-master-person (#13040)
+mvp/enrich/run-base-person-enrich (#12554)  [retired predecessor]
+────────────────────────────────────────────
+Phase 4b — process Exa stash (#13031) → bios, avatar, work_experience
 ```
 
 ## Tier-by-tier
 
 ### Tier 1 — People Data Labs
 
-Always fires (when `cascade_depth == 0`). Returns a profile or a 404. After the first call, the cascade may re-run PDL a second time if RocketReach surfaces a linkedin URL.
+Always fires (when `cascade_depth == 0`). Returns a profile or a 404.
 
 ```
 GET https://api.peopledatalabs.com/v5/person/enrich
@@ -60,45 +52,21 @@ GET https://api.peopledatalabs.com/v5/person/enrich
 
 Stored at `person_enrich_data.people_data_labs`.
 
-### Tier 2 — RocketReach Person Lookup
+### Tier 2 — EnrichLayer Fallback (v3.21)
 
-**Function:** `mvp/enrich/get-rocketreach-person` (#13032)
-**Env var:** `$env.ROCKET_REACH`
-**Gate (v3.14):** `($input.email|first is non-empty) AND ($api1.status == 404 OR PDL has no data.experience)`
-
-```
-GET https://api.rocketreach.co/api/v2/person/lookup?email={email}
-  Header: Api-Key: {key}
-```
-
-Returns a rich profile keyed off the email — `linkedin_url` (already a full URL, no reassembly needed), `name`, `current_title`, `current_employer` (+ `current_employer_domain` / `_website` / `_linkedin_url` / `_industry`), `location` / `city` / `region` / `country`, `profile_pic`, `phones[]`, `emails[]`, `job_history[]`, `education[]`, `skills[]`, plus a `links` object of social profiles.
-
-The killer feature versus Hunter.io: **RocketReach resolves on both personal and work emails.** No classify-email gate is needed. RocketReach uses `Api-Key:` header auth (not `Authorization: Bearer`), and headers must be passed as an array of `"Key:value"` strings — `headers = []|push:("Api-Key:"|concat:$env.ROCKET_REACH:"")` — not as an object.
-
-**v3.14 — PDL re-run.** When Tier 2 returns a `linkedin_url`, `mvp/get-add/master-person` re-calls PDL with the linkedin so PDL can supply the work history / richer data that triggered Tier 2 in the first place. The original Tier 3/4 gates still consider the final `$api1.status`, so a successful re-run cleanly skips them.
-
-**Stashed only here.** Bios, avatar, work_experience, emails, phones, and social links are processed by `mvp/enrich/process-person-rocket-reach` (#13033) in Phase 4c of `run-base-person-enrich`.
-
-Stored at `person_enrich_data.rocket_reach` (json, added in v3.9 as `hunter`, renamed in v3.12).
-
-### Tier 3 — EnrichLayer Reverse Email Lookup
-
-**Function:** `api/enrich_layer/person-email` (#12734) — *already existed* prior to v3.10
+**Functions:** `api/enrich_layer/person-email` (#12734), `api/enrich_layer/person-linkedin` (#12612)
 **Env var:** `$env.ENRICH_LAYER`
-**Gate:** `$api1.status == 404 && $linkedinUrl is still empty && $input.email|first is non-empty`
+**Gate:** `$api1.status == 404`
 
-```
-GET https://enrichlayer.com/api/v2/profile/resolve/email
-  ?email={email}&lookup_depth=deep&enrich_profile=enrich
-```
+Two sub-paths, picked by what input we have:
 
-The `lookup_depth=deep` parameter is what makes EnrichLayer a useful Tier 3 — it goes beyond their cache and runs heuristic resolution. `enrich_profile=enrich` then inlines the cached LinkedIn profile data, so we get both the resolved URL AND the profile payload in one round-trip.
+- **Email path (Tier 2a)** — gate: `($api1.status == 404) && ($input.email|first is non-empty)` → calls `#12734` (`/v2/profile/resolve/email?lookup_depth=deep&enrich_profile=enrich`). The `lookup_depth=deep` parameter goes beyond EnrichLayer's cache and runs heuristic resolution. The helper extracts `response.result.profile`, which has the same shape as `api/enrich_layer/person-linkedin` — so downstream code that already knows how to consume `enrich_layer_data` can consume this too. We rebuild the URL from `public_identifier` (`https://www.linkedin.com/in/{slug}`) and assign it to `$linkedinUrl`.
 
-The helper extracts `response.result.profile`, which has the same shape as `api/enrich_layer/person-linkedin` — meaning downstream code that already knows how to consume `enrich_layer_data` can consume this too. We rebuild the URL from `public_identifier` (`https://www.linkedin.com/in/{slug}`) and assign it to `$linkedinUrl`.
+- **LinkedIn path (Tier 2b)** — gate: `($api1.status == 404) && ($input.email is empty) && linkedin present` → calls `#12612` (`/v2/profile/{linkedin_url}`). Returns the same profile shape; we extract `linkedin_url` (rebuilt from public_identifier) and `profile_pic_url`.
 
-Stored at `person_enrich_data.enrich_layer_email` (json, added in v3.10 — distinct from `enrich_layer_data` which is from the linkedin-url path).
+Stored at `person_enrich_data.enrich_layer_email` (email-path response) or `person_enrich_data.enrich_layer_data` (linkedin-path response). `master_link` writes from EL use `source = "Enrich Layer"`. `$inputEmailSource` resolves to `"People Data Labs" | "Enrich Layer" | null`.
 
-### Tier 4 — Exa Profile Search
+### Tier 3 — Exa Profile Search
 
 **Function:** `mvp/enrich/get-exa-profile` (#12936)
 **Gate:** `$api1.status == 404 && $linkedinUrl is non-empty`
@@ -110,74 +78,51 @@ POST https://api.exa.ai/search
 
 Exa runs a "people"-category search keyed off the candidate's name, then filters results to the one whose URL contains the LinkedIn slug. It returns a rich `matched` object with `summary`, `highlights[]`, `image`, and `entities[0].properties.workHistory[]`.
 
-The Exa response is **stashed only here** — actual processing of `workHistory` into `work_experience` rows happens later in `mvp/enrich/run-base-person-enrich` Phase 4b via the helper `mvp/enrich/process-person-exa-profile` (#13031). That phase reads `person_enrich_data.exa`, iterates `workHistory`, resolves each company via `get-add/master-company`, and adds `master_person` biographies + avatar.
+The Exa response is **stashed only here** — actual processing of `workHistory` into `work_experience` rows happens later in the orchestrator's Phase 4b via the helper `mvp/enrich/process-person-exa-profile` (#13031). That phase reads `person_enrich_data.exa`, iterates `workHistory`, resolves each company via `get-add/master-company`, and adds `master_person` biographies + avatar.
 
 Stored at `person_enrich_data.exa` (json, added in v3.8).
-
-## Phase 4c — RocketReach processing (in #12554)
-
-The synchronous tier in #12553 only uses RocketReach for `linkedin_url` (to feed the PDL re-run) and `name` (as a fallback in the Section 9 chain `PDL.full_name → RocketReach.raw.name → EL.full_name → input.full_name`). All other RocketReach data is processed asynchronously in Phase 4c of the orchestrator via `mvp/enrich/process-person-rocket-reach` (#13033).
-
-Phase 4c has two passes:
-
-1. **Backfill pass** — gated on `rocket_reach is empty AND PDL.status == 404 AND email present`. Pulls the first `master_email` row for the person, calls #13032, persists. Catches the case where #12553's RocketReach tier didn't fire (no email at creation time, or persisted after RocketReach was added).
-2. **Process pass** — gated on `rocket_reach.raw is non-empty`. Applies, with each in its own try/catch:
-   - **(a)** Backfill `master_person.linkedin_url` when empty.
-   - **(b)** Insert the LinkedIn URL into `master_link` via `create-master-link` with `source = "RocketReach"`.
-   - **(c)** Replace `master_person.avatar` from `profile_pic` when empty (via `replace-avatar` with `data_source: 102`).
-   - **(d)** Add a biography row built from `current_title at current_employer` (via `add-person-biography` with `data_source_id: 102`).
-   - **(e)** Iterate `job_history[]` → resolve company via `get-add/master-company` → insert a `work_experience` row.
-   - **(f)** Iterate `emails[]` → `add-person-email` with `source = "RocketReach"`.
-   - **(g)** Iterate `phones[]` → `add-person-phone` (carrying RocketReach's `country_code`) with `source = "RocketReach"`.
-   - **(h)** Iterate the `links{}` object (twitter / github / facebook / etc) → `create-master-link` for any http(s) URL.
-
-The processing pass fires whenever `rocket_reach.raw` is populated, regardless of how it got there — so Phase 4c is idempotent and catches up rows whose RocketReach data was added later.
 
 ## What lands on `person_enrich_data`
 
 | Column | Source | When populated |
 |---|---|---|
-| `people_data_labs` | PDL `/v5/person/enrich` envelope (final state after any re-run) | Always (cascade_depth == 0) |
-| `enrich_layer_data` | EL `/v2/profile/{linkedin_url}` | When linkedin_url present (any tier) |
-| `enrich_layer_email` | EL `/v2/profile/resolve/email` profile | Tier 3 — PDL 404 + no linkedin upstream |
-| `rocket_reach` | RocketReach `/api/v2/person/lookup` profile | Tier 2 — (PDL 404 OR no work_history) + email |
-| `exa` | Exa `/search` matched object | Tier 4 — PDL 404 + linkedin URL (from any tier) |
+| `people_data_labs` | PDL `/v5/person/enrich` envelope | Always (cascade_depth == 0) |
+| `enrich_layer_data` | EL `/v2/profile/{linkedin_url}` | When linkedin path taken (Tier 2b) |
+| `enrich_layer_email` | EL `/v2/profile/resolve/email` profile | When email path taken (Tier 2a) |
+| `exa` | Exa `/search` matched object | Tier 3 — PDL 404 + linkedin URL present |
 
-All five columns are `json`, `nullable: false`, default `""`. The writes happen at two persist sites:
+All columns are `json`, `nullable: false`, default `""`. The writes happen at two persist sites:
 
-- **Section 7** of `mvp/get-add/master-person` (existing person path) — five separate gated `db.edit person_enrich_data` blocks, each conditional on the corresponding stash being non-empty.
-- **Section 9** (new person path) — a single `db.edit person_enrich_data` with all five fields in the data block.
+- **Section 7** of `mvp/get-add/master-person` (existing person path) — separate gated `db.edit person_enrich_data` blocks, each conditional on the corresponding stash being non-empty.
+- **Section 9** (new person path) — a single `db.edit person_enrich_data` with all fields in the data block.
 
 ## Resilience
 
-Every tier is wrapped in its own `try_catch`. A vendor outage on RocketReach doesn't block EnrichLayer; an EnrichLayer failure doesn't block Exa. Failures write a `log_crash` row with the email/url payload and continue. Phase 4c likewise wraps each sub-step (a–h) independently so one bad job_history entry doesn't poison the rest.
+Every tier is wrapped in its own `try_catch`. An EnrichLayer failure doesn't block Exa. Failures write a `log_crash` row with the email/url payload and continue. Phase 4b (Exa processing in the orchestrator) wraps each sub-step independently so one bad workHistory entry doesn't poison the rest.
 
 ## What's NOT in the cascade
 
-- **No name/phone-only resolution.** All three new tiers require an email. A phone-only seed still falls back to the thin-record path.
-- **No second-pass on Tier 3/4.** Tiers don't retry. If RocketReach returns a linkedin URL that's wrong, the PDL re-run + downstream phases happily use it and we end up with a polluted `master_person.linkedin_url`. Watch `log_crash` for "PDL re-run with RocketReach linkedin threw" or "phase-4c" rows in the first weeks of production traffic.
-- **No company-side cascade in #12553.** RocketReach returns `current_employer_domain` / `_linkedin_url` / `_industry`. Phase 4c's `(e)` step resolves the *job_history* companies via `get-add/master-company`, but the **current** employer linkage isn't separately wired — it ends up in `work_experience` once it appears as an `is_current` entry in `job_history`.
-- **No location handling yet.** RocketReach's `location` / `city` / `region` / `country` aren't yet resolved into `master_person.primary_location_id`. Deferred pending a `master_location` resolver helper.
+- **No name/phone-only resolution.** All tiers require either an email or a linkedin URL. A phone-only seed still falls back to the thin-record path.
+- **No second-pass on Tier 3.** If EnrichLayer returns a linkedin URL that's wrong, downstream phases happily use it and we end up with a polluted `master_person.linkedin_url`. Watch `log_crash` for issues in the first weeks of production traffic.
+- **No location handling yet.** Deferred pending a `master_location` resolver helper.
 
 ## Files touched
 
 | File | Change |
 |---|---|
-| `mvp/get-add/master-person` (#12553) | v3.14 — RocketReach Tier 2 fires on (PDL 404 OR no work_history); PDL re-runs after RocketReach returns linkedin; RocketReach name added to Section 9 fullName fallback chain |
-| `mvp/enrich/get-rocketreach-person` (#13032) | v2.4 — RocketReach `/api/v2/person/lookup` wrapper. Api-Key header via `[]|push:concat` array; env-var guard; plain `text` input |
-| `mvp/enrich/process-person-rocket-reach` (#13033) | v1.5 — Phase 4c helper: backfill on (PDL=404 + rocket_reach empty + email); comprehensive processing of linkedin/avatar/bio/work_experience + emails/phones/social links |
-| `mvp/enrich/run-base-person-enrich` (#12554) | v3.6 — Phase 4c call between Phase 4b (Exa) and Phase 5 (Fundable) |
+| `mvp/get-add/master-person` (#12553) | v3.21 — RocketReach removed; EnrichLayer fallback gated on PDL 404 (email path #12734, linkedin path #12612). Replaced the previous Tier 2 RocketReach + Tier 3 EnrichLayer-email structure. |
+| `mvp/enrich/enrich-master-person` (#13040) | v3.7 — Removed Phase 4c (RocketReach). Phase 4b (Exa) and Phases 5+ continue unchanged. |
+| `mvp/enrich/run-base-person-enrich` (#12554) | v3.7 — Same Phase 4c removal (retired predecessor of #13040). |
 | `mvp/enrich/process-person-exa-profile` (#13031) | Phase 4b helper — unchanged |
-| `api/enrich_layer/person-email` (#12734) | Tier 3 helper — unchanged |
-| `mvp/enrich/get-exa-profile` (#12936) | Tier 4 helper — unchanged |
-| `person_enrich_data` table | Columns: `rocket_reach` (renamed from `hunter` in v3.12), `enrich_layer_email` |
-| `data_source` table | Row `102 = "RocketReach"` (used by Phase 4c bios / work_experience / avatar) |
+| `api/enrich_layer/person-email` (#12734) | EnrichLayer email path — unchanged |
+| `api/enrich_layer/person-linkedin` (#12612) | EnrichLayer linkedin path — used in Tier 2b |
+| `mvp/enrich/get-exa-profile` (#12936) | Tier 3 helper — unchanged |
+| `person_enrich_data` table | `rocket_reach` column dropped 2026-05-30. `enrich_layer_email` retained. |
 
 ## Env vars required
 
 | Var | Used by |
 |---|---|
-| `PEOPLE_DATA_LABS` | Tier 1 (existing) |
-| `ROCKET_REACH` | Tier 2 + Phase 4c backfill |
-| `ENRICH_LAYER` | Tier 3 + the existing linkedin-url EL call |
-| `exa` | Tier 4 (existing, used by `get-exa-profile`) |
+| `PEOPLE_DATA_LABS` | Tier 1 |
+| `ENRICH_LAYER` | Tier 2 (email + linkedin paths) + the existing linkedin-url EL call |
+| `exa` | Tier 3 (used by `get-exa-profile`) |

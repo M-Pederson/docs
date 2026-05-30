@@ -4,20 +4,21 @@ description: "Receiver for FullEnrich async callbacks. FullEnrich is the last-re
 ---
 
 <Note>
-**Status as of end of session 2 (2026-05-30) — fully shipped + validated.**
+**Status as of end of session 3 (2026-05-30) — fully shipped + extended.**
 
-✅ All design questions answered, all code deployed, end-to-end validated in sandbox.
+✅ Session 2 baseline (dispatch → callback → wait → process → master_person) shipped and validated.
+✅ Session 3 adds: temp_ name backfill via `#2649` LLM, PDL retry on the resolved linkedin_url, EnrichLayer fallback when PDL still has no experience, and a fix to `#2649` so its structured-output schema actually applies.
 ✅ Production incident (Carl Bressler → Robert Boulos data corruption) cleaned up — see [Production incident](#production-incident--carl-bressler--robert-boulos-data-corruption-2026-05-30).
-✅ FullEnrich integration is functionally working: dispatch → callback → wait → process → master_person populated correctly. LIVE Robert Boulos unaffected.
+✅ Dedup of `work_experience` re-verified — count is stable across retries.
 
-**Currently deployed versions:** webhook v1.8, `process-full-enrich` v1.2, orchestrators v3.8, `#13039` v1.7, `#12997` v1.3, runtime_metadata table seeded across all data sources.
+**Currently deployed versions:** webhook v1.8, `process-full-enrich` **v1.7**, `mvp/format/name-format` **v3.4**, orchestrators v3.8, `#13039` v1.7, `#12997` v1.3, runtime_metadata table seeded across all data sources.
 
 **Pick up here in the next session — top priorities:**
 
-1. **Re-verify `process-full-enrich` v1.1 work_experience dedup** actually no-ops on duplicates. Sandbox Carl (`master_person.id=1`) has 30 work_experience rows from the pre-v1.1 run. Re-invoke `process-full-enrich(master_person_id=1)` in sandbox and confirm the count stays at 30.
-2. **Re-verify `#12997` v1.3 LinkedIn URL normalization.** Sandbox has two Carl rows (id=1 with `www.`, id=34 without). Delete id=34 + dependents, re-trigger a flow that surfaces Carl via Exa — expectation: matches id=1, no new row.
+1. **End-to-end fresh Carl test (post-wipe).** Wipe sandbox + re-trigger an email-only seed. Verify each step of v1.7 lands cleanly: (a) linkedin_url backfill, (b) master_link, **(b.4)** temp_ → "Carl Bressler" via `#2649` v3.4, **(b.5)** PDL re-fired with `profile=<url>` (was 404 on email-only) stashed to `people_data_labs`, **(b.6)** EnrichLayer fallback if PDL still has no experience.
+2. **Re-verify `#12997` v1.3 LinkedIn URL normalization** in the same fresh test — if Exa also surfaces Carl, the incoming `linkedin.com/in/carlbressler` should normalize to `www.linkedin.com/in/carlbressler` and match the existing row (no duplicate).
 3. **Patch `#12553`** with the same v1.7-style data_source auto-detect as `#13039`. Webhook v1.8 guard protects production from broken dispatches in the meantime.
-4. **Step (h)** of process-full-enrich — iterate non-`professional_network` social_profiles entries when a sample with twitter/github/etc appears.
+4. **Step (h)** of process-full-enrich — iterate non-`professional_network` social_profiles entries when a sample with twitter/github/etc appears. Carl confirmed: only `professional_network` is present in real FullEnrich payloads so far.
 
 See [Pending verification + remaining work](#pending-verification--remaining-work) below for the full checklist with table/function IDs.
 </Note>
@@ -299,10 +300,39 @@ mvp/enrich/full-enrich-reverse-email-lookup — 13036
 <Card icon="wrench">
 
 ```
-mvp/enrich/process-full-enrich — TO BE BUILT
+mvp/enrich/process-full-enrich — 13049 (v1.7)
 ```
 
-**New helper (proposed).** Mirrors the retired `#13033 process-person-rocket-reach`. Reads `person_enrich_data.full_enrich`, applies into master_link / avatar / biography / work_experience / emails / phones / social links. Called from the webhook after the orchestrator-wait completes.
+**Deployed helper.** Called from the webhook after the orchestrator-wait completes. Steps in execution order:
+
+- **(a)** backfill `master_person.linkedin_url` from `profile.social_profiles.professional_network.url`
+- **(b)** `create-master-link` for the LinkedIn URL (source=`FullEnrich`)
+- **(b.4)** if `master_person.first_name` starts with `temp_<hash>`, parse the FullEnrich name via `#2649 name-format` LLM (with FullEnrich pre-split fallback) and write `name`, `first_name`, `middle_name`, `last_name`, `suffix`, `nickname` back
+- **(b.5)** re-fire PDL `/v5/person/enrich` with `profile=<linkedin_url>` (was 404 on email-only earlier), stash raw payload to `person_enrich_data.people_data_labs`. **No processing**
+- **(b.6)** if PDL `data.experience` is empty, call `#12612 api/enrich_layer/person-linkedin` with the linkedin_url, stash raw payload to `person_enrich_data.enrich_layer_data`. **No processing**
+- **(c)** SKIPPED — FullEnrich does not return an avatar (confirmed across two real samples)
+- **(d)** `add-person-biography` for `"{title} at {company.name}"`
+- **(e)** iterate `employment.all[]` → `get-add/master-company` → insert `work_experience` row (dedup-safe since v1.1)
+
+</Card>
+
+<Card icon="cloud-arrow-up">
+
+```
+mvp/format/name-format — 2649 (v3.4)
+```
+
+**LLM name parser.** Used by step (b.4) of `process-full-enrich` and by `#12997 master-person-from-exa`. Calls `google/gemini-3.1-flash-lite` via OpenRouter with strict `response_format.json_schema`. v3.4 fixed structured-output enforcement after the schema's array literals were being silently dropped by the XanoScript parser (see [#2649 v3.4 structured-output fix](#2649-v34-structured-output-fix)).
+
+</Card>
+
+<Card icon="cloud-arrow-up">
+
+```
+api/enrich_layer/person-linkedin — 12612
+```
+
+**EnrichLayer GET wrapper.** Hits `https://enrichlayer.com/api/v2/profile` with `profile_url=<linkedin_url>`. Returns the parsed response object, or `{}` on failure (it logs its own `log_crash` internally). Invoked by step (b.6).
 
 </Card>
 
@@ -351,9 +381,13 @@ Required so `process-full-enrich` can attribute biography / work_experience / ma
 | Q6 | FullEnrich response shape | **Inspected.** See [Response shape](#fullenrich-response-shape-verified-against-one-real-sample) section below for the locked-in field mapping. |
 | Q7 | Backfill across already-stashed rows | **Yes** — `process-full-enrich` fires whenever `person_enrich_data.full_enrich` is non-empty, regardless of how it got there. Idempotent. Matches the Phase 4b (Exa) pattern. |
 
-## FullEnrich response shape (verified against one real sample)
+## FullEnrich response shape (verified against two real samples)
 
-Sampled the only non-empty `person_enrich_data.full_enrich` row across 80+ rows (ped_id=2). FullEnrich's response shape is **substantially different** from the retired RocketReach helper — process-full-enrich is a re-mapping, not a port.
+Confirmed against two real `person_enrich_data.full_enrich` payloads — Leon Silverman (ped_id=2, originally misaligned) and Carl Bressler (sandbox session 3). FullEnrich's response shape is **substantially different** from the retired RocketReach helper — process-full-enrich is a re-mapping, not a port. Both samples agree on:
+
+- `profile.avatar` / `profile.image` / `profile.profile_pic` — **all absent**. Avatar for Carl id=1 comes from a different vendor (ScrapeCreator), pinned at `person_enrich_data.scrapecreator_person.image`. Step (c) in `process-full-enrich` is correctly SKIPPED.
+- `profile.social_profiles` — **only `professional_network` (LinkedIn)** present. No twitter, github, facebook, instagram entries in either sample. Step (h) remains DEFERRED until a counter-example appears.
+- `contact_info: {}` — **always empty** for our endpoint (`/api/v2/contact/reverse/email/bulk`). Phone & Email Finder is a separate FullEnrich product on a different endpoint with separate credits.
 
 ### Top-level keys
 
@@ -418,18 +452,20 @@ And we don't actually need it. **The LinkedIn URL is the only field we need from
 | Artifact | id | Version | Role |
 | --- | --- | --- | --- |
 | Webhook `webhook/contact-finished` (group "Full Enrich" 1280, canonical `8hTTyqsU`) | API 8594 | v1.8 | FullEnrich callback receiver, wait + process |
-| `mvp/enrich/process-full-enrich` | 13049 | v1.1 | Applies FullEnrich payload to master_person (dedup-safe) |
+| `mvp/enrich/process-full-enrich` | 13049 | **v1.7** | Applies FullEnrich payload to master_person (dedup-safe). v1.5 added temp_ name backfill (b.4); v1.6 added PDL retry (b.5) + EL fallback (b.6); v1.7 cosmetic relabel |
+| `mvp/format/name-format` | 2649 | **v3.4** | LLM name parser. v3.4 fixed structured-output enforcement after XanoScript silently dropped array literals from the response_format schema |
+| `api/enrich_layer/person-linkedin` | 12612 | unchanged | EnrichLayer GET wrapper called by (b.6) |
 | `mvp/enrich/enrich-master-person` | 13040 | v3.8 | Active orchestrator (was #12554 v3.8 retired predecessor) |
 | `mvp/enrich/full-enrich-reverse-email-lookup` | 13036 | v1.3 | Dispatcher to FullEnrich bulk endpoint |
 | `mvp/get-add/master-person-new` | 13039 | v1.7 | Caller — auto-detects data_source via `runtime_metadata` |
 | `mvp/get-add/master-person` | 12553 | v3.21 | Older sibling — **NOT YET patched with v1.7-style auto-detect.** Webhook v1.8 guard protects production. Apply the same edit when convenient. |
-| `mvp/get-add/master-person-from-exa` | 12997 | v1.3 | LinkedIn URL normalization (canonical with `www.`) |
+| `mvp/get-add/master-person-from-exa` | 12997 | v1.3 | LinkedIn URL normalization (canonical with `www.`). Also calls `#2649` — benefits from v3.4 fix |
 
 ## Pending verification + remaining work
 
 These items survived the previous session and want a future agent's attention. Roughly in order of value.
 
-1. **Re-verify `process-full-enrich` v1.1 work_experience dedup actually no-ops on duplicates.** Sandbox `master_person.id=1` (Carl Bressler) has 30 work_experience rows from the pre-dedup test run. To validate: re-invoke `mvp/enrich/process-full-enrich` with `master_person_id=1` in sandbox. Expected: count of work_experience rows for that master_person_id stays at 30 (no new rows added). Check via `searchTableContent` on table 147 with `{master_person_id: 1}`.
+1. ~~**Re-verify `process-full-enrich` v1.1 work_experience dedup actually no-ops on duplicates.**~~ **✅ COMPLETE — 2026-05-30 (session 3).** True baseline was 48 (not 30 — original count missed 3 of the 5 retry batches). Re-invoked `mvp/enrich/process-full-enrich(master_person_id=1, cascade_depth=0)` at v1.2 in sandbox; `searchTableContent` on table 147 with `{master_person_id: 1}` returned `itemsTotal: 48`, max `id: 489` (unchanged). Dedup correctly matched all 18 `employment.all` entries → zero inserts. See [Dedup verification (2026-05-30, session 3)](#dedup-verification-2026-05-30-session-3) for details.
 
 2. **Re-verify `#12997` v1.3 LinkedIn URL normalization.** Sandbox has two Carl rows because v1.0–v1.2 didn't normalize `www.`: `id=1` (FullEnrich, with `www.`), `id=34` (Exa, without `www.`). Trigger another Exa C-Suite enrichment that surfaces Carl, OR delete sandbox `master_person.id=34` and re-run the full Carl flow — expectation: single Carl row, no duplicate.
 
@@ -454,11 +490,11 @@ All questions decided. Build order — each step is independently committable.
 | 1 | Add `data_source` row `id=103, source="FullEnrich"` | Low | ✅ Deployed 2026-05-30 |
 | 2 | Verify XanoScript supports `while` + blocking sleep. Confirmed `while` + `util.sleep` (native, no api.lambda needed). Tested up to 180s held requests. | Medium | ✅ Deployed 2026-05-30 |
 | 3 | Update orchestrators (`#13040` + retired `#12554`): switch enrich_history_person key from `data_source_id == 79` to `source == "Master Person Enrich"`; add end-of-pipeline `processing = false` step that runs regardless of `$hasCrash`. Both bumped to v3.8. | Medium | ✅ Deployed 2026-05-30 |
-| 4 | Build `mvp/enrich/process-full-enrich` (new helper). Test in isolation against ped_id=2 (the known good sample) | Medium — careful field mapping per [Response shape](#fullenrich-response-shape-verified-against-one-real-sample) | ⚠️ Built (#13049 v1.0) — isolation test **aborted**; ped_id=2 sample is misaligned (Leon Silverman payload routed onto Mark Pederson's master_person row, almost certainly an early manual test callback). Validation deferred to Step 6 end-to-end. See [Step 4 details](#step-4--process-full-enrich-built-but-not-yet-isolation-tested). |
+| 4 | Build `mvp/enrich/process-full-enrich` (new helper). Test in isolation against ped_id=2 (the known good sample) | Medium — careful field mapping per [Response shape](#fullenrich-response-shape-verified-against-two-real-samples) | ✅ Deployed (#13049 v1.7). Isolation test against ped_id=2 was aborted (misaligned data); validation moved to the fresh Carl end-to-end test under Step 6. See [Step 4 details](#step-4--process-full-enrich-built-but-not-yet-isolation-tested). |
 | 5 | Update webhook v1.6 → v1.7: add Step 4 (resolve master_person_id from person_enrich_data), Step 5 (wait loop), Step 6 (call process-full-enrich) | Medium — wait-loop XanoScript pattern verified | ✅ Deployed 2026-05-30 |
-| 6 | Validate end-to-end with a real email-only seed that fails PDL + EL: confirm webhook arrives, waits, processes, and `master_person` has correct master_link / bio / work_experience rows | High — full integration | pending |
-| 7 | Inspect a real callback with non-empty `contact_info` (when found) to verify the emails/phones mapping (currently hypothesized) | Low (read-only) | pending |
-| 8 | Update this doc with final v1.7 details (drop "proposed" markers, fold in any deviations from this plan) | Low | pending |
+| 6 | Validate end-to-end with a real email-only seed that fails PDL + EL: confirm webhook arrives, waits, processes, and `master_person` has correct master_link / bio / work_experience rows | High — full integration | ⏳ Pending — sandbox wipe + fresh Carl seed planned. Will also verify (b.4) temp_ name backfill, (b.5) PDL retry on linkedin_url, (b.6) EL fallback, and `#12997` v1.3 dedup-by-canonical-linkedin-url |
+| 7 | ~~Inspect a real callback with non-empty `contact_info`~~ — **WONTFIX.** Both real samples (Leon and Carl) confirm `contact_info` is always `{}` for our endpoint. | Low | ✅ Closed |
+| 8 | Update this doc with final v1.7 details (drop "proposed" markers, fold in any deviations from this plan) | Low | ✅ Done in session 3 — see [Session 3 changes](#session-3-changes-2026-05-30) |
 
 ### Production incident — Carl Bressler → Robert Boulos data corruption (2026-05-30)
 
@@ -538,7 +574,67 @@ Both `mvp/enrich/enrich-master-person` (#13040) and the retired predecessor `mvp
 
 Existing `enrich_history_person` rows from past runs that don't have `source` set are now functionally orphaned (the new queries won't find them). Acceptable — they're historical records, not load-bearing. Possible future migration: backfill `source = "Master Person Enrich"` on rows where `data_source_id == 79`.
 
-## Version history (v1.6 deployed, v1.7 proposed)
+### Session 3 changes (2026-05-30)
+
+Session 3 extends `process-full-enrich` from a passthrough applier into a tier-2 re-enrichment trigger, fixes a latent bug in the LLM name parser that was polluting cross-source dedup, and adds two retry steps that piggy-back on FullEnrich's resolved LinkedIn URL.
+
+#### v1.5 — temp_ name backfill via #2649 (step b.4)
+
+Email-only seeds create `master_person` with `first_name = "temp_<hash>"` since no real name is known at create-time. Before session 3, the FullEnrich callback never wrote the resolved name back, so:
+
+- `master_person.first_name` stayed as `temp_<hash>` indefinitely
+- Cross-source merges (e.g. Exa firing later via `#12997`) silently preserved the placeholder, because `#12997`'s `first_name|first_notempty:$parsedName.first_name` only swaps when the existing value is *empty*, not when it's `temp_`
+
+v1.5 added step (b.4): if `$masterPerson.first_name` starts with `temp_`, run `profile.full_name` (fallback: `first_name + " " + last_name`) through `#2649 mvp/format/name-format`, JSON.parse the result, and write `name`, `first_name`, `middle_name`, `last_name`, `suffix`, `nickname` back. If the LLM returns something unparseable, fall back to FullEnrich's own pre-split `profile.first_name` / `profile.last_name` (it provides both separately). Defense in depth — never blank out the placeholder.
+
+#### v1.6 — PDL retry (b.5) + EnrichLayer fallback (b.6)
+
+FullEnrich is the last-resort tier *because PDL and EnrichLayer already failed on the email*. But those failures were against `email=<seed>`. Once FullEnrich resolves the canonical LinkedIn URL, the *same* PDL endpoint hit with `profile=<url>` is dramatically more likely to succeed.
+
+v1.6 added two new steps after (b):
+
+- **(b.5)** `GET https://api.peopledatalabs.com/v5/person/enrich?profile=<url>&first_name=...&last_name=...&email=...&required=experience OR profiles` — stash whatever comes back to `person_enrich_data.people_data_labs`. **Pure persistence, no processing.** Downstream phases (`#13040` Phase 0 and the per-vendor process helpers) handle the data application on a future re-run.
+- **(b.6)** Only if `pdl.data.experience` is empty/missing → `function.run "api/enrich_layer/person-linkedin"` with the linkedin_url → stash raw response to `person_enrich_data.enrich_layer_data`. **Pure persistence, no processing.**
+
+Both writes overwrite the prior 404 entries (`db.edit person_enrich_data` by master_person_id). Same retry-safety story as the FullEnrich stash: if the webhook retries, the second pass writes the same payload again — idempotent.
+
+#### v1.7 — cosmetic relabel
+
+The temp_ name step was labeled `(a.5)` but actually runs **after** step (b). Renamed to `(b.4)` so the label matches execution order. No behavior change.
+
+#### #2649 v3.4 — structured-output fix
+
+Direct call to `#2649` with "Carl Bressler" was returning the dict-literal string `full_name: "Carl Bressler", first_name: "Carl", ...` instead of JSON `{"full_name":"Carl Bressler","first_name":"Carl",...}` — making `JSON.parse` throw at every caller.
+
+Three issues, all fixed:
+
+1. **`response_format.json_schema` was a string template, not a nested object.** The original v3.0 code wrapped the schema in backticks with literal `\n` chars, which XanoScript serialized to a multi-line *string* rather than an object expression. OpenRouter received unparseable schema and silently fell back to free-form output. Rewrote as plain nested `{} |set: "type": "json_schema" |set: "json_schema": (...)` object construction.
+2. **`provider.allow_fallbacks: true` without `require_parameters: true`.** OpenRouter was free to route to a provider that doesn't honor `response_format.json_schema`. Added `require_parameters: true` so the router refuses non-conforming providers.
+3. **Prompt examples used dict-literal syntax.** Even when structured output isn't enforced, models imitate the few-shot examples in the system prompt. Reshaped every example from `→ full_name: "X", first_name: "Y"` to `→ {"full_name":"X","first_name":"Y"}` and added an explicit "Return STRICT JSON only" directive.
+
+Two intermediate versions before landing on v3.4:
+
+- **v3.2** introduced the response_format-as-object fix and JSON examples — but used `(["a","b"])` for array literals, which XanoScript silently strips when saving. Schema saved as `|set:"required":` and `|set:"type":` with no RHS — model produced just `"{"` (one brace) and stopped.
+- **v3.3** dropped `reasoning.effort` and added `max_tokens: 500` while debugging the truncation — but the broken array literals were still the actual root cause.
+- **v3.4** rebuilt all arrays via the `[] |push:"x" |push:"y"` chain (the pre-v3.2 pattern), which XanoScript preserves correctly. Verified by reading the saved XanoScript back: `required` has all 6 fields, each `*_name` property has the `["string","null"]` union type intact.
+
+The same JSON.parse-only pattern in `#12997 master-person-from-exa` had been silently writing empty `first_name` for every Exa-sourced row that went through `#2649` — visible on sandbox `master_person.id=34` (Carl from Exa), `first_name: ""`. v3.4 of `#2649` fixes both callers without any change to `#12997` itself.
+
+### Dedup verification (2026-05-30, session 3)
+
+Re-invoked `mvp/enrich/process-full-enrich(master_person_id=1, cascade_depth=0)` at v1.2 in sandbox to confirm v1.1's `work_experience` dedup logic actually no-ops on duplicates.
+
+**Pre-invoke baseline:** sandbox `work_experience where master_person_id=1` → `itemsTotal: 48`, max `id: 489`.
+
+The session-2 doc said "30 rows from the pre-v1.1 run", but the true count was 48. Function request history for `#13049` confirms **6 invocations** against `master_person_id=1` on 2026-05-30, with `created_at` timestamps clustered into 5 distinct insert batches (6 + 24 + 6 + 6 + 6 rows). All 48 rows have `data_source_id=103` (FullEnrich) and landed within a ~5-minute window — exactly the v1.0 retry-storm pattern the dedup was built to fix. The earlier count of 30 was a miscount of that pre-v1.1 burst, not a separate generation of rows.
+
+**Post-invoke result:** `itemsTotal: 48`, max `id: 489`. **Unchanged.**
+
+Interpretation: v1.2's dedup query — `(master_person_id, master_company_id when resolved else company_name, title, start_year, start_month)` — correctly matched all 18 `employment.all` entries in FullEnrich's payload against existing rows and skipped every insert. master_link and about_person dedup were already verified earlier via their helpers' built-in dedup.
+
+**Dedup is correct.** The only situation that could still produce duplicates is one outside the dedup key — e.g., FullEnrich changing the `start_year` between calls, or `master_company_id` resolving differently across runs (which would happen for empty-company-name entries where `get-add/master-company` mints a new row each time). Both are acceptable for the current scope; the named-company duplicate scenario that v1.0 had is closed.
+
+## Version history — webhook `webhook/contact-finished` (API 8594)
 
 | Version | Date | Change |
 | --- | --- | --- |
@@ -549,4 +645,28 @@ Existing `enrich_history_person` rows from past runs that don't have `source` se
 | v1.4 | 2026-05-27 | Wrap `db.set_datasource` in `try_catch`. Drop `data_source` from name-parse fallback. |
 | v1.5 | 2026-05-27 | `db.set_datasource` needs LITERAL value; per-branch conditional dispatch over (live / staging / sandbox). |
 | v1.6 | 2026-05-30 | Drop `email_enrich_fallback` branch and table (vendor-validation pass complete). Drop the DEBUG `log_crash`. No-id callbacks now `skipped`+`ok=true`. |
-| **v1.7 (proposed)** | TBD | **Add wait-for-orchestrator + process-full-enrich step.** Webhook stops being a pure stash receiver; now ends with the FullEnrich payload fully applied to the master_person.|
+| v1.7 | 2026-05-30 | **Add wait-for-orchestrator + process-full-enrich step.** Webhook stops being a pure stash receiver; now ends with the FullEnrich payload fully applied to the master_person. |
+| **v1.8** | 2026-05-30 | **Emergency safety guard.** Refuses any callback item with empty `custom.data_source` — logs to `log_crash`, returns ok=true so FullEnrich stops retrying. Stopped the Robert Boulos data-corruption incident within seconds. See [Production incident](#production-incident--carl-bressler--robert-boulos-data-corruption-2026-05-30). |
+
+## Version history — `mvp/enrich/process-full-enrich` (#13049)
+
+| Version | Date | Change |
+| --- | --- | --- |
+| v1.0 | 2026-05-30 | Initial implementation. |
+| v1.1 | 2026-05-30 | `work_experience` dedup in (e) — match on `(master_person_id, master_company_id\|company_name, title, start_year, start_month)` before insert. Closes the v1.0 retry-storm duplicate scenario. |
+| v1.2 | 2026-05-30 | Removed (f) emails / (g) phones blocks. FullEnrich's reverse-email endpoint never populates `contact_info`. |
+| v1.3 | 2026-05-30 | New temp_ name backfill step via `#2649` LLM. |
+| v1.4 | 2026-05-30 | Hardened parser with regex fallback — threw on escape collision, rolled back. |
+| v1.5 | 2026-05-30 | Simpler temp_ name backfill: strict JSON.parse → fall back to FullEnrich's pre-split `profile.first_name` / `profile.last_name`. |
+| v1.6 | 2026-05-30 | **New (b.5) PDL retry + (b.6) EnrichLayer fallback.** Once FullEnrich resolves a LinkedIn URL, retry PDL with `profile=<url>` and stash raw to `person_enrich_data.people_data_labs`; if PDL still has no experience, retry EnrichLayer via `#12612` and stash raw to `person_enrich_data.enrich_layer_data`. No processing in either case. |
+| **v1.7** | 2026-05-30 | Cosmetic relabel — temp_ name step is now `(b.4)` (was `(a.5)`) so the label matches actual execution position. No behavior change. |
+
+## Version history — `mvp/format/name-format` (#2649)
+
+| Version | Date | Change |
+| --- | --- | --- |
+| v3.0 | 2026-04-20 | Gemini 3 Flash Preview + structured output + response-healing plugin. |
+| v3.1 | 2026-05-25 | Defensive accessor on the LLM response so an OpenRouter error envelope (missing `choices` array) doesn't crash callers. |
+| v3.2 | 2026-05-30 | Attempted structured-output fix — used `(["a","b"])` array literals which XanoScript silently dropped. Schema saved malformed; model returned `"{"` only. |
+| v3.3 | 2026-05-30 | Dropped `reasoning.effort`, added `max_tokens:500` — didn't fix the truncation because the schema was still malformed. |
+| **v3.4** | 2026-05-30 | **Actual fix.** Rebuilt `response_format.json_schema` via plain nested-object construction (no backtick template); rebuilt all arrays via `[] \|push: "x" \|push: "y"` chains; added `provider.require_parameters: true`; reshaped few-shot examples to JSON; added "Return STRICT JSON only" directive. Verified by reading saved XanoScript back. |

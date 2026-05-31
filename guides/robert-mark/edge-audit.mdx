@@ -1,0 +1,690 @@
+---
+title: "Edge Audit"
+description: "Graph-edge data-quality punch list. Two passes: (1) fix-forward — the Xano functions that create / update edges; (2) backfill — sweeps to clean already-poisoned edges and node properties."
+---
+
+## Scope
+
+Audited ~50 exported edges across two FalkorDB pulls — HAS_SUBDOMAIN ontology edges plus WORKS_AT / FOUNDED / LOCATED_IN / IN_REGION / IN_COUNTRY / RAISED / INVESTED_IN entity edges. Inspection focuses on the `r.properties` object on the relationship itself (not endpoint node properties). Eleven distinct issues, three of them HIGH priority. Full findings appear in the [Audit findings](#audit-findings) section at the bottom.
+
+Every issue below has a **fix-forward** action (change the edge-creation / update function so future writes are clean) and, where existing data is already polluted, a **backfill** action (sweep + repair sweep). Some issues are write-side only (e.g. a new field on creation); some are read-side only (e.g. cast `visibility` on already-written nodes).
+
+## Fix-forward — edge creators / updaters
+
+These are the Xano functions that write edges (or write node properties consumed by edges). Each card lists the issue, the function(s) to patch, and the change.
+
+<Card icon="wrench">
+
+```
+HIGH §3.1 — Domain-parse exception strings persisted as live data
+```
+
+**Problem.** Stealth Startup (master_company_id 5) has `company_domain: "[Line 16:Char 9] Error parsing domain: …"`. The exception text was interpolated into `logo` (logo.dev call with `pk_` token against a garbage path) and `website` (dead link).
+
+**Function to patch.** The company-domain extractor — `mvp/get-add/master-company` (#12558) → its domain-parse helper `mvp/format/domain-extractor` (#4587). Wrap the parse in try / catch; on exception, write `null` (or empty string per existing field-empty convention), never the exception message.
+
+**✅ Fixed-forward (2026-05-31).** Root cause was `mvp/format/domain-extractor` (#4587): it ran `psl.parse()` and **threw** `Error parsing domain: …` on bad input — Xano surfaced that thrown string back as the result (hence the `[Line 16:Char 9]` prefix = the `throw` line), and it was persisted into `company_domain` / `logo` / `website`. The extractor now returns `null` on any parse error or exception — never the message. Defensively, `mvp/get-add/master-company` (#12558) now nulls `logo` when there is no valid domain, so the logo.dev `pk_` token is never fired against a garbage path.
+
+**Backfill required.** See §3.1 below.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+HIGH §3.2 — Stealth Startup entity collision (person identity stapled to company node)
+```
+
+**Problem.** "Stealth Startup" node mixes Scott Lincicome's biography + handles with mark-phillips and nextinsuranceusa profiles. Entity resolution merged a person's identity onto a company node.
+
+**Function to patch.** `mvp/get-add/master-company` profile-attach step — and any `create-master-link` calls that target a company entity. Add a guard: a `linkedin.com/in/<handle>` URL is a *person* identifier, never a company identifier; reject (or split to a person node).
+
+**✅ Fixed-forward (2026-05-31).** In `mvp/get-add/master-company` (#12558): the SECTION 7b profile classifier now only accepts `linkedin.com/company/` or `linkedin.com/school/` as the company `linkedin_url` — a `linkedin.com/in/<handle>` person URL is rejected. Additionally, person `linkedin.com/in/` URLs are filtered out of the company link-resolution set (`$enrichedLinks`) before attach, so a person's profile can no longer be stapled onto a company node.
+
+**Backfill required.** See §3.2 below.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+HIGH §3.3 — Duplicate edges between same node pair across edge types
+```
+
+**Problem.** Carl Bressler → Unknown Company has two edges with identical title "Limited Partner": INVESTED_IN (id 8348, weight 15) and WORKS_AT (id 8642, weight 20). Target node is also an unresolved stub.
+
+**Function to patch.** Two changes:
+
+1. The edge-creator that decides `WORKS_AT` vs `INVESTED_IN` from a `work_experience` / employment row needs a precedence rule. Limited Partner / Angel Investor / Board Observer roles should go to INVESTED_IN only — never both.
+2. The edge writer should also refuse to attach to a node whose `name == "Unknown Company"` and `company_domain == ""` — those are unresolved stubs and need company resolution to complete first.
+
+**✅ Fixed-forward (2026-05-31).** In `mvp/edges/create-work-edges` (#2800): a new `isOperatingPartner()` helper distinguishes general/managing partners (employment → WORKS_AT eligible) from Limited Partners. `isWorksAtEligible()` now routes Limited Partner / Angel / Board Observer / Advisor titles to their specialized edge **only**, never WORKS_AT (the old `indexOf('partner') === -1` guard let "Limited Partner" slip through to both). The grouping loop also skips any company whose node is an unresolved stub (`company_name == "Unknown Company"` AND empty `company_domain`) — the `master_company` addon now returns `company_domain` to support this check.
+
+**v1.2 refinement (2026-05-31).** Caught during the sandbox Carl test: "Advisor to CEO" / "Advisor to COO" were still producing a WORKS_AT because the C-suite keyword check (`['chief','ceo','cto','cfo','coo']`) matched the `ceo`/`coo` *substring* and ran *before* the advisor exclusion. Fixed by moving the advisory / investor / board / membership exclusions **ahead of** the loose title-keyword matching in `isWorksAtEligible()`. Founders and operating partners are still short-circuited to WORKS_AT first.
+
+**v1.4 refinement (2026-05-31).** Caught during the graph-wide §3.3 dedupe dry run: the board-member exclusion's executive carve-out (`indexOf('executive') === -1`, meant to keep "Executive Chairman") also fired for **"non-executive director"** (substring "executive"), wrongly keeping non-exec directors as WORKS_AT. Tightened to `(executive present AND non-executive absent) OR managing` so non-exec directors route to BOARD_MEMBER_OF only. The dedupe (#13052) ports the same v2.1 classifier.
+
+**Backfill required.** See §3.3 below.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+MEDIUM §3.4 — `description` vs `fact` field name inconsistency
+```
+
+**Problem.** LOCATED_IN uses `description`; IN_REGION + IN_COUNTRY use `fact`. Same semantic slot, two field names.
+
+**Function to patch.** The geography-edge creators (IN_REGION, IN_COUNTRY). Rename the property they write from `fact` → `description`, so all human-readable edge prose lives at `r.description`.
+
+**✅ Fixed-forward (2026-05-31).** In `mvp/node/location-nodes-edges-company` (#4528) and `mvp/node/primary-location-nodes-edges_v2` (#4690): every IN_REGION / IN_COUNTRY edge now writes `description` instead of `fact` (rel vars `relates2`, `relates3`, `rel2`). LOCATED_IN already used `description`. No reads of `.fact` existed to break. (The earlier tool `tool/backfill-located-in-edge-description` #12987 had migrated LOCATED_IN only — geography edges were the remaining gap.)
+
+**Backfill required.** Yes — copy `fact` → `description` on existing IN_REGION / IN_COUNTRY edges, then null `fact`.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+MEDIUM §3.5 — `valid_from` conflates valid time with ingestion time + missing edge `created_at`
+```
+
+**Problem.** Edges have no `created_at`. Geography edges (LOCATED_IN, IN_REGION, IN_COUNTRY) stamp `valid_from: "2026-05"` (current ingestion month) instead of the true validity start. Bitemporal gap.
+
+**Function to patch.** Every edge creator. Two additive changes:
+
+1. Always write `r.created_at = now` on edge insert (epoch millis or ISO — pick one per §3.9). This is ingestion time.
+2. Only write `r.valid_from` when an actual real-world validity date is known. For geography edges where validity = "since founding" or "since incorporation", either omit `valid_from` or source it from the node's `founded_year`.
+
+**✅ Fixed-forward (2026-05-31) — created_at + updated_at.** Every edge creator now stamps both timestamps on write. The pattern, idiomatic to the existing `coalesce(r.uuid, randomUUID())` style:
+
+```cypher
+MERGE (a)-[r:REL]->(b)
+SET r.created_at = coalesce(r.created_at, timestamp()),   // set once, at creation
+    r.updated_at = timestamp(),                           // refreshed on every write
+    ...existing props...
+```
+
+Canonical format is **epoch milliseconds** — FalkorDB's `timestamp()` — matching §3.9 and the FalkorDB skill. `CREATE`-style edges use `created_at: timestamp(), updated_at: timestamp()` in the inline map. Applied across: `create-work-edges` (#2800), `resolve-investors-edges` (#12702), `create-education-edges` (#1898), `location-nodes-edges-company` (#4528), `primary-location-nodes-edges_v2` (#4690), `resolve-edges-honor` (#4574), `resolve-edges-volunteering` (#4575 — also renamed camelCase `createdAt` → `created_at`), `resolve-edges-certifications` (#12578), `resolve-edges-projects-publications` (#12579), and `create_knows_edge` (#12778 — added the missing `updated_at`). `add-credit-edges-from-person/title` (#13013 / #13015) and `add-node-edge-imdb-award` (#2334) already stamped both. **Note:** the `valid_from` bitemporal cleanup (point 2 above) is *not* part of this pass — tracked as a follow-up.
+
+**Backfill required.** Add `created_at` to every existing edge based on the earliest evidence we have (could fall back to the connected node's `created_at`).
+
+</Card>
+
+<Card icon="wrench">
+
+```
+MEDIUM §3.7 — Union membership modeled as WORKS_AT
+```
+
+**Problem.** Carl Bressler → SAG-AFTRA: `WORKS_AT` with `title: "Actor / Artist"`, `seniority_level: "C Suite"`. Membership ≠ employment, and an actor isn't C-Suite.
+
+**Function to patch.** Two changes:
+
+1. The WORKS_AT edge creator needs a guard: if the company is tagged `is_union` (or matches a union allowlist — SAG-AFTRA, WGA, DGA, IATSE, etc.), emit `MEMBER_OF` instead.
+2. The `seniority_level` classifier needs tighter rules — `C Suite` should only fire for `CEO / CTO / CFO / COO / Chief …` titles, not loosely across non-exec roles.
+
+**✅ Fixed-forward (2026-05-31, v1.3).** In `mvp/edges/create-work-edges` (#2800): a new `isUnionCompany()` name-allowlist helper (SAG-AFTRA, Screen Actors Guild, Writers/Directors Guild, IATSE, AFM, Actors' Equity, Animation/Editors/Producers Guild, …) — when the company matches, the group emits `MEMBER_OF` and suppresses `WORKS_AT`. And `getSeniority()` now only tags `C Suite` for genuine exec titles (CXO as a whole word via `\b…\b`, or "Chief … Officer"/"Chief Executive/Technology/…"), explicitly excluding advisor / assistant / board / "to CEO" / deputy titles. (No `is_union` schema field is required — detection is name-based; add the allowlist entry if a new guild shows up.)
+
+**Backfill required.** See §3.7 below.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+MEDIUM §3.8 — `visibility` typed inconsistently
+```
+
+**Problem.** Person nodes: boolean `false`. Company / Organization nodes: string `"true"`. Funding_Round / VC_Firm: boolean. `WHERE visibility = true` Cypher filter mis-fires depending on label.
+
+**Function to patch.** The Company / Organization node creators. Coerce string `"true"` / `"false"` to boolean before write. Bonus: add a Xano schema validator that rejects non-boolean writes.
+
+**✅ Fixed-forward (2026-05-31).** The two string-`visibility` culprits were the *update* paths: `mvp/node/update-person-node` (#2758) wrote `n.visibility = "{{…}}"` (quoted Twig → string) and `mvp/node/update-company-node` (#4659) piped the DB boolean through `|to_text`. Both now emit a real Cypher boolean — 2758 via `{% if … %}true{% else %}false{% endif %}`, 4659 by dropping `|to_text` (its SET-builder lambda already emits bare `true`/`false` for boolean values). The create paths (`add-person-node` #2601, `add-company-node` #2602, `add-fundable-deal-node` #12701) already wrote booleans.
+
+**Backfill required.** See §3.8 below.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+MEDIUM §3.9 — `created_at` stored in three formats across node labels
+```
+
+**Problem.** Person uses ISO-Z. Company uses epoch millis. Region / State use ISO with microseconds + offset. Cross-label sort / range requires normalization first.
+
+**Function to patch.** Decide a canonical format (recommend epoch millis since Xano's native timestamp filters use it), then patch every node creator that writes `created_at`.
+
+**✅ Fixed-forward (2026-05-31) — canonical = epoch millis (`timestamp()`).** Patched every node creator: `add-person-node` (#2601, was ISO-Z via JS `toISOString()`), `update-person-node` (#2758, `updated_at` was ISO+micros), `location-nodes-edges-company` (#4528) and `primary-location-nodes-edges_v2` (#4690) for Region/State (was ISO+micros) **and City** (had none — added), `add-all-country-nodes` (#12583, was ISO+micros), `add-fundable-deal-node` (#12701, Funding_Round node had none — added), and `sync-domain-expertise-nodes` (#12663) for the ontology Entity nodes (§3.12). Company create/update (#2602/#4659) already used `timestamp()`. All now write `created_at`/`updated_at` as epoch millis on create + `updated_at` on every match.
+
+**Backfill required.** See §3.9 below.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+LOW-MED §3.10 — Junk enrichment profiles on company nodes
+```
+
+**Problem.** Harmonic AI's `profiles` array includes `facebook.com/forbes`, `instagram.com/popular`, `crunchbase/akhenaten` — unrelated identities attached by profile-matching.
+
+**Function to patch.** The profile-matcher (likely inside `mvp/get-add/master-company` or `mvp/link/create-master-link`). Add a domain-affinity check: a profile only attaches if (a) the URL's handle / slug matches the company name above some similarity threshold, OR (b) the profile URL's domain is the company domain. Discard otherwise.
+
+**✅ Fixed-forward (2026-05-31) — root cause was the projection addon.** The Company node's `profiles` array is populated by `update-company-node` (#4659) via addon `master_link:profiles:master_company_id` (#690), which selected links by **`service`-domain only** — missing the `profile == true` filter that the person addon (#721) has. So any link on one of the 5 social domains surfaced, including `facebook.com/forbes`, `instagram.com/popular`, `crunchbase/<junk>`, and personal `linkedin.com/in/…` (all written with `profile = false`). Addon #690 now requires `profile == true`, and `create-master-link` (#2541) only sets `profile = true` for company/school LinkedIn, x.com, and crunchbase URLs — so junk no longer lands on the node.
+
+**Deeper follow-up (not done):** the *write* path (`apply-company-llm-payload` #12989 → `add-bulk-company-links` #2446) still stores the raw LLM `profiles` array (and Fundable links) into `master_link` with no affinity check — they're just now correctly flagged `profile = false` and filtered out of the node. A true domain/name-affinity gate on the write path remains a future enhancement.
+
+**Backfill required.** See §3.10 below.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+NOTE §3.11 — Node embeddings (`name_embedding`, `expertise_embedding`) null on every node
+```
+
+**Problem.** Both embedding fields are null on every node in the exported sample.
+
+**Function to investigate (not necessarily patch).** First determine whether the export query *projects out* embeddings (likely) or whether the embedding-write pipeline is failing. If the former, no action. If the latter, the embedding-writer needs to be re-kicked.
+
+**✅ Investigated (2026-05-31) — no fix needed.** `name_embedding` writers exist and run on the create/enrich path for both Person (`add-person-node` #2601 / `update-person-node` #2758) and Company (`add-company-node` #2602 / `update-company-node` #4659), all via `vectors/create-vectors-string` (#4676) with real `vecf32(...)` values. The blanket nulls in the export are an **export-projection artifact** (FalkorDB vector columns are commonly omitted by generic exports), not missing data. `expertise_embedding` **is** written on the ontology Entity nodes (`sync-domain-expertise-nodes` #12663) but is **not** written on Person/Company nodes — whether those should carry an expertise vector is a **product decision**, not a bug. No backfill unless a re-embed is desired.
+
+**Backfill required.** None (see above).
+
+</Card>
+
+<Card icon="clock">
+
+```
+TODO §3.12 — Ontology Entity nodes have no `created_at` (node-level gap)
+```
+
+**Surfaced by the §3.5 edge backfill (2026-05-31).** All 134 HAS_SUBDOMAIN ontology edges fell back to the `now` timestamp during backfill because **both** endpoint Entity nodes (the domain / subdomain taxonomy nodes — e.g. "Software Engineering" → "Frontend Engineering") carry no `created_at` at all. The edge backfill accepted `now` as a baseline, but the underlying node gap remains.
+
+**✅ Resolved (2026-05-31).** Fix-forward: `mvp/node/sync-domain-expertise-nodes` (#12663) now stamps `created_at` + `updated_at` (epoch millis) on the `DomainExpertise` / `SubDomainExpertise` Entity nodes **and** on the `HAS_SUBDOMAIN` edge (which previously had none — this was also the source of the 134 `now`-fallback edges in the §3.5 backfill). Backfill for existing ontology nodes is covered by `tool/backfill-node-timestamps` (#13053), which stamps the missing-`created_at` Entity nodes with `now` (one consistent value). 
+
+**Note:** since the ontology was seeded in one build, the existing nodes/edges all get the backfill-run timestamp rather than a true creation time — acceptable for static taxonomy (same rationale as the HAS_SUBDOMAIN edges in §3.5).
+
+</Card>
+
+## Backfill — clean existing data
+
+These are sweeps over already-written data to repair what the fix-forward changes prevent going forward.
+
+<Note>
+**Backfill workflow — sandbox-only until everything is resolved, then one consolidated live pass.**
+
+1. Each backfill ships as a data-source-aware Xano **function** (Run & Debug with the target `X-Data-Source`), promoted to a scheduled Task only if a recurring live drain is needed.
+2. **Run every backfill against `X-Data-Source: sandbox` only.** Sandbox has a known-good Carl Bressler (`master_person.id = 1`) end-to-end fixture from the session-3 fresh seed — verify the sweep produces the expected Carl outcome and nothing else regresses.
+3. **🚫 LIVE backfills are HELD.** We do *not* run any backfill against `X-Data-Source: live` until **every** audit issue below is resolved and validated on sandbox. Rationale: several sweeps overlap (node-property normalization for §3.8 / §3.9 / §3.12; profile cleanup for §3.2 / §3.10; edge timestamps + renames) and should be **consolidated into the fewest possible live passes** rather than run piecemeal — fewer full-graph scans, one snapshot, one verification. The live-promotion plan is assembled at the end.
+4. **Fix-forward is separate from this hold.** Fix-forward code lands on branch `v1` and is shared across data sources, so it takes effect for live enrichment immediately — only the *data backfills* are held.
+5. **Document every backfill as you build it** in the standard artifact-card pattern (e.g. ``tool/backfill-edge-timestamps — 13051``).
+6. Before the eventual LIVE run: snapshot the relevant tables / export the affected edges via Cypher. All sweeps are reversible in principle but the snapshot is the safety net.
+</Note>
+
+<Warning>
+**Two caveats to verify before trusting these changes in live — both checkable from the sandbox Carl run.**
+
+**1. Pre-existing `debug.stop` gate in `master-company` (#12558).** SECTION 11 has a `!debug.stop { value: "masterCompany" }` guard that blocks the downstream enrichment dispatch (`run-base-company-enrich-v*`). It is *pre-existing* — the §3.1/§3.2 fixes did not touch it — but it means a full end-to-end company-enrichment test may halt before edges are written. **To test the edge changes without that gate**, drive the edge creators directly instead of the whole cascade:
+
+```
+// Carl Bressler in sandbox is master_person.id = 1
+mvp/edges/create-work-edges      { master_person_id: 1 }   // §3.3 + WORKS_AT/FOUNDED/INVESTED_IN timestamps
+mvp/resolve/resolve-edges-work   { master_person_id: 1 }   // resolves then calls create-work-edges
+```
+
+Then confirm the §3.3 fix on Carl — his "Limited Partner" → Unknown Company should now yield **INVESTED_IN only** (no duplicate WORKS_AT), and the stub guard should skip unresolved `Unknown Company` nodes:
+
+```cypher
+// Should return rows for INVESTED_IN only — no WORKS_AT with the same title
+MATCH (p:Person {name: "Carl Bressler"})-[r]->(c)
+WHERE r.title CONTAINS "Limited Partner"
+RETURN type(r) AS rel_type, r.title, c.name, r.created_at, r.updated_at
+```
+
+**2. Cypher-pattern validation status — ✅ all confirmed on sandbox Carl (2026-05-31).** The backfill's `UNWIND […] WHERE ID(r) = row.eid` write (248 edges stamped, re-run `scanned: 0`) AND the `coalesce(r.created_at, timestamp())`-inside-`FOREACH` writes in the fix-forward creators are both proven against live FalkorDB. The `coalesce` proof: re-creating Carl's Kintsugi "Advisor to CEO" edge kept `created_at = 1780179114363` while `updated_at` advanced to a fresh value — and **no WORKS_AT was recreated**, confirming the §3.3 v1.2 routing fix end-to-end. Verification queries:
+
+```cypher
+// (a) New edges from the fix-forward writers carry both timestamps
+MATCH ()-[r]->()
+WHERE r.created_at IS NOT NULL
+RETURN type(r) AS rel_type, count(r) AS with_ts
+ORDER BY rel_type
+
+// (b) Backfill coverage — should trend to 0 after running tool/backfill-edge-timestamps with dry_run:false
+MATCH ()-[r]->()
+WHERE r.created_at IS NULL
+RETURN count(r) AS still_missing
+```
+
+If any of these error in the sandbox run, capture the FalkorDB error message and send it back — the fix is a one-line adjustment to the affected pattern.
+</Warning>
+
+<Card icon="clock-rotate-left">
+
+```
+backfill §3.1 — Purge domain-parse exception strings
+```
+
+**Task.** *TBD — fill in the Xano Task name + ID once built (e.g. `backfill/strip-domain-parse-errors — 13xxx`).*
+
+**Sweep.** SQL-equivalent on `master_company` table: rows where `company_domain LIKE '[Line%'` OR `company_domain LIKE '%Error parsing domain%'`. For each match, null `company_domain`, `logo`, `website`. Optionally re-fire the domain-extractor against the source field that originally produced the exception so the row gets a real domain.
+
+**Risk.** Low — these fields are already broken in production; nulling them is strictly safer than the current state.
+
+</Card>
+
+<Card icon="clock-rotate-left">
+
+```
+backfill §3.2 — Split Stealth Startup entity collision (and audit for siblings)
+```
+
+**Task.** *TBD — fill in the Xano Task name + ID once built (e.g. `backfill/strip-domain-parse-errors — 13xxx`).*
+
+**Sweep.** Two parts:
+
+1. Surgical fix on `master_company_id = 5` ("Stealth Startup"): clear `description`, `summary`, and `profiles` (they describe Scott Lincicome / mix unrelated handles). Re-run company enrichment on the cleared row so it picks up legitimate Stealth Startup data.
+2. Detect siblings: query `master_company` for rows where `profiles` contains a `linkedin.com/in/` URL (those should never be on a company node), or where `description` mentions a single named individual. Flag for manual review.
+
+**Risk.** Medium — clearing fields is reversible (re-enrichment); but mis-merged entities may have downstream edges that need re-attachment.
+
+</Card>
+
+<Card icon="clock-rotate-left">
+
+```
+backfill §3.3 — Dedupe duplicate WORKS_AT edges (sibling-aware)
+```
+
+```
+tool/backfill-dedupe-worksat — 13052
+```
+
+**Built (2026-05-31).** Carl Bressler revealed the duplication is broader than just LPs — angels and advisors also got a stray `WORKS_AT` alongside the correct edge. So the sweep is **sibling-aware** rather than INVESTED_IN-only.
+
+**Inputs.** `dry_run` (default **true** — reports the WORKS_AT edges that *would* be deleted), `person_name` (optional — scope to one person, e.g. `"Carl Bressler"`, for the canary; empty = whole graph). **Returns** `{ dry_run, person_name, candidates, to_delete, kept, deleted, by_pair, delete_sample, kept_sample }`.
+
+**Rule (v2 — mirrors fix-forward).** v1's naive "any same-title sibling exists → delete" over-deleted legitimate WORKS_AT edges for **founders** ("Founder & Investor", "Co-Founder & Board Member") and **genuine execs** ("Chief Executive Officer & Executive Chairman Of The Board") — titles the fix-forward intentionally *keeps* as WORKS_AT (caught in the graph-wide dry run: ~436 candidates, ~10-15% were founder/exec). v2 deletes a `WORKS_AT` only when **all three** hold:
+
+1. a **same-title** sibling of `INVESTED_IN` / `ADVISOR_TO` / `BOARD_MEMBER_OF` / `MEMBER_OF` exists (so the relationship survives — no data loss), **and**
+2. the title is **not** WORKS_AT-eligible under the create-work-edges v1.2 `isWorksAtEligible()` (the function ports that exact classifier into JS), **and**
+3. the person has **no** `FOUNDED` edge to that company.
+
+So it deletes exactly the LP / Angel / Advisor / plain-Board / plain-Member duplicates and protects founder + operating-partner + exec WORKS_AT — the graph converges to what fix-forward would produce. `kept` / `kept_sample` in the response show what was protected and why.
+
+**Run order (sandbox-first, Carl canary).** `dry_run: true, person_name: "Carl Bressler"` → expect ~4 matches (Unknown Company "Limited Partner", InVita "Seed Angel & Early Advisor to CEO", Kintsugi "Advisor to CEO", Skyboxe "Advisor to COO") and the Harmonic AI founder WORKS_AT **not** listed → re-run `dry_run: false` → re-run dry to confirm `matched: 0` → then whole-graph (empty `person_name`) on sandbox. **Live run:** 🚫 held — bundled into the consolidated live pass (see workflow note).
+
+**Still separate.** The `INVESTED_IN` edge to the "Unknown Company" stub (`name = "Unknown Company"`, empty `company_domain`) is the canonical LP edge and is kept; resolving/quarantining that stub node is a distinct entity-resolution task (the §3.3 fix-forward stub guard already blocks *new* edges to such stubs).
+
+**Risk.** Medium — edge deletion is destructive. Snapshot / export the WORKS_AT edges first.
+
+</Card>
+
+<Card icon="clock-rotate-left">
+
+```
+backfill §3.4 — Rename `fact` → `description` on geography edges
+```
+
+**Sweep (run via `mvp/falkor/send-cypher`, sandbox).** Note: FalkorDB has no `REMOVE` — null the property instead. Dry count first:
+
+```cypher
+MATCH ()-[r:IN_REGION|IN_COUNTRY]->()
+WHERE r.fact IS NOT NULL AND r.description IS NULL
+RETURN type(r) AS rel_type, count(r) AS to_migrate
+```
+
+Then migrate:
+
+```cypher
+MATCH ()-[r:IN_REGION|IN_COUNTRY]->()
+WHERE r.fact IS NOT NULL AND r.description IS NULL
+SET r.description = r.fact, r.fact = NULL
+RETURN count(r) AS migrated
+```
+
+Simple enough to run inline — no wrapper function. Folds into the consolidated **edge-cleanup** live pass (alongside §3.7). **Live run:** 🚫 held.
+
+**Risk.** Low — purely structural rename.
+
+</Card>
+
+<Card icon="clock-rotate-left">
+
+```
+backfill §3.5 — Stamp edge `created_at` / `updated_at` on existing edges
+```
+
+```
+tool/backfill-edge-timestamps — 13051
+```
+
+**Built (2026-05-31).** Shipped as a **function** (not an auto-firing scheduled task) so the sandbox-first → live run order stays under manual control via Run & Debug. Promote to a Xano Task only when scheduling the live drain. Data-source-aware: it routes through `mvp/falkor/send-cypher` (#2815), which reads `environmental_variables_falkordb` in the ambient `X-Data-Source` — so running under `sandbox` hits the sandbox graph.
+
+**Inputs.** `dry_run` (default **true** — report only, no writes), `batch_size` (default `500`). **Returns** `{ dry_run, scanned, updated, more_remaining, fallback_now_count, by_type, sample }`.
+
+**Sweep.** For each edge where `r.created_at IS NULL`: set `created_at` from the **head (source) node's** `created_at`, normalized to epoch millis (falls back to the target node, then to `now`); set `updated_at = created_at` as a baseline (legacy edges carry no real last-modified signal). Edges are matched by internal `ID(r)` via a batched `UNWIND`. `valid_from` is intentionally **not** used as the proxy — §3.5 shows it conflates real validity with the ingestion month, so it's unreliable for ingestion time; the head-node `created_at` is the requested fallback.
+
+**Run order (sandbox-first, Carl canary).** Run & Debug with `X-Data-Source: sandbox`, `dry_run: true` → inspect `sample` for Carl Bressler's edges and the `by_type` / `fallback_now_count` counts → re-run with `dry_run: false` → repeat until `more_remaining: false`. Only after the Carl fixture validates do the same against `X-Data-Source: live`.
+
+**Sandbox run — complete (2026-05-31).** Dry run scanned 248 edges missing `created_at`; the live write (`dry_run: false, batch_size: 2000`) returned **`updated: 248`, `more_remaining: false`**, and a confirming dry pass afterward returned **`scanned: 0`** — full coverage, zero edges left missing `created_at`. This confirms the backfill write pattern (`UNWIND […] WHERE ID(r) = row.eid SET …`) executes correctly against live FalkorDB. `fallback_now_count: 134` — **every HAS_SUBDOMAIN ontology edge** hit the `now` fallback because both endpoint Entity nodes lack `created_at`. **Decision: accept `now`** for these static taxonomy edges (one consistent backfill timestamp; `created_at` isn't read by anything yet). The remaining 114 entity edges (WORKS_AT, FOUNDED, LOCATED_IN, INVESTED_IN, …) resolved from real endpoint timestamps. **Follow-up:** ontology Entity nodes have no `created_at` at all — a node-level gap in the ontology seeder, tracked as TODO §3.12. **Live run:** 🚫 held — bundled into the consolidated live pass once all issues are resolved (see workflow note).
+
+**Risk.** Low — purely additive; no query reads `created_at` yet.
+
+</Card>
+
+<Card icon="clock-rotate-left">
+
+```
+backfill §3.7 — Convert union WORKS_AT to MEMBER_OF + tighten C-Suite tagging
+```
+
+**Two sweeps, run via `mvp/falkor/send-cypher` (sandbox).** Carl Bressler → SAG-AFTRA "Actor / Artist" is the canary.
+
+**Pass 1 — union WORKS_AT → MEMBER_OF.** Dry count first:
+
+```cypher
+MATCH (p:Person)-[w:WORKS_AT]->(c)
+WHERE toLower(c.name) CONTAINS 'sag-aftra' OR toLower(c.name) CONTAINS 'screen actors guild'
+   OR toLower(c.name) CONTAINS 'aftra' OR toLower(c.name) CONTAINS 'writers guild'
+   OR toLower(c.name) CONTAINS 'directors guild' OR toLower(c.name) CONTAINS 'iatse'
+   OR toLower(c.name) CONTAINS 'american federation of musicians'
+   OR toLower(c.name) CONTAINS "actors' equity" OR toLower(c.name) CONTAINS 'animation guild'
+   OR toLower(c.name) CONTAINS 'editors guild' OR toLower(c.name) CONTAINS 'producers guild'
+RETURN p.name AS person, c.name AS company, w.title AS title
+```
+
+Then convert (recreates MEMBER_OF carrying the old edge's props + `created_at`, then deletes the WORKS_AT):
+
+```cypher
+MATCH (p:Person)-[w:WORKS_AT]->(c)
+WHERE toLower(c.name) CONTAINS 'sag-aftra' OR toLower(c.name) CONTAINS 'screen actors guild'
+   OR toLower(c.name) CONTAINS 'aftra' OR toLower(c.name) CONTAINS 'writers guild'
+   OR toLower(c.name) CONTAINS 'directors guild' OR toLower(c.name) CONTAINS 'iatse'
+   OR toLower(c.name) CONTAINS 'american federation of musicians'
+   OR toLower(c.name) CONTAINS "actors' equity" OR toLower(c.name) CONTAINS 'animation guild'
+   OR toLower(c.name) CONTAINS 'editors guild' OR toLower(c.name) CONTAINS 'producers guild'
+MERGE (p)-[m:MEMBER_OF]->(c)
+SET m.created_at  = coalesce(m.created_at, w.created_at, timestamp()),
+    m.updated_at  = timestamp(),
+    m.title       = coalesce(m.title, w.title),
+    m.uuid        = coalesce(m.uuid, w.uuid, randomUUID()),
+    m.weight      = coalesce(m.weight, w.weight, 20),
+    m.description = coalesce(m.description, w.description),
+    m.valid_from  = coalesce(m.valid_from, w.valid_from),
+    m.valid_to    = coalesce(m.valid_to, w.valid_to)
+DELETE w
+RETURN count(*) AS converted
+```
+
+**Pass 2 — clear loose `C Suite` seniority.** Null `seniority_level` on WORKS_AT edges where the title isn't a genuine exec (mirrors the new `getSeniority` rules):
+
+```cypher
+MATCH ()-[w:WORKS_AT]->()
+WHERE w.seniority_level = 'C Suite'
+  AND ( toLower(w.title) CONTAINS 'advisor'   OR toLower(w.title) CONTAINS 'adviser'
+     OR toLower(w.title) CONTAINS 'assistant' OR toLower(w.title) CONTAINS 'board'
+     OR toLower(w.title) CONTAINS 'to ceo'    OR toLower(w.title) CONTAINS 'deputy'
+     OR NOT (
+          w.title =~ '(?i).*(\\bceo\\b|\\bcto\\b|\\bcfo\\b|\\bcoo\\b|\\bcmo\\b|\\bcro\\b|\\bcpo\\b|\\bcio\\b|\\bciso\\b|chief executive|chief technology|chief financial|chief operating|chief marketing|chief revenue|chief product).*'
+          AND NOT (toLower(w.title) CONTAINS 'chief' AND toLower(w.title) CONTAINS 'officer')
+        ) )
+SET w.seniority_level = NULL
+RETURN count(*) AS cleared
+```
+
+Folds into the consolidated **edge-cleanup** live pass (with §3.4). **Live run:** 🚫 held.
+
+**Risk.** Medium — Pass 1 deletes WORKS_AT and mints a new MEMBER_OF `uuid` when none carried over; snapshot/export the affected edges first. Check whether any downstream code keys on the old WORKS_AT `edge_uuid`.
+
+</Card>
+
+<Card icon="clock-rotate-left">
+
+```
+backfill §3.8 — Cast string `"true"` / `"false"` to boolean on Company / Organization nodes
+```
+
+**Sweep (run via `mvp/falkor/send-cypher`, sandbox).** Dry count first:
+
+```cypher
+MATCH (n) WHERE n.visibility IN ['true','false']
+RETURN labels(n)[0] AS label, n.visibility AS string_val, count(n) AS cnt
+```
+
+Then cast:
+
+```cypher
+MATCH (n) WHERE n.visibility IN ['true','false']
+SET n.visibility = (n.visibility = 'true')
+RETURN count(n) AS cast
+```
+
+Idempotent (a re-run matches `scanned: 0` strings). Folds into the consolidated **node-cleanup** live pass (with §3.9/§3.12 and §3.10). **Live run:** 🚫 held.
+
+**Risk.** Low — well-defined coercion, reversible.
+
+</Card>
+
+<Card icon="clock-rotate-left">
+
+```
+backfill §3.9 — Normalize `created_at` to canonical format across all node labels
+```
+
+```
+tool/backfill-node-timestamps — 13053
+```
+
+**Built (2026-05-31).** Node analog of `tool/backfill-edge-timestamps`. Normalizes every node's `created_at`/`updated_at` to epoch millis: already-millis → left as-is; ISO strings (Person ISO-Z, Region/State/Country ISO+micros) → parsed → millis; missing (City, Funding_Round, ontology Entity nodes — §3.12) → stamped with `now`. Only nodes that need a change are written. **Inputs:** `dry_run` (default true), `batch_size` (default 500), `offset` (default 0). Paginates by `ORDER BY ID(n) SKIP/LIMIT` — pass `offset += scanned` each call until `more_remaining: false`. **Returns** `{ scanned, need_write, updated, more_remaining, next_offset, by_label, stamped_missing, converted_string, already_ms, sample }`.
+
+**Run order (sandbox).** `offset: 0, dry_run: true` → inspect `by_label` + the `stamped_missing` / `converted_string` / `already_ms` split + `sample` (before/after per node) → re-run `dry_run: false` → advance `offset` until `more_remaining: false`. Folds into the consolidated **node-cleanup** live pass. **Live run:** 🚫 held.
+
+**Risk.** Low — additive/normalizing; no query reads `created_at` yet. Verify ranges look sane post-conversion.
+
+</Card>
+
+<Card icon="clock-rotate-left">
+
+```
+backfill §3.10 — Strip junk profiles from company nodes
+```
+
+**Sweep — re-sync via the fixed addon (no graph heuristic needed).** The fix-forward corrected addon #690 (`profile == true`), so the cleanest backfill is to re-run the company-node updater so each node re-pulls its `profiles` from the now-correct addon: re-invoke `mvp/node/update-company-node` (#4659) per `master_company` (e.g. iterate the table, or let the next enrichment cycle refresh it). A direct graph sweep is impractical — the junk lives as an array property on the node and stripping it correctly requires the `master_link.profile` join the addon already does.
+
+Lower priority (cosmetic node property, not read by ranking). Folds into the consolidated **node-cleanup** live pass. **Live run:** 🚫 held.
+
+**Risk.** Low — discarding noise. Snapshot before bulk update.
+
+</Card>
+
+## HOLD — do not address yet
+
+<Warning>
+**Do not touch the items in this section until further research is complete and a dedicated weight reference page exists in Mintlify.**
+
+Re-weighting requires a locked-in scale decision (0-100 normalized? fixed enum per edge type? evidence-derived?), a documented per-edge-type baseline, and a clear definition of what `weight` is *for* (ranking? confidence? edge-strength?). Changing weights without that foundation will silently shift any downstream ranking that already keys on the current values. Park this issue until the weight reference page is published; only then revisit fix-forward + backfill for §3.6.
+</Warning>
+
+<Card icon="wrench">
+
+```
+HOLD §3.6 — `weight` has no consistent scale
+```
+
+**Problem.** Observed values: 5, 8, 10, 15, 20, 25, 28, 38, 50. Looks like two different weighting passes. Same person's FOUNDED edge (always 5) disagrees with their WORKS_AT edge (5-28). Geo-hierarchy edges look like schema constants (IN_REGION = 25, IN_COUNTRY = 50); others look computed (28, 38).
+
+**Status.** ⏸ On hold. Reactivate after the weight reference page is published and a scale is locked.
+
+**Fix-forward (when unblocked).** Patch every edge creator that writes `weight` — WORKS_AT, FOUNDED, IN_REGION, IN_COUNTRY, RAISED, INVESTED_IN — to the locked scale.
+
+**Backfill (when unblocked).** Bulk Cypher recompute over every existing edge; snapshot first since `weight` is consumed by ranking queries.
+
+</Card>
+
+## Implementation order
+
+Suggested order matches audit priority. §3.6 deliberately omitted — see [HOLD](#hold--do-not-address-yet).
+
+1. **§3.1** — Stop persisting parser exceptions; purge poisoned `company_domain` / `logo` / `website` values. Fastest win, highest blast radius.
+2. **§3.2** — Resolve Stealth Startup entity collision and audit for sibling collisions. (Blocks §3.3 partially since the Unknown Company stub may be a similar entity-resolution failure.)
+3. **§3.3** — Dedupe LP edges and quarantine unresolved stubs.
+4. **§3.4 + §3.5** — Schema-shape changes: rename `fact` → `description`, add edge `created_at`, separate valid-time from ingestion-time.
+5. **§3.7** — Union → MEMBER_OF + C-Suite tightening.
+6. **§3.8 + §3.9** — Type / format consistency sweeps.
+7. **§3.10** — Profile-matcher heuristic + cleanup.
+8. **§3.11** — Verify embedding pipeline (likely no action).
+
+Each step is independently committable: a function patch + a backfill sweep + a verification query.
+
+## Audit findings
+
+Original audit verbatim — preserved for traceability.
+
+### 1. Edge `created_at` coverage
+
+**Every edge type is missing `created_at` on the relationship.** None of the edges in either export carries one — not HAS_SUBDOMAIN, WORKS_AT, FOUNDED, LOCATED_IN, IN_REGION, IN_COUNTRY, RAISED, or INVESTED_IN.
+
+Nodes carry `created_at`; edges never do. With no edge creation timestamp, you cannot disambiguate *valid time* from *ingestion time* at the edge level — the core bitemporal gap.
+
+### 2. Edge `description` coverage
+
+| Edge type    | Has `description`? | Notes |
+|--------------|--------------------|-------|
+| FOUNDED      | Yes                | e.g. "Mark Phillips founded Stealth Startup in 2025." |
+| LOCATED_IN   | Yes                | e.g. "Skyboxe is located in Sarasota" |
+| RAISED       | Yes                | Series A funding blurb |
+| INVESTED_IN  | Field present, **empty** (`""`) | Only instance: Carl Bressler → Unknown Company |
+| WORKS_AT     | No                 | Carries `title`, `seniority_level`, `role_history` instead |
+| IN_REGION    | No                 | Uses `fact` field instead of `description` |
+| IN_COUNTRY   | No                 | Uses `fact` field instead of `description` |
+| HAS_SUBDOMAIN| No                 | `properties: {}` — fully empty |
+
+**Effective non-empty `description`:** FOUNDED, LOCATED_IN, RAISED. (INVESTED_IN has the field but it's blank.)
+
+<Note>
+**Update (2026-05-31) — descriptions are partly filled out-of-band by cron, not at creation.** The export was a snapshot; several edge descriptions are generated asynchronously by backfill crons (OpenRouter `gpt-oss-120b`), so "No" in the table above doesn't mean "never gets one." Full coverage map:
+
+| Edge type(s) | Description source | Status |
+|---|---|---|
+| WORKS_AT / WORKED_AT | LLM pipeline `#13003`→`#13006` | ✅ **active** crons #171/#167/#168 (every 5 min) |
+| HAS_EXPERTISE | LLM pipeline `#13046` | ✅ **active** cron #177 |
+| FOUNDED, LOCATED_IN, IN_REGION, IN_COUNTRY, ATTENDED*, RECEIVED_HONOR/ISSUED_BY, HAS_CERTIFICATION/GRANTED_BY/CERTIFIED_BY, VOLUNTEERED_AT, HAS_AWARD/WON_AWARD/NOMINATED_FOR | inline at creation (templated or LLM) | ✅ at write time |
+| BOARD_MEMBER_OF, ADVISOR_TO, INVESTED_IN (work-derived), MEMBER_OF | LLM pipeline `#13009`→`#13011` | ⚠️ crons #166/#169/#170 **INACTIVE** — only raw LinkedIn text until enabled |
+| WORKED_ON (IMDb) | LLM pipeline `#13016`→`#13018` exists | ⚠️ **no cron at all** |
+| RAISED, LEAD_INVESTED_IN, FOLLOW_ON_INVESTED_IN, INVESTMENT_PARTNER_IN/AT, INVESTED_IN (deal-side) | none | ❌ no description pipeline |
+| HAS_SUBDOMAIN, KNOWS | none — by design (structural / evidence-envelope edges) | n/a |
+
+So WORKS_AT *does* get an LLM description (async). The gaps to close are: the **inactive relationship crons**, the **missing WORKED_ON cron**, and the **uncovered investor/funding edge family**.
+
+**Remediation plan — sandbox-first (decided 2026-05-31), live crons stay OFF until validated.** The backfill *functions* are data-source-aware (they route through `mvp/falkor/send-cypher`), so we validate on the sandbox graph via Run & Debug before enabling any live cron:
+
+<Warning>
+**Descriptions are a ONE-SHOT, LAST step — run them only after ALL edge-data cleanups.** The description backfills generate only when the description is absent (`description IS NULL` for #13006; `description_generated_at IS NULL` for #13011/#13018) and **never regenerate** when the edge's data later changes. If you describe an edge before fixing its data, the stale data is baked into the prose permanently. Observed on sandbox (2026-05-31): running #13006 before §3.7 produced "Carl Bressler … Actor / Artist **at the C‑Suite seniority level**" on the SAG‑AFTRA WORKS_AT — an edge §3.7 then converts to MEMBER_OF and strips of its bogus C‑Suite tag. **Correct order: §3.3 dedupe → §3.7 union+C‑Suite → §3.8 → §3.9 → THEN descriptions.** To re-describe an edge whose data changed after it was already described, null its `description`/`description_generated_at` first so the backfill picks it up again.
+</Warning>
+
+1. **Relationship descriptions** — Run `tool/backfill-relationship-edge-descriptions` (#13011), `X-Data-Source: sandbox`, `limit: 30`, re-run until `processed: 0`. (Run *after* the §3.7 union→MEMBER_OF conversion so the new MEMBER_OF edges get described, and after the §3.3 dedupe so we don't spend LLM calls on WORKS_AT that get deleted — though #13011 only describes BOARD/ADVISOR/INVESTED_IN/MEMBER_OF, not WORKS_AT.)
+2. **WORKED_ON descriptions** — Run `tool/backfill-worked-on-edge-descriptions` (#13018), `X-Data-Source: sandbox`, `limit: 30`, re-run until `action: "no_pending_edges"`.
+3. **Verify (sandbox):** `MATCH (p)-[e:BOARD_MEMBER_OF|ADVISOR_TO|INVESTED_IN|MEMBER_OF]->(c) WHERE e.description_generated_at IS NULL RETURN count(e)` → 0; same for `WORKED_ON`.
+4. **Investor/funding family** — no pipeline exists yet (RAISED / LEAD_INVESTED_IN / FOLLOW_ON_INVESTED_IN / INVESTMENT_PARTNER_IN/AT / deal-side INVESTED_IN); deferred — build later if those edges should carry descriptions.
+5. **Live cutover (held):** only after sandbox validates, enable the live crons — flip #166/#169/#170 active, and create a WORKED_ON cron calling #13018 (mirror the #171/#167/#168 cadence).
+</Note>
+
+### 3. Issues found
+
+#### §3.1 — Domain-parse error strings persisted as live data (HIGH)
+
+The "Stealth Startup" company node (`master_company_id: 5`, shared by Gennady S. and Mark Phillips) has a parser exception baked into four fields:
+
+```
+company_domain: "[Line 16:Char 9] Error parsing domain: Domain name label can only contain alphanumeric characters or dashes."
+```
+
+The same error string is interpolated into the `logo` and `website` URLs:
+
+```
+logo:    https://img.logo.dev/[Line 16:Char 9] Error parsing domain: ...?token=pk_...
+website: https://[Line 16:Char 9] Error parsing domain: ...
+```
+
+The enrichment pipeline caught a parse exception and persisted the exception text instead of null-ing the field. Downstream effect: broken images, dead links, and logo.dev calls firing the `pk_` token against a garbage path.
+
+#### §3.2 — Stealth Startup entity collision (HIGH)
+
+The same "Stealth Startup" node is a full entity collision. Its `description` / `summary` describe **Scott Lincicome** (Cato Institute VP, Duke Law, Bloomberg/Dispatch columnist), but the node is attached as the **employer company** for two unrelated founders. The `profiles` array mixes unrelated handles:
+
+- `x.com/scottlincicome` (the economist the description is actually about)
+- `linkedin.com/in/mark-phillips...`
+- `facebook.com/nextinsuranceusa`, `instagram.com/theselfemployedshow`
+
+Entity resolution stapled a person's identity + junk web profiles onto a company node.
+
+#### §3.3 — Duplicate edges between same node pair + unresolved stub (HIGH)
+
+Carl Bressler → "Unknown Company" (VC_Firm) has **two** edges with the same role title:
+
+- INVESTED_IN — `id 8348`, "Limited Partner", weight 15
+- WORKS_AT — `id 8642`, "Limited Partner", weight 20
+
+The LP relationship is double-modeled across two relationship types. The target node itself is an unresolved stub: `name: "Unknown Company"`, `company_domain: ""`, `visibility: false` — yet it sits on live INVESTED_IN/WORKS_AT edges.
+
+#### §3.4 — `description` vs `fact` field-name inconsistency (MEDIUM)
+
+The same semantic slot (human-readable edge label) uses different field names by edge type:
+
+- LOCATED_IN → `description` ("X is located in Y")
+- IN_REGION / IN_COUNTRY → `fact` ("X is a city located in Y")
+
+Any consumer reading edge prose must branch on edge type. Pick one field name.
+
+#### §3.5 — `valid_from` conflates valid time with ingestion time (MEDIUM)
+
+- WORKS_AT / FOUNDED use real role dates (e.g. `2023-01`).
+- Every LOCATED_IN, plus IN_REGION / IN_COUNTRY, either stamp `valid_from: "2026-05"` (current month = ingestion date masquerading as validity) or omit it entirely.
+
+A company located in a city since founding should not have `valid_from = this month`. Combined with the missing edge `created_at` (§1), there is no way to recover true validity.
+
+#### §3.6 — `weight` has no consistent scale (MEDIUM)
+
+Observed values: 5, 8, 10, 15, 20, 25, 28, 38, 50.
+
+- Geo-hierarchy edges look like schema constants (IN_REGION = 25, IN_COUNTRY = 50).
+- Some look computed (28, 38).
+- The same person's FOUNDED edge (always 5) disagrees with their WORKS_AT edge (5-28) for what is effectively the same relationship.
+
+Looks like residue from two different weighting passes. Confirm intended scale.
+
+#### §3.7 — Semantically wrong WORKS_AT for union membership (MEDIUM)
+
+Carl Bressler → SAG-AFTRA: `title: "Actor / Artist"`, `seniority_level: "C Suite"` (`id 5919`). Union membership is being modeled as a WORKS_AT employment edge, and an actor's membership is tagged C-Suite. `seniority_level: "C Suite"` is applied loosely across non-exec titles generally.
+
+#### §3.8 — `visibility` typed inconsistently (MEDIUM)
+
+Same field, mixed types across labels:
+
+- Person nodes: boolean `false`
+- Company / Organization nodes: string `"true"`
+- Funding_Round / VC_Firm: boolean `true` / `false`
+
+Any `WHERE visibility = true` Cypher filter will misbehave.
+
+#### §3.9 — `created_at` stored in three formats across node labels (MEDIUM)
+
+- Person: ISO-Z — `2026-05-30T22:15:44.246Z`
+- Company: epoch millis — `1780179235150`
+- Region / State: ISO + microseconds + offset — `2026-05-30T22:15:06.425258+00:00`
+
+Cross-label sorting / range queries on creation time require normalization first.
+
+#### §3.10 — Junk enrichment profiles on company nodes (LOW-MEDIUM)
+
+Beyond Stealth Startup (§3.2), Harmonic AI's `profiles` include obvious mismatches: `linkedin.com/company/stealth-startup-community`, `facebook.com/forbes`, `instagram.com/popular`, `crunchbase/akhenaten`. Profile-matching is attaching unrelated web identities to company nodes.
+
+#### §3.11 — Embeddings null on all nodes (NOTE)
+
+`name_embedding` and `expertise_embedding` are `null` on every node in both exports. If these exports were taken post-embedding this is a data gap; if the export deliberately strips them (as the projection query did), disregard. Flagging so it isn't mistaken for backfilled state.

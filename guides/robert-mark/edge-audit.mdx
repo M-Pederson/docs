@@ -225,6 +225,9 @@ These are sweeps over already-written data to repair what the fix-forward change
 5. **Document every backfill as you build it** in the standard artifact-card pattern (e.g. ``tool/backfill-edge-timestamps — 13051``).
 6. Before the eventual LIVE run: snapshot the relevant tables / export the affected edges via Cypher. All sweeps are reversible in principle but the snapshot is the safety net.
 7. **Verify with `tool/edge-qa-gate` (#13055)** — one **read-only** call returns every should-be-zero check (edge/node `created_at`, string `visibility`, geo `fact`, WORKS_AT sibling-dups, union WORKS_AT, description coverage) **plus the target FalkorDB `graph_name`**. Always glance at `target_graph` to confirm you're on sandbox vs live before trusting the numbers — the data source silently defaults to live, and a whole-graph dedupe *dry* was accidentally run against live this way (read-only, so no harm, but a destructive run would not be).
+8. **Optional one-call cleanup:** `tool/run-sandbox-edge-cleanup` (#13058) bundles the deterministic sweeps (§3.7 Pass 1 union→MEMBER_OF, §3.8 visibility, §3.4 geo, §3.9 node timestamps) — **dry-by-default**, echoes `target_graph` first, and only writes with `execute: true`. It deliberately excludes §3.7 Pass 2 (C-Suite regex), the §3.3 dedupe (#13052, destructive), and descriptions (LAST) — run those individually.
+
+**Backfill toolbox (all sandbox-first, dry-by-default where destructive):** `#13051` edge-timestamps · `#13052` dedupe-worksat · `#13053` node-timestamps · `#13056` strip-domain-parse-errors (§3.1) · `#13057` detect-entity-collisions (§3.2, read-only) · `#13058` run-sandbox-edge-cleanup (orchestrator) · `#13055` edge-qa-gate (read-only gate). Description backfills: `#13006` work · `#13011` relationship · `#13018` worked-on.
 </Note>
 
 <Warning>
@@ -271,9 +274,11 @@ If any of these error in the sandbox run, capture the FalkorDB error message and
 backfill §3.1 — Purge domain-parse exception strings
 ```
 
-**Task.** *TBD — fill in the Xano Task name + ID once built (e.g. `backfill/strip-domain-parse-errors — 13xxx`).*
+```
+tool/backfill-strip-domain-parse-errors — 13056
+```
 
-**Sweep.** SQL-equivalent on `master_company` table: rows where `company_domain LIKE '[Line%'` OR `company_domain LIKE '%Error parsing domain%'`. For each match, null `company_domain`, `logo`, `website`. Optionally re-fire the domain-extractor against the source field that originally produced the exception so the row gets a real domain.
+**Built (2026-05-31).** Scans `master_company` for rows whose `company_domain` is a parse-exception string (starts with `[`, contains "error parsing domain", or has chars invalid in a domain) and nulls `company_domain` + `logo`. `dry_run` defaults to true (returns `matched` + `sample`); set `dry_run: false` to clear. Data-source-aware — **sandbox first**. The graph Company node's domain/logo/website rebuild from the cleaned table value on the next `update-company-node` sync.
 
 **Risk.** Low — these fields are already broken in production; nulling them is strictly safer than the current state.
 
@@ -285,14 +290,16 @@ backfill §3.1 — Purge domain-parse exception strings
 backfill §3.2 — Split Stealth Startup entity collision (and audit for siblings)
 ```
 
-**Task.** *TBD — fill in the Xano Task name + ID once built (e.g. `backfill/strip-domain-parse-errors — 13xxx`).*
+```
+tool/detect-entity-collisions — 13057
+```
 
-**Sweep.** Two parts:
+**Built (2026-05-31) — READ-ONLY detector.** Lists company rows that have a person `linkedin.com/in/` master_link attached (the fingerprint of the Stealth-Startup collision), grouped by company with the offending `master_link` ids. Surfaces the suspects; it does **not** auto-remediate, because the fix is per-row judgment:
 
-1. Surgical fix on `master_company_id = 5` ("Stealth Startup"): clear `description`, `summary`, and `profiles` (they describe Scott Lincicome / mix unrelated handles). Re-run company enrichment on the cleared row so it picks up legitimate Stealth Startup data.
-2. Detect siblings: query `master_company` for rows where `profiles` contains a `linkedin.com/in/` URL (those should never be on a company node), or where `description` mentions a single named individual. Flag for manual review.
+1. **Surgical fix** on a flagged row (e.g. `master_company_id = 5`): clear the mis-merged `description` / `summary` / person `profiles`, then re-run company enrichment so it repopulates with legitimate data. *(Manual — re-enrichment may be gated by the `debug.stop` in #12558 SECTION 11.)*
+2. **Detach** the person links: null `master_company_id` on the `suspect_link_ids` the detector returns (the §3.2 fix-forward already blocks new `/in/` attachments, and addon #690 now requires `profile == true`, so they no longer surface on the node regardless).
 
-**Risk.** Medium — clearing fields is reversible (re-enrichment); but mis-merged entities may have downstream edges that need re-attachment.
+**Risk.** Detector is zero-risk (read-only). Remediation is medium — clearing fields is reversible via re-enrichment, but mis-merged entities may have downstream edges needing re-attachment.
 
 </Card>
 
@@ -578,7 +585,8 @@ Nodes carry `created_at`; edges never do. With no edge creation timestamp, you c
 | FOUNDED, LOCATED_IN, IN_REGION, IN_COUNTRY, ATTENDED*, RECEIVED_HONOR/ISSUED_BY, HAS_CERTIFICATION/GRANTED_BY/CERTIFIED_BY, VOLUNTEERED_AT, HAS_AWARD/WON_AWARD/NOMINATED_FOR | inline at creation (templated or LLM) | ✅ at write time |
 | BOARD_MEMBER_OF, ADVISOR_TO, INVESTED_IN (work-derived), MEMBER_OF | LLM pipeline `#13009`→`#13011` | ⚠️ crons #166/#169/#170 **INACTIVE** — only raw LinkedIn text until enabled |
 | WORKED_ON (IMDb) | LLM pipeline `#13016`→`#13018` exists | ⚠️ **no cron at all** |
-| RAISED, LEAD_INVESTED_IN, FOLLOW_ON_INVESTED_IN, INVESTMENT_PARTNER_IN/AT, INVESTED_IN (deal-side) | none | ❌ no description pipeline |
+| LEAD_INVESTED_IN, FOLLOW_ON_INVESTED_IN, INVESTMENT_PARTNER_IN/AT, INVESTED_IN (deal-side) | inline templated at creation (#12702) | ✅ present ("X invested in the Y Series A funding round.") — *not* an LLM pipeline; building one would overwrite working text (optional polish only) |
+| RAISED | created by funding cascade | ❓ verify whether it carries a description; no LLM pipeline |
 | HAS_SUBDOMAIN, KNOWS | none — by design (structural / evidence-envelope edges) | n/a |
 
 So WORKS_AT *does* get an LLM description (async). The gaps to close are: the **inactive relationship crons**, the **missing WORKED_ON cron**, and the **uncovered investor/funding edge family**.

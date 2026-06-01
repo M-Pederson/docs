@@ -1,0 +1,272 @@
+---
+title: "GoDigital POC Spec"
+description: "Path-of-least-resistance build to seed a GoDigital demo graph — one script, FalkorDB + browser, no waterfall — plus the question bank of demo Cypher queries."
+---
+
+The minimum build to get a **live, explorable GoDigital graph** for a demo — skipping the full [Music Industry Waterfall](/guides/enrichment/waterfall/music-industry-waterfall) (no Xano, no queue tables, no crons). One script fetches the [seed set](/guides/enrichment/waterfall/seed-godigital#seed-set-real-musicbrainz-ids), maps it to the [node](/guides/enrichment/waterfall/music-nodes) / [edge](/guides/enrichment/waterfall/music-edges) specs, and `MERGE`s straight into a FalkorDB graph you explore in the FalkorDB Browser.
+
+## Least-resistance principles
+
+| Decision | POC choice | Why |
+|---|---|---|
+| Orchestration | **None** — one standalone script, run once | No queues/crons/Xano to build |
+| Graph store | A dedicated FalkorDB graph `godigital_poc` | Isolated, wipe-and-rerun, visual in the browser |
+| Demo UI | **FalkorDB Browser** (`:3000`) | Instant visual graph exploration — no frontend to build |
+| Rate limit | in-process `sleep(1.1s)` + retry on `503` | No token-bucket table needed at this scale |
+| Descriptions | **templated from data** (no LLM in v0) | "X was a member of Y (1987–1994, guitar)" — deterministic, zero cost |
+| Reconciliation | none — music graph stands alone | Skip `SAME_AS` / Person-dedup; add later |
+| Idempotency | `MERGE` on `mbid` | Re-runs are safe |
+
+<Note>
+This reuses the **exact** node/edge specs — it is just an un-queued, single-process version of the orchestrators. ~150 lines of Python. Everything carries `created_at` / `updated_at` / `description` from line one.
+</Note>
+
+## Stack
+
+```bash
+# 1. FalkorDB + browser (one container)
+docker run -p 6379:6379 -p 3000:3000 -it --rm falkordb/falkordb:latest
+# Browser → http://localhost:3000  (select graph "godigital_poc")
+
+# 2. Script deps
+pip install requests falkordb
+```
+
+```python
+from falkordb import FalkorDB
+db = FalkorDB(host="localhost", port=6379)
+g  = db.select_graph("godigital_poc")
+
+UA = {"User-Agent": "Orbiter/1.0 ( mark@orbiter.io )"}
+MB = "https://musicbrainz.org/ws/2"
+```
+
+## Ingest algorithm
+
+BFS from the seeds to **depth 2**, with the same caps as the waterfall (20 albums, 50 recordings, T1–T2 only past depth 0). `MERGE` makes re-visits free.
+
+```text
+seeds   = [Cinq label] + [9 marquee MBIDs]      # see Seed GoDigital
+queue   = [(mbid, entity_type, depth=0) for each seed]
+visited = set()
+
+while queue:
+    mbid, etype, depth = queue.pop(0)
+    if mbid in visited: continue
+    visited.add(mbid)
+
+    data = mb_get(etype, mbid, inc=INC[etype])   # throttled 1/s + retry on 503
+    upsert_node(etype, data)                       # MERGE node (+ description)
+    for edge in extract_edges(etype, data):
+        upsert_edge(edge)                          # MERGE edge (+ weight, description)
+
+    if depth < 2:
+        for child in neighbors(etype, data, depth):  # capped, T1–T2 past depth 0
+            queue.append((child.mbid, child.type, depth + 1))
+```
+
+```python
+import time, requests
+def mb_get(etype, mbid, inc):
+    for attempt in range(5):
+        time.sleep(1.1)                                   # global 1 req/s floor
+        r = requests.get(f"{MB}/{etype}/{mbid}", headers=UA,
+                         params={"inc": inc, "fmt": "json"})
+        if r.status_code == 200: return r.json()
+        if r.status_code in (400, 404): return None       # terminal
+        time.sleep(2 ** attempt)                           # 503/5xx backoff
+    return None
+```
+
+`INC` per entity (the relationship sets that produce edges):
+
+| Entity | `inc=` |
+|---|---|
+| `artist` | `aliases+tags+genres+ratings+url-rels+artist-rels` |
+| `recording` | `artist-credits+work-rels+artist-rels+genres` |
+| `work` | `artist-rels` |
+| `release-group` | `artist-credits+genres` |
+| `label` | `url-rels+label-rels+ratings+tags` (+ browse `release?label=`) |
+
+## Node + edge MERGE templates
+
+Parameterized, idempotent, with the standard envelope. `created_at` is set once via `ON CREATE SET`; `updated_at` on every write.
+
+```cypher
+// Person artist  →  Entity:Person:Music_Artist
+MERGE (a:Entity:Person:Music_Artist {mbid: $mbid})
+ON CREATE SET a.uuid = randomUUID(), a.created_at = timestamp()
+SET a.name = $name, a.sort_name = $sort_name, a.display_label = 'Person',
+    a.visibility = true, a.gender = $gender, a.country = $country,
+    a.birth_date = $birth, a.death_date = $death, a.begin_area = $area,
+    a.isnis = $isnis, a.genres = $genres, a.disambiguation = $disambig,
+    a.description = $description, a.updated_at = timestamp()
+```
+
+```cypher
+// Group  →  Entity:Music_Group   (a band is never a Person)
+MERGE (grp:Entity:Music_Group {mbid: $mbid})
+ON CREATE SET grp.uuid = randomUUID(), grp.created_at = timestamp()
+SET grp.name = $name, grp.display_label = 'Music_Group', grp.group_type = $type,
+    grp.country = $country, grp.formed_year = $formed, grp.ended = $ended,
+    grp.genres = $genres, grp.description = $description, grp.updated_at = timestamp()
+```
+
+```cypher
+// MEMBER_OF edge  (Person:Music_Artist) -> (Music_Group)
+MATCH (p:Music_Artist {mbid: $person_mbid}), (grp:Music_Group {mbid: $group_mbid})
+MERGE (p)-[r:MEMBER_OF]->(grp)
+ON CREATE SET r.uuid = randomUUID(), r.created_at = timestamp()
+SET r.weight = $weight, r.instruments = $instruments, r.begin = $begin,
+    r.end = $end, r.ended = $ended, r.original = $original,
+    r.description = $description, r.updated_at = timestamp()
+```
+
+The same shape covers every [edge](/guides/enrichment/waterfall/music-edges) — `MATCH` both endpoints by `mbid`, `MERGE` the typed edge, `ON CREATE SET uuid+created_at`, `SET weight + specifics + description + updated_at`. POC `description` is templated, e.g.:
+
+```python
+desc = f"{p_name} was {'a founding ' if original else 'a '}member of {grp_name}" \
+       + (f" ({begin}–{end or 'present'})" if begin else "") \
+       + (f", playing {instruments}." if instruments else ".")
+```
+
+## Indexes (run first)
+
+```cypher
+CREATE INDEX FOR (a:Music_Artist)  ON (a.mbid);
+CREATE INDEX FOR (g:Music_Group)   ON (g.mbid);
+CREATE INDEX FOR (r:Recording)     ON (r.mbid);
+CREATE INDEX FOR (w:Work)          ON (w.mbid);
+CREATE INDEX FOR (l:Music_Label)   ON (l.mbid);
+```
+
+<Tip>
+Add a full-text index for live search in the demo: `CALL db.idx.fulltext.createNodeIndex('Music_Artist', 'name')` → then `CALL db.idx.fulltext.queryNodes('Music_Artist', 'Daddy*')`. (Vector `name_embedding` / "similar artists" is a v2 add — it needs an embedding call per node.)
+</Tip>
+
+## The question bank — what we ask the graph
+
+Read-only (`GRAPH.RO_QUERY`). `$cinq = "fb742ab4-4035-4ef1-8684-98eaa80f6fe2"`. These are the demo's talking points.
+
+### 1 · The full roster ("this is your catalog")
+
+```cypher
+MATCH (a)-[:RELEASED]->(:Release_Group)<-[:RELEASE_OF]-(:Release)-[:RELEASED_ON]->(:Music_Label {mbid: $cinq})
+RETURN DISTINCT a.name AS artist, count(DISTINCT a) AS _ 
+ORDER BY artist
+```
+
+### 2 · An artist's collaboration network
+
+```cypher
+MATCH (a {name: 'Daddy Yankee'})-[:PERFORMED]->(rec:Recording)<-[:PERFORMED]-(b)
+WHERE b <> a
+RETURN b.name AS collaborator, count(rec) AS shared_tracks
+ORDER BY shared_tracks DESC LIMIT 20
+```
+
+### 3 · Shortest path between two artists ("six degrees")
+
+```cypher
+MATCH (a {name: 'Janet Jackson'}), (b {name: 'Ñengo Flow'}),
+      p = shortestPath((a)-[*..6]-(b))
+RETURN [n IN nodes(p) | n.name] AS path, length(p) AS degrees
+```
+
+### 4 · A&R signing radar — connected but unsigned
+
+```cypher
+MATCH (r)-[:RELEASED]->(:Release_Group)<-[:RELEASE_OF]-(:Release)-[:RELEASED_ON]->(:Music_Label {mbid: $cinq})
+WITH collect(DISTINCT r) AS roster
+MATCH (signed)-[:PERFORMED]->(rec:Recording)<-[:PERFORMED]-(candidate)
+WHERE signed IN roster AND NOT candidate IN roster
+RETURN candidate.name AS prospect, count(DISTINCT signed) AS roster_collabs
+ORDER BY roster_collabs DESC LIMIT 15
+```
+
+### 5 · Rights chain for a work (the rights-company angle)
+
+```cypher
+MATCH (w:Work {title: $title})
+OPTIONAL MATCH (writer)-[:COMPOSED|WROTE_LYRICS|WROTE]->(w)
+OPTIONAL MATCH (rec:Recording)-[:RECORDING_OF]->(w)
+OPTIONAL MATCH (rec)-[:APPEARS_ON]->(:Release)-[:RELEASED_ON]->(lbl:Music_Label)
+RETURN w.title, w.iswcs, w.pro_ids,
+       collect(DISTINCT writer.name) AS writers,
+       count(DISTINCT rec)           AS recordings,
+       collect(DISTINCT lbl.name)    AS labels
+```
+
+### 6 · Most-connected artists (degree centrality)
+
+```cypher
+MATCH (a)-[e]-()
+WHERE a:Music_Artist OR a:Music_Group
+RETURN a.name, count(e) AS connections
+ORDER BY connections DESC LIMIT 15
+```
+
+### 7 · Shared producers across the catalog
+
+```cypher
+MATCH (p:Person)-[:PRODUCED]->(rec:Recording)<-[:PERFORMED]-(a)
+WHERE a:Music_Artist OR a:Music_Group
+RETURN p.name AS producer, count(DISTINCT a) AS artists_worked_with
+ORDER BY artists_worked_with DESC LIMIT 15
+```
+
+### 8 · Geographic & genre footprint
+
+```cypher
+MATCH (a)-[:FROM_AREA]->(area)
+WHERE a:Music_Artist OR a:Music_Group
+RETURN area.name AS origin, count(a) AS artists ORDER BY artists DESC;
+
+MATCH (a)-[:HAS_GENRE]->(gen:Genre)
+RETURN gen.name AS genre, count(a) AS artists ORDER BY artists DESC LIMIT 12
+```
+
+### 9 · Catalog stats (the opening slide)
+
+```cypher
+MATCH (a) WHERE a:Music_Artist OR a:Music_Group RETURN 'artists'    AS type, count(a) AS n
+UNION MATCH (r:Recording)     RETURN 'recordings'    AS type, count(r) AS n
+UNION MATCH (w:Work)          RETURN 'works'         AS type, count(w) AS n
+UNION MATCH (rg:Release_Group) RETURN 'release_groups' AS type, count(rg) AS n
+UNION MATCH (l:Music_Label)   RETURN 'labels'        AS type, count(l) AS n
+```
+
+### 10 · Whole-catalog map (the visual centerpiece)
+
+Paste into the FalkorDB Browser to render the catalog around the label node:
+
+```cypher
+MATCH p = (:Music_Label {mbid: $cinq})<-[:RELEASED_ON]-(:Release)-[:RELEASE_OF]-(:Release_Group)<-[:RELEASED]-(a)
+OPTIONAL MATCH cp = (a)-[:PERFORMED]->(:Recording)<-[:PERFORMED]-()
+RETURN p, cp LIMIT 300
+```
+
+<Note>
+**Bridge query (v2, once seeded into the main graph):** because a `Person:Music_Artist` *is* an Orbiter `Person`, you can ask `MATCH (a:Music_Artist:Person)-[:FOUNDED|INVESTED_IN|WORKS_AT]->(c:Company) RETURN a.name, c.name` to surface a roster artist's *business* side. Out of scope for the isolated POC graph — it lands when music ingests into the main graph with reconciliation.
+</Note>
+
+## Run checklist
+
+1. `docker run … falkordb` → browser at `:3000`.
+2. Create the `mbid` indexes.
+3. Run the ingest script (~10–15 min for the curated catalog to depth 2; do it **the night before**).
+4. Sanity check: query **#9** (counts look right) and **#2** for Daddy Yankee (dozens of collaborators).
+5. Pre-stage queries **#1, #2, #5, #4, #10** in the browser — that's the [five-click flow](/guides/enrichment/waterfall/seed-godigital#what-the-fully-graphed-catalog-lets-you-do-in-the-demo): catalog → network → rights → A&R → full map.
+6. Keep one fresh artist MBID to seed **live** on camera (a single entity finishes in seconds).
+
+## What's deliberately cut (vs. production waterfall)
+
+| Cut for POC | Restored in production |
+|---|---|
+| Xano gates / orchestrators / queue tables / crons | full [waterfall](/guides/enrichment/waterfall/music-industry-waterfall) |
+| Token-bucket rate limiter | `mb/rate-limit/acquire` + unified cron |
+| LLM `description` generation | `mb/enrich/*-edge-description` pass |
+| `SAME_AS` / Person-dedup reconciliation | reconciliation pass into the main graph |
+| Depth-2 cap, single seed batch | full catalog, unbounded cascade with caps |
+
+The POC proves the **model and the questions**; the waterfall makes it continuous, rate-safe, and integrated.

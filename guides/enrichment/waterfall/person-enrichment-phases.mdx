@@ -3,17 +3,52 @@ title: "Person Enrichment Phases"
 description: "The person waterfall — from a LinkedIn URL to a fully enriched master_person, plus the 12-phase run-base-person-enrich orchestrator."
 ---
 
-The person waterfall begins when any function calls `mvp/get-add/master-person`. This page walks through the full flow using **Zeno Rocha** (founder of Resend) as the running example — entered with just a LinkedIn URL. See [Core Concepts](/guides/enrichment/waterfall/core-concepts) for shared mechanics (cascade depth, priority tiers, queue tables).
+The person waterfall begins when any function calls the master-person get-add. This page walks through the full flow using **Zeno Rocha** (founder of Resend) as the running example — entered with just a LinkedIn URL. See [Core Concepts](/guides/enrichment/waterfall/core-concepts) for shared mechanics (cascade depth, priority tiers, queue tables).
+
+<Note>
+**New architecture (May 2026).** The original monolith `mvp/get-add/master-person` #12553 is being replaced by a refactored sibling, **`mvp/get-add/master-person-new` #13039** — same input/response shape, a drop-in swap once verified. It splits the get-add into three composable stages and dispatches a new orchestrator, **`mvp/enrich/enrich-master-person` #13040** (successor to `run-base-person-enrich` #12554). The phase sub-functions (`process-person-phase-*`) are **shared** between both orchestrators, so the phase reference below applies to both. Sections marked _(legacy)_ describe the #12553/#12554 path, which behaves identically except where noted.
+</Note>
 
 ---
 
-## Entry Point
+## Pipeline Architecture (master-person-new)
 
 ```text
-mvp/get-add/master-person — #12553
+mvp/get-add/master-person-new — #13039   (v1.7, 2026-05-30)
 ```
 
-**Current version:** v2.9 (2026-04-13) — calls helper function `mvp/format/set-person-names` to write `first_name` / `last_name` via `db.edit` in an isolated scope, working around a Xano naming-collision bug. See function description in Xano for the v2.1 → v2.9 changelog.
+The refactored entry point splits the old monolith into three composable stages, then dispatches the orchestrator:
+
+```mermaid
+graph TD
+    A["1 · cascade-person-data #13037<br/>PDL → Enrich Layer → Exa"] --> B["2 · match-master-person #13038<br/>id resolution + phone format"]
+    B --> C["3 · master-person-new #13039<br/>kill-switch · local dedup · fundable ·<br/>contact write loops · add-person-node · dispatch"]
+    C --> D["enrich-master-person #13040<br/>(async-shared orchestrator)"]
+```
+
+| Stage | Function | Responsibility |
+|-------|----------|----------------|
+| 1 | `mvp/enrich/cascade-person-data` #13037 | Gathers raw enrichment in order: PDL → Enrich Layer (`api/enrich_layer/person-linkedin`, `person-email`) → Exa (`get-exa-profile`). Returns deduped `el_links` and a `needs_full_enrich` flag when sources are thin. |
+| 2 | `mvp/resolve/match-master-person` #13038 | Resolves the `master_person` id from links / emails / phones and formats phone numbers via `llm-phone-format`. No graph writes. |
+| 3 | `mvp/get-add/master-person-new` #13039 | Kill-switch → **pre-API local dedup** (v1.6: links/emails/`linkedin_url`) → Fundable lookup → contact write loops (`add-person-email`, `create-master-link`, `add-person-phone`) → `add-person-node` #2601 (graph Person node) → downstream dispatch. When `needs_full_enrich`, also fires `enrich/full-enrich-reverse-email-lookup` #13036 (async; FullEnrich webhook #8594 writes back into `person_enrich_data.full_enrich`). |
+
+**Downstream dispatch (final section).** When the person is new and not queued (`cascade_depth == 0` and `queue == false`), #13039 fires **`enrich-master-person` #13040** in **async-shared** mode (`master_person_id`, `deep_research`, `cascade_depth`). Otherwise it upserts `queue_enrich_person`. A `hold_downstream` input skips the dispatch and logs a `log_crash` note instead.
+
+<Warning>
+**Sandbox WIP:** the immediate-dispatch branch currently contains a `debug.stop "HOLD!!"` **immediately before** the `enrich-master-person` call, so the synchronous enrichment path is halted for debugging. Remove the `debug.stop` to restore live dispatch.
+</Warning>
+
+---
+
+## Entry Point _(live: #13039 — migrated 2026-06-01)_
+
+```
+mvp/get-add/master-person-new — #13039
+```
+
+<Note>
+  **Migrated 2026-06-01.** All function callers and the V2 Master Persons `POST master-persons` endpoint now invoke `mvp/get-add/master-person-new` (#13039) — the phase-split refactor (cascade `#13037` → match `#13038` → write / create / downstream dispatch). The previous entry point `mvp/get-add/master-person` (#12553) is **deprecated** and pending retirement. See [person-pipeline-polish](/guides/robert-mark/person-pipeline-polish) for the version timeline and the #12553 → #13039 divergences.
+</Note>
 
 Called with:
 ```json
@@ -169,7 +204,7 @@ Same routing logic as the company waterfall:
 
 ```mermaid
 graph TD
-    A{cascade_depth == 0<br/>AND queue == false?} -->|Yes| B["Enrich immediately<br/>run-base-person-enrich #12554<br/>(async)"]
+    A{cascade_depth == 0<br/>AND queue == false?} -->|Yes| B["Enrich immediately (async)<br/>enrich-master-person #13040<br/>legacy: run-base-person-enrich #12554"]
     A -->|No| C{Already in queue?}
     C -->|Yes| D["Bump count<br/>Upgrade priority_tier"]
     C -->|No| E["db.add queue_enrich_person<br/>cascade_depth, priority_tier,<br/>source_function, source_entity_id"]
@@ -179,13 +214,21 @@ For Zeno at depth 0: **immediate enrichment** fires asynchronously.
 
 ---
 
-## run-base-person-enrich Phases
+## Orchestrator Phases
 
 ```text
-mvp/enrich/run-base-person-enrich — #12554
+mvp/enrich/enrich-master-person   — #13040   (v3.8, 2026-05-30)   ← new orchestrator, dispatched by master-person-new
+mvp/enrich/run-base-person-enrich — #12554   (v3.4, 2026-04-24)   ← legacy orchestrator, dispatched by master-person
 ```
 
-**Current version:** v3.4 (2026-04-24) — adds **Phase 12** (`mvp/format/resolve-temp-name` #12890) as a final cleanup pass that replaces any remaining `temp_{uuid}` placeholder names on `master_person` with real data, either by scanning `enrich_history_person` (priority: PDL → EL → Twitter → Fundable → CB) or by parsing the LinkedIn URL slug. v3.2 (2026-04-14) was the prior refactor that split each phase into its own `process-person-phase-N` function wrapped in a try_catch, writing per-phase `qa_passed` / `CRASH: phase-N` rows into `log_crash` using a dedicated `phase` enum field for clean dashboard filtering.
+Both orchestrators run the **same shared `process-person-phase-*` sub-functions**, each wrapped in a `try_catch` that writes per-phase `qa_passed` / `CRASH: phase-N` rows to `log_crash` (using the dedicated `phase` enum field). `enrich-master-person` #13040 differs from the legacy `run-base-person-enrich` #12554 in four ways:
+
+- **Source-keyed history (v3.8).** Debounce + upsert key on `enrich_history_person.source == "Master Person Enrich"` instead of `data_source_id == 79` (the numeric id is retained for backward-compatible readers).
+- **Completion marker (v3.8).** A final step flips `enrich_history_person.processing = false` regardless of crash state — the FullEnrich webhook (#8594) polls this flag to detect orchestrator completion before applying `process-full-enrich`.
+- **Phase 4b — Exa profile (v3.5).** Runs `process-person-exa-profile` #13031 between Phase 4 and Phase 5 (bios, avatar replacement, work_experience rows; idempotent — no-ops when `person_enrich_data.exa` is empty).
+- **RocketReach removed (v3.7).** The former Phase 4c and its helpers (`process-person-rocket-reach` #13033, `get-rocketreach-person` #13032) are gone.
+
+**Legacy version:** `run-base-person-enrich` v3.4 (2026-04-24) — adds **Phase 12** (`mvp/format/resolve-temp-name` #12890) as a final cleanup pass that replaces any remaining `temp_{uuid}` placeholder names on `master_person` with real data, either by scanning `enrich_history_person` (priority: PDL → EL → Twitter → Fundable → CB) or by parsing the LinkedIn URL slug. v3.2 (2026-04-14) was the prior refactor that split each phase into its own `process-person-phase-N` function wrapped in a try_catch, writing per-phase `qa_passed` / `CRASH: phase-N` rows into `log_crash` using a dedicated `phase` enum field for clean dashboard filtering.
 
 A stale-dispatch guard at the top returns early with a `log_crash` entry if the `master_person` row has been deleted since the async fire.
 
@@ -195,11 +238,13 @@ Each phase passes independently — failures are logged but don't block later ph
 
 | # | Sub-function | What It Does |
 |:-:|--------------|-------------|
-| **—** | **Setup** (inline) | Upsert `enrich_history_person` row (`data_source_id: 79`), load `person_enrich_data`, copy PDL `sex` onto `master_person`. |
+| **—** | **Setup** (inline) | Upsert `enrich_history_person` row — keyed on `source = "Master Person Enrich"` in #13040 (legacy #12554 keys on `data_source_id: 79`), load `person_enrich_data`, copy PDL `sex` onto `master_person`. |
+| **0** | `process-person-phase-0` #12857 | **PDL Backfill** (v3.3, 2026-04-20) — re-fetches PDL into `person_enrich_data.pdl` before Phase 1 when it is missing. |
 | **1** | `process-person-phase-1` #12822 | **Enrich Layer API** — LinkedIn path with email fallback, 30-day dedup, history record (`data_source_id: 94`). |
 | **2** | `process-person-phase-2` #12823 | **Primary Location** — cascade EL → LinkedIn → PDL, call `add-person-primary-location`. |
 | **3** | `process-person-phase-3` #12824 | **Process PDL** — skills, interests, languages, education, work, certs, bios. **v3 (2026-04-15):** primary-current-company call now hard-codes `cascade_depth: 0` in addition to `queue: false`, so PDL+EL and `run-base-company-enrich-v3` always fire for the current employer regardless of the enclosing person's depth. v2 (2026-04-14) introduced the primary-current-company enrichment step. |
 | **4** | `process-person-phase-4` #12825 | **Process Enrich Layer Data** — call `process-enrich-layer`, mark EL history complete (`data_source_id: 94`). |
+| **4b** | `process-person-exa-profile` #13031 | **Process Exa Profile** (#13040 only, v3.5, 2026-05-24) — turns `person_enrich_data.exa` into bio rows, an avatar replacement, and `work_experience` rows. Idempotent — no-ops when `exa` is empty. |
 | **5** | `process-person-phase-5` #12826 | **Fundable People Linking** — match via LinkedIn / CB / X URLs, link `fundable_people.master_person_id`. |
 | **6** | `process-person-phase-6` #12827 | **LLM Bios & Deep Research** — `create-llm-person-bios`; conditional `deep-research-person-prompt` when `deep_research=true`. |
 | **7** | `process-person-phase-7` #12828 | **Resolve Edges** — all 6 edge types: `resolve-edges-education` #12560, `resolve-edges-work` #12562, `resolve-edges-certifications` #12578, `resolve-edges-projects-publications` #12579, `resolve-edges-honor` #4574, `resolve-edges-volunteering` #4575. |
@@ -210,10 +255,14 @@ Each phase passes independently — failures are logged but don't block later ph
 | **12** | `mvp/format/resolve-temp-name` #12890 | **Resolve Temp Name** — if `master_person.name` (or `first_name`) still starts with `temp_`, scan `enrich_history_person` for a usable name (priority: PDL `data_source_id 91` → EL `94` → Twitter `7` → Fundable `89` → CB `8`) and fall back to parsing the LinkedIn URL slug. When a candidate is found, it passes through `name-format` + `set-person-names` to overwrite the placeholder. A sanity-check rejects LLM output whose letters don't overlap the input (guards against transient garbage). Added in v3.4 (2026-04-24). |
 
 <Note>
-All Phase 7 `resolve-edges-*` functions were upgraded in April 2026 to accept `cascade_depth` and pass `queue: true` + `priority_tier` + `source_function` + `source_entity_id` to every `get-add/master-company` and `get-add/master-person` call. This makes the cascade traceable in the queue tables.
+All Phase 7 `resolve-edges-*` functions were upgraded in April 2026 to accept `cascade_depth` and pass `queue: true` + `priority_tier` + `source_function` + `source_entity_id` to every `get-add/master-company` and `get-add/master-person-new` (#13039) call. This makes the cascade traceable in the queue tables.
 
 Most recent: `run-base-person-enrich` v3.4 (2026-04-24, Phase 12 — `resolve-temp-name` cleanup), `process-person-phase-9` v3.0 (2026-04-19, deal cascade via `cascade-deal-participants`), `process-person-phase-10` v2.0 (2026-04-19, reduced to no-op stub — phase-9 owns the cascade), `resolve-edges-work` v1.3 (2026-04-14, `|first_notnull:0` fix), `resolve-edges-certifications` v2.1 (2026-04-14, added missing `master_person_id` input).
 </Note>
+
+<Check>
+**Graph node timestamp coverage (audited 2026-06-01).** Every node create/update reachable from this flow now stamps `created_at` on create and `updated_at` on update — verified across `add-person-node` #2601, the Phase 7 `resolve-edges-*` writers (`Certification`, `Project`, `Publication`, `Honor`, `Organization`), Phase 8 expertise (`SubDomainExpertise`) + IMDB (`Film_TV`, `Film_TV_Award`), Phase 9 funding (`Funding_Round`, `VC_Firm` label), Phase 2/3 location (`Country`/`Region`/`City`) + `Company`, and the `create-work-edges` #2800 Person/Company stub-`MERGE` (patched 2026-06-01). The orchestration / data functions (`master-person-new` #13039, `enrich-master-person` #13040, `cascade-person-data` #13037, `match-master-person` #13038, `process-person-exa-profile` #13031) perform **no** graph-node Cypher — they delegate to the leaf writers. Full per-function record: [Node Types → Timestamp coverage audit](/guides/ontology/nodes#timestamp-coverage-audit).
+</Check>
 
 ### Phase 3 Detail: Primary Current Company Auto-Enrichment
 
@@ -277,8 +326,8 @@ Here's the complete cascade from the sandbox run — one LinkedIn URL generated 
 
 ```
 Depth 0: Zeno Rocha (linkedin.com/in/zeno-rocha-6270a914)
-├── get-add/master-person → person #1 (immediate enrichment)
-│   └── run-base-person-enrich (12 phases)
+├── get-add/master-person-new #13039 → person #1 (immediate enrichment)
+│   └── enrich-master-person #13040 (legacy: run-base-person-enrich) — phases 0–12
 │
 │       Phase 3 (process-person-phase-3 v3) — Process PDL
 │       │   + auto-enrich primary current company (cascade_depth=0, queue=false)

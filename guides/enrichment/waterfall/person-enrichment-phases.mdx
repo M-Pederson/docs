@@ -14,7 +14,7 @@ The person waterfall begins when any function calls the master-person get-add. T
 ## Pipeline Architecture (master-person-new)
 
 ```text
-mvp/get-add/master-person-new — #13039   (v1.7, 2026-05-30)
+mvp/get-add/master-person-new — #13039   (v1.9, 2026-06-01)
 ```
 
 The refactored entry point splits the old monolith into three composable stages, then dispatches the orchestrator:
@@ -22,21 +22,21 @@ The refactored entry point splits the old monolith into three composable stages,
 ```mermaid
 graph TD
     A["1 · cascade-person-data #13037<br/>PDL → Enrich Layer → Exa"] --> B["2 · match-master-person #13038<br/>id resolution + phone format"]
-    B --> C["3 · master-person-new #13039<br/>kill-switch · local dedup · fundable ·<br/>contact write loops · add-person-node · dispatch"]
+    B --> C["3 · master-person-new #13039<br/>kill-switch · local dedup · Fundable sync ·<br/>contact write loops · add-person-node · dispatch"]
     C --> D["enrich-master-person #13040<br/>(async-shared orchestrator)"]
 ```
 
 | Stage | Function | Responsibility |
 |-------|----------|----------------|
-| 1 | `mvp/enrich/cascade-person-data` #13037 | Gathers raw enrichment in order: PDL → Enrich Layer (`api/enrich_layer/person-linkedin`, `person-email`) → Exa (`get-exa-profile`). Returns deduped `el_links` and a `needs_full_enrich` flag when sources are thin. |
+| 1 | `mvp/enrich/cascade-person-data` #13037 | Gathers raw enrichment in order: PDL → Enrich Layer (`api/enrich_layer/person-linkedin`, `person-email`) → Exa (`get-exa-profile`). v1.4 treats PDL 200 responses with empty `data.experience` as thin and continues through fallback. Returns deduped `el_links` and a `needs_full_enrich` flag when sources are thin. |
 | 2 | `mvp/resolve/match-master-person` #13038 | Resolves the `master_person` id from links / emails / phones and formats phone numbers via `llm-phone-format`. No graph writes. |
-| 3 | `mvp/get-add/master-person-new` #13039 | Kill-switch → **pre-API local dedup** (v1.6: links/emails/`linkedin_url`) → Fundable lookup → contact write loops (`add-person-email`, `create-master-link`, `add-person-phone`) → `add-person-node` #2601 (graph Person node) → downstream dispatch. When `needs_full_enrich`, also fires `enrich/full-enrich-reverse-email-lookup` #13036 (async; FullEnrich webhook #8594 writes back into `person_enrich_data.full_enrich`). |
+| 3 | `mvp/get-add/master-person-new` #13039 | Kill-switch → **pre-API local dedup** (v1.6: links/emails/`linkedin_url`) → Fundable lookup from the full enriched link set → contact write loops (`add-person-email`, `create-master-link`, `add-person-phone`) → Fundable direct-field sync (v1.9: profile URLs, email, phone, avatar, about/title snippets) → `add-person-node` #2601 (graph Person node) → downstream dispatch. When `needs_full_enrich`, also fires `enrich/full-enrich-reverse-email-lookup` #13036 (async; FullEnrich webhook #8594 writes back into `person_enrich_data.full_enrich`). |
 
 **Downstream dispatch (final section).** When the person is new and not queued (`cascade_depth == 0` and `queue == false`), #13039 fires **`enrich-master-person` #13040** in **async-shared** mode (`master_person_id`, `deep_research`, `cascade_depth`). Otherwise it upserts `queue_enrich_person`. A `hold_downstream` input skips the dispatch and logs a `log_crash` note instead.
 
-<Warning>
-**Sandbox WIP:** the immediate-dispatch branch currently contains a `debug.stop "HOLD!!"` **immediately before** the `enrich-master-person` call, so the synchronous enrichment path is halted for debugging. Remove the `debug.stop` to restore live dispatch.
-</Warning>
+<Check>
+**2026-06-01:** the temporary immediate-dispatch debug stop was removed in #13039 v1.8. New, non-queued depth-0 people now dispatch `enrich-master-person` #13040 directly.
+</Check>
 
 ---
 
@@ -110,7 +110,7 @@ Before creating anything, the function checks for existing records:
 graph TD
     A["Section 3: Quick Check<br/>input links → master_link"] -->|not found| B
     B["Section 5: Post-EL/PDL<br/>enriched links<br/>emails, phones"] -->|not found| C
-    C["Section 5b: Fundable lookup<br/>link-fundable-person"] -->|not found| D
+    C["Section 5b: Fundable lookup<br/>enriched links → fundable_people"] -->|not found| D
     D["Section 7: Final Check<br/>merged contact data"] -->|not found| E
     E["Section 7b: Existing-person gate<br/>status / conflict checks"] -->|not found| F["Section 9: Create"]
 
@@ -127,12 +127,12 @@ For Zeno Rocha on first entry — no existing `master_link` for his LinkedIn URL
 
 ## Phase 4: External API Enrichment (Sections 4, 6) + Fundable
 
-When `cascade_depth == 0`, both external APIs are called; Fundable is also queried to link any matching `fundable_people` record.
+When `cascade_depth == 0`, the PDL/EL/Exa cascade runs first, then Fundable is queried against the merged link set. When a matching `fundable_people` row is found, #13039 v1.9 adds every Fundable profile URL as `master_link.source = "Fundable"` and processes direct Fundable person fields in the same create/update path.
 
 ```mermaid
 graph TD
     A["Section 4: Enrich Layer<br/>Person LinkedIn lookup"] --> B["Section 6: People Data Labs<br/>/v5/person/enrich"]
-    B --> C["Section 5b: Fundable lookup<br/>link-fundable-person"]
+    B --> C["Section 5b: Fundable lookup<br/>sync Fundable profile URLs + fields"]
     C --> D["Merge results into<br/>working variables"]
 ```
 
@@ -142,7 +142,7 @@ graph TD
 |-----|----------|----------------|
 | **Enrich Layer** | `api/enrich_layer/person-linkedin` | Full name, avatar, headline, current company, location |
 | **PDL** | `/v5/person/enrich` | Full name, emails, phones, profiles, work history, education |
-| **Fundable** | `mvp/fundable/link-fundable-person` | Matches by LinkedIn / CB / X URL, links `fundable_people.master_person_id` |
+| **Fundable** | `mvp/fundable/link-fundable-person` + #13039 v1.9 inline sync | Matches by LinkedIn / CB / X URL; links `fundable_people.master_person_id`; writes Fundable LinkedIn / Crunchbase / X / Tracxn / CB Insights / PitchBook URLs to `master_link` with `source = "Fundable"`; processes Fundable email, phone, profile image, `about`, `linkedin_title`, and `crunchbase_title`. Existing `master_link` rows are skipped by `create-master-link`. |
 
 For Zeno at depth 0, PDL returns his full profile — name, work history at Resend and Liferay, education at UNIRIO and PUCPR, social profiles, and contact info.
 
@@ -217,7 +217,7 @@ For Zeno at depth 0: **immediate enrichment** fires asynchronously.
 ## Orchestrator Phases
 
 ```text
-mvp/enrich/enrich-master-person   — #13040   (v3.9, 2026-06-01)   ← new orchestrator, dispatched by master-person-new
+mvp/enrich/enrich-master-person   — #13040   (v3.10, 2026-06-02)   ← active orchestrator, dispatched by master-person-new and process-full-enrich
 mvp/enrich/run-base-person-enrich — #12554   (source sweep, 2026-06-01)   ← legacy orchestrator, dispatched by master-person
 ```
 
@@ -225,6 +225,7 @@ Both orchestrators run the **same shared `process-person-phase-*` sub-functions*
 
 - **Source-keyed history (v3.9).** Debounce + upsert key on `enrich_history_person.source == "Master Person Enrich"` instead of the legacy numeric source id. New setup rows write source text only; legacy `data_source_id` inputs remain unused for compatibility.
 - **Completion marker (v3.8).** A final step flips `enrich_history_person.processing = false` regardless of crash state — the FullEnrich webhook (#8594) polls this flag to detect orchestrator completion before applying `process-full-enrich`.
+- **Forced re-run for FullEnrich (v3.10).** Optional `force_run` bypasses the 60s debounce. `process-full-enrich` #13049 v1.8 uses this to immediately re-dispatch #13040 after FullEnrich backfills LinkedIn and refreshes PDL/EL stashes.
 - **Phase 4b — Exa profile (v3.5).** Runs `process-person-exa-profile` #13031 between Phase 4 and Phase 5 (bios, avatar replacement, work_experience rows; idempotent — no-ops when `person_enrich_data.exa` is empty).
 - **RocketReach removed (v3.7).** The former Phase 4c and its helpers (`process-person-rocket-reach` #13033, `get-rocketreach-person` #13032) are gone.
 
@@ -232,7 +233,7 @@ Both orchestrators run the **same shared `process-person-phase-*` sub-functions*
 
 A stale-dispatch guard at the top returns early with a `log_crash` entry if the `master_person` row has been deleted since the async fire.
 
-**60s debounce (source-keyed).** Immediately after the stale-dispatch guard, a second early-return checks for any `enrich_history_person` row with the same `master_person_id` + `source == "Master Person Enrich"` + `updated_at > now - 60_000`. If found, logs `"DUPLICATE TRIGGER, debounced (60s window)"` and returns null — no phases re-run. The setup row is upsert-style on (master_person_id, source), so the key is `updated_at` (touched on every re-run) rather than `created_at` (frozen at first write). Caveat: a manual force re-run within 60s is also blocked — null the row's `updated_at` to override.
+**60s debounce (source-keyed).** Immediately after the stale-dispatch guard, a second early-return checks for any `enrich_history_person` row with the same `master_person_id` + `source == "Master Person Enrich"` + `updated_at > now - 60_000`. If found, logs `"DUPLICATE TRIGGER, debounced (60s window)"` and returns null — no phases re-run. The setup row is upsert-style on (master_person_id, source), so the key is `updated_at` (touched on every re-run) rather than `created_at` (frozen at first write). As of v3.10, callers can pass `force_run: true` to bypass this debounce.
 
 Each phase passes independently — failures are logged but don't block later phases.
 

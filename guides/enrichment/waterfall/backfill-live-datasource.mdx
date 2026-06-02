@@ -1,0 +1,174 @@
+---
+title: "Backfill Live Datasource"
+description: "Operator reference for enrichment backfill functions, dry-run behavior, and live datasource rollout."
+---
+
+Backfill functions repair or complete historical enrichment data after the fix-forward path has been updated. Treat them as operator tools: run sandbox first, inspect the dry-run output, then execute in small batches before pointing anything at the live datasource.
+
+This page lists the current backfill-named functions and keeps the rollout notes for backfills that may eventually run from a task.
+
+---
+
+## Operating Rules
+
+1. Run every backfill against `sandbox` first.
+2. Use `dry_run: true` before any write.
+3. Keep batches small when moving from sandbox to live.
+4. Prefer idempotent backfills that can be re-run safely.
+5. Do not activate a recurring task until manual sandbox execution has passed.
+
+Most backfills default to dry-run mode. For boolean inputs, use `first_notnull` in XanoScript so an explicit `false` survives; `first_notempty` treats `false` as empty and can accidentally keep a destructive function in dry-run mode forever.
+
+---
+
+## Fundable Organization Company Backfill
+
+```text
+tool/backfill-fundable-org-companies - #13066
+```
+
+**Purpose:** find Fundable organizations that have Fundable deals but do not yet have a `master_company_id`, then run `mvp/get-add/master-company-new` and link the Fundable organization to the returned master company.
+
+**Selection criteria:**
+
+| Table | Criteria |
+|-------|----------|
+| `fundable_organizations` | `master_company_id == null` and `num_funding_rounds > 0` |
+| `fundable_deals` | At least one row exists where `organization_id == fundable_organizations.id` |
+
+**Inputs passed to `mvp/get-add/master-company-new`:**
+
+| Input | Source |
+|-------|--------|
+| `domain` | `fundable_organizations.domain`, fallback `website` |
+| `profile_url` | LinkedIn, fallback Crunchbase, fallback PitchBook |
+| `company_name` | `name`, fallback `legal_name` |
+| `source` | `Fundable` |
+| `data_source_id` | `89` |
+| `is_vc` | `fundable_organizations.is_investor` |
+| `queue` | Worker input, defaults to `true` |
+| `cascade_depth` | Worker input, defaults to `0` |
+| `priority_tier` | Worker input, defaults to `2` |
+| `fundable_org_id` | Optional smoke-test target; when present, the worker only evaluates that Fundable org |
+| `source_function` | `tool/backfill-fundable-org-companies` |
+| `source_entity_uuid` | `fundable_organizations.id` |
+| `source_entity_type` | `fundable_organizations` |
+
+After `get-add/master-company-new` returns a `master_company_id`, the worker writes back:
+
+```text
+fundable_organizations.master_company_id
+fundable_organizations.master_company_node_uuid
+```
+
+### Dry Run
+
+Dry run is read-only. It selects candidates and verifies they have Fundable deals, but it does not call `mvp/get-add/master-company-new`, does not write to `fundable_organizations`, and does not enqueue company enrichment.
+
+Use this first:
+
+```json
+{
+  "data_source": "sandbox",
+  "dry_run": true,
+  "batch_size": 10,
+  "queue": true,
+  "cascade_depth": 0,
+  "priority_tier": 2
+}
+```
+
+Expected response fields:
+
+| Field | Meaning |
+|-------|---------|
+| `candidates` | Number of Fundable org rows selected by the broad criteria |
+| `processed` | Rows that passed the actual Fundable deal existence check |
+| `skipped` | Rows skipped, usually because no deal row was found |
+| `remaining_count` | Total rows still matching the broad criteria |
+| `results` | Candidate preview, including the domain/profile URL that would be sent to `get-add` |
+
+To retest one exact Fundable org, include `fundable_org_id`:
+
+```json
+{
+  "data_source": "sandbox",
+  "dry_run": true,
+  "batch_size": 1,
+  "fundable_org_id": "4e47b9e1-58f8-4e66-8574-b8c12a7e73bb"
+}
+```
+
+### Sandbox Execute
+
+Once the dry run looks right, execute a small sandbox batch:
+
+```json
+{
+  "data_source": "sandbox",
+  "dry_run": false,
+  "batch_size": 5,
+  "queue": true,
+  "cascade_depth": 0,
+  "priority_tier": 2
+}
+```
+
+With `queue: true`, the company is added or upgraded in `queue_enrich_company`. `cascade_depth: 0` means the record is treated as a seed-depth company for the queue metadata; queueing is still controlled by the `queue` input.
+
+### Task Wrapper
+
+A sandbox task wrapper has been staged locally but not published or activated:
+
+```text
+xano-staged/fundable-org-company-backfill/task/backfill_fundable_org_companies_sandbox.xs
+```
+
+It calls `tool/backfill-fundable-org-companies` with `data_source: "sandbox"`, `dry_run: true`, and `cascade_depth: 0`. It intentionally has no active `schedule` line. When the task is ready to become recurring, enable a schedule such as:
+
+```xanoscript
+schedule = [{starts_on: 2026-06-02 10:00:00+0000, freq: 300}]
+```
+
+Keep the task disabled until manual sandbox dry-run and sandbox execute have both passed.
+
+---
+
+## Backfill Function Index
+
+Snapshot from live Xano workspace 3 on 2026-06-02. Most new backfills use the `tool/backfill-*` prefix; a few older backfills live under `mvp/imdb` or `mvp/expertise`.
+
+| ID | Function | Scope | Safety / dry-run behavior |
+|----|----------|-------|---------------------------|
+| `#13066` | `tool/backfill-fundable-org-companies` | Links Fundable orgs with deals to `master_company` via `get-add/master-company-new`. | Read-only candidate/deal preview when `dry_run: true`; writes only when `dry_run: false`. |
+| `#13065` | `tool/backfill-raised-edge-timestamps` | Adds `created_at`, `updated_at`, and deterministic `uuid` to legacy `RAISED` edges. | Defaults to dry run; re-run batches until `more_remaining = false`. |
+| `#13064` | `tool/backfill-purge-was-founded` | Removes `WAS_FOUNDED` artifact edges and their `contextFounded` placeholder node. | Dry run inspects artifact node identity and incident edge types; destructive when `dry_run: false`. |
+| `#13063` | `tool/backfill-edge-weights` | Reweights existing FalkorDB edges to the canonical Edge Weights scale. | `dry_run: true` reports off-scale counts; `dry_run: false` applies `SET` operations. |
+| `#13060` | `tool/backfill-strip-domain-errors-nodes` | Cleans poisoned graph Company node domain/logo values caused by domain parse exception strings. | Defaults to dry run; graph node writes only when executed. |
+| `#13059` | `tool/backfill-clear-loose-csuite` | Clears `seniority_level = "C Suite"` from non-executive `WORKS_AT` edges. | Defaults to dry run; writes only on execute. |
+| `#13056` | `tool/backfill-strip-domain-parse-errors` | Cleans poisoned `master_company.company_domain` and logo table values. | Defaults to dry run; table writes only on execute. |
+| `#13053` | `tool/backfill-node-timestamps` | Normalizes graph node `created_at` and `updated_at` to epoch milliseconds. | Defaults to dry run; paginates with `offset` until `more_remaining = false`. |
+| `#13052` | `tool/backfill-dedupe-worksat` | Removes legacy duplicate `WORKS_AT` edges that fix-forward now prevents. | Defaults to dry run; destructive when `dry_run: false`. |
+| `#13051` | `tool/backfill-edge-timestamps` | Stamps `created_at` and `updated_at` on graph edges missing timestamps. | Defaults to dry run; repeat batches until `more_remaining = false`. |
+| `#13047` | `mvp/imdb/backfill-film-tv-posters` | Uploads raw Film/TV poster URLs to GCS and writes the GCS URL back to `film_tv.image_url`. | Batch-limited and safe to re-run; skips rows already on GCS. |
+| `#13046` | `mvp/expertise/backfill-has-expertise-descriptions-v2` | Replacement for `#13021`; generates missing `HAS_EXPERTISE` edge descriptions with corrected result handling. | Safe to re-run; `description_generated_at` guard skips completed edges. |
+| `#13043` | `mvp/expertise/backfill-has-expertise-weight` | Backfills `HAS_EXPERTISE` graph edge weights and repairs `person_has_expertise.weight = 0` table rows. | Safe to re-run; graph path only updates edges where `r.weight IS NULL`. |
+| `#13041` | `tool/backfill-broken-imdb-poster-urls` | Repairs malformed Amazon IMDB poster URLs in `film_tv`. | Dry run returns rows that would be fixed; idempotent on repeat. |
+| `#13021` | `tool/backfill-expertise-edge-descriptions` | Generates missing descriptions for `HAS_EXPERTISE` edges. | Batch-drains undone edges; safe to re-run. |
+| `#13018` | `tool/backfill-worked-on-edge-descriptions` | Generates missing descriptions for `WORKED_ON` Film/TV edges. | Batch-drains undone edges; safe to re-run. |
+| `#13014` | `tool/backfill-award-edges-imdb` | Re-runs award edge creation for an IMDB person after node UUID backfill. | Idempotent because award edge writer uses `MERGE`. |
+
+---
+
+## Moving a Backfill to Live
+
+Use this checklist before setting `data_source: "live"` or enabling a task:
+
+1. Run `dry_run: true` against sandbox when the function supports dry run.
+2. Run a small sandbox execute batch.
+3. Verify table rows, graph writes, and queue rows landed as expected.
+4. Run `dry_run: true` against live to inspect candidate counts when supported.
+5. Execute live in small batches.
+6. Only then enable a recurring task, and start with a low batch size.
+
+For graph backfills, confirm the function is data-source aware. Most graph backfills route through `mvp/falkor/send-cypher`, which reads the ambient Xano data source and points to the matching FalkorDB graph.

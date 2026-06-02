@@ -217,33 +217,33 @@ For Zeno at depth 0: **immediate enrichment** fires asynchronously.
 ## Orchestrator Phases
 
 ```text
-mvp/enrich/enrich-master-person   — #13040   (v3.8, 2026-05-30)   ← new orchestrator, dispatched by master-person-new
-mvp/enrich/run-base-person-enrich — #12554   (v3.4, 2026-04-24)   ← legacy orchestrator, dispatched by master-person
+mvp/enrich/enrich-master-person   — #13040   (v3.9, 2026-06-01)   ← new orchestrator, dispatched by master-person-new
+mvp/enrich/run-base-person-enrich — #12554   (source sweep, 2026-06-01)   ← legacy orchestrator, dispatched by master-person
 ```
 
-Both orchestrators run the **same shared `process-person-phase-*` sub-functions**, each wrapped in a `try_catch` that writes per-phase `qa_passed` / `CRASH: phase-N` rows to `log_crash` (using the dedicated `phase` enum field). `enrich-master-person` #13040 differs from the legacy `run-base-person-enrich` #12554 in four ways:
+Both orchestrators run the **same shared `process-person-phase-*` sub-functions**, each wrapped in a `try_catch` that writes per-phase `qa_passed` / `CRASH: phase-N` rows to `log_crash` (using the dedicated `phase` enum field). Current behavior:
 
-- **Source-keyed history (v3.8).** Debounce + upsert key on `enrich_history_person.source == "Master Person Enrich"` instead of `data_source_id == 79` (the numeric id is retained for backward-compatible readers).
+- **Source-keyed history (v3.9).** Debounce + upsert key on `enrich_history_person.source == "Master Person Enrich"` instead of the legacy numeric source id. New setup rows write source text only; legacy `data_source_id` inputs remain unused for compatibility.
 - **Completion marker (v3.8).** A final step flips `enrich_history_person.processing = false` regardless of crash state — the FullEnrich webhook (#8594) polls this flag to detect orchestrator completion before applying `process-full-enrich`.
 - **Phase 4b — Exa profile (v3.5).** Runs `process-person-exa-profile` #13031 between Phase 4 and Phase 5 (bios, avatar replacement, work_experience rows; idempotent — no-ops when `person_enrich_data.exa` is empty).
 - **RocketReach removed (v3.7).** The former Phase 4c and its helpers (`process-person-rocket-reach` #13033, `get-rocketreach-person` #13032) are gone.
 
-**Legacy version:** `run-base-person-enrich` v3.4 (2026-04-24) — adds **Phase 12** (`mvp/format/resolve-temp-name` #12890) as a final cleanup pass that replaces any remaining `temp_{uuid}` placeholder names on `master_person` with real data, either by scanning `enrich_history_person` (priority: PDL → EL → Twitter → Fundable → CB) or by parsing the LinkedIn URL slug. v3.2 (2026-04-14) was the prior refactor that split each phase into its own `process-person-phase-N` function wrapped in a try_catch, writing per-phase `qa_passed` / `CRASH: phase-N` rows into `log_crash` using a dedicated `phase` enum field for clean dashboard filtering.
+**Legacy baseline:** `run-base-person-enrich` v3.4 (2026-04-24) added **Phase 12** (`mvp/format/resolve-temp-name` #12890) as a final cleanup pass that replaces any remaining `temp_{uuid}` placeholder names on `master_person` with real data, either by scanning `enrich_history_person` (priority: PDL → EL → Twitter → Fundable → CB) or by parsing the LinkedIn URL slug. The 2026-06-01 source sweep keeps that behavior but keys the scan by source text.
 
 A stale-dispatch guard at the top returns early with a `log_crash` entry if the `master_person` row has been deleted since the async fire.
 
-**60s debounce (2026-05-13).** Immediately after the stale-dispatch guard, a second early-return checks for any `enrich_history_person` row with the same `master_person_id` + `data_source_id == 79` + `updated_at > now - 60_000`. If found, logs `"DUPLICATE TRIGGER, debounced (60s window)"` and returns null — no phases re-run. The setup row is upsert-style on (master_person_id, ds=79), so the key is `updated_at` (touched on every re-run) rather than `created_at` (frozen at first write). Mirrors the parallel debounce on `enrich-master-company`. Caveat: a manual force re-run within 60s is also blocked — null the row's `updated_at` to override.
+**60s debounce (source-keyed).** Immediately after the stale-dispatch guard, a second early-return checks for any `enrich_history_person` row with the same `master_person_id` + `source == "Master Person Enrich"` + `updated_at > now - 60_000`. If found, logs `"DUPLICATE TRIGGER, debounced (60s window)"` and returns null — no phases re-run. The setup row is upsert-style on (master_person_id, source), so the key is `updated_at` (touched on every re-run) rather than `created_at` (frozen at first write). Caveat: a manual force re-run within 60s is also blocked — null the row's `updated_at` to override.
 
 Each phase passes independently — failures are logged but don't block later phases.
 
 | # | Sub-function | What It Does |
 |:-:|--------------|-------------|
-| **—** | **Setup** (inline) | Upsert `enrich_history_person` row — keyed on `source = "Master Person Enrich"` in #13040 (legacy #12554 keys on `data_source_id: 79`), load `person_enrich_data`, copy PDL `sex` onto `master_person`. |
+| **—** | **Setup** (inline) | Upsert `enrich_history_person` row — keyed on `source = "Master Person Enrich"` in #13040 and #12554, load `person_enrich_data`, copy PDL `sex` onto `master_person`. |
 | **0** | `process-person-phase-0` #12857 | **PDL Backfill** (v3.3, 2026-04-20) — re-fetches PDL into `person_enrich_data.pdl` before Phase 1 when it is missing. |
-| **1** | `process-person-phase-1` #12822 | **Enrich Layer API** — LinkedIn path with email fallback, 30-day dedup, history record (`data_source_id: 94`). |
+| **1** | `process-person-phase-1` #12822 | **Enrich Layer API** — LinkedIn path with email fallback, 30-day dedup, history record (`source: "Enrich Layer"`). |
 | **2** | `process-person-phase-2` #12823 | **Primary Location** — cascade EL → LinkedIn → PDL, call `add-person-primary-location`. |
 | **3** | `process-person-phase-3` #12824 | **Process PDL** — skills, interests, languages, education, work, certs, bios. **v3 (2026-04-15):** primary-current-company call now hard-codes `cascade_depth: 0` in addition to `queue: false`, so PDL+EL and `run-base-company-enrich-v3` always fire for the current employer regardless of the enclosing person's depth. v2 (2026-04-14) introduced the primary-current-company enrichment step. |
-| **4** | `process-person-phase-4` #12825 | **Process Enrich Layer Data** — call `process-enrich-layer`, mark EL history complete (`data_source_id: 94`). |
+| **4** | `process-person-phase-4` #12825 | **Process Enrich Layer Data** — call `process-enrich-layer`, mark EL history complete (`source: "Enrich Layer"`). |
 | **4b** | `process-person-exa-profile` #13031 | **Process Exa Profile** (#13040 only, v3.5, 2026-05-24) — turns `person_enrich_data.exa` into bio rows, an avatar replacement, and `work_experience` rows. Idempotent — no-ops when `exa` is empty. |
 | **5** | `process-person-phase-5` #12826 | **Fundable People Linking** — match via LinkedIn / CB / X URLs, link `fundable_people.master_person_id`. |
 | **6** | `process-person-phase-6` #12827 | **LLM Bios & Deep Research** — `create-llm-person-bios`; conditional `deep-research-person-prompt` when `deep_research=true`. |
@@ -252,7 +252,7 @@ Each phase passes independently — failures are logged but don't block later ph
 | **9** | `process-person-phase-9` #12830 | **Investor Pipeline + Deal Cascade** — Signal NFX scrape, `person-extract-cb-signal`, Fundable investor data, `investor_profile_person` upsert. **v3.0 (2026-04-19):** each angel investment now cascades through `mvp/investor/cascade-deal-participants` #12856 — portfolio company, co-angels, VC firms, VC partners (via `fundable_institutional_investments_person`), Funding_Round node, RAISED + INVESTED_IN edges, and IPO/exit signal to `company_financial.is_public`. |
 | **10** | `process-person-phase-10` #12831 | **Stub (deprecated).** v2.0 (2026-04-19) reduced this to a no-op — deal cascade is fully owned by Phase 9 v3.0. Kept in the orchestrator call chain during transition; safe to drop later. |
 | **11** | `process-person-phase-11` #12832 | **Complete Enrichment** — call `complete-person-enrich` to finalize (flip visibility, mark `enrich_success`). |
-| **12** | `mvp/format/resolve-temp-name` #12890 | **Resolve Temp Name** — if `master_person.name` (or `first_name`) still starts with `temp_`, scan `enrich_history_person` for a usable name (priority: PDL `data_source_id 91` → EL `94` → Twitter `7` → Fundable `89` → CB `8`) and fall back to parsing the LinkedIn URL slug. When a candidate is found, it passes through `name-format` + `set-person-names` to overwrite the placeholder. A sanity-check rejects LLM output whose letters don't overlap the input (guards against transient garbage). Added in v3.4 (2026-04-24). |
+| **12** | `mvp/format/resolve-temp-name` #12890 | **Resolve Temp Name** — if `master_person.name` (or `first_name`) still starts with `temp_`, scan `enrich_history_person` for a usable name (priority: `People Data Labs` → `Enrich Layer` → `Twitter` → `Fundable` → `Crunchbase`) and fall back to parsing the LinkedIn URL slug. When a candidate is found, it passes through `name-format` + `set-person-names` to overwrite the placeholder. A sanity-check rejects LLM output whose letters don't overlap the input (guards against transient garbage). Added in v3.4 (2026-04-24); source-keyed in the 2026-06-01 migration. |
 
 <Note>
 All Phase 7 `resolve-edges-*` functions were upgraded in April 2026 to accept `cascade_depth` and pass `queue: true` + `priority_tier` + `source_function` + `source_entity_id` to every `get-add/master-company-new` and `get-add/master-person-new` (#13039) call. This makes the cascade traceable in the queue tables.

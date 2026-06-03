@@ -3,7 +3,9 @@ title: "Core Concepts"
 description: "Shared mechanics of the enrichment waterfall — cascade depth, priority tiers, queue tables, queue processing, and the kill switch."
 ---
 
-The enrichment waterfall is the sequence of functions that fires when a new entity enters the system. It starts with a single input (a domain, a LinkedIn URL, a name) and cascades outward — creating records, enriching from external APIs, discovering related entities, and queueing them for their own enrichment.
+The enrichment waterfall is the sequence of functions that fires when a new entity enters the system. It starts with a single input (a domain, a LinkedIn URL, a name), creates records, enriches from external APIs, discovers directly related entities, and queues those related entities for later enrichment.
+
+As of **2026-06-03**, the core rule is **bounded and non-recursive**: seed entities may create one direct wave of related people / companies, but queued children do not create another seed-equivalent wave. Deeper enrichment can save provider responses, build the current entity, write edges, and queue leaf companies; it must not keep expanding founders, C-suite, YC people, or funding-network participants indefinitely.
 
 This page documents the **shared mechanics** that apply to both the company and person pipelines. See [Company Enrichment Phases](/guides/enrichment/waterfall/company-enrichment-phases) and [Person Enrichment Phases](/guides/enrichment/waterfall/person-enrichment-phases) for the pipeline-specific flow.
 
@@ -15,22 +17,25 @@ Every entity in the system has a **cascade depth** — the number of hops from t
 
 | Depth | Meaning | Behavior |
 |:-----:|---------|----------|
-| **0** | Seed entity (the one the user asked for) | Enriched immediately, all APIs called |
-| **1** | Direct discovery (e.g. a founder's current employer) | Queued, external APIs skipped in `get-add` |
-| **2** | Secondary discovery (e.g. an investor found on a depth-1 company) | Queued, lower priority |
-| **3+** | Tertiary and beyond | Queued, lowest priority |
+| **0** | Seed entity (the one the user asked for) | Enriched immediately; seed-only fanout is allowed |
+| **1** | Direct discovery | Queued for later enrichment; child fanout is gated |
+| **2+** | Leaf / secondary discovery | Queued or deferred by worker policy; no recursive fanout |
 
-When `cascade_depth > 0`, the `get-add` functions skip external API calls (PDL, Enrich Layer) entirely. The entity is created from whatever data is already available (Fundable, input params) and queued for later enrichment.
+When `cascade_depth > 0`, the `get-add` functions skip person external API calls (PDL, Enrich Layer) and force queue writes instead of immediate downstream dispatch. The entity is created from whatever data is already available (Fundable, Exa, YC, input params) and queued for later enrichment.
 
 <Check>
-**Default seed behavior (cascade_depth: 0):** calling `get-add/master-person-new` (#13039) with `cascade_depth: 0` gives you a **fully enriched person AND their primary current company**, synchronously dispatched. _(The previous entry point `get-add/master-person` #12553 was deprecated 2026-06-01; all callers migrated to #13039.)_
+**Default seed behavior (cascade_depth: 0):** calling `get-add/master-person-new` (#13039) with `cascade_depth: 0` gives you a fully enriched person. _(The previous entry point `get-add/master-person` #12553 was deprecated 2026-06-01; all callers migrated to #13039.)_
 
 - The person runs through `enrich-master-person` (all 12 phases; legacy `run-base-person-enrich` remains compatible).
-- Phase 3 (Process PDL) identifies the best current role — ranked **founder → C-suite → VP → latest start year** — and calls `get-add/master-company-new` with `cascade_depth: 0` and `queue: false` hard-coded (v3, 2026-04-15). This fires the current company get-add enrichment and `enrich-master-company` immediately for that one company, regardless of the enclosing person's depth.
-- `priority_tier` does not affect this path — it only orders the queue when an entity is queued (depth > 0). At depth 0, nothing is queued.
+- Phase 3 (Process PDL) identifies the best current role — ranked **founder → C-suite → VP → latest start year** — and calls `get-add/master-company-new` with `queue: true`, `cascade_depth: 1`, and `priority_tier: 1` (v3.2, 2026-06-03). This links the primary current employer but does not fully enrich that company inline.
+- `priority_tier` orders the queue only; lower values run sooner.
 
-Past employers, schools, investors, and other discovered edges still honor cascade depth and get queued — so one person seed triggers at most **one** extra immediate company enrichment (the primary current employer).
+Past employers, schools, investors, and other discovered edges honor the bounded policy and get queued as leaf candidates. A person seed no longer triggers an immediate company enrichment wave.
 </Check>
+
+<Info>
+**Seed-company exception:** calling `get-add/master-company-new` (#12558) with `cascade_depth: 0` and `queue: false` still fully enriches that company. During `enrich-master-company` (#12992), seed-only phases can create direct people: Exa founders / C-suite, YC founders / partner, and Fundable investors / partners. Those people are queued at depth 1 for later person enrichment. When their enrichment discovers companies from work history, those companies are queued as leaf companies and must not mint another people wave.
+</Info>
 
 ---
 
@@ -40,10 +45,10 @@ Queue entries are ranked by business importance:
 
 | Tier | Description | Examples |
 |:----:|-------------|----------|
-| **1** | Current employer, founders | The company a person works at now |
-| **2** | Past employers, VC firms | Previous jobs, investment firms |
-| **3** | Schools, angel investors | Educational institutions, individual investors |
-| **4** | Everything else | Certification issuers, volunteer orgs, publishers |
+| **1** | Highest-value direct people / companies | Current employer, seed-company Exa founders / C-suite, YC founders, Fundable investor partners, angels / co-investor people |
+| **2** | Investor / portfolio companies and YC partner | Portfolio companies, VC firms, YC primary partner, past employers |
+| **3** | Schools and lower-business-signal orgs | Educational institutions |
+| **4** | Everything else | Certification issuers, volunteer orgs, publishers, Exa work-history leaf companies |
 
 When a queue entry already exists and a new reference arrives with a better (lower) tier, the tier is upgraded. The `count` field tracks how many times the entity was referenced.
 
@@ -82,14 +87,14 @@ Queued entities are processed by cron jobs that pull from the queue tables in pr
 <Warning>
 **Before turning on queue task processing:** `process-person-queue` (#126) and `process-company-queue` (#127) are intentionally `active = false` until the full-enrichment depth policy is set.
 
-Set or confirm these before flipping either task to `active = true`; the depth caps should be encoded as guards in #126 / #127 or in the orchestrators they dispatch:
+Set or confirm these before flipping either task to `active = true`; the depth caps and seed-only guards should be encoded as guards in #126 / #127 or in the orchestrators they dispatch:
 
-- **Person full-enrichment depth:** choose the maximum `cascade_depth` that should run `enrich-master-person` (recommended starting policy: people at depth **0–1** only).
-- **Company full-enrichment depth:** choose the maximum `cascade_depth` that should run `enrich-master-company` (recommended starting policy: companies at depth **0–2** only).
-- **Primary current employer exception:** keep `process-person-phase-3`'s `cascade_depth: 0`, `queue: false` current-employer path enabled; current employers should receive full company enrichment even when the person was discovered deeper in the cascade.
-- **Depth overflow behavior:** decide what happens beyond the caps before activation — leave rows queued for manual review, mark them deferred, or delete them with a `log_crash` audit row. Do not silently full-enrich depth-3+ rows.
+- **Person full-enrichment depth:** choose the maximum `cascade_depth` that should run `enrich-master-person`; the current bounded test posture is people at depth **0–1**.
+- **Company full-enrichment depth:** choose the maximum `cascade_depth` that should run `enrich-master-company`; deeper company runs must keep seed-only people / deal fanout gated.
+- **Seed-only expansion:** company Exa C-suite / founders, YC people, company deal fanout, and person investment-network fanout run only at `cascade_depth == 0`.
+- **Funding-round investor company suppression:** VC firms discovered by `resolve-investors-edges` are created / linked and queued, but `enrich-master-company` suppresses full company enrichment for funding-round investor companies when they arrive from that source at depth > 0.
+- **Depth overflow behavior:** decide what happens beyond the caps before activation — leave rows queued for manual review, mark them deferred, or delete them with a `log_crash` audit row. Do not silently full-enrich depth-2+ rows into another expansion wave.
 - **Task invariants:** both queue processors must sort by `{priority_tier: "asc", cascade_depth: "asc", id: "asc"}`, pass the stored `cascade_depth` into the orchestrator, delete only their own queue table on success, and release `processing = false` on failure.
-- **Seed-person dispatch hold:** if live seed-person enrichment is intended, remove the `debug.stop "HOLD!!"` in `get-add/master-person-new` (#13039) separately from queue activation. Queue activation does not affect that seed-path hold.
 </Warning>
 
 ### Queue Upsert Pattern
@@ -112,7 +117,7 @@ mvp/investor/cascade-deal-participants — #12856
 
 Given one `fundable_deals.id`, the helper does:
 
-1. **Portfolio company** — `get-add/master-company-new` for the deal's target org (queued at **depth+1, tier 2**). Writes `master_company_id` back onto `fundable_organizations`.
+1. **Portfolio company** — `get-add/master-company-new` for the deal's target org (queued at **depth 1, tier 2**). Writes `master_company_id` back onto `fundable_organizations`.
 2. **IPO / exit signal** — if `fundable_organizations.ipo_status == "public"`, sets `company_financial.is_public = true` on the portfolio company.
 3. **Funding_Round node** — `add-fundable-deal-node` materializes the round + a `RAISED` edge from the portfolio company.
 4. **All participants** — `resolve-investors-edges` #12702 walks the deal:
@@ -121,12 +126,14 @@ Given one `fundable_deals.id`, the helper does:
    - `fundable_institutional_investments_person` → VC partners at each firm on that deal (people)
    - Creates `LEAD_INVESTED_IN` / `INVESTED_IN` / `FOLLOW_ON_INVESTED_IN` / `INVESTMENT_PARTNER_IN` / `INVESTMENT_PARTNER_AT` edges in FalkorDB.
 
-**Called from two entry points:**
+People from this helper queue at **tier 1**; investor / portfolio companies queue at **tier 2**. Direct deal investor companies are treated as leaves: they get nodes, links, and investment edges, but not a recursive company enrichment wave.
 
-- `process-person-phase-9` v3.0 — for each row in the person's `fundable_angel_investments` (angel-origin)
-- `process-company-phase-7` → `add-all-fundable-deals` v2.0 — both for rounds the org **raised** and rounds the org **invested in** (VC-origin)
+**Called from two seed-only entry points:**
 
-Because both callers route through the same helper, a deal is cascaded identically whether it's discovered via the angel, the VC firm, or the target company. Queue upsert semantics (above) keep the fanout idempotent — if two angels on the same round surface the same VC firm, the firm's queue entry just increments `count` and holds its best tier.
+- `process-person-phase-9` v3.1 — for each row in a **seed person's** `fundable_angel_investments` (angel-origin)
+- `process-company-phase-7` v1.2 → `add-all-fundable-deals` — for a **seed company**, both rounds the org **raised** and rounds the org **invested in** (VC-origin)
+
+Because both seed callers route through the same helper, a direct deal is materialized consistently from either side. Queue upsert semantics (above) keep the fanout idempotent — if two seed paths surface the same VC firm, the firm's queue entry just increments `count` and holds its best tier.
 
 ### Queue Entry Lifecycle
 

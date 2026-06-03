@@ -35,7 +35,7 @@ graph TD
 **Downstream dispatch (final section).** When the person is new and not queued (`cascade_depth == 0` and `queue == false`), #13039 fires **`enrich-master-person` #13040** in **async-shared** mode (`master_person_id`, `deep_research`, `cascade_depth`). Otherwise it upserts `queue_enrich_person`. A `hold_downstream` input skips the dispatch and logs a `log_crash` note instead.
 
 <Check>
-**2026-06-01:** the temporary immediate-dispatch debug stop was removed in #13039 v1.8. New, non-queued depth-0 people now dispatch `enrich-master-person` #13040 directly.
+**2026-06-01:** the temporary immediate-dispatch debug stop was removed in #13039 v1.8. New, non-queued depth-0 people now dispatch `enrich-master-person` #13040 directly unless `hold_downstream` is set.
 </Check>
 
 ---
@@ -243,184 +243,112 @@ Each phase passes independently — failures are logged but don't block later ph
 | **0** | `process-person-phase-0` #12857 | **PDL Backfill** (v3.3, 2026-04-20) — re-fetches PDL into `person_enrich_data.pdl` before Phase 1 when it is missing. |
 | **1** | `process-person-phase-1` #12822 | **Enrich Layer API** — LinkedIn path with email fallback, 30-day dedup, history record (`source: "Enrich Layer"`). |
 | **2** | `process-person-phase-2` #12823 | **Primary Location** — cascade EL → LinkedIn → PDL, call `add-person-primary-location`. |
-| **3** | `process-person-phase-3` #12824 | **Process PDL** — skills, interests, languages, education, work, certs, bios. **v3 (2026-04-15):** primary-current-company call now hard-codes `cascade_depth: 0` in addition to `queue: false`, so the current company get-add enrichment and `enrich-master-company` always fire for the current employer regardless of the enclosing person's depth. v2 (2026-04-14) introduced the primary-current-company enrichment step. |
+| **3** | `process-person-phase-3` #12824 | **Process PDL** — skills, interests, languages, education, work, certs, bios. **v3.2 (2026-06-03):** primary-current-company lookup is now non-recursive: it calls `get-add/master-company-new` with `queue: true`, `cascade_depth: 1`, and `priority_tier: 1`, then links `master_person.master_company_id` / `current_title`. v3 (2026-04-15) had fully enriched the current employer inline; v3.2 intentionally stops that company wave. |
 | **4** | `process-person-phase-4` #12825 | **Process Enrich Layer Data** — call `process-enrich-layer`, mark EL history complete (`source: "Enrich Layer"`). |
-| **4b** | `process-person-exa-profile` #13031 | **Process Exa Profile** (#13040 only, v3.5, 2026-05-24) — turns `person_enrich_data.exa` into bio rows, an avatar replacement, and `work_experience` rows. Idempotent — no-ops when `exa` is empty. |
+| **4b** | `process-person-exa-profile` #13031 | **Process Exa Profile** (#13040 only, v3.5, 2026-05-24) — turns `person_enrich_data.exa` into bio rows, an avatar replacement, and `work_experience` rows. v1.3 (2026-06-03) queues Exa work-history companies as `cascade_depth: 1` leaf companies at tier 4; later company enrichment may save provider responses but must not create people from those companies. Idempotent — no-ops when `exa` is empty. |
 | **5** | `process-person-phase-5` #12826 | **Fundable People Linking** — match via LinkedIn / CB / X URLs, link `fundable_people.master_person_id`. |
 | **6** | `process-person-phase-6` #12827 | **LLM Bios & Deep Research** — `create-llm-person-bios`; conditional `deep-research-person-prompt` when `deep_research=true`. |
 | **7** | `process-person-phase-7` #12828 | **Resolve Edges** — all 6 edge types: `resolve-edges-education` #12560, `resolve-edges-work` #12562, `resolve-edges-certifications` #12578, `resolve-edges-projects-publications` #12579, `resolve-edges-honor` #4574, `resolve-edges-volunteering` #4575. |
 | **8** | `process-person-phase-8` #12829 | **Expertise, IMDB & Angel Detection** — `llm-identify-person-expertise`, IMDB verify/link, angel flag from expertise `subdomain 22`. |
-| **9** | `process-person-phase-9` #12830 | **Investor Pipeline + Deal Cascade** — Signal NFX scrape, `person-extract-cb-signal`, Fundable investor data, `investor_profile_person` upsert. **v3.0 (2026-04-19):** each angel investment now cascades through `mvp/investor/cascade-deal-participants` #12856 — portfolio company, co-angels, VC firms, VC partners (via `fundable_institutional_investments_person`), Funding_Round node, RAISED + INVESTED_IN edges, and IPO/exit signal to `company_financial.is_public`. |
-| **10** | `process-person-phase-10` #12831 | **Stub (deprecated).** v2.0 (2026-04-19) reduced this to a no-op — deal cascade is fully owned by Phase 9 v3.0. Kept in the orchestrator call chain during transition; safe to drop later. |
+| **9** | `process-person-phase-9` #12830 | **Investor Pipeline + Deal Cascade** — Signal NFX scrape, `person-extract-cb-signal`, Fundable investor data, `investor_profile_person` upsert. **v3.1 (2026-06-03):** investment-network fanout is seed-person only. At `cascade_depth == 0`, each angel investment routes through `mvp/investor/cascade-deal-participants` #12856 — portfolio company, co-angels, VC firms, VC partners, Funding_Round node, RAISED + INVESTED_IN edges, and IPO/exit signal. At depth > 0, it still builds investment summaries but does not cascade deal participants. |
+| **10** | `process-person-phase-10` #12831 | **Stub (deprecated).** v2.0 (2026-04-19) reduced this to a no-op — deal cascade is fully owned by Phase 9, now with the v3.1 seed-only guard. Kept in the orchestrator call chain during transition; safe to drop later. |
 | **11** | `process-person-phase-11` #12832 | **Complete Enrichment** — call `complete-person-enrich` to finalize (flip visibility, mark `enrich_success`). |
 | **12** | `mvp/format/resolve-temp-name` #12890 | **Resolve Temp Name** — if `master_person.name` (or `first_name`) still starts with `temp_`, scan `enrich_history_person` for a usable name (priority: `People Data Labs` → `Enrich Layer` → `Twitter` → `Fundable` → `Crunchbase`) and fall back to parsing the LinkedIn URL slug. When a candidate is found, it passes through `name-format` + `set-person-names` to overwrite the placeholder. A sanity-check rejects LLM output whose letters don't overlap the input (guards against transient garbage). Added in v3.4 (2026-04-24); source-keyed in the 2026-06-01 migration. |
 
 <Note>
 All Phase 7 `resolve-edges-*` functions were upgraded in April 2026 to accept `cascade_depth` and pass `queue: true` + `priority_tier` + `source_function` + `source_entity_id` to every `get-add/master-company-new` and `get-add/master-person-new` (#13039) call. This makes the cascade traceable in the queue tables.
 
-Most recent: `run-base-person-enrich` v3.4 (2026-04-24, Phase 12 — `resolve-temp-name` cleanup), `process-person-phase-9` v3.0 (2026-04-19, deal cascade via `cascade-deal-participants`), `process-person-phase-10` v2.0 (2026-04-19, reduced to no-op stub — phase-9 owns the cascade), `resolve-edges-work` v1.3 (2026-04-14, `|first_notnull:0` fix), `resolve-edges-certifications` v2.1 (2026-04-14, added missing `master_person_id` input).
+Most recent bounded-waterfall changes: `process-person-phase-3` v3.2 (2026-06-03, current employer queues at depth 1 / tier 1), `resolve-edges-work` v1.4 (2026-06-03, work-history companies are always depth-1 leaf companies), `process-person-exa-profile` v1.3 (2026-06-03, Exa work-history companies are depth-1 leaves), and `process-person-phase-9` v3.1 (2026-06-03, investment-network fanout is seed-person only). Earlier: `process-person-phase-10` v2.0 (2026-04-19, no-op stub — phase-9 owns the cascade), `resolve-edges-certifications` v2.1 (2026-04-14, added missing `master_person_id` input).
 </Note>
 
 <Check>
 **Graph node timestamp coverage (audited 2026-06-01).** Every node create/update reachable from this flow now stamps `created_at` on create and `updated_at` on update — verified across `add-person-node` #2601, the Phase 7 `resolve-edges-*` writers (`Certification`, `Project`, `Publication`, `Honor`, `Organization`), Phase 8 expertise (`SubDomainExpertise`) + IMDB (`Film_TV`, `Film_TV_Award`), Phase 9 funding (`Funding_Round`, `VC_Firm` label), Phase 2/3 location (`Country`/`Region`/`City`) + `Company`, and the `create-work-edges` #2800 Person/Company stub-`MERGE` (patched 2026-06-01). The orchestration / data functions (`master-person-new` #13039, `enrich-master-person` #13040, `cascade-person-data` #13037, `match-master-person` #13038, `process-person-exa-profile` #13031) perform **no** graph-node Cypher — they delegate to the leaf writers. Full per-function record: [Node Types → Timestamp coverage audit](/guides/ontology/nodes#timestamp-coverage-audit).
 </Check>
 
-### Phase 3 Detail: Primary Current Company Auto-Enrichment
+### Phase 3 Detail: Primary Current Company Queueing
 
-As of v3 of `process-person-phase-3` (2026-04-15), once PDL is processed the phase immediately finds the person's best current role and calls `get-add/master-company-new` with `cascade_depth: 0` and `queue: false` hard-coded — this **always enriches the primary current employer synchronously**, even when the enclosing person was itself discovered deeper in the cascade. v2 (2026-04-14) introduced this step but propagated the enclosing `cascade_depth`, so downstream people's current companies were still being queued; v3 fixes that.
+As of v3.2 of `process-person-phase-3` (2026-06-03), once PDL is processed the phase finds the person's best current role and calls `get-add/master-company-new` with `queue: true`, `cascade_depth: 1`, and `priority_tier: 1`. This creates / links the current employer and updates `master_person.master_company_id` + `current_title`, but it does **not** full-enrich the company inline.
 
-For Zeno Rocha, this means **Resend** is created and fully enriched during Phase 3 — before Phase 7 runs. This triggers the full company waterfall documented in [Company Enrichment Phases](/guides/enrichment/waterfall/company-enrichment-phases), including:
-
-- Fundable lookup (finds Resend's Fundable org ID)
-- `new-company-enrichment` fires inside `get-add/master-company-new` at initial create time
-- Company node, enrich data, industries, about, links all created
-- `enrich-master-company` fires async — the orchestrator opens with LLM preflight / Fundable re-lookup gates, then `get-exa-company-c-suite` (Exa founder + key-employee search) and the existing company phase chain. Later discovers Resend's institutional investors (Polar, Accel, Charm, Fuel Capital, Gradient, Cavalry Ventures) and queues them.
+For Zeno Rocha, this means **Resend** is created / linked as the current employer at depth 1 and tier 1. A queue worker can enrich Resend later, but company-side people expansion remains seed-company-only, so this person-seed path cannot recursively create Resend's founders / C-suite and then their companies.
 
 ### Phase 7 Detail: Edge Resolution
 
-Phase 7 runs all six `resolve-edges-*` functions sequentially. Zeno's work-history sub-call (`resolve-edges-work` v1.3) skips Resend (already enriched in Phase 3) but queues his past employers. Education resolution queues YC, Berkeley, UNIRIO, and PUCPR at tier 3.
+Phase 7 runs all six `resolve-edges-*` functions sequentially. Zeno's work-history sub-call (`resolve-edges-work` v1.4) queues current jobs at tier 1 and past jobs at tier 2, always as depth-1 leaf companies. Education resolution queues YC, Berkeley, UNIRIO, and PUCPR at tier 3.
 
-### Phase 9 Detail: Investor & Deal Discovery (v3.0)
+### Phase 9 Detail: Investor & Deal Discovery (v3.1)
 
-As of **v3.0 (2026-04-19)**, Phase 9 owns the full deal cascade. In addition to Signal NFX / Crunchbase signal extraction and the `investor_profile_person` upsert, it now loops `fundable_angel_investments` for the person and routes **each deal** through `mvp/investor/cascade-deal-participants` #12856.
+As of **v3.1 (2026-06-03)**, Phase 9 owns the deal cascade but only for **seed people**. In addition to Signal NFX / Crunchbase signal extraction and the `investor_profile_person` upsert, a seed person loops `fundable_angel_investments` and routes each deal through `mvp/investor/cascade-deal-participants` #12856. When `cascade_depth > 0`, the phase still builds investment summaries but does not cascade deal participants.
 
 The cascade helper handles one fundable deal end-to-end:
 
-1. **Portfolio company** — `get-add/master-company-new` for the deal's target org (queued at **depth+1, tier 2**, `source_function: "cascade-deal-participants"`). Writes `master_company_id` back onto `fundable_organizations` for future lookups.
+1. **Portfolio company** — `get-add/master-company-new` for the deal's target org (queued at **depth 1, tier 2**, `source_function: "cascade-deal-participants"`). Writes `master_company_id` back onto `fundable_organizations` for future lookups.
 2. **IPO / exit signal** — when `fundable_organizations.ipo_status == "public"`, sets `company_financial.is_public = true` for the portfolio company (initialized upstream in `get-add/master-company-new` Section 9).
 3. **Funding_Round node** — `add-fundable-deal-node` materializes the round as a graph node with a `RAISED` edge from the portfolio company.
 4. **Co-investors + partners** — `resolve-investors-edges` #12702 walks both sides of the deal:
    - `fundable_angel_investments` → every **other angel** on the deal (people)
    - `fundable_institutional_investments` → every **VC firm** on the deal (companies)
    - `fundable_institutional_investments_person` → every **VC partner** tied to each firm on that deal (people)
-   - All queued at **depth+1**, with the correct `LEAD_INVESTED_IN` / `INVESTED_IN` / `FOLLOW_ON_INVESTED_IN` / `INVESTMENT_PARTNER_IN` / `INVESTMENT_PARTNER_AT` edges in FalkorDB.
+   - People queue at **depth 1, tier 1**; investor / portfolio companies queue at **depth 1, tier 2**, with the correct `LEAD_INVESTED_IN` / `INVESTED_IN` / `FOLLOW_ON_INVESTED_IN` / `INVESTMENT_PARTNER_IN` / `INVESTMENT_PARTNER_AT` edges in FalkorDB.
 
-The same helper is called on the company side from `process-company-phase-7` → `add-all-fundable-deals` v2.0 (#12703), which walks both `fundable_deals WHERE organization_id=X` (rounds the org raised) **and** `fundable_institutional_investments WHERE organization_id=X` (rounds the org invested in). One cascade helper, one source of truth for deal fanout — whether entering from the angel-person side or the VC-firm-company side.
+The same helper is called on the company side from `process-company-phase-7` → `add-all-fundable-deals` (#12703), but only when the company is a seed company (`cascade_depth == 0`). One cascade helper remains the source of truth for deal fanout, with seed-only guards at the person and company entry points.
 
-Example: for Zeno, each of his angel investments pulls in the portfolio company + every other investor (angel or VC) on that round + every partner at the VC firms — at depth 1, queued for later enrichment. Here is the subset discovered via `resolve-investors-edges` on Zeno's pre-v3.0 run:
+Example: for Zeno, each seed-person angel investment pulls in the portfolio company + every other investor (angel or VC) on that round + every partner at the VC firms — at depth 1, queued for later enrichment. Here is the subset discovered via `resolve-investors-edges` on an earlier Zeno run, updated to the current tier policy:
 
 | Investor | Source | Queue Tier | Why |
 |----------|--------|:----------:|-----|
 | Bu Kinoshita | process-yc-people (co-founder) | **1** | YC co-founder gets highest priority |
 | Diana Hu | process-yc-people (YC partner) | **2** | YC partner, high value |
-| Guillermo Rauch | resolve-investors-edges | **3** | Angel investor |
-| Dylan Field | resolve-investors-edges | **3** | Angel investor |
-| Paul Copplestone | resolve-investors-edges | **3** | Angel investor |
-| Alana Goyal | resolve-investors-edges | **3** | Angel investor |
-| Calvin French-Owen | resolve-investors-edges | **3** | Angel investor |
-| Lachy Groom | resolve-investors-edges | **3** | Angel investor |
-| Elad Gil | resolve-investors-edges | **3** | Angel investor |
+| Guillermo Rauch | resolve-investors-edges | **1** | Angel / co-investor |
+| Dylan Field | resolve-investors-edges | **1** | Angel / co-investor |
+| Paul Copplestone | resolve-investors-edges | **1** | Angel / co-investor |
+| Alana Goyal | resolve-investors-edges | **1** | Angel / co-investor |
+| Calvin French-Owen | resolve-investors-edges | **1** | Angel / co-investor |
+| Lachy Groom | resolve-investors-edges | **1** | Angel / co-investor |
+| Elad Gil | resolve-investors-edges | **1** | Angel / co-investor |
 
 All 9 investors are created at **depth 1** with external APIs skipped — their names and LinkedIn URLs come from Fundable data. Each is queued to `queue_enrich_person` for full enrichment later.
 
-In v3.0, the same loop **also** pulls in the deal's portfolio company + VC firms + VC partners (institutional_investments_person), and writes the IPO signal to `company_financial.is_public` when the target org has exited via IPO. Queue metadata is stamped with `source_function: "cascade-deal-participants"` and `source_entity_id: master_person_id` for full traceability.
+The same loop also pulls in the deal's portfolio company + VC firms + VC partners (institutional_investments_person), and writes the IPO signal to `company_financial.is_public` when the target org has exited via IPO. Queue metadata is stamped with `source_function: "cascade-deal-participants"` and `source_entity_id: master_person_id` for full traceability.
 
 ### Phase 10 Detail: Stub (v2.0, 2026-04-19)
 
-Prior to v2.0 this phase had its own loop over `fundable_angel_investments` that queued target companies (tier 3) and VC firms (tier 2) at depth 1. That logic was a strict subset of what Phase 9 v3.0 now handles through `cascade-deal-participants`, so Phase 10 was reduced to a no-op stub. It's kept in the `run-base-person-enrich` call chain during the transition — safe to remove from the orchestrator in a later pass.
+Prior to v2.0 this phase had its own loop over `fundable_angel_investments` that queued target companies (tier 3) and VC firms (tier 2) at depth 1. That logic was a strict subset of what Phase 9 now handles through `cascade-deal-participants`, so Phase 10 was reduced to a no-op stub. It's kept in the `run-base-person-enrich` call chain during the transition — safe to remove from the orchestrator in a later pass.
 
 ---
 
-## Cascade Example: Zeno Rocha at Depth 0
+## Bounded Cascade Example: Zeno Rocha at Depth 0
 
-Here's the complete cascade from the sandbox run — one LinkedIn URL generated **10 people** and **19 companies**:
+The current run shape for a seed person is intentionally bounded:
 
-```
+```text
 Depth 0: Zeno Rocha (linkedin.com/in/zeno-rocha-6270a914)
-├── get-add/master-person-new #13039 → person #1 (immediate enrichment)
-│   └── enrich-master-person #13040 (legacy: run-base-person-enrich) — phases 0–12
+├── get-add/master-person-new #13039
+│   └── enrich-master-person #13040 — phases 0–12
 │
-│       Phase 3 (process-person-phase-3 v3) — Process PDL
-│       │   + auto-enrich primary current company (cascade_depth=0, queue=false)
-│       └── Resend (company #1) → depth 0, immediate enrichment
-│           └── enrich-master-company #12992
-│               └── Phase 7 (process-company-phase-7) — add-all-fundable-deals
-│                   └── resolve-investors-edges (institutional)
-│                       ├── Polar (#14) → queued depth 0, tier 4
-│                       ├── Accel (#15) → queued depth 0, tier 4
-│                       ├── Charm (#16) → queued depth 0, tier 4
-│                       ├── Fuel Capital (#17) → queued depth 0, tier 4
-│                       ├── Gradient (#18) → queued depth 0, tier 4
-│                       └── Cavalry Ventures (#19) → queued depth 0, tier 4
+│       Phase 3 — Process PDL
+│       └── best current employer: Resend
+│           → get-add/master-company-new(queue=true, cascade_depth=1, tier=1)
+│           → linked as current company; no inline company full-enrich
 │
-│       Phase 7 (process-person-phase-7) — Resolve Edges
-│       ├── resolve-edges-work (past employers)
-│       │   ├── WorkOS (#7) → queued depth 1, tier 2
-│       │   ├── Liferay (#8) → queued depth 1, tier 2
-│       │   ├── Globo (#9) → queued depth 1, tier 2
-│       │   ├── Petrobras (#10) → queued depth 1, tier 2
-│       │   └── Caos (#11) → queued depth 1, tier 2
-│       ├── resolve-edges-education
-│       │   ├── Y Combinator (#2) → queued depth 1, tier 3
-│       │   ├── UC Berkeley (#3) → queued depth 1, tier 3
-│       │   ├── UNIRIO (#4) → queued depth 1, tier 3
-│       │   └── PUCPR (#5) → queued depth 1, tier 3
-│       └── resolve-edges-projects-publications
-│           ├── Turbo Excel (#12) → queued depth 1, tier 4
-│           └── yfdpco2.com (#13) → queued depth 1, tier 4
+│       Phase 7 — Resolve Edges
+│       ├── work history companies → queue_enrich_company(depth 1)
+│       │   ├── current roles: tier 1
+│       │   └── past roles: tier 2
+│       ├── education orgs → queue_enrich_company(depth 1, tier 3)
+│       └── publications / projects / misc orgs → queue_enrich_company(depth 1, tier 4)
 │
-│       Phase 9 (process-person-phase-9 v3.0) — Investor Pipeline + Deal Cascade
-│       ├── Signal NFX + CB extraction → investor_profile_person
-│       └── foreach angel investment → cascade-deal-participants #12856
-│           ├── Portfolio co (target org) → queued depth 1, tier 2
-│           ├── IPO signal → company_financial.is_public (if applicable)
-│           ├── Funding_Round node + RAISED edge (add-fundable-deal-node)
-│           └── resolve-investors-edges walks the deal:
-│               ├── Co-angels → queued depth 1, tier 3
-│               ├── VC firms → queued depth 1, tier 2
-│               └── VC partners (institutional_investments_person) → queued depth 1, tier 2
-│       (for Zeno, this surfaced 9 investor people; v3.0 also now surfaces
-│        co-investor VCs + their partners on those same rounds)
+│       Phase 9 — Investor Pipeline
+│       └── if the seed person is an angel:
+│           ├── portfolio companies → queue_enrich_company(depth 1, tier 2)
+│           ├── co-angels → queue_enrich_person(depth 1, tier 1)
+│           ├── VC firms → queue_enrich_company(depth 1, tier 2)
+│           └── VC partners → queue_enrich_person(depth 1, tier 1)
 │
-│       Phase 10 (process-person-phase-10 v2.0) — No-op stub (cascade owned by Phase 9)
-│
-│       Phase 11 (process-person-phase-11) — Complete enrichment
-│       └── complete-person-enrich → visibility: true
-│
-│       Phase 12 (mvp/format/resolve-temp-name) — Temp name cleanup
-│       └── (Zeno's name is already set; this is a no-op for him. Only fires
-│            when an earlier phase left the placeholder temp_{uuid} in place.)
+└── Later queue runs
+    ├── depth-1 people can be fully enriched
+    ├── their work-history companies are queued as depth-1 leaves
+    ├── depth-1 company Exa responses may be saved
+    └── depth-1 companies do not create another founders / C-suite / deals wave
 ```
 
-### Final Queue State
-
-After Zeno's enrichment completes, the queues contain:
-
-**queue_enrich_person** (9 entries):
-
-| Person | Tier | Source (`source_function`) | Depth |
-|--------|:----:|---------------------------|:-----:|
-| Bu Kinoshita | **1** | process-yc-people | 1 |
-| Diana Hu | **2** | process-yc-people | 1 |
-| Guillermo Rauch | **3** | resolve-investors-edges | 1 |
-| Dylan Field | **3** | resolve-investors-edges | 1 |
-| Paul Copplestone | **3** | resolve-investors-edges | 1 |
-| Alana Goyal | **3** | resolve-investors-edges | 1 |
-| Calvin French-Owen | **3** | resolve-investors-edges | 1 |
-| Lachy Groom | **3** | resolve-investors-edges | 1 |
-| Elad Gil | **3** | resolve-investors-edges | 1 |
-
-**queue_enrich_company** (18 entries):
-
-| Company | Tier | Source | Depth |
-|---------|:----:|--------|:-----:|
-| SV Angel | **2** | resolve-investors-edges | 1 |
-| WorkOS | **2** | resolve-edges-work | 1 |
-| Liferay | **2** | resolve-edges-work | 1 |
-| Globo | **2** | resolve-edges-work | 1 |
-| Petrobras | **2** | resolve-edges-work | 1 |
-| Caos | **2** | resolve-edges-work | 1 |
-| Y Combinator | **3** | resolve-edges-education | 1 |
-| UC Berkeley | **3** | resolve-edges-education | 1 |
-| UNIRIO | **3** | resolve-edges-education | 1 |
-| PUCPR | **3** | resolve-edges-education | 1 |
-| Polar | **4** | _(from Resend's enrichment)_ | 0 |
-| Accel | **4** | _(from Resend's enrichment)_ | 0 |
-| Charm | **4** | _(from Resend's enrichment)_ | 0 |
-| Fuel Capital | **4** | _(from Resend's enrichment)_ | 0 |
-| Gradient | **4** | _(from Resend's enrichment)_ | 0 |
-| Cavalry Ventures | **4** | _(from Resend's enrichment)_ | 0 |
-| Turbo Excel | **4** | resolve-edges-projects | 1 |
-| yfdpco2.com | **4** | resolve-edges-projects | 1 |
-
-When the queue worker processes these in priority order, each entity will trigger its own enrichment — potentially discovering more entities and queueing them at depth 2, continuing the cascade.
+The intended result is **some waterfall, no recursion**: one seed person can surface their current employer, work history, education, and direct investment network, but those queued children do not keep expanding the graph indefinitely.

@@ -1,0 +1,255 @@
+---
+title: "Build Scope — YuNet Avatar Pipeline (Full GCP)"
+description: "Square headshot avatar generation from enrichment-sourced images — deterministic geometry, commercially-clean licensing, GCP-native."
+icon: "image"
+---
+
+<Info>
+  **Status:** Open Work spec, ready to build. See [Developer Notes](#developer-notes) at the end for build approach, effort estimates, and known gotchas before pointing an agent at it.
+</Info>
+
+## Goal
+
+Turn an arbitrary enrichment-sourced image into a square (1:1) headshot avatar, composed on the correct person's face, at standard sizes. Deterministic geometry, commercially-clean licensing, no GPU. Gemini stays in the loop only for identity selection/verification. Fully GCP-native — no Xano.
+
+<Note>
+  **Non-goals (v1):** face-alignment rotation, background replacement/segmentation, on-the-fly generation. All deferrable to v2.
+</Note>
+
+## 1. Inputs / Outputs
+
+**Input**
+
+- Source image: URL or bytes (from the Serper fallback resolver, or the primary PDL/Enrich Layer avatar).
+- Contact identity: `name`, optional descriptors, optional known-good reference face.
+- `verification_required: bool` — `false` for trusted single-source avatars (e.g. LinkedIn), `true` for scraped candidates.
+
+**Output**
+
+- Avatar set: `800x800` master + `400x400` + `128x128`, WebP with JPEG fallback, metadata stripped.
+- Record written to **AlloyDB** (avatar table): `source_url`, `face_box`, `det_confidence`, `gemini_verified`, `gemini_confidence`, `crop_params`, `sizes[]`, `quality_flag`.
+
+## 2. Pipeline Flow
+
+1. **Fetch & normalize** — URL to bytes, decode, fix EXIF orientation, flatten transparency/animation.
+2. **Detect** — YuNet (`FaceDetectorYN`) returns boxes + 5 landmarks + scores.
+3. **Select** the target face:
+   - 0 faces: reject, fall through to next candidate source, then monogram fallback.
+   - 1 face: use it (Gemini-verify only if `verification_required`).
+   - More than 1: cheap heuristic first (largest by centrality); escalate to Gemini ("which face is `{name}`") when ambiguous or identity matters.
+4. **Verify** (identity-gated) — Gemini Flash confirms the selected face is plausibly the target. Folds into the call you already make.
+5. **Compose & crop** — expand box, square it, eye-line placement, clamp, quality gate.
+6. **Resize & encode** — multi-size, WebP + JPEG, strip metadata.
+7. **Store** — GCS bucket + signed/CDN URL; write metadata to AlloyDB.
+8. **Telemetry** — system signals to Cloud Logging/Monitoring/Trace; Gemini calls to Phoenix; feed the avatar audit (see [§6](#6-telemetry-observability)).
+
+## 3. Crop / Composition Spec
+
+Quality lives here, not in detection. Use the **eye midpoint** as the anchor, not the box center — it gives consistent headroom across varied source framings.
+
+```python
+import cv2, numpy as np
+
+# YuNet row layout (15 cols):
+# [x, y, w, h, x_reye, y_reye, x_leye, y_leye, x_nose, y_nose,
+#  x_rmouth, y_rmouth, x_lmouth, y_lmouth, score]
+
+detector = cv2.FaceDetectorYN.create(
+    model="face_detection_yunet_2023mar.onnx",  # OpenCV Zoo
+    config="", input_size=(320, 320),
+    score_threshold=0.7, nms_threshold=0.3, top_k=5000,
+)
+
+def detect_faces(img_bgr):
+    h, w = img_bgr.shape[:2]
+    detector.setInputSize((w, h))
+    _, faces = detector.detect(img_bgr)
+    return faces if faces is not None else np.empty((0, 15))
+
+def compose_square(img, face, k=2.0, eye_top_frac=0.40):
+    """k = face-height multiplier (1.7 tight avatar, 2.4 head+shoulders).
+       eye_top_frac = where the eye-line sits from the top (~0.40)."""
+    x, y, w, h = face[:4]
+    eye_cx = (face[4] + face[6]) / 2.0
+    eye_cy = (face[5] + face[7]) / 2.0
+    H, W = img.shape[:2]
+
+    S    = min(k * h, W, H)            # square side, capped to image
+    left = eye_cx - 0.5 * S            # center horizontally on eyes
+    top  = eye_cy - eye_top_frac * S   # eye-line in upper third
+    left = max(0, min(left, W - S))    # clamp inside image
+    top  = max(0, min(top,  H - S))
+    left, top, S = map(lambda v: int(round(v)), (left, top, S))
+    return img[top:top+S, left:left+S]
+```
+
+<Warning>
+  **Quality gate (QA-critical):** if `face_h < 90px`, the source is too low-res for a crisp avatar — flag `quality_flag = "low_res"` and prefer another candidate rather than upscaling a blurry crop. This is the gate that keeps junk out of the avatar audit.
+</Warning>
+
+<Tip>
+  Spike `k` and `eye_top_frac` against **real** enrichment images before locking them — media/press photography frames faces very differently from headshots.
+</Tip>
+
+## 4. Gemini Selection / Verification Contract
+
+One structured call does select + verify + locate, routed through OpenRouter and logged to Phoenix.
+
+**Request:** image + `"The target person is {name} {descriptors}."`
+
+**Response — JSON only**, box normalized 0 to 1000:
+
+```json
+{ "match": true, "confidence": 0.0, "face_box": [0, 0, 0, 0], "reason": "" }
+```
+
+- **Reconciliation:** convert Gemini's box to pixels, then **IoU-match it against YuNet's boxes** and crop the *YuNet* box. Gemini decides *which* person and *whether* it's them; YuNet supplies the precise geometry. Best of both, no encumbered recognition weights.
+- **Skip the call** entirely on single-face trusted sources and on re-crops.
+
+## 5. Architecture — Full GCP, No Xano
+
+Event-driven and GCP-native end to end. Nothing orchestrates from Xano.
+
+- **Ingest / trigger** — the enrichment step (candidates via the Serper resolver) publishes to **Pub/Sub** (`avatar-requests`) with `{contact_id, candidate_urls, name, verification_required}`.
+- **Queue & backpressure** — Pub/Sub subscription with a **dead-letter topic** after N delivery attempts, or **Cloud Tasks** for explicit per-queue rate limiting.
+- **Worker** — the avatar service on **Cloud Run** (push subscription delivers the message; or a Cloud Run job pulls for batch). CPU-only, scales to zero, model loaded once per warm instance.
+- **Storage** — originals + rendered avatars to **GCS** (lifecycle: keep master, expire/regenerate derivatives); serve via CDN/signed URLs.
+- **Source of truth** — avatar record + crop params + confidence + flags to **AlloyDB**. pgvector is right there if you later want to persist the face embedding for dedup/matching.
+- **LLM calls** — Gemini via OpenRouter, traced to Phoenix ([§6](#6-telemetry-observability)).
+
+<Warning>
+  **Pub/Sub is at-least-once** — the worker **must be idempotent**. Dedupe key `hash(source) + contact_id`; check AlloyDB/GCS before recomputing. A DLQ with bounded retries (or Cloud Tasks rate limits) is also the structural fix for the runaway queue-saturation failure mode.
+</Warning>
+
+### CV language decision
+
+YuNet is trivial in Python (`cv2.FaceDetectorYN`), but the platform is consolidating on a Go API server. Three paths:
+
+| Path | Tradeoff |
+|------|----------|
+| **Python CV microservice** the Go service calls | Fastest to ship; separate deploy |
+| **onnxruntime-go** | Run the YuNet ONNX directly; pre/post-processing in Go |
+| **GoCV** | Wraps OpenCV `FaceDetectorYN` for a truly in-process Go path (verify the binding in your GoCV version) |
+
+GoCV is cleanest if you want it native; a Python sidecar is cleanest if you want it fast.
+
+## 6. Telemetry & Observability
+
+Telemetry is the data the pipeline emits about its own behavior so you can see it run in production. Three pillars — logs, metrics, traces — instrumented once via **OpenTelemetry**, exported to GCP, with Phoenix as the lens on the LLM layer.
+
+**What to track**
+
+- **Detection hit-rate** — share of sources yielding a usable face. A continuous read on the Phase 0 risk; a drop signals a source-mix shift or model regression.
+- **Escalation rate** — share of images sent to Gemini. The LLM cost driver.
+- **Verification** — Gemini match rate, confidence histogram, manual-override rate (proxy for false accept/reject).
+- **Quality** — share flagged `low_res`, share falling back to monogram.
+- **Latency** — per-stage p50/p95 (fetch / detect / gemini / crop / store).
+- **Throughput / queue** — Pub/Sub backlog, DLQ count, processing rate.
+- **Cost** — Gemini calls per day times price.
+- **Errors** — fetch / decode / timeout counts by type.
+
+**Stack (full GCP)**
+
+| Layer | Tool | Role |
+|-------|------|------|
+| Logs | **Cloud Logging** | Structured JSON, auto-captured from Cloud Run stdout — one line per processed image |
+| Metrics | **Cloud Monitoring** | Custom metrics via OTel / Managed Prometheus; dashboards; alert policies (e.g. `hit-rate < X`, `DLQ > 0`, `p95 > Y`) |
+| Traces | **Cloud Trace** | Spans across Pub/Sub to Cloud Run to stages |
+| Exceptions | **Error Reporting** | Aggregated stack traces |
+| LLM | **Arize Phoenix** | Prompt + image + response + tokens per Gemini call, plus evals on whether selection was correct |
+
+Phoenix's OpenInference spans are OTel-compatible, so it sits **alongside** Cloud Trace, not instead of it.
+
+<Note>
+  **Split:** system/infra to Cloud Monitoring/Logging/Trace; LLM-decision quality to Phoenix.
+</Note>
+
+## 7. Dependencies & Licensing
+
+| Dependency | License | Notes |
+|------------|---------|-------|
+| opencv-python *(Python path)* | Apache-2.0 | `cv2.FaceDetectorYN` |
+| GoCV *(Go-native path)* | Apache-2.0 | Wraps OpenCV `FaceDetectorYN` |
+| onnxruntime-go *(alt Go path)* | MIT (bindings) | Run YuNet ONNX directly |
+| YuNet `face_detection_yunet_2023mar.onnx` | MIT *(confirm)* | OpenCV Zoo |
+| Gemini Flash (via OpenRouter) | API | Selection/verification only |
+
+<Warning>
+  Pick **one** CV path. All options are commercial-safe and CPU-only — no encumbered recognition weights enter the codebase. Confirm the exact YuNet model-weight terms with counsel before it's load-bearing.
+</Warning>
+
+## 8. Edge Cases
+
+- **No face** — next candidate source, then a generated monogram avatar.
+- **Multi-face, Gemini uncertain** — store best-effort, flag for avatar audit, never block.
+- **Tiny/low-res face** — reject for crispness (quality gate), prefer alternate source.
+- **Profile / sunglasses / occlusion** — YuNet may still box it; if landmarks look unreliable, fall back to box-center vertical placement; Gemini guards identity.
+- **EXIF rotation / animated / transparent** — normalize before detection.
+- **Inappropriate source image** — optional Gemini safety flag before use as an avatar.
+- **At-least-once redelivery** — idempotent worker (key `hash(source) + contact_id`); cache crops so re-runs are free.
+
+## 9. Phased Delivery
+
+| Phase | Scope | Est. |
+|-------|-------|------|
+| **0 — Spike** | YuNet detect + naive crop on a sample of **real** enrichment images (Python is fine here regardless of final language). Validate hit-rate on the actual distribution; tune `k` / `eye_top_frac`. De-risks the whole build. | ~0.5d |
+| **1 — Crop module** | Production compose (eye-based), multi-size output, EXIF/format handling, quality gate. Single-face path end-to-end. Pick the CV language. | ~1–2d |
+| **2 — Gemini integration** | Selection + verification + IoU reconciliation; multi-face handling; confidence/flagging. | ~1–2d |
+| **3 — Service + GCP wiring** | Cloud Run worker, Pub/Sub trigger + DLQ (or Cloud Tasks), GCS storage, AlloyDB metadata write-back, idempotency. | ~1–1.5d |
+| **4 — Telemetry** | OTel instrumentation to Cloud Monitoring/Logging/Trace + Error Reporting; Phoenix on Gemini calls; dashboards + alert policies; wire into the avatar audit. | ~0.5–1d |
+
+**MVP (Phases 0–1, single-face):** ~2–3 days (human). **Polished v1:** ~1–1.5 eng weeks (human). See Developer Notes for AI-agent build estimates.
+
+## 10. Open Decisions
+
+- **CV language** — Python microservice vs GoCV vs onnxruntime-go. Decide before Phase 3; Python is fine for the Phase 0 spike either way.
+- **Delivery model** — Pub/Sub push subscription (low latency) vs Cloud Run job pulling batches (cheaper at volume).
+- **Embedding persistence** — store the face embedding in AlloyDB/pgvector for future dedup/matching, or skip for v1.
+- `k` and `eye_top_frac` defaults — settle empirically in Phase 0.
+- Multi-face heuristic threshold before escalating to Gemini (cost vs. accuracy).
+- Monogram fallback styling — owned by design or generated?
+
+---
+
+## Developer Notes
+
+Notes for whoever builds this — especially if you're driving an AI coding agent (Codex or Claude Code, Opus 4.8).
+
+<Note>
+  **The core reality:** an agent collapses the *code-writing* from days to hours, but calendar time is set by the parts an agent can't do for you — empirical tuning, GCP provisioning, integration testing, and review. Those don't compress. Plan around the bottleneck, not the typing.
+</Note>
+
+### Effort with an AI agent
+
+| Target | Estimate | Notes |
+|--------|----------|-------|
+| **Working MVP** — detect + compose + quality gate, single-face, running on real sample images and tuned | **~1 day** | Agent writes the [§3](#3-crop-composition-spec) module + test harness in 1–2 hrs; the rest is **you** eyeballing crops and tuning `k`/`eye_top_frac`. No agent can judge whether a crop "looks right" for an avatar. |
+| **Full v1 deployed on GCP** — Pub/Sub + Cloud Run + AlloyDB + GCS + Gemini + telemetry, wired into enrichment, reviewed | **~3–5 focused days** | Down from ~1–1.5 human-weeks. Agent one-shots most modules; the items below eat the rest. |
+
+### What eats the time (and won't compress)
+
+<Steps>
+  <Step title="GCP wiring (~1 day)">
+    The agent writes the Terraform/gcloud, but a human runs it, approves IAM, and debugs the gotchas — especially **Cloud Run reaching AlloyDB over a VPC connector** (AlloyDB lives in a VPC; Cloud Run needs a connector or Direct VPC egress), and secrets / Workload Identity for the Gemini + OpenRouter keys. Agents stall here because they can't see the console or hold credentials.
+  </Step>
+  <Step title="Integration + real-data testing (~1 day)">
+    Publishing into the live enrichment flow without breaking it, then watching it run on actual contacts.
+  </Step>
+  <Step title="Verification-quality loop (~0.5–1 day)">
+    Deciding whether Gemini's face selection is good enough and setting thresholds — empirical, human judgment (watch for false accepts on lookalikes).
+  </Step>
+  <Step title="Review">
+    This touches enterprise contacts — read the IAM surface and the data-write paths. Don't blind-merge agent output.
+  </Step>
+</Steps>
+
+### Working with the agent
+
+<Tip>
+  **The spec is the accelerant, not the model.** Codex and Claude Code Opus 4.8 land about the same timeline for this job — both write Python and standard GCP/Gemini code fluently, and the bottleneck (provisioning, tuning, review) is identical. This doc is tight enough for either to one-shot most modules; feed it in directly.
+</Tip>
+
+- **Resolve the CV-language decision before pointing the agent at Phase 3** — leave it open and the agent will thrash. Python + OpenCV is the agent's happy path and fastest to ship; GoCV / onnxruntime-go trades some agent fluency for the native Go stack.
+- **Verify SDK signatures against current docs** — agents occasionally use stale GCP/Gemini client API shapes.
+- **Provision infra yourself or pair closely** — IAM/permission retry loops are where agents burn time blindly.
+- **Suggested build order:** Phase 0 spike (Python) → §3 module → Gemini contract → service skeleton → GCP wiring → telemetry. Tackle one phase per agent session with this doc as context.

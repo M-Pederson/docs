@@ -1,0 +1,509 @@
+---
+title: "Current Implementation"
+description: "How Orbiter AI chat memory works today: the OpenUI05 dispatch path, Zep, the deterministic Xano context functions, and the existing Mem0 audit"
+---
+
+This page documents what exists in Orbiter today for AI chat memory and context: the server-side OpenUI05 dispatch path (Zep-backed), the context blocks injected into each turn, the deterministic Xano context functions (`#13069`, `#13070`), the conversation tables, and an audit confirming there are no live Mem0 consumers yet.
+
+For the target Mem0 architecture and the steps to get there, see [Migration Plan](/guides/open-work/mem0/migration-plan).
+
+## Current Implementation Snapshot
+
+The existing OpenUI AI chat path is already server-side. The frontend calls one Xano endpoint and does not call an LLM, Zep, or Mem0 directly.
+
+| Item | Current state |
+| --- | --- |
+| Frontend entrypoint | `POST /openui05/dispatch` |
+| Xano API | Endpoint `#8497` in `Robert OpenUI 0.5` group `#1276` (`api:C5i2nPpF`) |
+| Auth | `user` table auth (`#125`) |
+| Memory provider today | Zep |
+| Frontend inputs | `query`, stable `thread_id`, `suggestion_request_id`, and YAML context blocks |
+| Server output | OpenUI response payload plus `mem_used` and `mem_ingested` flags |
+
+`openui05/dispatch` does the memory work inside Xano:
+
+1. Builds a Zep user id as `user-{auth.id}`.
+2. If `thread_id` and `$env.zep` exist, ensures the Zep user and thread exist.
+3. Reads Zep thread context from `GET /api/v2/threads/{thread_id}/context`.
+4. Builds `$mem_context` from frontend-provided YAML blocks plus Zep's `[NETWORK MEMORY]`.
+5. Routes the turn through classification and the appropriate OpenUI tool endpoint.
+6. Writes back to Zep with `POST /api/v2/threads/{thread_id}/messages`.
+
+The current Zep write stores the user's raw query and an assistant route summary like `Routed to find_investors. ...`; it does not appear to store the full rendered OpenUI response as a Xano transcript inside endpoint `#8497`.
+
+### Context Blocks
+
+The frontend-provided YAML blocks are injected into `$mem_context` in this order when present:
+
+1. `[YOU]` from `self_yaml_context`.
+2. `[NETWORK MEMORY]` from Zep.
+3. `[HELPING TARGET -- master_person #{for_master_person_id}]` from `target_yaml_context`.
+4. `[YOUR RELATIONSHIP WITH TARGET]` from `target_relationship_summary`.
+5. `[YOUR COMPANY]` from `self_company_yaml_context`.
+6. `[TARGET COMPANY -- master_person #{for_master_person_id}'s current company]` from `target_company_yaml_context`.
+
+### User Context Snapshot (#13069)
+
+Use `mvp/context/get-all-user-context` (`function #13069`) to create the user's frozen self-context at the start of a suggestion request draft.
+
+Function contract:
+
+```txt
+function: mvp/context/get-all-user-context
+id: 13069
+input: { user_id: auth.id }
+response: markdown string
+```
+
+This function returns compact Markdown for the authenticated user. It includes person signals, experience, education, and current work context. It intentionally excludes noisy/internal context such as user IDs, master person IDs, raw YAML IDs, `bio_500`, and current company rows where `master_company_id` is null.
+
+#### When to call it
+
+Call `#13069` once immediately after the `suggestion_request` draft row is created and before the first OpenUI chat turn.
+
+Current table:
+
+```txt
+suggestion_request (#529)
+- id
+- user_id
+- copilot_mode
+- request_context
+- master_person_id
+- status
+- llm_summary_context
+- number_of_results
+- deliver_format
+```
+
+Do not store the user context in `request_context`. Keep `request_context` for the user's actual ask. Store the generated Markdown snapshot in the JSON field `suggestion_request.llm_summary_context` under a namespaced key:
+
+```json
+{
+  "openui_context": {
+    "self_context_function_id": 13069,
+    "self_context_function": "mvp/context/get-all-user-context",
+    "self_context_format": "markdown",
+    "self_context_generated_at": "2026-06-08T00:00:00Z",
+    "self_context_user_id": 15,
+    "self_markdown": "# User Context\n\n## Robert Boulos\n\n..."
+  }
+}
+```
+
+Implementation sketch:
+
+```txt
+1. POST /suggestion-requests creates suggestion_request #529 with status = draft.
+2. Run function #13069 with { user_id: auth.id }.
+3. Edit the new suggestion_request row.
+4. Merge the function result into llm_summary_context.openui_context.self_markdown.
+5. Use the same stored snapshot for every chat turn on that suggestion_request.
+```
+
+If we later add `ai_chat_context_snapshot`, store the full Markdown there and keep only `context_snapshot_id` plus metadata in `llm_summary_context`. Until then, `llm_summary_context.openui_context.self_markdown` is the least-invasive storage location because the field already exists on `suggestion_request`.
+
+#### How it feeds back into chat
+
+Every call to `POST /openui05/dispatch` for the same `suggestion_request_id` should include the stored Markdown snapshot as `self_yaml_context`.
+
+The input name is still `self_yaml_context` for backwards compatibility, but the value can be Markdown. Endpoint `#8497` treats it as text and injects it under `[YOU]`.
+
+Current flow:
+
+```txt
+suggestion_request.llm_summary_context.openui_context.self_markdown
+  -> dispatch input self_yaml_context
+  -> [YOU] block in $mem_context
+  -> downstream OpenUI tool endpoint context
+```
+
+Preferred server-side cleanup: update `openui05/dispatch` so that when `suggestion_request_id` is present and `self_yaml_context` is empty, it loads `suggestion_request.llm_summary_context.openui_context.self_markdown` itself. That keeps the frontend contract smaller and ensures Xano owns context assembly.
+
+Do not rerun `#13069` on every chat turn. Refresh it only when:
+
+- creating the draft `suggestion_request`
+- the user explicitly asks to refresh their context
+- the product intentionally restarts the draft with a new context snapshot
+
+Do not write this full context snapshot to Mem0. Mem0 should receive only extracted durable memories, not the whole profile/work context.
+
+#### Example context output
+
+```md
+# User Context
+
+## Robert Boulos
+
+### Signals
+- Robert Boulos is the Founder of snappy.ai, focusing on AI integration for internal systems by building production-grade MCP servers that connect AI agents like Claude and ChatGPT to APIs and databases.
+- He operates in the AI and tech integration industry, with a specific emphasis on secure, role-based access for AI agents without the need to rebuild user interfaces.
+- Robert frequently engages with topics related to AI tools, development practices, and teaching developers how to build and ship using tools like Claude Code and Xano.
+- His communication style appears professional and educational, often sharing insights and tutorials aimed at technical founders and developers.
+- He is likely part of communities focused on AI development, tech integration, and developer education, given his focus on teaching and building AI solutions.
+
+### Experience
+- Founder at snappy.ai (2022-present)
+- Applications Engineering at B&R Industrial Automation (2018-2019) - Mississauga, Ontario
+- Manufacturing Engineering at Tesla (2017-2018) - Reno, Nevada Area
+
+### Education
+- conestoga college (2015-2019)
+- brown university (2012-2015)
+- george brown college (2012-2015)
+- Conestoga College (2015-2019)
+- George Brown College (2012-2015)
+
+## Current Work Context
+
+### Founder at snappy.ai
+
+Signals:
+-
+
+Relationship context:
+- Robert Boulos has served as the Founder of snappy.ai since January 2022. In this role, he has held one distinct position within the company.
+- Robert Boulos founded snappy.ai in 2022.
+```
+
+### Meeting Prep Memo (#13070)
+
+Use `mvp/meeting-prep/classify-participants_v2` (`function #13070`) as the canonical meeting-prep participant context builder.
+
+Function contract:
+
+```txt
+function: mvp/meeting-prep/classify-participants_v2
+id: 13070
+response: participant JSON with embedded Markdown context
+```
+
+The function expands the older participant classification response with Markdown context fields:
+
+| Location | Context field | Source helper |
+| --- | --- | --- |
+| `my_team` | `my_team_company_context` | `mvp/context/get-master-company-markdown-context` (`#13072`) |
+| `my_team.members[]` | `person_context` | `mvp/context/get-master-person-markdown-context` (`#13071`) |
+| `participating_companies[]` | `company_context` | `mvp/context/get-master-company-markdown-context` (`#13072`) |
+| `participating_companies[].members[]` | `person_context` | `mvp/context/get-master-person-markdown-context` (`#13071`) |
+| `personal_participants[]` | `person_context` | `mvp/context/get-master-person-markdown-context` (`#13071`) |
+
+#### When to call it
+
+Call `mvp/meeting-prep/classify-participants_v2` (`#13070`) only when the user chooses meeting prep for a calendar event.
+
+Preferred lifecycle: keep Nylas webhook ingestion and calendar sync focused on calendar/event freshness. Do not run `#13070` for every incoming meeting by default. When the user actively opens or starts meeting prep, create or load the `meeting_prep_context`, run `#13070`, and store the packaged participant context there.
+
+Use the stable meeting key that already exists in Xano:
+
+```txt
+meeting_prep_context.id        -> internal meeting prep context id
+meeting_prep_context.nylas_event_id -> external calendar event id
+```
+
+If the product introduces a separate `meeting_id`, store that alongside `nylas_event_id`, but do not lose the Nylas event id because it is needed for webhook reconciliation.
+
+Implementation sketch:
+
+```txt
+1. User selects "meeting prep" for a calendar event.
+2. Create or load meeting_prep_context for user_id + nylas_event_id.
+3. If participant_context exists and is still fresh for the current event version, reuse it.
+4. Otherwise, skip cancelled events and events with no useful participants.
+5. Extract participant emails from the calendar event.
+6. Run mvp/meeting-prep/classify-participants_v2 (#13070).
+7. Store the full JSON result in meeting_prep_context.participant_context.
+8. Derive a single meeting prep memo Markdown string from the embedded context fields.
+9. Store the derived memo under meeting_prep_context.participant_context.meeting_prep_memo_markdown.
+10. Store lightweight metadata such as participant_context_generated_at and source_event_updated_at.
+11. Use that stored memo for every meeting-prep chat turn for the same event.
+```
+
+Rerun `#13070` idempotently only when the user chooses meeting prep and the stored participant context is missing or stale because the event participant list, attendee emails, organizer, or linked company/person identities changed. Do not rerun it on every chat turn.
+
+<Note>
+  **Candidate `meeting_prep_context` cleanup.** Once `#13070` owns the packaged participant context and memo Markdown, review older fields before continuing to feed or duplicate them in chat:
+
+  | Field | Recommendation | Why |
+  | --- | --- | --- |
+  | `team_structure` | Consider deprecating or making it derived from `participant_context`. | `#13070` now returns `my_team`, `participating_companies`, `personal_participants`, members, logos, titles, and Markdown context in one response. |
+  | `participant_context` | Keep as the canonical JSON snapshot. | This is the right home for the full `#13070` result plus `meeting_prep_memo_markdown`. |
+  | `email_threads` | Keep only as raw evidence, references, or a compact email summary. | Do not inject full email threads every chat turn if the meeting memo already contains the useful distilled context. |
+  | `prior_meetings` | Keep only as raw evidence, references, or a compact prior-meeting summary. | Past meetings can be useful, but they should be summarized before prompt use and should not duplicate Mem0 memories. |
+  | `checklist_status` | Keep for UI/workflow state, not LLM context. | The model usually does not need checkbox state unless the current action depends on it. |
+  | `qa_history` | Move toward admin/debug or `ai_memory_event_log` style storage. | QA traces are not meeting context and should not ride along in normal chat prompts. |
+  | `desired_outcome` | Keep. | This remains first-class meeting-prep state and should be included in the prompt. |
+  | `user_id`, `nylas_event_id` | Keep. | These are identity/linking fields, not prompt context. |
+</Note>
+
+Do not ask the frontend to re-send the full nested participant payload on every chat turn. The frontend should send a stable meeting prep identifier, such as `meeting_prep_context_id` or `nylas_event_id`, and Xano should load the stored `participant_context` server-side.
+
+#### How the memo feeds chat
+
+For meeting prep, the LLM should receive all participant Markdown, but as deterministic Xano context rather than Mem0 memory.
+
+Build a single memo from:
+
+```txt
+# Meeting Prep Context
+
+## My Team
+{my_team.my_team_company_context}
+
+### My Team Members
+{my_team.members[].person_context}
+
+## Participating Companies
+{participating_companies[].company_context}
+
+### External Participants
+{participating_companies[].members[].person_context}
+
+## Personal Participants
+{personal_participants[].person_context}
+```
+
+Then pass the stored memo into the meeting-prep chat input before retrieved memories:
+
+```txt
+System instructions
+
+User context snapshot from #13069, when available
+
+Meeting prep memo Markdown from #13070 participant_context
+
+Relevant durable user memories from Mem0
+
+Relevant run memories from Mem0
+
+Recent meeting-prep chat transcript
+
+Latest user message
+```
+
+This gives the model the full participant context every turn without polluting Mem0 with large profile/company snapshots.
+
+#### Mem0 processing
+
+Do not POST the full `#13070` participant result, full meeting memo, or raw participant Markdown to Mem0.
+
+Use Mem0 around meeting prep this way:
+
+1. **Before the LLM turn:** search Mem0 with a query built from the latest user message, meeting title, desired outcome, and participant names.
+2. **During the LLM turn:** include the `#13070` meeting memo as deterministic Xano context and the Mem0 search results as retrieved memory.
+3. **After the assistant response:** run memory extraction asynchronously against the latest user message, assistant response, meeting flow state, and retrieved memories.
+4. **Write to Mem0 only when extracted facts are durable:** relationship facts confirmed by the user, reusable meeting preferences, strong strategy decisions, or meeting-specific commitments.
+5. **Use run scope for event-specific facts:** `run_id = "meeting_prep:{meeting_prep_context_id}"`.
+6. **Use user scope for durable facts that should follow the user across meetings:** `user_id = "{auth.id}"`.
+
+Recommended metadata for meeting prep writes:
+
+```json
+{
+  "flow_type": "meeting_prep",
+  "thread_id": "meeting_prep:88",
+  "source_type": "meeting_prep_chat",
+  "source_id": "ai_chat_message:456",
+  "meeting_prep_context_id": "88",
+  "nylas_event_id": "calendar-event-id",
+  "category": "meeting_strategy"
+}
+```
+
+#### Example #13070 result
+
+```json
+{
+  "my_team": {
+    "master_company_id": 3,
+    "name": "Orbiter.io",
+    "logo": "https://xh2o-yths-38lt.n7c.xano.io/vault/HQ70VIj3/6WFzoCBw7mJLmIn4LTY4VgC144o/ZygfsQ../orbiter_logo_new.png",
+    "my_team_company_context": "## Orbiter.io\n\nOrbiter.io is an AI relationship intelligence platform built for high-performing professionals in media and technology who treat relationships as strategic assets.\n\nCombining knowledge graph technology with an AI reasoning engine, the platform enables operators to discover, manage, and grow meaningful connections with the same rigor they apply to data, capital, and strategy.\n\nOrbiter transforms professional networks into actionable intelligence, unlocking opportunities that would otherwise stay hidden and revolutionizing how ambitious professionals connect with their world.\n\n### Signals\n- Orbiter.io positions itself as an AI relationship intelligence platform that uses knowledge graph technology combined with an AI reasoning engine to help users treat professional connections as strategic assets.\n- The core offering targets high-performing professionals specifically in media and technology industries, focusing on discovering, managing, and growing meaningful relationships with data-driven rigor.\n- Orbiter.io emphasizes transforming unstructured professional networks into actionable intelligence to surface hidden opportunities in business development, partnerships, and career growth.\n- The company frames its value proposition around applying the same analytical discipline to relationships that operators typically reserve for data, capital, and strategy.\n\n### Relationship context\n- Mark Pederson has served as a Co-Founder at Orbiter.io since August 2022. During his tenure, he has held this single leadership role within the company.\n- Mark Pederson co-founded Orbiter.io in 2022.\n- Jason Diamond co-founded Orbiter.io in 2022.\n- Josh Diamond co-founded Orbiter.io in 2022.\n\n",
+    "members": [
+      {
+        "master_person_id": 5,
+        "name": "Njogu Kimondo",
+        "avatar": "https://storage.googleapis.com/orbiter-production/avatars/5/actual/0dvD9-kimondo.webp",
+        "title": "Development Specialist (Backend)",
+        "person_context": "## Njogu Kimondo\n\n### Signals\n- Njogu Kimondo is a specialist in custom no-code development, focusing on creating web applications for change makers to solve complex problems with elegant solutions, as highlighted in his professional bio and LinkedIn activity.\n- He operates in the tech and software development industry, with a particular emphasis on no-code platforms and modern web design trends, evident from his public professional descriptions.\n- Njogu frequently engages with topics related to technology, programming, and social impact, reflecting his passion for building solutions that benefit wide audiences, as seen in his LinkedIn posts and bio.\n- His communication style appears professional and solution-oriented, often emphasizing innovation and impact in technology, based on the tone of his LinkedIn profile and shared content.\n- He expresses a strong opinion on the importance of technology as a tool for positive change, aligning his work with enhancing the world, as noted in his bio and professional messaging.\n\n### Experience\n- Artificial Intelligence Engineer || Python at Technology Consultant (2023-present) - United States\n- Development Specialist (Backend) at VamosWatu (2024-present) - Austin, Texas, United States\n- Software Engineer at Wise and Agile Solutions Limited (2023-2024) - Nairobi, Nairobi, Kenya\n- Software Engineer at CoAmana (2024-2024) - Abuja, Federal Capital Territory, Nigeria\n- Full Stack Engineer Consultant at SKYPINS TRAVEL AGENCY (2023-2023) - Nairobi, Kenya\n- Lead Software Engineer at Enigma Consultancy Limited (2023-2023) - Nairobi, Nairobi, Kenya\n- Junior Software Engineer at Identigate Integrated Solutions (2022-2023) - Bomas Of Kenya, Nairobi, Kenya\n- Junior Software Developer at Enigma Consultancy Limited (2022-2022) - Nairobi, Nairobi, Kenya\n- Information Technology Solutions Specialist at University of Nairobi (2022-2022) - Nairobi, Nairobi, Kenya\n- Information Technology Services Specialist at University of Nairobi (2018-2018) - Nairobi, Nairobi, Kenya\n\n### Education\n- cisco networking academy (2019-2019)\n- jomo kenyatta university of agriculture and technology (jkuat) (2017-2022)\n\n"
+      }
+    ]
+  },
+  "participating_companies": [
+    {
+      "master_company_id": 7005,
+      "name": "Grant Drive Group",
+      "logo": "https://img.logo.dev/grantdrivegroup.com?token=pk_Twvl42WzTX2-ySNbnZKlSA",
+      "company_context": "## Grant Drive Group\n\nGrant Drive Group is a business development and capital advisory firm helping small to mid-sized companies scale, raise capital, and prepare for what's next.\n\nNamed after the founder's grandfather who embodied the American Dream, the firm was built to serve with heart, hustle, and hands-on execution.\n\nGrant Drive Group delivers strategic guidance and operational support to businesses on the rise, combining capital advisory expertise with growth-focused business development.\n\n### Signals\n- Grant Drive Group was founded in 2024 by Katelyn Gallanty, who previously held roles in institutional FX sales, product development, and private banking at Citi and Wells Fargo after starting in back-office risk operations.\n- The firm positions itself explicitly around capital advisory and growth strategy for small to mid-sized companies, with specialties including expansion planning, cap table advisory, investor readiness, and exit planning as listed on its LinkedIn company page.\n- Katelyn Gallanty maintains dual roles as founding partner of Grant Drive Group and CFO of Orbiter.io, with her personal LinkedIn bio highlighting investor and board member activities alongside the advisory work.\n- The company maintains a LinkedIn company page (557 followers as of recent data) that posts regularly on startup fundraising topics such as pre-revenue traction signals, pitch deck structure, and investor interview questions, functioning as primary content marketing.\n- Grant Drive Group is headquartered in New York, NY, with a company size listed as 2-10 employees on LinkedIn and a focus on hands-on execution for businesses preparing to raise or exit.\n- The firm's name and mission narrative center on the founder's grandfather as the embodiment of the American Dream, with service principles of \"heart, hustle, and hands-on execution\" repeated across the website and LinkedIn about section.\n- Katelyn Gallanty is FINRA licensed with Series 7, 63, 66, and 82 (pursuing Series 79) and holds a Business Administration (Marketing) degree from Marist College, per her LinkedIn and website bio.\n- The firm offers curated venture opportunities alongside advisory services, as stated on the homepage tagline \"Capital Advisory & Curated Venture Opportunities.\"\n- Recent LinkedIn activity from the company account emphasizes practical founder advice on traction metrics and investor selection rather than direct client wins or product launches, consistent with a new advisory practice building thought leadership.\n- No prominent X/Twitter, GitHub, or YouTube presence was identified; the primary public surfaces are the company website, LinkedIn company and founder profiles, and a low-follower Instagram account (@grantdrivegroup).\n\n### Relationship context\n- Katelyn Gallanty founded Grant Drive Group in 2024.\n\n",
+      "members": [
+        {
+          "master_person_id": 1002,
+          "name": "Katelyn Gallanty",
+          "avatar": "https://storage.googleapis.com/orbiter-production/avatars/1002/actual/OWx59-gallanty.webp",
+          "title": "Chief Financial Officer",
+          "person_context": "## Katelyn Gallanty\n\n### Signals\n- \n\n### Experience\n- Chief Financial Officer at Orbiter.io (2025-present)\n- Board Member & Treasurer at Veterans Future Foundation (VFF) (2025-present)\n- Founding Partner at Grant Drive Group (2024-present) - New York, New York, United States\n- Senior Vice President at Citi India (2022-2024) - New York, New York, United States\n- Vice President at Wells Fargo (2021-2022) - San Francisco, California, United States\n- Assistant Vice President at Citi India (2015-2018) - New York, New York, United States\n\n### Education\n- marist university (2011-2015)\n- harborfields high school (2007-2011)\n\n"
+        }
+      ]
+    }
+  ],
+  "personal_participants": null
+}
+```
+
+### Conversation Tables Found
+
+The live Xano tables that look like first-party conversation storage are:
+
+| Table | ID | Live schema | Current relationship to `openui05/dispatch` |
+| --- | --- | --- | --- |
+| `copilot_conversations` | `636` | `user_id`, `mode`, `title`, `master_person_id` | Conversation threads for copilot/meeting-style chat; no direct write found in endpoint `#8497`. |
+| `copilot_chat_messages` | `637` | `conversation_id`, `role`, `content`, `template_name`, `template_props` | Individual messages for `copilot_conversations`; no direct write found in endpoint `#8497`. |
+
+The meeting prep docs already list these as the copilot conversation tables. They are useful reference tables if OpenUI05 should gain first-party transcript persistence, but the current OpenUI05 dispatch memory path is Zep-first.
+
+## Existing Xano Audit
+
+Audit date: 2026-06-08.
+
+Target external API: `POST https://api.mem0.ai/`.
+
+Scope scanned:
+
+- Xano workspace 3 (`OrbiterV2`), branch `v1`
+- API group `1261` (`🚀 Robert API`)
+- API group `1276` (`Robert OpenUI 0.5`)
+
+Result: **no direct Mem0 API consumers were found in the accessible Xano `v1` workspace metadata.** API groups `1261` and `1276` were scanned directly. The originally referenced group `1287` could not be resolved from the authenticated Xano context; see [API group 1287 status](#api-group-1287-status).
+
+### Copy/Paste Inventory
+
+```txt
+# Mem0 API consumers found by exact text scan
+# Target: POST https://api.mem0.ai/
+
+none
+
+# Scanned target groups
+API group #1261: 🚀 Robert API — 107 endpoints scanned; 0 direct Mem0 calls found.
+API group #1276: Robert OpenUI 0.5 — 40 endpoints scanned; 0 direct Mem0 calls found.
+
+# Unresolved referenced group
+API group #1287: unresolved in workspace 3/v1; not returned by Xano MCP or explicit v1 workspace pull.
+
+# Workspace-wide v1 corroboration
+Exact text search across 2,267 pulled Xano v1 documents:
+- "api.mem0.ai": 0 matches
+- "mem0": 0 matches
+- "Mem0": 0 matches
+```
+
+### API group 1261: 🚀 Robert API
+
+`🚀 Robert API` is the memory-adjacent group in the requested scope. It includes chat, copilot conversation, local memory CRUD, meeting prep, outcome generation, QA, and relationship endpoints.
+
+Scan steps:
+
+1. Listed all endpoints in group `1261` from Xano MCP.
+2. Pulled workspace `3`, branch `v1`, with drafts to `/private/tmp/xano-mem0-scan-v1`.
+3. Searched the pulled XanoScript for `api.mem0.ai`, `mem0`, and `Mem0`.
+4. Inspected the likely memory-related endpoints and reusable memory function manually.
+
+No endpoint in group `1261` posts to `https://api.mem0.ai/`.
+
+#### Checked near-matches
+
+These endpoints look memory-related, but they use Xano tables instead of Mem0.
+
+##### POST `memory` (#8223)
+
+Step-by-step behavior:
+
+1. Accepts `key`, `value`, optional `category`, `scope`, `team_id`, and `source`.
+2. Queries `copilot_memory` for an active row for the authenticated user with the same `key` and `scope`.
+3. If an active memory exists, updates that row's `value`, `category`, and `source`.
+4. If no active memory exists, creates a new `copilot_memory` row.
+5. Writes a create/update entry into `copilot_memory_log`.
+6. Returns `{ memory, action }`.
+
+Mem0 status: **no external Mem0 call**; this is local Xano memory storage.
+
+##### GET `memory` (#8222)
+
+Step-by-step behavior:
+
+1. Accepts optional `scope`, `category`, and `team_id` inputs.
+2. Queries active `copilot_memory` rows for the authenticated user.
+3. Returns `{ memories, total }`.
+
+Mem0 status: **no external Mem0 call**; this reads local Xano memory rows.
+
+##### PATCH `memory/{memory_id}` (#8229)
+
+Step-by-step behavior:
+
+1. Loads the requested `copilot_memory` row by `memory_id`.
+2. Confirms the row exists.
+3. Confirms the row belongs to the authenticated user.
+4. Updates `value`, `active`, `category`, and `confidence`.
+5. Writes an update entry to `copilot_memory_log`.
+6. Returns `{ memory }`.
+
+Mem0 status: **no external Mem0 call**; this edits a local Xano memory row.
+
+##### DELETE `memory/{memory_id}` (#8230)
+
+Step-by-step behavior:
+
+1. Loads the requested `copilot_memory` row by `memory_id`.
+2. Confirms the row exists.
+3. Confirms the row belongs to the authenticated user.
+4. Soft-deletes the row by setting `active: false`.
+5. Writes a delete entry to `copilot_memory_log`.
+6. Returns `{ success: true }`.
+
+Mem0 status: **no external Mem0 call**; this soft-deletes local Xano memory.
+
+##### POST `chat` (#8064)
+
+Step-by-step behavior:
+
+1. Loads the selected copilot mode config by `input.mode`.
+2. Builds the base system prompt from `copilot_config.prompt`.
+3. Runs `mvp/copilot/build-memory-context` (#12665).
+4. Appends the returned `[USER MEMORY]` block to the system prompt when memory exists.
+5. Appends active person context and network data when provided.
+6. Builds the OpenRouter chat-completions message array.
+7. Calls `https://openrouter.ai/api/v1/chat/completions`.
+8. Parses the LLM response into the frontend response shape.
+
+Mem0 status: **no external Mem0 call**. The memory function reads `copilot_memory`; it does not call Mem0.
+
+### API group 1276: Robert OpenUI 0.5
+
+`Robert OpenUI 0.5` is the screenshot-confirmed second group. It contains OpenUI 0.5 endpoints for classification, dispatch, investor/talent/customer search, research, interview flows, summaries, and related Anything Engine requests.
+
+Scan steps:
+
+1. Listed all endpoints in group `1276` from Xano MCP.
+2. Confirmed the group contains 40 endpoints.
+3. Searched the pulled group XanoScript under `/private/tmp/xano-mem0-scan-v1/api/robert_open_ui_0_5`.
+4. Searched for `api.mem0.ai`, `mem0`, and `Mem0`.
+5. Corroborated with the workspace-wide `v1` exact text search.
+
+No endpoint in group `1276` posts to `https://api.mem0.ai/`.
+
+There are no Mem0-consuming endpoints in this group to explain step by step.
+
+### API group 1287 status
+
+Group `1287` could not be scanned from the currently authenticated Xano context. The Xano screenshot showed `Robert OpenUI 0.5` as group `1276`, which has now been scanned separately above.
+
+Resolution attempts:
+
+1. `getApiGroup` for workspace `3`, group `1287` returned `ERROR_CODE_NOT_FOUND`.
+2. `listAPIGroups` for workspace `3`, live `v1`, returned groups through `1280`; no `1287`.
+3. Checked accessible workspaces `5` and `6`; neither exposes group `1287`.
+4. Checked alternate workspace `3` branches available from MCP; no group `1287`.
+5. Pulled workspace `3`, branch `v1`, with drafts; no API group or file corresponding to `1287` was present.
+
+Next action: confirm the workspace and branch for API group `1287`, or grant access to the Xano context that contains it. Once it resolves, re-run the exact search for `api.mem0.ai`, `mem0`, and `Mem0`.

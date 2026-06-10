@@ -1,0 +1,1186 @@
+---
+title: "Historical Memories from Email Threads"
+description: "Scope for user-triggered historical email processing that extracts durable contact memories from Nylas threads and stores them in Mem0."
+---
+
+<Warning>
+  **DO NOT DEPLOY THIS FUNCTION YET.**
+
+  This page documents a proof of concept only. Function `mem0/create-memories-from-email-threads-v1` (`13077`) should not be used in production or exposed to end users until persistent audit tables, idempotency, deletion tooling, write retries, and broader contact QA are complete. Current use is limited to controlled internal dry runs or explicitly approved Mem0 write tests.
+</Warning>
+
+Build a user-triggered Xano function that takes a `MyPersonID`, finds that person's active email addresses, searches every connected email account owned by the user through the `nylas_grant` table, finds historical email threads involving that person, extracts durable relationship memories from cleaned thread body content, and stores those memories in Mem0 with metadata that links each memory back to the specific contact and source email account.
+
+The function is subject-focused: it only processes historical email threads where the requested `my_person` appears as a direct sender or recipient. Every accepted memory is stored against that requested `my_person`. If the memory also surfaces other people, Xano resolves them against the user's `my_person` records and logs them in metadata as `surfaced_contacts[]` and `retrieval_contact_ids[]`; it does not create duplicate Mem0 rows for those people.
+
+<Note>
+  **V1 Xano function status**
+
+  - Function: `mem0/create-memories-from-email-threads-v1`
+  - Xano ID: `13077`
+  - Workspace: `3`
+  - Deployment status: **POC only; not approved for production deployment**
+  - Status: created on June 10, 2026; dry-run-first implementation updated for subject-focused surfaced-contact logging; post-update smoke test pending
+  - Mem0 writes: guarded by `dry_run`; default is `dry_run=true`
+  - Mem0 key: uses Xano env var `MEM0_API_KEY` when `dry_run=false`
+  - Mem0 user ID: uses `user.workos_id` from the Xano `user` table; no fallback ID
+  - Contact handling: stores memories only for the input `my_person`; related people are logged as `surfaced_contacts[]` and included in `retrieval_contact_ids[]`
+  - Cost tracking: response includes `model_usage[]` with calls, prompt tokens, completion tokens, total tokens, and reported OpenRouter cost per model
+  - Model config: internal function variables only; client requests cannot override model slugs
+</Note>
+
+This page now tracks both the design scope and the v1 Xano implementation.
+
+## Goal
+
+Create a background-safe historical processor:
+
+- Name: `mem0/create-memories-from-email-threads-v1`
+- Xano function ID: `13077`
+- Required input: `my_person_id`
+- Required trigger: explicit user action, such as "create memories from past email threads"
+- Required runtime context: authenticated Orbiter user and workspace
+- Required account scope: all active Nylas email accounts connected to the authenticated user through `nylas_grant`
+- Optional inputs: `since`, `before`, `max_threads_per_batch`, `max_messages_per_thread`, `max_cleaned_transcript_chars`, `dry_run`, `force_reprocess`, `selected_nylas_grant_ids`
+
+Important design decision already made: this is **historical email processing**, not a realtime webhook path. It is triggered by the user when they want Orbiter to mine past emails for one contact. It should never run automatically for every contact or every new email.
+
+Recommended first implementation:
+
+1. Run only from a user action.
+2. Process one contact at a time.
+3. Query the `nylas_grant` table for every active email account owned by the user.
+4. Search each active grant for threads involving the contact's active email addresses.
+5. Search full available thread history by default, using pagination and resumable batches rather than a date lookback.
+6. Use `dry_run=true` first to show candidate memories before writing to Mem0.
+7. Store only curated memory statements, not raw email bodies.
+
+## Resolved design decisions
+
+| Decision | Outcome |
+| --- | --- |
+| Contact email source | Use associated `master_email` records where `active_status == true`. |
+| Contact display name | Use the `master_person` record associated with the `my_person_id`. |
+| Memory visibility | Private to the mailbox owner/user, not workspace-shared. |
+| First run behavior | `dry_run=true` by default. |
+| Historical range | Full available email history by default. `since` and `before` remain optional overrides, not defaults. |
+| Audit source storage | Store source IDs only: Nylas thread IDs and message IDs. Do not store source snippets. |
+| Email body cleaning | V1 uses an inline deterministic Xano `api.lambda` helper. Before extracting this to a shared helper, check for existing email clean conversation or email summary helper logic. |
+| Related people in memories | Resolve other people mentioned in extracted memories against the user's `my_person` records only when an email address can be matched. Do not write extra Mem0 rows for related people, but include email-resolved IDs in `retrieval_contact_ids[]` so the memory can be found when querying that person. |
+
+## Required data
+
+Xano needs these records available before the function can run:
+
+| Data | Purpose |
+| --- | --- |
+| `my_person_id` | Contact/person to link memories to |
+| Active `master_email` records for the person | Search keys for Nylas thread lookup; include only records where `active_status == true` |
+| Associated `master_person` record | Source for `subject_person_name` |
+| User's `my_person` contact directory | Resolve related people mentioned in memories to additional `subject_contact_id` targets |
+| Workspace/account ID | Tenant boundary for retrieval and deletion |
+| Requesting Orbiter user ID | Authorization and Mem0 identity mapping |
+| `user.workos_id` | Required Mem0 `user_id` string for memory storage; the function fails if this is missing |
+| Active `nylas_grant` rows for the user | Connected email accounts to search through Nylas |
+| Memory consent flag | Prevent email-derived memory creation unless enabled |
+
+Do not search workspace-wide shared grants in the first implementation. The historical run should search the authenticated user's own connected accounts only, using rows from `nylas_grant` where the row belongs to `auth.id` and the grant is active.
+
+## Nylas API flow
+
+Use Nylas v3. Base URL depends on the Nylas region:
+
+- U.S.: `https://api.us.nylas.com`
+- E.U.: `https://api.eu.nylas.com`
+
+Nylas requests use:
+
+```http
+Authorization: Bearer <NYLAS_API_KEY>
+Accept: application/json
+Content-Type: application/json
+```
+
+### 1. Resolve active email addresses
+
+From `my_person_id`, load the associated `master_email` records and keep only rows where `master_email.active_status == true`. Load the associated `master_person` record for the contact display name used in Mem0 metadata as `subject_person_name`.
+
+Normalize before searching:
+
+- Trim whitespace.
+- Lowercase the local and domain parts for matching.
+- Remove duplicates.
+- Skip invalid email formats.
+- Keep the original value for display/audit metadata.
+
+Example normalized output:
+
+```json
+{
+  "my_person_id": 12345,
+  "subject_person_name": "Jane Doe",
+  "active_emails": [
+    "jane@example.com",
+    "jane.doe@acme.com"
+  ]
+}
+```
+
+### 2. Resolve the user's connected email accounts
+
+Query `nylas_grant` for every active account connected to the authenticated user.
+
+Recommended filter:
+
+```txt
+nylas_grant.user_id == auth.id
+nylas_grant.grant_expired == false
+nylas_grant.grant_id != null
+```
+
+Recommended output fields:
+
+```txt
+id
+user_id
+grant_id
+email_account
+ai_enabled
+grant_expired
+```
+
+The function should search every active result. `selected_nylas_grant_ids` can exist as an advanced/debug input, but the default product behavior should be all active user-owned email accounts.
+
+Example normalized output:
+
+```json
+{
+  "user_id": 15,
+  "nylas_grants": [
+    {
+      "id": 183,
+      "grant_id": "grant_abc",
+      "email_account": "user@company.com"
+    },
+    {
+      "id": 184,
+      "grant_id": "grant_def",
+      "email_account": "user@gmail.com"
+    }
+  ]
+}
+```
+
+### 3. Find threads for each contact email in each user account
+
+Nylas supports filtering threads by participants with `any_email`. Use this as a broad discovery query, then enforce the product rule locally: process only threads where one of the contact's active email addresses appears in a message `from` or `to` field. Skip CC/BCC-only threads.
+
+Endpoint:
+
+```http
+GET /v3/grants/{grant_id}/threads
+```
+
+Recommended query parameters:
+
+| Parameter | Use |
+| --- | --- |
+| `any_email` | Broad discovery filter; can match To, From, CC, or BCC, so local From/To validation is still required |
+| `latest_message_after` | Optional override only; do not use by default because the product requirement is full history |
+| `latest_message_before` | Optional override for repeatable backfills or debug runs |
+| `limit` | Use a small page size such as `20`; continue with `page_token` until full history is exhausted or the resumable batch pauses |
+| `page_token` | Cursor for pagination |
+| `select` | Return only top-level fields needed for queueing, if validated against the Nylas response shape |
+
+Example:
+
+```http
+GET https://api.us.nylas.com/v3/grants/{grant_id}/threads?any_email=jane%40example.com&limit=20
+```
+
+Loop through:
+
+```txt
+for each active user nylas_grant
+  for each active contact email
+    GET /v3/grants/{grant_id}/threads?any_email={contact_email}
+```
+
+Nylas allows `any_email` to contain a comma-separated list of up to 25 addresses. For the first implementation, loop one contact email at a time per grant because it makes matching, audit logs, and contact attribution easier. Later, batch all active contact addresses into one request per grant for lower API volume.
+
+After fetching messages for a candidate thread, confirm locally that the contact appears as a direct sender or recipient:
+
+```txt
+message.from contains active_contact_email OR message.to contains active_contact_email
+```
+
+If the contact appears only in `cc` or `bcc`, skip the thread with `contact_not_in_direct_from_to_participants`.
+
+Thread de-dupe key:
+
+```text
+{xano_nylas_grant_id}:{nylas_grant_id}:{thread_id}
+```
+
+### 4. Pull message bodies for each thread
+
+Do not rely on the thread list response as the source of full body content. Use the Messages API filtered by `thread_id`.
+
+Endpoint:
+
+```http
+GET /v3/grants/{grant_id}/messages
+```
+
+Recommended query parameters:
+
+| Parameter | Use |
+| --- | --- |
+| `thread_id` | Pull messages for the selected thread |
+| `limit` | Use `50` initially; paginate if needed |
+| `page_token` | Cursor for long threads |
+| `fields=standard` | Start with standard payload, which includes normal message fields |
+| `select` | Use only after confirming the exact fields needed from the Nylas payload |
+
+Example:
+
+```http
+GET https://api.us.nylas.com/v3/grants/{grant_id}/messages?thread_id={thread_id}&limit=50&fields=standard
+```
+
+For Microsoft grants, Nylas documents provider limitations around `to`, `from`, `cc`, and `bcc` filters. The safer pattern is:
+
+1. Find candidate threads with `any_email`.
+2. Fetch messages by `thread_id`.
+3. Confirm locally that the contact email appears in message `from` or `to` before processing.
+
+### 5. Normalize thread content
+
+Before any LLM call, transform the Nylas message payloads into a compact, chronological thread transcript.
+
+Recommended implementation: build or reuse a Xano helper that performs deterministic email cleanup. Before creating a new helper, search existing Xano functions/helpers for email clean conversation or email summary logic and reuse the existing cleaner if it already removes HTML, quote chains, signatures, disclaimers, and repeated thread history.
+
+Include:
+
+- `message_id`
+- `thread_id`
+- `date`
+- `from`
+- `to`
+- `cc`
+- `subject`
+- Plain-text body
+
+Remove or reduce:
+
+- HTML tags
+- Tracking pixels and links that do not affect meaning
+- Quoted reply chains repeated in later messages
+- Signatures and legal footers where possible
+- Attachments and inline base64 content
+- Raw headers unless needed for debugging
+
+Skip a thread if:
+
+- The contact email does not appear in message `from` or `to`.
+- The normalized body content is too short to contain useful memory.
+- The thread is a newsletter, automated notification, receipt, calendar invite, or no-reply system thread.
+- The content is mostly attachments with no meaningful body text.
+
+## Lower-cost processing plan
+
+The main cost risk is sending raw email HTML, quoted reply chains, signatures, legal footers, and repeated thread history into the LLM. Reduce cost before the extraction step.
+
+Recommended pipeline:
+
+1. Use Nylas only to fetch thread/message data.
+2. Send each message body to the deterministic Xano cleaner helper before any LLM call.
+3. The helper returns only normalized body text and lightweight metadata.
+4. Xano builds a compact chronological transcript from the cleaned bodies.
+5. Xano skips irrelevant or low-signal threads deterministically.
+6. Only surviving cleaned transcripts go to the LLM extractor.
+7. Store curated memory statements in Mem0 with `infer=false`.
+
+### Xano cleaner helper responsibilities
+
+The cleaner should be deterministic and cheap. It should not call an LLM in the default path.
+
+Input:
+
+```json
+{
+  "thread_id": "thread_abc",
+  "messages": [
+    {
+      "message_id": "msg_123",
+      "date": 1781138400,
+      "from": [{"email": "jane@example.com", "name": "Jane Doe"}],
+      "to": [{"email": "user@company.com", "name": "User"}],
+      "cc": [],
+      "subject": "Follow-up from today",
+      "body": "<html>...</html>"
+    }
+  ]
+}
+```
+
+Output:
+
+```json
+{
+  "thread_id": "thread_abc",
+  "messages": [
+    {
+      "message_id": "msg_123",
+      "date": 1781138400,
+      "from_email": "jane@example.com",
+      "to_emails": ["user@company.com"],
+      "cc_emails": [],
+      "subject": "Follow-up from today",
+      "clean_body": "Thanks for the call. For next steps, please send a concise agenda with action items first.",
+      "body_char_count": 96,
+      "removed_quote_count": 2,
+      "looks_automated": false
+    }
+  ],
+  "thread_char_count": 96,
+  "should_skip": false,
+  "skip_reason": null
+}
+```
+
+Cleaning rules:
+
+- Convert HTML to text.
+- Drop CSS, scripts, hidden content, tracking pixels, and inline image references.
+- Remove quoted prior messages where possible.
+- Remove common signatures, disclaimers, and unsubscribe footers.
+- Normalize whitespace.
+- Preserve sender, recipient, date, subject, and message ID metadata.
+- Flag automated/no-reply/newsletter/receipt-style content.
+- Return a `source_hash` input string or cleaned-body hash so Xano can skip unchanged threads.
+
+### Additional cost controls
+
+- Use full available history by default.
+- Process full history in paginated, resumable batches so long-running mailboxes do not exceed Xano or provider runtime limits.
+- Cap `max_threads_per_batch`.
+- Cap `max_messages_per_thread`.
+- Cap cleaned transcript characters before extraction with `max_cleaned_transcript_chars`, defaulting to `30000`.
+- Skip threads with only one short transactional message.
+- Skip threads where the contact appears only in CC/BCC. The contact must appear in `from` or `to` on at least one message.
+- Cache the cleaned transcript by `{xano_nylas_grant_id, thread_id, source_hash}`.
+- Run deterministic skip rules before the LLM.
+- Use `openai/gpt-oss-120b` only for borderline "is this worth extracting?" decisions.
+- Use `deepseek/deepseek-v4-flash` for structured memory extraction.
+- Model slugs are internal function variables. V1 production defaults are `openai/gpt-oss-120b` for prefilter and `deepseek/deepseek-v4-flash` for final extraction.
+- Do not send attachments to the extraction model in the first version.
+- Do not ask Mem0 to infer from raw email; write curated statements with `infer=false`.
+
+## LLM extraction strategy
+
+Use a separate LLM extraction step before calling Mem0.
+
+Reason: Mem0 can infer memories directly from messages, but email threads are noisy and expensive. A dedicated extraction step over cleaned transcripts lets Orbiter enforce contact linkage, evidence requirements, privacy exclusions, confidence scores, and a dry-run review path before long-term storage.
+
+Use a three-tier processing setup:
+
+| Tier | Model | Purpose |
+| --- | --- | --- |
+| 1 | Deterministic Xano cleaner helper | Strip HTML, quoted text, signatures, disclaimers, tracking pixels, and repeated history before any LLM call. |
+| 2 | `openai/gpt-oss-120b` | Cheap prefilter for borderline cases where deterministic rules cannot decide whether a thread is worth extraction. |
+| 3 | `deepseek/deepseek-v4-flash` | Default final memory extraction model for structured candidate memories. |
+
+The default path should avoid the prefilter when deterministic rules already decide the thread. Use `openai/gpt-oss-120b` only when the Xano cleaner helper cannot confidently classify the thread as useful or skippable. Send accepted cleaned transcripts to `deepseek/deepseek-v4-flash` for final structured extraction.
+
+Call the selected models through OpenRouter's OpenAI-compatible API. Require structured JSON output with the extraction schema below, then validate the response in Xano before writing to Mem0.
+
+The inline Xano Lambda performs deterministic JSON post-processing before parsing model output:
+
+- Strip Markdown code fences and stray backticks.
+- Remove trailing commas before `}` or `]`.
+- Extract the first balanced JSON object if the model adds surrounding text.
+- Repair common adjacent-object and adjacent-array/key comma omissions where deterministic.
+- Return a parse error in `thread_results[].extraction.error` if strict JSON parsing still fails.
+
+### Completed extraction model tests
+
+The model comparison used `dry_run=true` with the same `my_person_id`, `user_id`, pagination token, batch size, message cap, transcript cap, and prefilter model. The public model override inputs were temporary and have been removed; future model tests should edit the internal `$prefilter_model` and `$extraction_model` variables in the function.
+
+Current OpenRouter list prices checked on June 10, 2026:
+
+| Test | `prefilter_model` | `extraction_model` | Price per 1M input/output | Purpose |
+| --- | --- | --- | --- | --- |
+| A | `openai/gpt-oss-120b` | `deepseek/deepseek-v4-flash` | `$0.0983 / $0.1966` | Baseline from the first dry run. Lowest extraction cost and strong enough subject focus so far. |
+| B | `openai/gpt-oss-120b` | `openai/gpt-oss-120b` | `$0.039 / $0.18` | OSS comparison. Tests whether the same cheap model can handle final extraction and strict JSON. |
+| C | `openai/gpt-oss-120b` | `openai/gpt-4.1-mini` | `$0.40 / $1.60` | Recommended OpenAI comparison. More expensive than A/B, still cheaper than Kimi, and likely stronger at instruction following and structured extraction. |
+| D | `openai/gpt-oss-120b` | `moonshotai/kimi-k2-0905` | `$0.60 / $2.50` | Kimi comparison. Better recall than A and less overcapture than C, but more expensive. |
+| E | `openai/gpt-oss-120b` | `deepseek/deepseek-v4-pro` | `$0.435 / $0.87` | DeepSeek escalation test. Failed the current strict JSON path and is not a production candidate without model-specific retry handling. |
+
+Using the A-run extraction token shape as a rough comparator (`15,881` input tokens and `25,409` output tokens), extraction-only list-cost estimates are approximately:
+
+| Model | Estimated extraction cost |
+| --- | ---: |
+| `deepseek/deepseek-v4-flash` | `$0.00656` list; observed reported extraction cost was `$0.00809` |
+| `openai/gpt-oss-120b` | `$0.00519` list |
+| `openai/gpt-4.1-mini` | `$0.04701` list |
+| `moonshotai/kimi-k2-0905` | `$0.07305` list |
+
+Use the actual `model_usage[].cost_usd` returned by each dry run as the source of truth for comparison, because OpenRouter routing, caching, and provider-specific usage reporting can differ from headline list prices.
+
+### A baseline response
+
+Actual A dry-run response excerpt from the June 10, 2026 test. `thread_results[]` and full nested metadata are omitted here for readability, but this preserves the run status, model usage, total cost, and candidate memories.
+
+```json
+{
+  "function_name": "mem0/create-memories-from-email-threads-v1",
+  "status": "dry_run_complete",
+  "dry_run": true,
+  "my_person_id": 24,
+  "subject_person_name": "Ethan Jacks",
+  "subject_contact_id": 24,
+  "mailbox_owner_user_id": 12,
+  "mem0_user_id": "user_01KP3XJHQ6XMVNRZ1SMHCBVDN0",
+  "workspace_id": "user_12",
+  "active_emails": [
+    "ethan@mediabridgecap.com",
+    "ethan.jacks@gmail.com",
+    "ethanjacks@gmail.com",
+    "ethenejay@gmail.com"
+  ],
+  "known_contacts_seen": 198,
+  "nylas_grants_seen": 1,
+  "threads_seen": 20,
+  "threads_processed": 11,
+  "threads_skipped": 9,
+  "candidate_memory_count": 9,
+  "total_cost_usd": 0.0164277268,
+  "candidate_memories": [
+    {
+      "memory": "Ethan Jacks offered a warm introduction of Mark Pederson to Greg Estes.",
+      "category": "relationship_history",
+      "confidence": 0.95,
+      "subject_contact_id": 24,
+      "retrieval_contact_ids": [24],
+      "nylas_thread_id": "19e99d4dc29d1656"
+    },
+    {
+      "memory": "Offered angel investment slots at $10M cap SAFE with early platform access.",
+      "category": "business_context",
+      "confidence": 0.8,
+      "subject_contact_id": 24,
+      "retrieval_contact_ids": [24],
+      "unresolved_related_contacts": ["Dirk Ulrich"],
+      "nylas_thread_id": "19d8c12418098451"
+    },
+    {
+      "memory": "Mark Pederson shared with Ethan Jacks a list of target VCs for introductions, including high-priority firms like Lerer Hippeau.",
+      "category": "business_development",
+      "confidence": 0.85,
+      "subject_contact_id": 24,
+      "retrieval_contact_ids": [24],
+      "nylas_thread_id": "19c57145efc8fcba"
+    },
+    {
+      "memory": "Ethan Jacks agreed to forward the Orbiter.io Seed deck to Dirk Ulrich.",
+      "category": "commitment",
+      "confidence": 0.95,
+      "subject_contact_id": 24,
+      "retrieval_contact_ids": [24],
+      "unresolved_related_contacts": ["Dirk Ulrich"],
+      "nylas_thread_id": "19c570c2a1f268c4"
+    },
+    {
+      "memory": "Ethan Jacks identified 3i as a VC that has been around forever.",
+      "category": "business_context",
+      "confidence": 0.9,
+      "subject_contact_id": 24,
+      "retrieval_contact_ids": [24],
+      "nylas_thread_id": "19a7f41d98120f17"
+    },
+    {
+      "memory": "Ethan Jacks was closing a complicated sale to Dirk.",
+      "category": "business_context",
+      "confidence": 0.85,
+      "subject_contact_id": 24,
+      "retrieval_contact_ids": [24],
+      "nylas_thread_id": "19a7f41d98120f17"
+    },
+    {
+      "memory": "Ethan Jacks intended to reach out to Mark Pederson's team after letting things chill out for a bit.",
+      "category": "commitment",
+      "confidence": 0.8,
+      "subject_contact_id": 24,
+      "retrieval_contact_ids": [24],
+      "nylas_thread_id": "19a7f41d98120f17"
+    },
+    {
+      "memory": "Ethan Jacks and Mark Pederson planned to catch up on Monday (Nov 17, 2025).",
+      "category": "commitment",
+      "confidence": 0.9,
+      "subject_contact_id": 24,
+      "retrieval_contact_ids": [24],
+      "nylas_thread_id": "19a7f41d98120f17"
+    },
+    {
+      "memory": "Recruited by Mark Pederson to source potential investors/deal leads for Orbiter, but is viewed as a 'closer' not a 'que up the deal' guy.",
+      "category": "business_context",
+      "confidence": 0.85,
+      "subject_contact_id": 24,
+      "retrieval_contact_ids": [24],
+      "nylas_thread_id": "19a60dfe5d52463b"
+    }
+  ],
+  "model_usage": [
+    {
+      "model": "openai/gpt-oss-120b",
+      "purpose": "cheap_prefilter",
+      "calls": 18,
+      "prompt_tokens": 16758,
+      "completion_tokens": 3302,
+      "total_tokens": 20060,
+      "cost_usd": 0.0083418
+    },
+    {
+      "model": "deepseek/deepseek-v4-flash",
+      "purpose": "final_memory_extraction",
+      "calls": 11,
+      "prompt_tokens": 15881,
+      "completion_tokens": 25409,
+      "total_tokens": 41290,
+      "cost_usd": 0.0080859268
+    }
+  ],
+  "continuation_cursors": [
+    {
+      "xano_nylas_grant_id": 1,
+      "source_email_account": "mark@orbiter.io",
+      "contact_email": "ethan@mediabridgecap.com",
+      "next_cursor": "15299573903159165430"
+    }
+  ]
+}
+```
+
+Decision after A/B/C/D/E testing:
+
+- Keep `deepseek/deepseek-v4-flash` as the default final extractor.
+- Do not use `openai/gpt-oss-120b` as final extractor because it produced too many JSON parse failures.
+- Do not use `openai/gpt-4.1-mini` without stricter prompting because it overcaptured company-only and scheduling-only facts.
+- Keep Kimi as the best recall-oriented challenger, but not the default because it costs more and still overcaptures some third-party facts.
+- Do not use `deepseek/deepseek-v4-pro` unless a model-specific structured-output retry path is added.
+
+Mem0 write-test payload:
+
+```json
+{
+  "my_person_id": 24,
+  "user_id": 12,
+  "workspace_id": "",
+  "dry_run": false,
+  "max_threads_per_batch": 20,
+  "max_messages_per_thread": 50,
+  "max_cleaned_transcript_chars": 8000,
+  "page_token": ""
+}
+```
+
+Compare each run on:
+
+- Valid JSON / parse failures.
+- Candidate memory count.
+- Subject focus: every memory should be materially about the input `my_person`.
+- Overcapture: avoid one-off scheduling links, generic fundraising updates, and facts only about other people.
+- `surfaced_contacts[]` and `unresolved_related_contacts[]` behavior.
+- Total cost from `model_usage[]`.
+- Latency from `thread_results[].prefilter.latency_ms` and `thread_results[].extraction.latency_ms`.
+
+### Extraction output schema
+
+The LLM should return:
+
+```json
+{
+  "thread_summary": "Short neutral summary of the thread.",
+  "should_store_any": true,
+  "skip_reason": null,
+  "candidate_memories": [
+    {
+      "memory": "Jane Doe prefers concise meeting agendas with action items listed first.",
+      "category": "communication_preference",
+      "confidence": 0.91,
+      "sensitivity": "normal",
+      "evidence_message_ids": ["msg_123", "msg_456"],
+      "evidence_dates": ["2026-04-13"],
+      "source_email": "jane@example.com",
+      "subject_person_name": "Jane Doe",
+      "subject_contact_id": 12345,
+      "related_contacts": [
+        {
+          "name": "Jane Doe",
+          "email": "jane@example.com",
+          "relationship_role": "primary_subject",
+          "is_memory_subject": true,
+          "confidence": 0.99
+        },
+        {
+          "name": "Mike Levine",
+          "email": "mike@example.com",
+          "relationship_role": "introduced_contact",
+          "is_memory_subject": true,
+          "confidence": 0.88
+        }
+      ],
+      "should_store": true,
+      "reason": "Explicitly stated in the email thread."
+    }
+  ]
+}
+```
+
+Recommended categories:
+
+- `relationship_context`
+- `communication_preference`
+- `business_priority`
+- `pain_point`
+- `objection`
+- `decision`
+- `commitment`
+- `follow_up_preference`
+- `product_interest`
+- `company_context`
+
+Do not store:
+
+- Passwords, tokens, API keys, credentials, or private links.
+- Payment details, bank details, SSNs, government IDs, or exact financial account data.
+- Health, religion, political affiliation, family details, or other sensitive personal data unless there is an explicit product/legal reason and consent.
+- Speculation about feelings, intent, personality, or private life.
+- One-off logistics that expire quickly.
+- Raw email text, whole paragraphs, or quoted confidential content.
+
+### Extraction prompt contract
+
+Use a prompt like this as the starting point:
+
+```text
+You extract durable CRM-style memories from email threads.
+
+The subject contact is:
+- my_person_id: {{my_person_id}}
+- name: {{person_name}}
+- active_emails: {{active_emails}}
+
+The mailbox owner is:
+- orbiter_user_id: {{orbiter_user_id}}
+- workspace_id: {{workspace_id}}
+- source_email_account: {{nylas_grant.email_account}}
+- xano_nylas_grant_id: {{nylas_grant.id}}
+
+Task:
+Read the normalized email thread and produce only durable, useful memories about the subject contact or their company that would help future Orbiter assistants personalize meeting prep, relationship context, follow-up, or outcome creation.
+
+Rules:
+- Store only facts supported by the email body.
+- Write memories as short, neutral, standalone statements.
+- Prefer facts about preferences, priorities, goals, objections, decisions, commitments, relationship history, and business context.
+- Create candidate memories only when they are materially about the subject contact or the mailbox owner's relationship/history with the subject contact.
+- Do not store raw email text.
+- Do not store secrets, credentials, financial account data, sensitive personal traits, or speculative judgments.
+- If a fact is temporary or already expired, skip it.
+- If the thread is mostly automated, transactional, or irrelevant, return should_store_any=false.
+- Every candidate memory must include evidence_message_ids from the provided thread.
+- Every candidate memory should include `related_contacts[]` for other people the memory surfaces. Include names and emails when visible in the thread.
+- Related contacts are annotations only; do not create memories primarily about unrelated people or the mailbox owner.
+- Use confidence 0.0 to 1.0. Store only candidates with confidence >= 0.75.
+```
+
+### Surfaced-contact logging
+
+The extraction model can identify related people, but Xano owns identity resolution. V1 only cross-tags related people when there is an email-backed match to an existing `my_person`. It resolves surfaced contacts in this order:
+
+1. Exact related-contact email match against the user's active `master_email` records.
+2. Name match to a thread participant that has an email address, followed by exact email match against active `master_email`.
+3. Source/participant email match, excluding the mailbox owner's connected email accounts.
+
+Name-only mentions are not cross-tagged. They remain in `unresolved_related_contacts[]` for review and possible later contact enrichment.
+
+For every accepted candidate, the function keeps the input `my_person_id` as the only `subject_contact_id`. It then logs any email-resolved related contacts as metadata for audit, graph work, and secondary retrieval. For example, if the historical run is for Ethan Jacks and a memory also mentions Mike Levine with an email-backed match, the function returns one candidate entry:
+
+| Entry | `metadata.subject_contact_id` | `metadata.subject_person_name` | `metadata.surfaced_contacts` |
+| --- | --- | --- | --- |
+| Ethan row | Ethan's `my_person.id` | Ethan Jacks | Includes Mike Levine with his resolved `my_person.id` and relationship role |
+
+The row includes:
+
+- `metadata.primary_subject_contact_id`
+- `metadata.primary_subject_person_name`
+- `metadata.canonical_memory_hash`
+- `metadata.surfaced_contact_ids`
+- `metadata.surfaced_person_names`
+- `metadata.surfaced_contacts`
+- `metadata.retrieval_contact_ids`
+- `metadata.retrieval_person_names`
+
+This keeps Mem0 writes de-duplicated while allowing retrieval to find the memory for either the primary subject or a surfaced contact. If Mike is processed later as the input `my_person`, his run can still create Mike-scoped memories from the same or other source threads.
+
+## Mem0 integration
+
+Use the existing Orbiter Mem0 strategy:
+
+- Mem0 `user_id`: `user.workos_id` from the Xano `user` table. Do not use a synthetic fallback ID.
+- Contact reference: `metadata.subject_contact_id`, always using the input `my_person.id`
+- Contact display name: `metadata.subject_person_name`, always using the input contact name
+- Primary run subject: `metadata.primary_subject_contact_id` and `metadata.primary_subject_person_name`, using the input `my_person_id`
+- Surfaced people: `metadata.surfaced_contacts`, `metadata.surfaced_contact_ids`, and `metadata.surfaced_person_names`
+- Retrieval links: `metadata.retrieval_contact_ids`, containing the primary subject contact ID plus surfaced contact IDs
+- Workspace boundary: `metadata.workspace_id`
+- Visibility: private to the mailbox owner/user. Do not write email-derived memories as workspace-shared memories in the first implementation.
+- Source traceability: Xano `nylas_grant` row, Nylas grant/thread/message metadata, and source email account
+
+Recommended Mem0 endpoint:
+
+```http
+POST https://api.mem0.ai/v3/memories/add/
+```
+
+Because the LLM already creates curated memory statements, call Mem0 with `infer: false` for the first implementation. That stores the curated statement directly instead of asking Mem0 to infer again from noisy email content.
+
+Write one Mem0 add request per accepted memory candidate so each memory gets precise metadata.
+
+Example:
+
+```json
+{
+  "user_id": "workos_user_id",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Jane Doe prefers concise meeting agendas with action items listed first."
+    }
+  ],
+  "metadata": {
+    "source_type": "email_thread",
+    "source_platform": "nylas",
+    "source_table": "my_person",
+    "subject_person_name": "Jane Doe",
+    "subject_contact_id": 12345,
+    "primary_subject_person_name": "Jane Doe",
+    "primary_subject_contact_id": 12345,
+    "all_subject_person_names": ["Jane Doe"],
+    "all_subject_contact_ids": [12345],
+    "relationship_role": "primary_subject",
+    "surfaced_person_names": ["Mike Levine"],
+    "surfaced_contact_ids": [67890],
+    "surfaced_contacts": [
+      {
+        "subject_contact_id": 67890,
+        "subject_person_name": "Mike Levine",
+        "relationship_role": "introduced_contact",
+        "resolution_source": "llm_related_contact",
+        "resolution_confidence": 0.88
+      }
+    ],
+    "retrieval_contact_ids": [12345, 67890],
+    "retrieval_person_names": ["Jane Doe", "Mike Levine"],
+    "workspace_id": "workspace_123",
+    "memory_scope": "mailbox_owner_private",
+    "mailbox_owner_user_id": 15,
+    "xano_nylas_grant_id": 183,
+    "nylas_grant_id": "grant_abc",
+    "source_email_account": "user@company.com",
+    "nylas_thread_id": "thread_abc",
+    "nylas_message_ids": ["msg_123", "msg_456"],
+    "source_email": "jane@example.com",
+    "category": "communication_preference",
+    "confidence": 0.91,
+    "source_hash": "sha256:...",
+    "canonical_memory_hash": "sha256:...",
+    "memory_hash": "sha256:...",
+    "fanout_target_count": 1,
+    "extraction_model": "deepseek/deepseek-v4-flash",
+    "schema_version": "2026-06-10"
+  },
+  "infer": false
+}
+```
+
+Mem0 writes are asynchronous. Store the returned `event_id` in an audit table and do not block the Xano response waiting for the memory to finish processing.
+
+## Xano function flow
+
+### V1 implementation
+
+Function `mem0/create-memories-from-email-threads-v1` (`13077`) implements the first dry-run path:
+
+- Loads `my_person`, verifies ownership against the mailbox owner, and resolves `master_person.name` for `subject_person_name`.
+- Loads associated `my_person_email_join` rows, then keeps only linked `master_email` records where `active_status == true`.
+- Queries all active user-owned `nylas_grant` rows with `user_id == mailbox_owner_user_id`, `grant_expired != true`, and `grant_id != ""`.
+- Preloads the user's `my_person` contact directory, including `master_person.name` and active `master_email` values, so related people can be resolved to Orbiter contact IDs.
+- Reuses `mvp/nylas/fetch-threads` (`12638`) and `mvp/nylas/fetch-messages` (`12766`) for Nylas access.
+- Uses Nylas `any_email` for broad thread discovery, then processes only threads where the subject contact appears in message `from` or `to`.
+- Cleans message bodies inside the function with an inline deterministic `api.lambda`.
+- Calls `openai/gpt-oss-120b` for the cheap prefilter and `deepseek/deepseek-v4-flash` for final memory extraction through OpenRouter by default.
+- Keeps model selection inside function variables so callers cannot change extraction models at runtime.
+- Strips code fences/backticks and runs strict JSON post-processing before parsing model output.
+- Resolves `related_contacts[]` from model output to the user's `my_person` records and logs them as `surfaced_contacts[]` metadata.
+- Adds `retrieval_contact_ids[]`, containing the subject contact plus email-resolved surfaced contacts, so the memory can be pulled for either contact without duplicate writes.
+- Returns one candidate memory row per accepted memory for the input `my_person` when `dry_run=true`.
+- Calls Mem0 add memories with `infer=false` only when `dry_run=false`, using Xano env var `MEM0_API_KEY`.
+
+V1 is intentionally batch-scoped. It processes up to `max_threads_per_batch` unique threads and returns `continuation_cursors` for follow-up batches.
+
+### Step-by-step
+
+1. Validate `my_person_id`.
+2. Validate the caller has access to the person and workspace.
+3. Validate memory extraction from email is enabled for the user/workspace.
+4. Resolve `mem0_user_id` from `user.workos_id` for the requesting user and fail if it is missing.
+5. Query `nylas_grant` for every active grant owned by `auth.id`.
+6. Load active email addresses for the person.
+7. Create a processing run record with `status=running`.
+8. For each active `nylas_grant`, loop through each active contact email.
+9. Call `GET /v3/grants/{grant_id}/threads`.
+10. De-dupe thread IDs across contact emails within the same grant.
+11. For each unique thread, call `GET /v3/grants/{grant_id}/messages?thread_id=...`.
+12. Send message bodies to the Xano cleaner helper.
+13. Skip if the cleaner returns `should_skip=true`.
+14. Compute `source_hash` from cleaned message IDs, dates, participants, and cleaned body text.
+15. Skip if the same `{xano_nylas_grant_id, thread_id, source_hash}` was already processed unless `force_reprocess=true`.
+16. Call the LLM extraction step with structured output.
+17. Validate and redact candidate memories.
+18. Normalize confidence scores to `0.0`-`1.0`.
+19. Resolve related contacts by email-backed match against the user's `my_person` records.
+20. Attach resolved related people to the candidate as `surfaced_contacts[]`, excluding the mailbox owner.
+21. Add `retrieval_contact_ids[]` from the input subject contact plus email-resolved surfaced contacts.
+22. Skip candidates below confidence threshold or in disallowed sensitivity categories.
+23. De-dupe candidates by `memory_hash`.
+24. In `dry_run`, return candidates without writing to Mem0.
+25. In write mode, call Mem0 add once per accepted subject-focused memory with `infer=false`.
+26. Store Mem0 `event_id`, candidate metadata, and write status.
+27. Return counts and candidate summaries.
+
+### V1 response shape
+
+Dry-run output should show the memories that would be written:
+
+```json
+{
+  "function_name": "mem0/create-memories-from-email-threads-v1",
+  "status": "dry_run_complete",
+  "dry_run": true,
+  "my_person_id": 12345,
+  "subject_person_name": "Jane Doe",
+  "subject_contact_id": 12345,
+  "mailbox_owner_user_id": 15,
+  "mem0_user_id": "workos_user_id",
+  "active_emails": ["jane@example.com"],
+  "known_contacts_seen": 428,
+  "nylas_grants_seen": 2,
+  "threads_seen": 20,
+  "threads_processed": 8,
+  "threads_skipped": 12,
+  "candidate_memory_count": 4,
+  "candidate_memories": [
+    {
+      "memory": "Jane Doe prefers concise meeting agendas with action items listed first.",
+      "category": "communication_preference",
+      "confidence": 0.91,
+      "subject_person_name": "Jane Doe",
+      "subject_contact_id": 12345,
+      "primary_subject_person_name": "Jane Doe",
+      "primary_subject_contact_id": 12345,
+      "relationship_role": "primary_subject",
+      "canonical_memory_hash": "sha256:...",
+      "memory_hash": "sha256:...",
+      "fanout_target_count": 1,
+      "surfaced_contacts": [
+        {
+          "subject_contact_id": 67890,
+          "subject_person_name": "Mike Levine",
+          "relationship_role": "introduced_contact",
+          "resolution_source": "llm_related_contact",
+          "resolution_confidence": 0.88
+        }
+      ],
+      "surfaced_contact_count": 1,
+      "metadata": {
+        "source_type": "email_thread",
+        "source_platform": "nylas",
+        "subject_person_name": "Jane Doe",
+        "subject_contact_id": 12345,
+        "primary_subject_person_name": "Jane Doe",
+        "primary_subject_contact_id": 12345,
+        "all_subject_person_names": ["Jane Doe"],
+        "all_subject_contact_ids": [12345],
+        "relationship_role": "primary_subject",
+        "surfaced_person_names": ["Mike Levine"],
+        "surfaced_contact_ids": [67890],
+        "surfaced_contacts": [
+          {
+            "subject_contact_id": 67890,
+            "subject_person_name": "Mike Levine",
+            "relationship_role": "introduced_contact",
+            "resolution_source": "llm_related_contact",
+            "resolution_confidence": 0.88
+          }
+        ],
+        "retrieval_contact_ids": [12345, 67890],
+        "retrieval_person_names": ["Jane Doe", "Mike Levine"],
+        "canonical_memory_hash": "sha256:...",
+        "memory_hash": "sha256:...",
+        "memory_scope": "mailbox_owner_private",
+        "mailbox_owner_user_id": 15,
+        "nylas_thread_id": "thread_abc",
+        "nylas_message_ids": ["msg_123", "msg_456"],
+        "extraction_model": "deepseek/deepseek-v4-flash"
+      },
+      "mem0": {
+        "dry_run": true,
+        "attempted": false
+      }
+    }
+  ],
+  "model_usage": [
+    {
+      "model": "openai/gpt-oss-120b",
+      "purpose": "cheap_prefilter",
+      "calls": 8,
+      "prompt_tokens": 12000,
+      "completion_tokens": 600,
+      "total_tokens": 12600,
+      "cost_usd": 0.003
+    },
+    {
+      "model": "deepseek/deepseek-v4-flash",
+      "purpose": "final_memory_extraction",
+      "calls": 5,
+      "prompt_tokens": 18000,
+      "completion_tokens": 2500,
+      "total_tokens": 20500,
+      "cost_usd": 0.004
+    }
+  ],
+  "continuation_cursors": [],
+  "thread_results": []
+}
+```
+
+`candidate_memory_count` counts accepted memories for the input `my_person`. If one memory surfaces Ethan and Mike, the response still contains one subject-scoped candidate row; Mike appears only in `surfaced_contacts[]`.
+
+Use `model_usage` for cost review before enabling writes. The values come from OpenRouter usage fields when returned by the provider.
+
+### Suggested Xano tables
+
+Add an audit table before production:
+
+`email_thread_memory_runs`
+
+| Field | Purpose |
+| --- | --- |
+| `id` | Run ID |
+| `my_person_id` | Subject contact |
+| `workspace_id` | Tenant boundary |
+| `orbiter_user_id` | Requesting user |
+| `nylas_grant_ids` | Xano grant rows searched |
+| `source_email_accounts` | Email accounts searched |
+| `status` | `running`, `complete`, `failed`, `partial` |
+| `dry_run` | Whether Mem0 writes were skipped |
+| `grants_seen` | Count |
+| `grants_processed` | Count |
+| `threads_seen` | Count |
+| `threads_processed` | Count |
+| `memories_created` | Count |
+| `model_usage` | JSON totals by model: calls, prompt tokens, completion tokens, total tokens, and cost |
+| `error` | Failure details |
+| `created_at`, `completed_at` | Run timing |
+
+`email_thread_memory_items`
+
+| Field | Purpose |
+| --- | --- |
+| `run_id` | Parent run |
+| `my_person_id` | Primary run subject contact |
+| `subject_contact_id` | Input `my_person_id` used in Mem0 metadata |
+| `subject_person_name` | Input contact display name |
+| `primary_subject_contact_id` | Original input `my_person_id` |
+| `surfaced_contact_ids` | Other resolved contacts mentioned by this memory |
+| `surfaced_contacts` | Resolved related-contact metadata and roles |
+| `retrieval_contact_ids` | Primary subject contact plus surfaced contact IDs; use for "all memories for this person" retrieval |
+| `retrieval_person_names` | Display names for retrieval-linked contacts |
+| `relationship_role` | Always `primary_subject` for the stored memory row |
+| `workspace_id` | Tenant boundary |
+| `xano_nylas_grant_id` | Xano `nylas_grant.id` searched |
+| `nylas_grant_id` | External Nylas grant ID searched |
+| `source_email_account` | Email account searched |
+| `nylas_thread_id` | Source thread |
+| `nylas_message_ids` | Evidence |
+| `source_hash` | Reprocess detection |
+| `cleaner_version` | Xano cleaner helper version |
+| `cleaned_body_char_count` | LLM cost audit |
+| `prefilter_model` | Model used for "worth extracting?" decision |
+| `prefilter_prompt_tokens`, `prefilter_completion_tokens` | Prefilter token usage |
+| `extraction_model` | Model used for final memory extraction |
+| `extraction_prompt_tokens`, `extraction_completion_tokens` | Extraction token usage |
+| `model_cost_usd` | OpenRouter-reported cost for this thread, when available |
+| `canonical_memory_hash` | Hash for the normalized memory plus source thread |
+| `memory_hash` | Candidate de-dupe for the canonical memory and input subject contact |
+| `memory_text` | Curated memory statement |
+| `category` | Memory category |
+| `confidence` | LLM confidence |
+| `status` | `candidate`, `skipped`, `queued`, `succeeded`, `failed` |
+| `mem0_event_id` | Async Mem0 write tracking |
+| `mem0_memory_id` | Optional, if later resolved |
+| `skip_reason` | Why not stored |
+
+## Retrieval later
+
+For "How I know X" or contact-aware chats, search Mem0 by user/workspace/contact metadata. V1 writes one subject-scoped memory row, but retrieval should use `metadata.retrieval_contact_ids` so a memory can be found for either the primary subject or a surfaced person.
+
+```json
+{
+  "query": "What should I remember about Jane Doe before this meeting?",
+  "filters": {
+    "AND": [
+      { "user_id": "workos_user_id" },
+      { "metadata": { "workspace_id": "workspace_123" } },
+      { "metadata": { "retrieval_contact_ids": { "contains": 12345 } } }
+    ]
+  },
+  "top_k": 10,
+  "threshold": 0.1,
+  "rerank": true
+}
+```
+
+Mem0's Search API requires entity IDs inside `filters` and supports logical and comparison operators including `AND`, `OR`, `in`, and `contains`. Keep `metadata.subject_contact_id` in the result so the UI can distinguish a primary-subject memory from a surfaced-contact match. Use `metadata.surfaced_contacts[]` to explain why the memory was returned for the surfaced person.
+
+The prompt should present retrieved memories as context, not instructions:
+
+```text
+Retrieved contact memories:
+- Jane Doe prefers concise meeting agendas with action items listed first.
+- Jane Doe raised integration reliability as a blocker during the April renewal thread.
+
+Use these as background facts. Do not reveal that they came from email unless the user asks for source context.
+```
+
+## Dedupe rules
+
+Use three layers of de-dupe:
+
+1. Thread reprocessing: skip the same `{nylas_grant_id, nylas_thread_id, source_hash}`.
+2. Canonical memory: hash the normalized memory statement plus `workspace_id`, `nylas_thread_id`, and `source_hash`.
+3. Subject memory: hash `canonical_memory_hash` plus the input `subject_contact_id`.
+4. Semantic duplicate: before writing, optionally search Mem0 for the same contact and category. If a similar memory already exists, skip or write a newer memory only when it adds materially new information.
+
+Memory hash input:
+
+```text
+canonical_memory_hash = lowercase(trim(memory)) + "|" + workspace_id + "|" + nylas_thread_id + "|" + source_hash
+memory_hash = canonical_memory_hash + "|" + subject_contact_id
+```
+
+## Privacy and safety
+
+Email-derived memories are higher sensitivity than chat-derived memories.
+
+Required controls:
+
+- Workspace/user consent before reading email content for memory extraction.
+- Explicit user trigger for each historical run.
+- `dry_run=true` by default for the first run.
+- Full historical range by default, processed through pagination and resumable batches.
+- Per-batch thread and message caps.
+- Redaction before LLM calls and before Mem0 writes.
+- Audit log of source thread IDs and message IDs only; do not store raw bodies or source snippets.
+- User/admin ability to delete email-derived memories for a contact.
+- Never expose the Nylas API key, Mem0 API key, or OpenAI API key to the client.
+
+Recommended pilot guardrail:
+
+Only process manually selected contacts and show candidate memories to an internal admin before enabling automatic writes.
+
+## Error handling
+
+| Failure | Handling |
+| --- | --- |
+| No active emails | Return `skipped_no_active_emails` |
+| No active user-owned Nylas grants | Return `blocked_missing_active_nylas_grants` |
+| Nylas 401 | Mark grant auth as invalid and stop |
+| Nylas 429 | Back off, save cursor, retry later |
+| Nylas 504/provider failure | Retry with smaller page size |
+| Thread too large | Summarize in chunks, or skip with `skipped_thread_too_large` |
+| LLM invalid JSON | Retry once, then mark extraction failed |
+| Low-confidence extraction | Save candidate as skipped, do not write |
+| Mem0 write failure | Save failed item for retry |
+
+## Build and hardening instructions
+
+V1 has been created as Xano function `13077` and updated to support subject-focused memories with surfaced-contact metadata. Remaining hardening work:
+
+1. Runtime smoke test function `13077` with a known `my_person_id`, `user_id`, and `dry_run=true` after the surfaced-contact update.
+2. Inspect `candidate_memories`, `thread_results`, and `model_usage` for quality and cost.
+3. Confirm memories involving Ethan and Mike produce one Ethan-scoped row with Mike listed under `surfaced_contacts[]`.
+4. Add persistent Xano audit tables and idempotency checks before broad use.
+5. Promote the inline cleaner into a shared helper if another email clean conversation or summary helper is not suitable.
+6. Add retry/resume behavior around `continuation_cursors`.
+7. Add a retry path for failed Mem0 writes.
+8. Add contact-level retrieval test using `metadata.subject_contact_id`.
+9. Run against 3-5 known contacts and manually inspect every candidate memory.
+
+## Acceptance criteria
+
+- The function accepts `my_person_id` and finds active email addresses for that person.
+- The function runs only when explicitly triggered by the user.
+- The function queries all active user-owned `nylas_grant` rows.
+- The function searches full Nylas thread history involving the contact's email addresses across each connected user email account.
+- The function processes only threads where the contact appears in `from` or `to`; CC/BCC-only threads are skipped.
+- Full message content is fetched by `thread_id`.
+- Message bodies are cleaned before any LLM extraction call.
+- No raw email bodies are stored in Mem0.
+- Candidate memories are extracted with structured LLM output.
+- Every stored memory includes `subject_person_name`, `subject_contact_id`, `workspace_id`, `source_type: email_thread`, Nylas thread/message metadata, category, confidence, and `source_hash`.
+- Memories that involve multiple resolved contacts still produce one row for the input `my_person`.
+- Related people surfaced in a memory are logged in `surfaced_contacts[]`, `surfaced_contact_ids`, and `surfaced_person_names`.
+- `retrieval_contact_ids[]` includes the input subject contact plus email-resolved surfaced contacts, so the same memory can be retrieved for mentioned people without duplicate writes.
+- The mailbox owner/user is not logged as a surfaced contact and never becomes a Mem0 target.
+- Stored rows include `primary_subject_contact_id`, `relationship_role: primary_subject`, `canonical_memory_hash`, and subject-specific `memory_hash`.
+- Confidence scores are normalized to `0.0`-`1.0` before thresholding and storage.
+- Email-derived memories are private to the mailbox owner/user with `memory_scope: mailbox_owner_private`.
+- Audit storage uses source IDs only; it stores Nylas thread/message IDs, not raw email bodies or source snippets.
+- `dry_run=true` returns candidate memories without writing.
+- The response includes `model_usage` totals per model for cost review.
+- Duplicate threads, duplicate canonical memories, and duplicate subject memory rows are skipped.
+- Email-derived memories can be retrieved for "How I know X" via `metadata.subject_contact_id`.
+
+## Remaining v1 follow-ups
+
+Most product decisions are resolved and function `13077` is created. Remaining work:
+
+- Runtime smoke test the surfaced-contact function update against a live contact.
+- Verify a thread involving two known contacts, such as Ethan and Mike, returns one subject-scoped row with the other person in `surfaced_contacts[]`.
+- Decide whether to keep the inline cleaner in v1 or extract it into a reusable function after smoke testing.
+- Add persistent audit/idempotency tables before turning on repeated production use.
+- Tune batch defaults if runtime testing shows provider or Xano timeouts: initial values are `limit=20` thread pages, `limit=50` messages per thread page, and `max_cleaned_transcript_chars=30000` per extraction call.
+
+## Source links
+
+- Nylas Messages overview: https://developer.nylas.com/docs/reference/api/messages/
+- Nylas list messages: https://developer.nylas.com/docs/reference/api/messages/get-messages/
+- Nylas Threads overview: https://developer.nylas.com/docs/reference/api/threads/
+- Nylas list threads: https://developer.nylas.com/docs/reference/api/threads/get-threads/
+- Nylas get thread: https://developer.nylas.com/docs/reference/api/threads/get-threads-id/
+- Mem0 add memories: https://docs.mem0.ai/api-reference/memory/add-memories
+- Mem0 search memories: https://docs.mem0.ai/api-reference/memory/search-memories
+- Mem0 custom instructions: https://docs.mem0.ai/platform/features/custom-instructions
+- OpenRouter OpenAI gpt-oss-120b: https://openrouter.ai/openai/gpt-oss-120b
+- OpenRouter DeepSeek V4 Flash: https://openrouter.ai/deepseek/deepseek-v4-flash
+- OpenRouter OpenAI GPT-4.1 Mini: https://openrouter.ai/openai/gpt-4.1-mini
+- OpenRouter MoonshotAI Kimi K2 0905: https://openrouter.ai/moonshotai/kimi-k2-0905
+- OpenRouter OpenAI GPT-5.4 Nano: https://openrouter.ai/openai/gpt-5.4-nano
+- OpenAI models: https://platform.openai.com/docs/models
+- OpenAI latest model guide: https://platform.openai.com/docs/guides/latest-model
+- OpenAI structured outputs: https://platform.openai.com/docs/guides/structured-outputs

@@ -1,0 +1,229 @@
+---
+title: "File Upload Methods"
+description: "The two ways to upload a file for ingestion — frontend-extracted markdown vs. synchronous raw extraction — and when to use each."
+---
+
+# File Upload Methods
+
+Orbiter exposes **two** authenticated endpoints for uploading a document and
+kicking off the ingestion pipeline (extract → classify → pitch profile →
+embed → deliver). They produce the *same* end state — a stored file with
+markdown and a running pipeline — but they differ in **who extracts the
+markdown** and **when the caller gets it back**.
+
+Picking the right one is mostly a UX-latency decision. If a user is waiting on
+the result (e.g. uploading into a chatbot), the choice directly changes how
+long they stare at a spinner.
+
+| | `upload-file-markdown` | `upload-file-raw` |
+|---|---|---|
+| Who extracts | **Frontend** (LlamaParse in a server function) | **Backend** (synchronously, on the request) |
+| Markdown in request | Yes — you send it | No |
+| Markdown in response | Echoed back | Extracted and returned |
+| Request blocks on extraction | **No** | **Yes** (seconds → minutes) |
+| File leaves the browser | Twice (LlamaParse + Orbiter) | Once |
+| Frontend complexity | Higher (owns extraction) | Lower (just upload) |
+| Best for | Interactive UX (chatbots) | Server-to-server / batch / simple clients |
+
+Both endpoints:
+
+- Live under `POST /v1/ingestion/files/...`
+- Require a verified **WorkOS** session (`Authorization: Bearer <token>`)
+- Accept `multipart/form-data`
+- Return the file with `status=pending` and continue the rest of the pipeline
+  in the background via the `files.uploaded` event
+
+---
+
+## Method 1 — `upload-file-markdown` (frontend extraction)
+
+This is the path built for **interactive uploads**, like dropping a deck into a
+chatbot. The key idea: **the frontend extracts the markdown itself, before it
+ever talks to Orbiter.**
+
+### The flow
+
+<Steps>
+  <Step title="User picks a file in the UI">
+    The file is handed to a TanStack Start **server function** (server-side, so
+    the LlamaCloud API key never touches the browser).
+  </Step>
+  <Step title="Server function extracts markdown with LlamaParse">
+    It calls the LlamaIndex / LlamaParse SDK with the file and gets back
+    markdown.
+  </Step>
+  <Step title="Chat starts immediately">
+    The markdown is injected as context into the chatbot. **The user can start
+    chatting right now** — nothing else has to finish first.
+  </Step>
+  <Step title="The file + markdown are sent to Orbiter in the background">
+    The frontend POSTs the file and the already-extracted markdown to
+    `upload-file-markdown`. Orbiter stores the file, persists the markdown, and
+    publishes `files.uploaded`. Because the markdown is already supplied, the
+    worker **skips its extraction step** and goes straight to classification,
+    pitch-profile, and embeddings.
+  </Step>
+</Steps>
+
+### Why this is faster (the performance benefit)
+
+The win is that **extraction is on the path the user is already waiting on, and
+the Orbiter upload is *not*.**
+
+The chatbot needs the markdown. LlamaParse has to run regardless of who calls
+it — its processing time is the same whether the frontend or the backend
+triggers it. So the question is only: *what else is the user forced to wait
+for?*
+
+```text
+time-to-chat (markdown method)
+└─ upload to LlamaParse  +  LlamaParse processing
+   └─ markdown ready → chat starts ✅
+      └─ POST file + markdown to Orbiter   ← happens AFTER, off the critical path
+```
+
+The POST to Orbiter (and the entire ingestion pipeline behind it) runs **after**
+the user is already chatting. The user never waits on Orbiter's upload, GCS
+write, or background pipeline. Perceived latency = just the extraction the
+chatbot genuinely needs.
+
+<Note>
+  Make sure the frontend does **not** `await` the Orbiter upload before
+  unlocking the chat. Fire it in the background — that is the whole point of
+  this method.
+</Note>
+
+### Cost of this method
+
+- The file leaves the browser **twice** — once to LlamaParse, once to Orbiter.
+  For typical pitch PDFs (a few MB) this is negligible; for very large files on
+  a slow uplink it's noticeable.
+- The markdown your pipeline embeds is **client-supplied**. Since the route is
+  authenticated, this is a data-quality consideration (the file and its
+  markdown could theoretically diverge), not a security hole.
+
+---
+
+## Method 2 — `upload-file-raw` (synchronous backend extraction)
+
+This is the **simple-client** path. The caller sends *only the file*; Orbiter
+does everything.
+
+### The flow
+
+<Steps>
+  <Step title="Client uploads the raw file">
+    No markdown, no LlamaParse SDK on the client — just the file.
+  </Step>
+  <Step title="Orbiter extracts synchronously">
+    On the request path, Orbiter extracts markdown (local extractor or
+    LlamaParse, chosen by mime type), then uploads the file to GCS and saves
+    the row **with** the markdown.
+  </Step>
+  <Step title="Orbiter returns the file with markdown">
+    The HTTP response includes the extracted `markdown`. It then publishes
+    `files.uploaded` so the worker runs the rest of the pipeline and skips
+    re-extraction.
+  </Step>
+</Steps>
+
+<Warning>
+  This call **blocks** until extraction finishes — seconds for a small file,
+  potentially minutes for a large PDF via LlamaParse. Set generous client and
+  proxy timeouts. If extraction fails, **nothing is persisted** and the request
+  errors.
+</Warning>
+
+### When to use it
+
+- Server-to-server or batch ingestion where nobody is watching a spinner.
+- Simple clients that can't (or shouldn't) run extraction themselves.
+- When you want a **single source of truth** for the markdown (the backend
+  produced it) and the file to leave the source only **once**.
+
+It is the wrong choice for a chatbot: it forces the user to wait for *both* the
+upload *and* the full extraction before they get any markdown back, because the
+HTTP request can't return until extraction completes.
+
+---
+
+## Request shape (both endpoints)
+
+`multipart/form-data`. **Send the `file` part LAST**, after all text fields —
+the server reads fields as it streams and dispatches the moment it reaches the
+file part.
+
+| Field | Required | Notes |
+|---|---|---|
+| `file_source` | yes | Free-form label, e.g. `manual-upload` |
+| `data_source` | yes | Scope: `live` / `staging` / `sandbox` / … |
+| `file` | yes | The file bytes — **must be the last part** |
+| `markdown` | markdown endpoint only | Pre-extracted markdown; ignored by `raw` |
+| `xano_user_id` | no | Integer pass-through |
+| `file_id` | no | Integer pass-through |
+| `suggestion_request_id` | no | Integer pass-through |
+
+<CodeGroup>
+
+```bash upload-file-raw
+curl -sS -X POST https://<host>/v1/ingestion/files/upload-file-raw \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file_source=manual-upload" \
+  -F "data_source=staging" \
+  -F "file=@/path/to/deck.pdf" \
+  --max-time 600
+```
+
+```bash upload-file-markdown
+curl -sS -X POST https://<host>/v1/ingestion/files/upload-file-markdown \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file_source=manual-upload" \
+  -F "data_source=staging" \
+  -F "markdown=# 1 World Studios..." \
+  -F "file=@/path/to/deck.pdf"
+```
+
+</CodeGroup>
+
+## Response shape (both endpoints)
+
+`201 Created` with the standard envelope. The `data` object is a file plus the
+`markdown` it produced (raw) or received (markdown):
+
+```json
+{
+  "data": {
+    "id": "019eb1bc-dcfe-77e4-931d-c280a9173805",
+    "gcs_uri": "https://storage.googleapis.com/orbiter-staging/uploads/...",
+    "file_source": "manual-upload",
+    "data_source": "staging",
+    "status": "pending",
+    "markdown": "# 1 World Studios\n\nHighlights from our Current Slate...",
+    "created_at": "2026-06-10T13:33:25.123734Z",
+    "updated_at": "2026-06-10T13:33:25.123734Z"
+  },
+  "error": null,
+  "meta": { "requestId": "8f3cdaad-31c5-4efd-979d-b39f48698d62" }
+}
+```
+
+<Note>
+  Fields like `file_name`, `mime_type`, `size_bytes`, and `classification` are
+  absent on this immediate response — the worker enriches them from GCS a moment
+  later. Poll `GET /v1/ingestion/files/{id}` to watch the file progress through
+  the rest of the pipeline (`extracting` → `embedding` → `completed`).
+</Note>
+
+---
+
+## Choosing between them
+
+<Tip>
+  **User is waiting on the result (chatbot, interactive upload)** → use
+  `upload-file-markdown` and extract in a server function. Chat starts the
+  instant LlamaParse returns; Orbiter ingestion happens in the background.
+
+  **No one is watching, or the client can't extract** → use `upload-file-raw`
+  and let Orbiter do it synchronously. Simpler client, single source of truth,
+  one upload — at the cost of a blocking request.
+</Tip>

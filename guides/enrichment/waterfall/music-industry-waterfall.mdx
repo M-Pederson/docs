@@ -4,7 +4,7 @@ description: "Design — queue-driven MusicBrainz enrichment with tiered cascade
 ---
 
 <Note>
-**Status: DESIGN (2026-06-01) — not built.** This page scopes the node + edge ontology and the waterfall architecture for ingesting [MusicBrainz](https://musicbrainz.org/doc/MusicBrainz_API) into the Orbiter graph. It mirrors the [IMDB Waterfall](/guides/enrichment/waterfall/imdb-waterfall-plan) — queue tables, depth-capped cascade, priority tiers, upsert dedup — with two structural differences: MusicBrainz is a **structured JSON API** (no HTML scrape, no LLM extraction), and it enforces a **hard 1 request/second global limit**, which becomes the central design constraint. Node/edge specs below are derived from real API responses (Nirvana / *Nevermind* / Sub Pop / Reading Festival 1992). **We design here first, then build.** The five open design questions were resolved on 2026-06-11 — see [Resolved design decisions](#resolved-design-decisions-2026-06-11).
+**Status: DESIGN (2026-06-01) — not built.** This page scopes the node + edge ontology and the waterfall architecture for ingesting [MusicBrainz](https://musicbrainz.org/doc/MusicBrainz_API) into the Orbiter graph. It mirrors the [IMDB Waterfall](/guides/enrichment/waterfall/imdb-waterfall-plan) — queue tables, depth-capped cascade, priority tiers, upsert dedup — with two structural differences: MusicBrainz is a **structured JSON API** (no HTML scrape, no LLM extraction), and it enforces a **hard 1 request/second global limit**, which becomes the central design constraint. Node/edge specs below are derived from real API responses (Nirvana / *Nevermind* / Sub Pop / Reading Festival 1992). **We design here first, then build.** All six open design questions were resolved on 2026-06-11 — see [Resolved design decisions](#resolved-design-decisions-2026-06-11).
 </Note>
 
 ## Source: the MusicBrainz API
@@ -28,7 +28,7 @@ description: "Design — queue-driven MusicBrainz enrichment with tiered cascade
 
 ## Core entities → graph nodes
 
-MusicBrainz's 13 core entities map to Orbiter graph nodes as follows. **Seed entities** (minimum bootstrap set) are **artist, recording, label, event**; the rest are created via cascade.
+MusicBrainz's 13 core entities map to Orbiter graph nodes as follows. **Seed entities** (minimum bootstrap set) are **artist, recording, label, event**; "cascade" entities get their own queued lookup; "inline" entities (place, area, genre) are materialized directly from data embedded in other entities' lookups — no queue, no extra API call.
 
 | MusicBrainz entity | Graph node label | Seed? | Bridges to existing Orbiter node |
 |---|---|:--:|---|
@@ -40,9 +40,9 @@ MusicBrainz's 13 core entities map to Orbiter graph nodes as follows. **Seed ent
 | `work` | `Entity:Work` (+`:Song` etc.) | cascade | — |
 | `release-group` | `Entity:Release_Group` (+`:Album`/`:Single`/`:EP`) | cascade | — |
 | `release` | `Entity:Release` | cascade | — |
-| `place` | `Entity:Place` (+`:Studio`/`:Venue`) | cascade | — |
-| `area` | reuse `Country` / `Region` / `City` (MERGE by name; stamp `mbid`) | cascade | Orbiter geography |
-| `genre` | `Entity:Genre` | cascade | — |
+| `place` | `Entity:Place` (+`:Studio`/`:Venue`) | inline | — |
+| `area` | reuse `Country` / `Region` / `City` (MERGE by name; stamp `mbid`) | inline | Orbiter geography |
+| `genre` | `Entity:Genre` | inline | — |
 | `series` / `instrument` / `url` | properties / deferred | — | — |
 
 Every node follows Orbiter conventions: base `Entity` label, `uuid` (random) **plus `mbid`** as the natural MERGE key, `display_label`, `visibility`, `name_embedding` (vecf32), and `created_at` / `updated_at` stamped via Cypher `timestamp()` on create and update (see [Node Types](/guides/ontology/nodes) and the [timestamp convention](/guides/ontology/nodes#timestamp-coverage-audit)).
@@ -168,7 +168,7 @@ A record label, publisher, or distributor. Bridges to `Company` via `SAME_AS`.
 Music_Event  —  Entity:Music_Event  (+ :Festival | :Concert | :Convention | :Award_Ceremony)
 ```
 
-A live event — festival, concert, ceremony. Sub-label from controlled `type` (alphanumeric only, like [Live_Event](/guides/ontology/nodes#live-event)).
+A live event — festival, concert, ceremony. Sub-label from controlled `type` (alphanumeric only, like [Live_Event](/guides/ontology/nodes#live_event)).
 
 | Property | Type | Example (Reading 1992) |
 |---|---|---|
@@ -301,7 +301,7 @@ mb/run-base-artist-enrich   (proposed)
 mb/run-base-recording-enrich   (proposed)
 ```
 
-1 lookup `recording/{mbid}?inc=artist-credits+work-rels+artist-rels+place-rels+genres+isrcs` → `Recording` node → `PERFORMED` / `PLAYED_ON` / `PRODUCED` / `ENGINEERED` edges → `RECORDING_OF` (work) → `RECORDED_AT` (place) → cascade: queue the **work** (T1), performing **artists** (T1), **producers** (T2), **place** (T3).
+1 lookup `recording/{mbid}?inc=artist-credits+work-rels+artist-rels+place-rels+genres+isrcs` → `Recording` node → `PERFORMED` / `PLAYED_ON` / `PRODUCED` / `ENGINEERED` edges → `RECORDING_OF` (work) → `RECORDED_AT` (place — `Place` node **materialized inline** from the embedded `place-rels` object, no queue) → cascade: queue the **work** (T1), performing **artists** (T1), **producers** (T2).
 
 </Card>
 
@@ -321,7 +321,7 @@ mb/run-base-label-enrich   (proposed)
 mb/run-base-event-enrich   (proposed)
 ```
 
-1 lookup `event/{mbid}?inc=artist-rels+place-rels+url-rels+ratings` → `Music_Event` node (+ type sub-label) → `HELD_AT` (place) → `HEADLINED` / `PERFORMED_AT` edges → cascade: queue **performers** (T1, headliners > support) + the **place** (T2).
+1 lookup `event/{mbid}?inc=artist-rels+place-rels+url-rels+ratings` → `Music_Event` node (+ type sub-label) → `HELD_AT` (place — `Place` node **materialized inline** from `place-rels`, no queue) → `HEADLINED` / `PERFORMED_AT` edges → cascade: queue **performers** (T1, headliners > support).
 
 </Card>
 
@@ -331,9 +331,9 @@ mb/run-base-event-enrich   (proposed)
 
 ```
 mb/cascade-from-artist     → band members T1 · collaborators T2 · recordings T2 (cap 50) · release-groups T2 · events T3
-mb/cascade-from-recording  → work T1 · performers T1 · producers/engineers T2 · place T3 · release-groups T3
+mb/cascade-from-recording  → work T1 · performers T1 · producers/engineers T2 · release-groups T3 · place inline
 mb/cascade-from-label      → sub-labels T1 · releases→credited artists T2
-mb/cascade-from-event      → headliners T1 · support acts T2 · place T2
+mb/cascade-from-event      → headliners T1 · support acts T2 · place inline
 ```
 
 Each guards `cascade_depth + 1 >= 3` → short-return `depth_exceeded`. Every `get-add` call wrapped in `try_catch` → `log_crash`. Dedup within a run by MBID (first tier wins).
@@ -488,7 +488,7 @@ from recording lookup:
     work (performance)                 → T1 (work)
     main performer artist-credit       → T1 (artist)
     producer / engineer / instrument   → T2 (artist)
-    recorded-at place                  → T3 (place)
+    recorded-at place                  → Place node inline (no queue)
 ```
 
 ---
@@ -552,6 +552,10 @@ Same shape: 1 throttled lookup with the entity's `inc=` set → `MERGE` node →
 
 ## Queue tables (proposed schema)
 
+<Note>
+The authoritative, build-ready spec for **all 15 tables** — field-by-field schemas, indexes, per-table extras, and the live IMDB conventions they mirror — is on the dedicated **[Music Waterfall Tables](/guides/enrichment/waterfall/music-tables)** page. The summary below is the design-level overview.
+</Note>
+
 One table per seedable entity, keyed on normalized `mbid`. Shared shape:
 
 | Field | Type | Notes |
@@ -560,14 +564,14 @@ One table per seedable entity, keyed on normalized `mbid`. Shared shape:
 | `created_at` | timestamp | |
 | `mbid` | text (unique) | natural key |
 | `name` / `title` | text | provisional, from discovery context |
-| `entity_id` | int nullable | FK into `mb_artist` / `mb_recording` / … once the stub exists |
+| `mb_<entity>_id` | int default 0 | FK into `mb_artist` / `mb_recording` / … once the stub exists (`0` = unset) |
 | `processing` | bool | lock flag |
 | `count` | int default 1 | incremented on duplicate discovery |
-| `cascade_depth` | int | 1 or 2 |
+| `cascade_depth` | int | 0 (bootstrap lane) / 1 / 2 |
 | `priority_tier` | int 0–4 default 4 | tier rule; **0 = bootstrap lane** (manual seed batches, drains first) |
 | `source_function` | text | e.g. `cascade-from-artist` |
 | `source_entity_mbid` | text | spawning entity |
-| `seed_mbid` | text nullable | root of the cascade (lineage) |
+| `seed_mbid` | text default `""` | root of the cascade (lineage); bootstrap rows set it to their own `mbid` |
 | `next_attempt_at` | timestamp nullable | retry backoff gate — cron skips the row until `now ≥ next_attempt_at` (see [retry policy](#retry-policy)) |
 | `retry_count` | int default 0 | attempts so far; drives the exponential backoff curve |
 
@@ -577,7 +581,7 @@ Tables: `queue_mb_artist`, `queue_mb_recording`, `queue_mb_label`, `queue_mb_eve
 
 ## Resolved design decisions (2026-06-11)
 
-The five open questions from the original design, each resolved before build:
+The open questions from the original design, each resolved before build (the sixth — places — surfaced while writing the [table spec](/guides/enrichment/waterfall/music-tables)):
 
 <CardGroup cols={1}>
   <Card title="Artist ↔ Person reconciliation — separate post-ingest pass" icon="link">
@@ -595,13 +599,16 @@ The five open questions from the original design, each resolved before build:
   <Card title="Backfill — live API only, bootstrap priority lane" icon="gauge-high">
     **Decided.** No offline import from the [MusicBrainz database dumps](https://musicbrainz.org/doc/MusicBrainz_Database/Download). Large bootstraps (e.g. a full label roster) ride the same 1 req/s live API, queued at **`priority_tier = 0`** — a reserved bootstrap lane that drains ahead of all cascade traffic. One code path, no dump tooling; multi-day backfills are accepted.
   </Card>
+  <Card title="Places — inline materialization, no queue" icon="location-dot">
+    **Decided.** `Place` nodes are written directly during recording/event enrich from the place object embedded in `place-rels` (name, type, address, coordinates, area — everything the node spec needs). No `queue_mb_place`, no place orchestrator, zero extra API calls at the 1 req/s ceiling. The `mb_place` source table stores the embedded JSON and `mbid`, so a URL-rels backfill pass can be added later without re-discovery.
+  </Card>
 </CardGroup>
 
 ## Build order (when we proceed)
 
-1. Tables (`mb_*` + `queue_mb_*`) + `mb/rate-limit/acquire` + `check-kill-switch-mb`.
+1. Tables (`mb_*` + `queue_mb_*` — full spec: [Music Waterfall Tables](/guides/enrichment/waterfall/music-tables)) + `mb/rate-limit/acquire` + `check-kill-switch-mb`.
 2. `mb/get-add/artist` + `mb/run-base-artist-enrich` + `Artist` node + `MEMBER_OF` / `FROM_AREA` / `HAS_GENRE` edges — prove the rate-limited single-entity path end-to-end on Nirvana.
 3. `cascade-from-artist` + `process-queue-musicbrainz` unified cron — prove depth-capped fanout drains.
 4. Recording + Work path (`run-base-recording-enrich`, `RECORDING_OF` / `PERFORMED` / `COMPOSED`).
-5. Label + Release path; Event + Place path.
+5. Label + Release path; Event path (`Place` nodes materialize inline).
 6. Post-ingest reconciliation pass to bridge into the existing people/company graph — `Person` artists merge with their existing `Person` node (node dedup, no edge); `Music_Label` gets `SAME_AS` → `Company`.

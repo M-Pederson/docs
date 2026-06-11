@@ -1,0 +1,207 @@
+---
+title: "Music Waterfall Tables"
+description: "Build spec — all 15 Xano tables for the MusicBrainz waterfall: 6 queue tables, 8 source-of-truth tables, and the mb_rate_limit singleton. Field-by-field schemas, indexes, and the conventions they mirror from the live IMDB pipeline."
+---
+
+<Note>
+**Status: SPEC (2026-06-11) — not built.** This page is the table-level build spec for [build-order step 1](/guides/enrichment/waterfall/music-industry-waterfall#build-order-when-we-proceed) of the [Music Industry Waterfall](/guides/enrichment/waterfall/music-industry-waterfall). Schemas mirror the **live IMDB pipeline tables** in Xano workspace 3 (`queue_imdb_person` #706, `queue_imdb_title` #707, `imdb_person` #394, `film_tv` #395) with deliberate deviations called out below. Verified 2026-06-11: **no `mb_*` or `queue_mb_*` tables exist yet** in workspace 3.
+</Note>
+
+## Table inventory — 15 tables
+
+| # | Table | Role |
+|--:|---|---|
+| 1–6 | `queue_mb_artist` · `queue_mb_recording` · `queue_mb_label` · `queue_mb_event` · `queue_mb_release_group` · `queue_mb_work` | Cascade queues (shared shape) |
+| 7–14 | `mb_artist` · `mb_recording` · `mb_label` · `mb_event` · `mb_release_group` · `mb_release` · `mb_work` · `mb_place` | Source of truth: raw JSON + enrichment metadata (shared base) |
+| 15 | `mb_rate_limit` | Singleton token-bucket state for the global 1 req/s limit |
+
+<Warning>
+**There is deliberately no `queue_mb_place`.** Places are **materialized inline** (decided 2026-06-11): MusicBrainz embeds the full place object (name, type, address, coordinates, area) inside `place-rels` on recording/event lookups — everything the [Place node](/guides/enrichment/waterfall/music-nodes) needs — so a separate place lookup, queue, and orchestrator would only burn 1 req/s budget. `mb_place` (a source table) still exists to store the embedded JSON and the `node_uuid`.
+</Warning>
+
+## Conventions (mirrored from live IMDB tables)
+
+These are the production conventions observed on the built IMDB pipeline tables in workspace 3 — the music tables copy them:
+
+- **`id`** int, primary key. **`created_at`** timestamp, not null, default `now`.
+- **`updated_at`** timestamp, nullable, app-managed — source tables only; omitted on queue tables.
+- **Raw API payloads** are Xano `json` type, in a field literally named `json`.
+- **Flags** are bool, not null, default `false`, with verbed names: `enrich_success`, `processing`, `gone`.
+- **FKs** are int, not null, **default `0` = unset**, with a Xano `tableref` — named for the target table (`mb_artist_id`), not generic `entity_id`.
+- **Text fields** carry `trim` validators.
+- **Queue worker pickup index**: composite `btree(processing, priority_tier, cascade_depth)` — exactly as on `queue_imdb_person`.
+
+**Deliberate deviations from IMDB:**
+
+1. **`unique(mbid)` on source tables too.** IMDB enforces uniqueness only at the queue layer (`unique(imdb_url)`) because URLs need normalization. MBIDs are stable UUIDs straight from the API — a unique index on every `mb_*` table is free insurance against race-created duplicate stubs.
+2. **`next_attempt_at` + `retry_count` on queue tables.** The [retry policy](/guides/enrichment/waterfall/music-industry-waterfall#retry-policy) defers instead of sleeping — IMDB has no equivalent because it has no hard rate limit.
+3. **No join tables.** IMDB needed `imdb_credit_join` (with its `edge_created` flag) because edges were written in a separate phase. Music orchestrators write edges inline from the lookup JSON, and the raw JSON is retained on the `mb_*` tables — edges are replayable without a join layer.
+
+**Reused infrastructure (no new tables):**
+
+- **Crashes** → the shared `log_crash` table (#542). Its `phase` enum gets music values appended: `mb_lookup`, `mb_browse`, `mb_node`, `mb_edges`, `mb_cascade`, `api_bad_request`, `api_exhausted`.
+- **Kill switch** → the `kill_switch_mb` **env var** (fail-open), per the [pipeline design](/guides/enrichment/waterfall/music-industry-waterfall#queue-infra--kill-switch). No table.
+- **Genres** → `Genre` nodes are created inline from the embedded `genres` array (name + mbid included in every lookup). No table.
+
+---
+
+## Queue tables (6 — shared shape)
+
+`queue_mb_artist` · `queue_mb_recording` · `queue_mb_label` · `queue_mb_event` · `queue_mb_release_group` · `queue_mb_work`
+
+One row per discovered-but-not-yet-enriched MBID. Written only by the `mb/queue/upsert-*` functions (keyed on `mbid`: duplicate discovery → `count++` + tier upgrade + FK backfill); drained only by the [unified cron](/guides/enrichment/waterfall/music-industry-waterfall#rate-limit-architecture).
+
+| Field | Type | Null / default | Notes |
+|---|---|---|---|
+| `id` | int | PK | |
+| `created_at` | timestamp | not null, `now` | |
+| `mbid` | text | not null, required, trim | Natural key — **unique** |
+| `name` (or `title`) | text | not null, `""`, trim | Provisional, from discovery context. `title` on `queue_mb_recording` / `queue_mb_release_group` / `queue_mb_work`; `name` on the rest |
+| `mb_<entity>_id` | int | not null, `0`, tableref | FK into the matching source table once the stub exists (`0` = unset). E.g. `mb_artist_id` on `queue_mb_artist` |
+| `processing` | bool | not null, `false` | Lock flag — cron sets `true` on pickup |
+| `count` | int | not null, `1`, min 0 | Incremented on duplicate discovery |
+| `cascade_depth` | int | not null, required, min 0 | `0` only for [bootstrap-lane](#bootstrap-lane-rows) rows; otherwise `1` or `2`; `3+` is never queued |
+| `priority_tier` | int | not null, `4`, min 0, max 4 | `0` = bootstrap lane; `1`–`4` per the [tier rules](/guides/enrichment/waterfall/music-industry-waterfall#priority-tiers). Upgraded (lowered) on duplicate discovery |
+| `source_function` | text | not null, `""`, trim | e.g. `cascade-from-artist` |
+| `source_entity_mbid` | text | not null, `""`, trim | MBID of the spawning entity |
+| `seed_mbid` | text | not null, `""`, trim | Root of the cascade (lineage) |
+| `next_attempt_at` | timestamp | nullable | Retry backoff gate — cron skips the row until `now ≥ next_attempt_at` |
+| `retry_count` | int | not null, `0`, min 0 | Attempts so far; drives the exponential backoff curve |
+
+**Indexes (each queue table):**
+
+| Index | Columns | Purpose |
+|---|---|---|
+| primary | `id` | |
+| unique | `mbid` | Upsert dedup — one row per MBID |
+| btree | `processing, priority_tier, cascade_depth` | Worker pickup (mirrors `queue_imdb_person`) |
+| btree | `mb_<entity>_id` | FK backfill / stub lookups |
+
+The `next_attempt_at ≤ now` filter is applied after the pickup index scan — at queue scale (thousands of rows, single-row pickup every ~2 s) it needs no dedicated index.
+
+### Bootstrap-lane rows
+
+Bootstrap batches (decision 5) are ordinary queue rows inserted manually (or by a seeding script) with `priority_tier = 0`, `cascade_depth = 0`, `source_function = "bootstrap"`, and `seed_mbid = mbid` (each bootstrap entity is its own seed). The gate's sync-enrich branch (`cascade_depth == 0 && queue == false`) is bypassed by passing `queue = true`, so bootstraps drain through the cron like everything else — just first.
+
+### Unified cron ordering & `entity_rank`
+
+The cron selects **one** row per tick across all six queues:
+
+```text
+ORDER BY priority_tier ASC, cascade_depth ASC, entity_rank ASC, id ASC
+```
+
+`entity_rank` is **not a column** — it is a constant the cron assigns per queue table in the unified selector, biasing identity-rich entities ahead of bulk catalog:
+
+| Rank | Queue |
+|:--:|---|
+| 1 | `queue_mb_artist` |
+| 2 | `queue_mb_label` |
+| 3 | `queue_mb_event` |
+| 4 | `queue_mb_work` |
+| 5 | `queue_mb_release_group` |
+| 6 | `queue_mb_recording` |
+
+---
+
+## Source-of-truth tables (8 — shared base)
+
+`mb_artist` · `mb_recording` · `mb_label` · `mb_event` · `mb_release_group` · `mb_release` · `mb_work` · `mb_place`
+
+One row per MusicBrainz entity ever touched. Created as a **stub** by `mb/get-add/*` (mbid + provisional name), filled by the orchestrator (raw JSON + node stamp + success flags). Retained raw JSON makes every graph write replayable without re-fetching — this is what makes the [canonical-release decision](/guides/enrichment/waterfall/music-industry-waterfall#resolved-design-decisions-2026-06-11) reversible.
+
+**Shared base fields:**
+
+| Field | Type | Null / default | Notes |
+|---|---|---|---|
+| `id` | int | PK | |
+| `created_at` | timestamp | not null, `now` | |
+| `updated_at` | timestamp | nullable | App-managed |
+| `mbid` | text | not null, required, trim | MERGE key — **unique** |
+| `name` (or `title`) | text | nullable, trim | `title` on `mb_recording` / `mb_release_group` / `mb_release` / `mb_work`; `name` on the rest |
+| `json` | json | nullable | Raw lookup payload (the full `?inc=` response). Null until first enrich |
+| `enriched_at` | timestamp | nullable | Last full orchestrator run — the 30-day dedup gate reads this |
+| `cascade_depth` | int | nullable | Depth at which first enriched (0, 1, 2) |
+| `enrich_success` | bool | not null, `false` | Flipped true on successful orchestrator completion |
+| `gone` | bool | not null, `false` | Tombstone — set on `404` (entity deleted/merged away); gates never re-queue a `gone` row |
+| `node_uuid` | text | nullable | UUID of the created graph node |
+
+**Indexes (each source table):** primary `id` · **unique `mbid`** · btree `created_at desc` (matches IMDB convention).
+
+### Per-table extras
+
+<Card icon="microphone">
+
+```
+mb_artist
+```
+
+| Extra field | Type | Notes |
+|---|---|---|
+| `artist_type` | text, nullable | `Person` / `Group` / `Orchestra` / … — lets the post-ingest reconciliation pass select person-type artists without parsing `json` |
+| `browse_json` | json, nullable | Paginated browse payloads (`recording?artist=`, `release-group?artist=`) accumulated across cascade pages |
+
+</Card>
+
+<Card icon="building">
+
+```
+mb_label
+```
+
+| Extra field | Type | Notes |
+|---|---|---|
+| `browse_json` | json, nullable | Paginated `release?label={mbid}` browse payloads — the full pressing catalog lives here, per the canonical-release decision |
+| `company_id` | int, not null, `0`, tableref → `company` | Stamped by the post-ingest reconciliation pass when `SAME_AS` → `Company` is written (`0` = unreconciled) |
+
+</Card>
+
+<Card icon="record-vinyl">
+
+```
+mb_release_group     +  canonical_release_mbid
+mb_release           +  mb_release_group_id
+```
+
+`mb_release_group` adds `canonical_release_mbid` (text, nullable) — stamped when the canonical release is selected (`status = Official`, earliest date), making decision 4 auditable. `mb_release` holds **one row per release-group** (the canonical edition only) and adds `mb_release_group_id` (int, not null, `0`, tableref → `mb_release_group`) with a btree index. All other pressings stay inside `mb_release_group.json` / `mb_label.browse_json`.
+
+</Card>
+
+<Card icon="location-dot">
+
+```
+mb_place   (no queue, no orchestrator)
+```
+
+Filled **inline** during recording/event enrich from the embedded `place-rels` object — `json` holds that embedded object (name, type, address, coordinates, area), not a lookup response. `enriched_at` = when inline-materialized; `cascade_depth` = depth of the enrich that embedded it; `enrich_success` = set true when the `Place` node write succeeds; `gone` is unused (always `false` — places are never individually looked up, so a 404 can't occur). If a future pass needs URL rels for places, the `mbid` is already here to drive a backfill without re-discovery.
+
+</Card>
+
+`mb_recording`, `mb_event`, and `mb_work` use the shared base with no extras.
+
+---
+
+## `mb_rate_limit` (singleton)
+
+Backs `mb/rate-limit/acquire` — the token-bucket gate every MusicBrainz call passes through. Exactly **one row** (`id = 1`), created at table-build time. No production precedent exists in workspace 3 (verified — the nearest analog is the `runtime_metadata` KV table); a dedicated table is used so `last_call_at` is timestamp-typed and the grant is an atomic single-row compare-and-update.
+
+| Field | Type | Null / default | Notes |
+|---|---|---|---|
+| `id` | int | PK | Always `1` |
+| `last_call_at` | timestamp | not null | Stamped on every granted call; `acquire` defers if `now − last_call_at < 1000 ms` |
+| `tokens` | int | not null, `1` | Binary gate (0 or 1) at the 1 req/s ceiling — kept as int so the bucket can widen if MusicBrainz ever raises the limit |
+
+**Indexes:** primary `id` only.
+
+---
+
+## Build checklist
+
+In dependency order (= [build-order step 1](/guides/enrichment/waterfall/music-industry-waterfall#build-order-when-we-proceed), expanded):
+
+1. `mb_rate_limit` + seed its singleton row (`id 1`, `last_call_at = 0`, `tokens = 1`).
+2. The 8 `mb_*` source tables (no FK dependencies among them except `mb_release` → `mb_release_group`, so build `mb_release_group` before `mb_release`; `mb_label.company_id` tablerefs the existing `company` table).
+3. The 6 `queue_mb_*` tables (each FKs its matching source table — build after step 2).
+4. Append the music `phase` values to the `log_crash` (#542) enum.
+5. Add the `kill_switch_mb` env var (default off).
+6. Sandbox-first: build and smoke-test in the sandbox data source before touching live, per the standard [backfill workflow](/guides/enrichment/waterfall/backfill-live-datasource).

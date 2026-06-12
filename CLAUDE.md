@@ -175,3 +175,17 @@ Use this pattern whenever the page is a quick-reference for "what got built in X
 - Blank lines before/after the fenced code block inside the Card are **required** — MDX won't parse the code block correctly otherwise.
 - Omit the `title` prop on Card so the icon sits cleanly at the top-left and the code block becomes the visible label.
 - Keep descriptions to 1–2 short paragraphs. Anything longer should live on a separate detailed page (and be linked at the top/bottom of the reference page).
+
+## XanoScript authoring traps (verified by live failures, 2026-06-11)
+
+When creating or patching Xano functions/tables/tasks via the MCP, these WILL bite — each was confirmed by a real failure while building the MusicBrainz pipeline:
+
+1. **Re-fetch after every create/update.** The serializer silently rewrites code: inline `{...}`/`[...]` literals or parenthesized `(expr)|filter` chains in `var` values can be stored as backtick **template strings** (dead expressions at runtime). After any `createFunction`/`updateFunction`, `getFunction` with `include_xanoscript: true` and diff the stored body.
+2. **`function.run` targets store as empty strings** when the named callee doesn't exist yet at create/update time — and they do NOT self-heal when the callee is created later. Create callees before callers; re-store callers afterward.
+3. **No leading-`?` nullable marker** (`timestamp ?updated_at?` is a syntax error despite appearing in doc examples). Trailing `?` (optional) and `?=default` only; "nullable" fields land as not-null with empty/zero defaults.
+4. **`'\\n'` inside `api.lambda` heredocs stores a literal backslash-n** → FalkorDB fails with `Invalid input '\'`. Join Cypher fragments with spaces, or use single-backslash `'\n'` (e.g. `lines.join('\n')` stores correctly).
+5. **FalkorDB rejects `a:Label` predicates in WHERE** — use `'Label' IN labels(a)`. `mvp/falkor/send-cypher` (#2815) returns Cypher errors as **strings**, not thrown errors — check `typeof r === 'string'` before reading `.data`, or failures read as silent nulls.
+6. **`each as $index` may not resolve** when referenced inside conditionals in API endpoints (`Missing var entry: $index`). Guard loops with a counter var or `($results|count) < $cap` instead.
+7. **Defaulted ints that may legitimately be 0** (priority tiers, depths) must use `first_notnull`, never `first_notempty` (0 is "empty" and gets coerced to the default). Same for bool flags.
+8. **`vectors/create-vectors-string` (#4676) returns a string** `"[0.1,...]"`, not an array — splice directly into `vecf32(...)`; an `Array.isArray` guard silently drops the embedding.
+9. **Tasks: include `active = false` explicitly** — omitting it ships the cron live immediately.

@@ -1,0 +1,56 @@
+---
+title: "2026-06-12 — Music Waterfall: designed, built, sandbox-verified"
+description: "Session handoff — the MusicBrainz waterfall went from open design questions to a fully built, sandbox-verified pipeline in one session: 6 design decisions, 15 tables, 25 functions, LLM edge descriptions, unified cron. Includes the operator runbook and next steps."
+---
+
+<Note>
+**Session handoff (2026-06-11 → 2026-06-12).** This page is the resume point for the next working session. Everything below is live in **Xano workspace 3 (OrbiterV2), branch `v1`**, and documented in detail on [Music Industry Waterfall](/guides/enrichment/waterfall/music-industry-waterfall), [Music Waterfall Tables](/guides/enrichment/waterfall/music-tables), and [Music Waterfall Functions](/guides/enrichment/waterfall/music-functions). Both scheduled tasks ship **INACTIVE** — nothing runs until they are switched on.
+</Note>
+
+## What happened this session
+
+1. **Six design decisions resolved** (recorded on the [waterfall page](/guides/enrichment/waterfall/music-industry-waterfall#resolved-design-decisions-2026-06-11)): post-ingest reconciliation, reuse Orbiter geography, genres-as-edges / tags-as-property, canonical release (one Official release per release-group), live-API-only backfill with a `priority_tier 0` bootstrap lane, and inline Place materialization. The kill switch was **skipped by design** — the cascade is structurally bounded, and pausing the unified cron is the manual kill.
+2. **15 tables built** (#736–#750): 6 `queue_mb_*` queues, 8 `mb_*` source tables, the `mb_rate_limit` singleton (seeded `id 1` in live/staging/sandbox). Music phase values appended to the shared `log_crash` (#542) enum. Field-by-field spec: [Music Waterfall Tables](/guides/enrichment/waterfall/music-tables).
+3. **25 functions built** (#13079–#13103): rate limiter, `mb/api/request` choke-point, 6 queue upserts, 5 gates (all with sync-enrich branches enabled), 2 node writers, 5 orchestrators (label / artist / release-group / recording / work), the unified drain core, the generic LLM edge-description trio, and the genre/area hub-edge backfill. Full inventory + deviations: [Music Waterfall Functions](/guides/enrichment/waterfall/music-functions).
+4. **Adversarially verified**: four multi-agent verification workflows re-fetched every stored schema and function body. They caught and fixed 5 must-fix function bugs (empty `function.run` targets, an embedding string/array mismatch, a serializer trap on the cascade lists) before any live call.
+5. **Sandbox smoke tests all green** (real MusicBrainz API, sandbox data source + sandbox graph):
+   - Sub Pop label seed → node + `SUBSIDIARY_OF` edges, 3 browse pages (300-release cap hit as designed), 205 release-groups + 106 artists + 2 labels queued with full seed lineage
+   - Nirvana artist seed → `Music_Group` node, 9 `MEMBER_OF` edges, exactly 20 albums + 50 recordings queued (caps verified)
+   - LLM edge descriptions: 11/11 processed, 0 pending (e.g. *"Kurt Cobain was an original member of the US grunge band Nirvana from 1987 until April 5 1994."*)
+   - Unified drain: processed 2 tier-1 member artists end-to-end (lock → enrich → delete)
+   - Genre/area hub edges: `HAS_GENRE` → `Genre` and `FROM_AREA` → `Country` written for Nirvana + Sub Pop
+
+## Current sandbox state
+
+The sandbox queues hold roughly **380 pending rows** (release-groups, artists, recordings, works from the two seed cascades). The sandbox graph contains the Sub Pop / Nirvana neighborhood with described edges. Nothing has touched the **live** data source — live queues are empty.
+
+## Operator runbook
+
+API group `musicbrainz` — base `https://xh2o-yths-38lt.n7c.xano.io/api:P8PNYYKM`, headers `Content-Type: application/json` + `X-Data-Source: sandbox|live` + `X-Branch: v1`:
+
+| Endpoint | Use |
+|---|---|
+| `POST seed/label` `{mbid, name?}` | Seed a label (sync depth-0 enrich; `queue:true, priority_tier:0` for bootstrap lane) |
+| `POST seed/artist` `{mbid, name?}` | Seed an artist |
+| `POST tool/drain-queue` `{count}` | Manually drain 1–20 queue rows |
+| `POST tool/backfill-edge-descriptions` `{limit}` | LLM-describe 1–100 edges missing `description_generated_at` |
+| `POST tool/backfill-genre-area-edges` `{limit}` | Write `HAS_GENRE`/`FROM_AREA` for 1–50 nodes |
+| `GET tool/peek-edge-descriptions` | Inspect described edges + pending count |
+
+**To start the pipeline**: set task #180 `process-queue-musicbrainz`'s **datasource to `sandbox`** and activate it (drains up to 10 rows/min). Activate task #181 for edge descriptions (20/5min). **Pausing task #180 is the kill switch.**
+
+## Next steps (in rough priority order)
+
+1. **Drain the sandbox queue** (enable task #180 on sandbox) and QA the resulting graph — node properties, edge weights, canonical-release behavior on real release-groups, recording → work cascades.
+2. **Run the edge-description + genre/area backfills** behind the drain and spot-check description quality at scale.
+3. **Event path** — `mb/get-add/event` + `mb/run-base-event-enrich` (`HEADLINED` w35 / `PERFORMED_AT` w45 / `HELD_AT` w30); entity_rank 3 is reserved for it in the drain core (#13102).
+4. **Post-ingest reconciliation pass** (build-order step 6, the only un-built design step): `Person:Music_Artist` merge into existing `Person` nodes + `Music_Label` → `Company` `SAME_AS` (name + URLs + ISNI; `mb_label.master_company_id` and `mb_artist.artist_type` are already in place to support it).
+5. **Live rollout decision**: GoDigital/Cinq Music seeding per [Seed GoDigital](/guides/enrichment/waterfall/seed-godigital), bootstrap lane usage, task datasource switch to live.
+
+## Notes for the next session (agent or human)
+
+- **Xano workspace 3**, all music artifacts tagged `musicbrainz`, branch `v1`. Sandbox-first for anything new.
+- **XanoScript authoring traps** learned this session are recorded in this repo's `CLAUDE.md` (§ XanoScript authoring traps) — read them before writing or patching any function. The worst ones: `function.run` targets silently store as empty strings if the callee doesn't exist yet, and inline expressions / escaped newlines can be silently rewritten by the serializer. **Always re-fetch stored XanoScript after create/update and diff it.**
+- `vectors/create-vectors-string` (#4676) returns the embedding as a **string** `"[0.1,...]"`, not an array — splice it directly into `vecf32()`.
+- FalkorDB: no `a:Label` predicates in WHERE (use `'Label' IN labels(a)`); Cypher built in lambdas must be space-joined or use single-`\n` joins; send-cypher returns errors as **strings** — check `typeof r === 'string'` before reading `.data`.
+- Queue tier/depth defaults must use `first_notnull` (never `first_notempty`) so bootstrap-lane `0` values survive.

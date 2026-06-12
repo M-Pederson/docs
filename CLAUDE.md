@@ -189,3 +189,10 @@ When creating or patching Xano functions/tables/tasks via the MCP, these WILL bi
 7. **Defaulted ints that may legitimately be 0** (priority tiers, depths) must use `first_notnull`, never `first_notempty` (0 is "empty" and gets coerced to the default). Same for bool flags.
 8. **`vectors/create-vectors-string` (#4676) returns a string** `"[0.1,...]"`, not an array — splice directly into `vecf32(...)`; an `Array.isArray` guard silently drops the embedding.
 9. **Tasks: include `active = false` explicitly** — omitting it ships the cron live immediately.
+
+Added 2026-06-12 (second session):
+
+10. **`log_crash.phase` (#542) is a STRICT enum** — writing a value outside the list makes the crash-logger itself fail at runtime. Check the enum (`get_table_schema` 542) before any `db.add log_crash` with a new phase; append values first. (Latent example: `mvp/imdb/backfill-film-tv-posters` #13047 logs phase `poster_upload`, which is not in the enum — its catch path is broken.)
+11. **Enum values can't be edited via the MCP** — `update_field` has no values param, and the Metadata API per-field PUT routes (`/schema/{field}`, `/schema/type/enum/{field}`) 404. The working route is a whole-schema read-modify-write: `GET /api:meta/workspace/3/table/{id}/schema` → append to the field's `values` → `PUT .../schema` with `{"schema": [...]}`.
+12. **Xano lambdas read inputs via `$input.x` and stack vars via `$var.x`** — referencing `$var.foo` for something that only exists as an input silently yields undefined (no error). When cloning a lambda between functions, re-check every `$var.`/`$input.` prefix against the new context.
+13. **Reasoning models on OpenRouter (e.g. `deepseek/deepseek-v4-flash`) can return EMPTY `content`** — they burn the completion budget on reasoning tokens for larger prompts, and `choices.0.message.content` comes back `""` while `message.reasoning` holds the thinking. For short structured outputs, pass `reasoning: {enabled: false}` (+ a `max_tokens` cap). Symptom: intermittent null LLM results that look like model refusals (found live in `mvp/music/create-node-description` #13112 — 3 of 4 rows silently skipped until patched).

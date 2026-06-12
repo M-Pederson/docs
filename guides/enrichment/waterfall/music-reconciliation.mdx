@@ -1,0 +1,89 @@
+---
+title: "Music Reconciliation (Scoping)"
+description: "Design scoping for the post-ingest reconciliation pass — Person:Music_Artist merges into existing Person nodes, Music_Label gets SAME_AS → Company. Reusable infra mapped 2026-06-12; open design questions listed for sign-off before build."
+---
+
+<Note>
+**Status: SCOPED (2026-06-12), not built.** This is the last unbuilt step of the [Music Industry Waterfall](/guides/enrichment/waterfall/music-industry-waterfall#build-order-when-we-proceed) — the separate post-ingest pass that bridges music entities into the existing Orbiter people/company graph ([decision 1](/guides/enrichment/waterfall/music-industry-waterfall#resolved-design-decisions-2026-06-11)). The existing workspace infra was audited on 2026-06-12; this page records what is directly reusable, the proposed tiered match flows, and the **[open design questions](#open-design-questions)** that need sign-off before build.
+</Note>
+
+## The two reconciliation jobs
+
+| Job | Mechanism | Why different |
+|---|---|---|
+| `Person:Music_Artist` → existing `Person` | **Node merge** (graph dedup — edges repoint onto the surviving node, no bridge edge) | A person artist *is* an Orbiter Person; two nodes for one human is a dedup bug |
+| `Music_Label` → `Company` | **`SAME_AS` edge** (w1, `match_method` + `confidence` params) + stamp `mb_label.master_company_id` | A label and a company profile are distinct records of the same entity — keep both, link them |
+
+## Reusable infrastructure (audited 2026-06-12)
+
+<Card icon="magnifying-glass">
+
+```
+mvp/resolve/match-master-person — 13038
+```
+
+Resolves a `master_person_id` from links / emails / phones, with a `linkedin_url` direct fallback; returns `match_via`. **Conditionally reusable**: only when the MB artist's `url-rels` contain a `linkedin.com/in/` URL. It requires link/email-grade keys — MB artists have neither by default, so this is Tier 1, not the workhorse.
+
+</Card>
+
+<Card icon="cloud-arrow-up">
+
+```
+mvp/falkor/send-cypher-with-embeddings — 12566
+```
+
+Takes a 1536-float vector + Cypher, inlines it as a `vecf32()` literal, and runs `db.idx.vector.queryNodes` KNN with score thresholds (0.65 general / 0.85 expertise). **Directly reusable** as the name-similarity workhorse — KNN the artist's `name_embedding` against `Person` nodes, the label's against `Company` nodes. This is the canonical name-matching pattern in the codebase (`resolve-person-expertise` 12668/12926).
+
+</Card>
+
+<Card icon="wrench">
+
+```
+merge/helpers/graph-merge-person — 12949
+merge/helpers/resync-person-node-uuid — 12964
+merge/helpers/graph-merge-company — 12958
+```
+
+The merge machinery. `graph-merge-person` repoints edges from the orphan node onto the survivor; `resync-person-node-uuid` sweeps the **13 tables** that store `person_node_uuid` after a merge. **Directly reusable** for the artist→Person merge once a match is confirmed. The company variant exists if a label turns out to *be* the company node (full merge instead of `SAME_AS`).
+
+</Card>
+
+<Card icon="building">
+
+```
+mvp/get-add/master-company-new — 12558
+```
+
+Get-or-create `master_company` by domain + profile URLs (LinkedIn / Crunchbase), with `hold_downstream=true` to skip enrich dispatch. **Directly reusable** for the label side: the MB label's `url-rels` `official homepage` relation yields the domain that feeds 12558's match path. On match/create: stamp `mb_label.master_company_id` (already in the schema, `0` = unreconciled) and write the `SAME_AS` edge via send-cypher (2815).
+
+</Card>
+
+<Warning>
+**Not reusable:** `mvp/get-add/master-person-new` (13039) and `mvp/enrich/enrich-master-person` (13040). 13039 requires email/LinkedIn keys and unconditionally runs the PDL→EnrichLayer→Exa cascade (wrong/expensive for MB artists); 13040 enriches known persons — it neither matches nor merges. The piece to *copy* (not call) from 13039 is its pre-API `master_link` lookup: query `master_link` for any of the MB artist's `url-rels` URLs (Wikipedia, Discogs, socials).
+</Warning>
+
+## Proposed flow — Person:Music_Artist merge
+
+1. **Select:** `mb_artist` rows with `artist_type = 'Person'`, `node_uuid` set, not yet reconciled (needs a tracking column — see open questions).
+2. **Tier 1 — hard keys:** `url-rels` contains `linkedin.com/in/` → `mvp/resolve/match-master-person` (13038). Cheapest definitive match.
+3. **Tier 2 — shared links:** any `url-rels` URL hits `master_link` (the 13039 pre-API pattern, adapted).
+4. **Tier 3 — name embedding:** KNN via 12566 against `Person` nodes. Candidates below the distance threshold go to Tier 4; no candidate → no match, stop.
+5. **Tier 4 — LLM confirmation:** two-tier confirm pattern from the merge-detection pipeline before any merge fires.
+6. **On confirmed match:** `graph-merge-person` (12949) + `resync-person-node-uuid` (12964); the surviving `Person` node keeps/gains the `Music_Artist` label and music properties.
+
+## Proposed flow — Music_Label → Company SAME_AS
+
+1. **Select:** `mb_label` rows with `node_uuid` set and `master_company_id = 0`.
+2. **Tier 1 — domain:** `url-rels` `official homepage` → domain → `master-company-new` (12558, `hold_downstream=true`).
+3. **Tier 2 — name embedding:** KNN via 12566 against `Company` nodes, LLM-confirmed.
+4. **On match:** stamp `mb_label.master_company_id` + write `SAME_AS` w1 with `match_method` (`domain` / `embedding+llm` / …) and `confidence` (0–1) — the [edge spec](/guides/enrichment/waterfall/music-edges#identity-bridges) already carries both params for auditability.
+
+## Open design questions
+
+These need decisions before build (the same design-first gate as the [original six](/guides/enrichment/waterfall/music-industry-waterfall#resolved-design-decisions-2026-06-11)):
+
+1. **Auto-merge vs review queue.** Person merges are destructive-ish (edges repoint). Do Tier 3/4 (embedding + LLM) matches merge automatically, or land in a review table for human confirmation with only Tier 1/2 (hard-key) matches auto-merging?
+2. **Match-state tracking on `mb_artist`.** `mb_label` has `master_company_id`; `mb_artist` has no equivalent. Add `master_person_id` (tableref, `0` = unreconciled) — and a `reconcile_status` (`pending` / `matched` / `no_match` / `review`) so no-match rows aren't rescanned forever?
+3. **Embedding threshold.** 12566's general threshold is 0.65. Person-name collisions (common names) argue for a stricter bar + mandatory LLM confirm; what's the floor?
+4. **Create-on-miss for companies.** 12558 *creates* a `master_company` when nothing matches. Should an unmatched `Music_Label` create a new company (Sub Pop deserves one) or only link to existing companies in v1?
+5. **Embedding source mismatch.** Node descriptions (13113) now overwrite `name_embedding` with description-based vectors for `Music_Group`/`Recording` — person artists keep name+disambiguation embeddings from 13092. Reconciliation KNN should run against `Person` embeddings, which are name-based — consistent today, but worth pinning before descriptions expand to more node types.

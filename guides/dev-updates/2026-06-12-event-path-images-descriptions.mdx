@@ -1,0 +1,83 @@
+---
+title: "2026-06-12 (PM) — Event path, image pipelines, node descriptions"
+description: "Session handoff — the music waterfall's deferred event path is built and drain-wired; recording cover art (Cover Art Archive) and group photos (serper.dev) pipelines store original + GCS WebP URLs; Recording/Music_Group nodes get LLM descriptions (deepseek-v4-flash) with description-based embeddings. Reconciliation scoped with open questions."
+---
+
+<Note>
+**Session handoff (2026-06-12, second session).** Everything below is live in **Xano workspace 3 (OrbiterV2), branch `v1`**, tagged `musicbrainz` — built, store-verified (every function re-fetched and diffed after create/update, per the CLAUDE.md traps), and **smoke-tested green on the sandbox data source** (see [results below](#smoke-test-results-sandbox)). Both scheduled tasks (#180/#181) remain INACTIVE. Detail pages: [Music Waterfall Functions](/guides/enrichment/waterfall/music-functions), [Music Reconciliation (Scoping)](/guides/enrichment/waterfall/music-reconciliation).
+</Note>
+
+## What happened this session
+
+1. **Event path built** (was deferred at v1): `mb/run-base-event-enrich` (**13105**) + `mb/get-add/event` (**13106**) + `POST seed/event` (**8649**). The drain (**13102 → v1.1**) now scans `queue_mb_event` and dispatches at the reserved `entity_rank 3`; the artist orchestrator (**13094 → v1.1**) discovers main-performer events via `inc=event-rels` and queues them at **T3, depth-0 seeds only**. Live API sampling (Reading Festival 1992, a Nirvana concert, artist event-rels) grounded the build: a third artist-event rel type — `guest performer` — maps to `PERFORMED_AT.role`; `place.type`/`coordinates`/`address` are null-safe; setlists store on the node capped at 4,000 chars.
+2. **Cover-art pipeline**: `mb_recording` gained `cover_art_url` + `gcp_cover_art_url`. `mvp/music/fetch-recording-cover-art` (**13108**) resolves art via 1 throttled MB `inc=releases` lookup → Cover Art Archive JSON (up to 5 releases, Official first, 500px thumbnail) → `mvp/music/save-cover-art` (**13104**, lambda rewritten from the IMDB `tt\d+` regex to MBID extraction) re-hosts as `music-cover-art/<mbid>.webp`. Batch: **13110** / `POST tool/backfill-cover-art` (**8650**).
+3. **Group-image pipeline**: `mb_artist` gained `music_group_image_url` + `gcp_music_group_image_url`. `mvp/music/fetch-group-image` (**13109**) searches serper.dev images (`"<name> band <disambiguation>"`, env `SERPER_DEV`, pattern from `find-avatar` 12846) → `mvp/music/save-music-group-image` (**13107**, same lambda rewrite) → `music-group-image/<mbid>.webp`. Groups only; Person rows skip. Batch: **13111** / `POST tool/backfill-group-images` (**8651**).
+4. **Node descriptions + embeddings**: `Recording` and `Music_Group` nodes get `description` — MusicBrainz `annotation`/`disambiguation` wins when ≥ 40 chars, else `mvp/music/create-node-description` (**13112**, **`deepseek/deepseek-v4-flash`** on OpenRouter, verified live on the models API). `name_embedding` is regenerated **from the description** (#4676 string → `vecf32`). Backfill **13113** is source-table-driven (stub-proof) gated on new `description_generated_at` columns (737/738); endpoint `POST tool/backfill-node-descriptions` (**8652**).
+5. **Reconciliation scoped** (last unbuilt step): reusable infra audited — 13038 (LinkedIn match), 12566 (embedding KNN), 12949/12964 (person merge + uuid resync), 12558 (company domain match). Five **open design questions** (auto-merge vs review queue, `mb_artist.master_person_id` tracking, threshold, create-on-miss, embedding-source consistency) await sign-off on [Music Reconciliation](/guides/enrichment/waterfall/music-reconciliation).
+6. **`log_crash.phase` enum extended** (#542): `image_fetch`, `image_upload`, `node_description` — appended via Metadata API whole-schema PUT (the MCP's `update_field` can't edit enums; the per-field PUT routes 404). Found in passing: **13047 `backfill-film-tv-posters` logs phase `poster_upload`, which is not in the enum — its catch path is latently broken.**
+
+## Adversarial verification round
+
+Four parallel reviewer agents re-fetched every stored artifact and tried to refute the build (the same pattern that caught 5 bugs in the first session). **8 findings accepted and patched, 3 refuted with evidence:**
+
+Fixed:
+- **13102**: `$nowMs = now` → `now|to_int` — the timestamp-object arithmetic trap. The backoff math (`$nowMs + retries × 300000`) would have thrown "Not numeric" on *any* enrich failure, leaving the queue row permanently locked at `processing = true`. This was latent in v1 across all five entity paths (the sandbox drain only exercised the success path) — one fix covers all six.
+- **13105**: empty-`node_uuid` guard — if the node MERGE Cypher errors (send-cypher returns error *strings*, not throws), the function now stamps `enrich_success: false` and returns `node_failed` instead of falling through to a success stamp (the "zombie row" hole, which also exists pattern-wide in the v1 orchestrators — flagged for QA).
+- **13105**: sub-label sanitizer now title-cases (`Award ceremony` → `Award_Ceremony`, matching the node spec — was producing `Award_ceremony`) and guards leading digits (a digit-leading label is a Cypher syntax error).
+- **13105 + 13100**: Place `ON MATCH` now updates `latitude`/`longitude` via `coalesce(r.x, pl.x)` — a venue first seen without coordinates was permanently stuck null; coalesce also prevents a later null from wiping good coords.
+- **13108**: each Cover Art Archive call wrapped in `try_catch` — uncertainty about whether `api.request` throws on CAA's routine 404s could have killed the 5-release fallback loop on the first miss.
+- **13109**: serper call wrapped per the 12846 pattern; transient 429/5xx now return `serper_error` (row retries next run) instead of counting as a backfill error.
+- **13112**: empty-record guard — an artifact with no MB JSON now returns null instead of asking the LLM to describe `{}`.
+- **13113**: the unverified native `throw {}` construct replaced with a production-proven throwing `api.lambda` (the #4676 pattern) for `CYPHER_ERROR` surfacing.
+
+Refuted (verifier wrong):
+- *"deepseek-v4-flash doesn't exist"* — verifier used stale training data; the model is on the **live** OpenRouter models API (checked this session).
+- *"events should queue at cascade_depth 0"* — misread of the depth model; events from a depth-0 seed are depth-1 children by design, otherwise the cascade re-opens unbounded.
+- *"8649 missing `history = all`"* — present in the stored script.
+
+Known pattern-wide gaps surfaced but deliberately not patched this session (QA items): `mb_place.node_uuid` is never written back by either 13100 or 13105 (the Place node's UUID isn't extracted from the HELD_AT/RECORDED_AT Cypher); the v1 orchestrators (13091/13094/13099/13100/13101) share the zombie-success hole fixed in 13105.
+
+## Gotchas confirmed this session
+
+- `phase` on `log_crash` is a **strict enum** — invent a value and the crash-logger itself crashes. Check the enum before writing any `db.add log_crash`.
+- Enum edits: Metadata API `PUT /workspace/3/table/{id}/schema` (full read-modify-write of the schema array) is the working route.
+- The serializer behaved this session — every create/update was re-fetched and diffed; zero rewrites. `function.run` targets all stored non-empty (callees were always created before callers).
+- `13104`/`13107` had a pre-existing bug pattern from their IMDB clone source: the precondition checked the raw input instead of the regex-extracted id — fixed in both.
+
+## Smoke-test results (sandbox)
+
+All run 2026-06-12, `X-Data-Source: sandbox`. **Zero `qa_passed = false` rows in `log_crash` across the entire session.**
+
+| Test | Result |
+|---|---|
+| `POST seed/event` — Reading Festival 1992 | ✅ `enriched_direct`, node `9f4d0614-…`. All four phases green: `mb_edges` logged `headliners=1 performers=0 places=1` (Nirvana `HEADLINED`, Little John's Farm `HELD_AT` inline), cascade queued 1 headliner T1 |
+| `POST tool/backfill-group-images {limit: 2}` | ✅ 1/1 saved — Nirvana via serper → `…/music-group-image/5b11f4ce-….webp` on GCS, both URL columns written |
+| `POST tool/backfill-node-descriptions` | ✅ Chain proven: Nirvana Music_Group + the canonical SLTS Recording written (deepseek-v4-flash → #4676 embedding → `vecf32` node write, source rows stamped). **2 thin recordings skipped** — LLM returned empty on a bootleg-only and a promo-only record; they stay unstamped and retry (consistent with the LLM-unknowns-stay-null house rule, but watch the skip rate at scale) |
+| `POST tool/backfill-cover-art` | ✅ Happy path proven on the real Nevermind SLTS recording (`5fb524f1-…`): CAA 500px → **44 KB `image/webp` on GCS, URL fetchable**. Two earlier `no_art` results were *correct* — both test recordings turned out to be bootleg/promo-only with no CAA art |
+| Drain v1.1 + bootstrap lane | ✅ Three tier-0 bootstrap rows drained **first** (lane ordering verified), recordings enriched, rows deleted on success |
+
+**Open risk closed:** Xano's `api.request` **does follow** the Cover Art Archive's 307 redirect (the JSON lands with status 200) — no patch needed.
+
+### Round 2 — Cinq Music Group (the real demo catalog)
+
+Re-ran the full surface on the actual GoDigital target, seeded per the [Seed GoDigital runbook](/guides/enrichment/waterfall/seed-godigital):
+
+| Test | Result |
+|---|---|
+| `POST seed/label` — Cinq Music Group LLC (`fb742ab4-…`) | ✅ All five phases green; 1 browse page → **30 release-groups + 36 roster artists queued** (Janet Jackson, Daddy Yankee, Farruko, Ñengo Flow, De La Ghetto, Justin Quiles, Jowell & Randy …) |
+| 4 marquee artists enriched | ✅ Daddy Yankee, Farruko, Diamante Eléctrico, Jowell & Randy — nodes, `MEMBER_OF` (3+2 members on the bands), 20/12/9/14 albums + 50 recordings each queued |
+| **Event discovery — both sides of the depth guard** | ✅ Daddy Yankee at depth 1: event *found* (`events=1`) but correctly **not queued** (T3 filter is depth-0-only). Farruko seeded at depth 0: his Festival d'été de Québec 2025 set **queued at T3** — then promoted and drained through `mb/queue/process-next`, verifying the **rank-3 event dispatch live** (Reading Festival had only exercised the sync path) |
+| Group images | ✅ 2/2 — Diamante Eléctrico + Jowell & Randy → GCS WebP |
+| Cover art | ✅ "Made for Now" (Janet Jackson × Daddy Yankee): RG drain picked canonical release `d6139113-…`, queued its track, cover art → **67 KB GCS WebP** |
+| Node descriptions | ⚠️→✅ **Found and fixed a real bug**: `deepseek/deepseek-v4-flash` is a *reasoning* model — on larger MB records it burned the completion on reasoning tokens and returned empty `content`, so 3 of 4 rows skipped. Patched 13112 with `reasoning: {enabled: false}` + `max_tokens: 400` (verified against the OpenRouter API first: 0 reasoning tokens, clean content). Re-run: **4/4 written**, including the previously-skipped Diamante Eléctrico and both thin recordings |
+
+Cumulative: **zero `qa_passed = false` rows in `log_crash` across both rounds.** The sandbox now holds the Cinq neighborhood (label node + 4 marquee artists + Made for Now with art) ready for the demo-flow dry run in the GoDigital runbook.
+
+**Test-data notes:** the canonical "Smells Like Teen Spirit" recording is `5fb524f1-8cc8-4c04-a921-e34c0a911ea7` — the docs' earlier sample mbid (`a8242652-…`) is a promo-sampler-only recording entity. The Nirvana recordings queue is dominated by live filler (`[demolition]`, `[banter]` …) — a consequence of the known *recordings browse unsorted* deviation; worth revisiting the top-50 selection before live rollout.
+
+## Next steps
+
+1. Drain the sandbox queue at scale (Task 180 → sandbox datasource) and QA the resulting graph — the original handoff priority #1.
+2. Run edge-description + genre/area + cover-art + group-image + node-description backfills behind the drain; watch the description skip rate on thin records.
+3. Reconciliation design sign-off (5 open questions on [Music Reconciliation](/guides/enrichment/waterfall/music-reconciliation)) → build.
+4. Live rollout decision (GoDigital/Cinq seeding, bootstrap lane, task datasource switch).

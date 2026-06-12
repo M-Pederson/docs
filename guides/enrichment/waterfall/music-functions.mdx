@@ -1,0 +1,275 @@
+---
+title: "Music Waterfall Functions"
+description: "Build reference — every Xano function, task, and operator endpoint in the MusicBrainz waterfall: rate-limit foundation, queue upserts, entry gates, node writers, orchestrators, the unified queue drain, LLM edge descriptions, and hub-edge backfills."
+---
+
+<Note>
+**Status: BUILT (2026-06-12), sandbox-verified.** The full function layer for the [Music Industry Waterfall](/guides/enrichment/waterfall/music-industry-waterfall) — 25 functions (#13079–#13103), 2 scheduled tasks, and the `musicbrainz` API group — now exists in Xano workspace 3, branch `v1`, all tagged `musicbrainz`. Smoke tests passed in the sandbox data source on 2026-06-11/12 (Sub Pop label seed, Nirvana artist seed, edge descriptions, unified drain, genre/area backfill). **Both scheduled tasks shipped INACTIVE** — nothing runs until they are switched on. Tables are documented separately on [Music Waterfall Tables](/guides/enrichment/waterfall/music-tables); deviations from the design are listed [at the bottom](#deviations--deferrals).
+</Note>
+
+## Foundation
+
+<Card icon="gauge-high">
+
+```
+mb/rate-limit/acquire — 13079
+```
+
+The global 1 req/s token gate, backed by the `mb_rate_limit` singleton (#736). If the last granted call was less than 1100 ms ago it sleeps 1 s, then stamps `last_call_at`. **Fail-open** — if the gate itself errors, the call proceeds and the failure is logged, so a broken limiter never halts the pipeline.
+
+</Card>
+
+<Card icon="cloud-arrow-up">
+
+```
+mb/api/request — 13080
+```
+
+Single choke-point for **every** MusicBrainz call. Calls `acquire` for pacing, sends the canonical `User-Agent` (`Orbiter/1.0 ( mark@orbiter.io )`), appends `fmt=json`, and retries up to 5 attempts with backoff sleeps between attempts (none after the final one). `400`/`404` are terminal — no retry. Returns `{ok, terminal, status, attempts, json}`; failures `log_crash` with phases `api_bad_request` / `api_exhausted`.
+
+</Card>
+
+## Queue upserts
+
+<Card icon="wrench">
+
+```
+mb/queue/upsert-artist — 13081
+mb/queue/upsert-recording — 13082
+mb/queue/upsert-label — 13083
+mb/queue/upsert-event — 13084
+mb/queue/upsert-release-group — 13085
+mb/queue/upsert-work — 13086
+```
+
+Single source of truth for queue writes, keyed on `mbid`. Duplicate discovery → `count++`, **lowest tier wins**, and the source-table FK is backfilled once the stub exists.
+
+Inputs default via `first_notnull` (tier 4 / depth 1) so an explicitly passed `0` survives — this is what lets bootstrap-lane rows (`priority_tier = 0`, `cascade_depth = 0`) be queued without the defaults coercing them.
+
+</Card>
+
+## Entry gates
+
+<Card icon="play">
+
+```
+mb/get-add/label — 13087           → run-base-label-enrich (13091)
+mb/get-add/artist — 13088          → run-base-artist-enrich (13094)
+mb/get-add/release-group — 13089   → run-base-release-group-enrich (13099)
+mb/get-add/recording — 13093       → run-base-recording-enrich (13100)
+mb/get-add/work — 13098            → run-base-work-enrich (13101)
+```
+
+One gate per enrichable entity (there is **no event gate** — events are [deferred](#deviations--deferrals)). Each gate: 30-day `enriched_at` dedup → skip `gone`-tombstoned rows → ensure a stub row in the matching `mb_*` source table → seed propagation (when no caller seed is passed, the just-created stub is its own seed).
+
+Branching: **sync-enrich** (invoke the orchestrator directly) when `cascade_depth == 0 && queue == false`; otherwise upsert the queue row and let the drain handle it.
+
+</Card>
+
+## Node writers
+
+<Card icon="database">
+
+```
+mb/node/add-music-label-node — 13090
+```
+
+MERGEs the `Entity:Music_Label` node on `mbid` with the full property set from the [node spec](/guides/enrichment/waterfall/music-nodes), including a `name_embedding` vecf32.
+
+</Card>
+
+<Card icon="database">
+
+```
+mb/node/add-music-artist-node — 13092
+```
+
+Splits on MusicBrainz `type`: a `Person` artist becomes `Entity:Person:Music_Artist`; `Group` / `Orchestra` / `Choir` / etc. become `Entity:Music_Group`. Stamps `artist_type` back onto the `mb_artist` row so the post-ingest reconciliation pass can select person-type artists without parsing `json`.
+
+</Card>
+
+## Orchestrators
+
+Every phase is wrapped in `try_catch` → `log_crash` (phases `mb_lookup` / `mb_node` / `mb_edges` / `mb_browse` / `mb_cascade`). A terminal `404`/`400` marks the source row `gone`. All edges stamp `e.uuid` (plus the full [standard envelope](/guides/enrichment/waterfall/music-edges#standard-edge-envelope)). Cascading is **inlined** in each orchestrator's `mb_cascade` phase — the standalone `cascade-from-*` helpers from the design were not built.
+
+<Card icon="layer-group">
+
+```
+mb/run-base-label-enrich — 13091
+```
+
+Lookup `label/{mbid}?inc=url-rels+label-rels+ratings+tags+genres` → `Music_Label` node → `SUBSIDIARY_OF` (w15, stub-MERGEs the other label). Then browses `release?label=`, capped at **3 pages / 300 releases** (`inc=artist-credits+release-groups`), queueing release-groups T2, credited artists T2, and ownership labels T1.
+
+</Card>
+
+<Card icon="layer-group">
+
+```
+mb/run-base-artist-enrich — 13094
+```
+
+Lookup `artist/{mbid}?inc=aliases+tags+genres+ratings+url-rels+artist-rels` → artist/group node → `MEMBER_OF` edges (w5 current / w12 past, with `instruments`, `begin`/`end`/`ended`, `original`). Cascade: members T1, Albums capped at 20 chronological T2, recordings capped at 50 T2. Collaborators and events are deferred to v2.
+
+</Card>
+
+<Card icon="layer-group">
+
+```
+mb/run-base-release-group-enrich — 13099
+```
+
+Implements the [canonical-release rule](/guides/enrichment/waterfall/music-industry-waterfall#resolved-design-decisions-2026-06-11): picks `status = Official` + earliest date (fallback: earliest of any status), stamps `canonical_release_mbid` on `mb_release_group`, and creates the single `mb_release` row + `Entity:Release` node.
+
+Edges: `RELEASED` w10 (`joinphrase`), `RELEASE_OF` w30, `RELEASED_ON` w50 (`catalog_number`), `APPEARS_ON` w45 (`track_number`/`position`/`disc`). Cascade: tracklist recordings T3.
+
+</Card>
+
+<Card icon="layer-group">
+
+```
+mb/run-base-recording-enrich — 13100
+```
+
+Edges: `PERFORMED` w10, `PLAYED_ON` w20 (`instruments`), `PRODUCED` w18, `ENGINEERED` w22 (`role`), `RECORDING_OF` w30 (`live`/`partial`/`cover`), and `RECORDED_AT` w35 — with `Place` nodes **materialized inline** from the embedded `place-rels` + `mb_place` rows, per [decision 6](/guides/enrichment/waterfall/music-industry-waterfall#resolved-design-decisions-2026-06-11). Cascade: work T1, credit artists T1, rel artists T2.
+
+</Card>
+
+<Card icon="layer-group">
+
+```
+mb/run-base-work-enrich — 13101
+```
+
+Creates `Entity:Work` with a sanitized work-type sub-label (`:Song` etc.). Edges: `COMPOSED` w8, `WROTE_LYRICS` w12, `WROTE` w10 (`role`). Cascade: composers T1, writers T2.
+
+</Card>
+
+## Unified queue drain
+
+<Card icon="wrench">
+
+```
+mb/queue/process-next — 13102
+```
+
+Picks the **single best row across all 5 active queues** ordered by `priority_tier ASC, cascade_depth ASC, entity_rank ASC, id ASC` — `entity_rank` is a constant per queue (artist 1, label 2, work 4, release_group 5, recording 6; **3 is reserved for events**) — skipping rows whose `next_attempt_at` is in the future. Locks the row, dispatches the matching orchestrator, deletes on success.
+
+On failure: `retry_count++` with a `next_attempt_at` backoff of 5 min × retries; the row is dropped after 5 failures.
+
+</Card>
+
+## LLM edge descriptions
+
+Mirrors the IMDB `WORKED_ON` trio (#13016–#13018), but **one generic trio covers all music edge types** — keyed on `e.uuid` rather than one trio per edge type. Model: `openai/gpt-oss-120b`, temperature 0.3, producing a single factual 15–30-word sentence.
+
+<Card icon="cloud-arrow-up">
+
+```
+mb/edge/create-music-edge-description — 13095
+```
+
+Given one edge's structured properties + endpoint node names, calls the LLM and returns the single-sentence description. Sandbox sample: *"Kurt Cobain was an original member of the US grunge band Nirvana from 1987 until April 5 1994."*
+
+</Card>
+
+<Card icon="wrench">
+
+```
+mb/edge/write-music-edge-description — 13096
+```
+
+Stamps `e.description` + `e.description_generated_at` (ISO) onto the edge via Cypher, matched on `e.uuid`.
+
+</Card>
+
+<Card icon="clock-rotate-left">
+
+```
+mb/tool/backfill-music-edge-descriptions — 13097
+```
+
+Batch drainer (1–100 per run, default 10). Selects edges where `description_generated_at IS NULL`, filtered by edge type + `labels()` membership, and runs the create → write pair per edge. Idempotent via the timestamp guard.
+
+</Card>
+
+## Hub-edge backfill
+
+<Card icon="clock-rotate-left">
+
+```
+mb/tool/backfill-genre-area-edges — 13103
+```
+
+Graph-derived, idempotent backfill — no API calls. For `Music_Artist` / `Music_Group` / `Music_Label` nodes it writes `HAS_GENRE` w100 → `Entity:Genre` (MERGE by lowercase name) from the node's `genres` csv, and `FROM_AREA` w70 → `Country` (MERGE by name, **country granularity only** in v1).
+
+v1 limits: no `count` property on `HAS_GENRE`, no city/region mapping on `FROM_AREA` — see [deviations](#deviations--deferrals).
+
+</Card>
+
+## Operator endpoints
+
+<Card icon="globe">
+
+```
+musicbrainz — API group 1283 (canonical P8PNYYKM)
+```
+
+Base URL `https://xh2o-yths-38lt.n7c.xano.io/api:P8PNYYKM`. Manual seeding + operator tooling — none of these are pipeline-wired.
+
+</Card>
+
+| Endpoint | Verb | ID | Purpose |
+|---|:--:|--:|---|
+| `seed/label` | POST | 8643 | Seed a label MBID (→ `mb/get-add/label`) |
+| `seed/artist` | POST | 8644 | Seed an artist MBID (→ `mb/get-add/artist`) |
+| `tool/backfill-edge-descriptions` | POST | 8645 | Run an edge-description batch (13097) |
+| `tool/peek-edge-descriptions` | GET | 8646 | Inspect pending / generated descriptions |
+| `tool/drain-queue` | POST | 8647 | Manually drain 1–20 queue rows (default 3) via 13102 |
+| `tool/backfill-genre-area-edges` | POST | 8648 | Run the genre/area hub-edge backfill (13103) |
+
+Every call requires the standard Xano headers — `X-Data-Source` and `X-Branch`:
+
+```bash
+curl -X POST https://xh2o-yths-38lt.n7c.xano.io/api:P8PNYYKM/seed/artist \
+  -H "Content-Type: application/json" \
+  -H "X-Data-Source: sandbox" \
+  -H "X-Branch: v1" \
+  -d '{"mbid": "5b11f4ce-a62d-471e-81fc-a69a8278c7da"}'
+```
+
+## Scheduled tasks
+
+<Card icon="clock-rotate-left">
+
+```
+process-queue-musicbrainz — Task 180   (INACTIVE)
+```
+
+The unified cron. Runs every **60 s** and drains up to **10 rows per tick** via `mb/queue/process-next` (13102). This deviates from the design's ~2 s cadence — Xano cron granularity is 60 s, so batch-10-per-tick gives roughly the same throughput. **Pausing this task is the pipeline's manual kill.**
+
+</Card>
+
+<Card icon="clock-rotate-left">
+
+```
+backfill-music-edge-descriptions — Task 181   (INACTIVE)
+```
+
+Runs every **300 s**, processing 20 edges per tick through `mb/tool/backfill-music-edge-descriptions` (13097).
+
+</Card>
+
+## Deviations & deferrals
+
+Differences between the [design](/guides/enrichment/waterfall/music-industry-waterfall) and what was built:
+
+| Deviation / deferral | Detail |
+|---|---|
+| **Events deferred** | No `mb/get-add/event` and no `mb/run-base-event-enrich` in v1. The `queue_mb_event` table (#748) and `upsert-event` (13084) exist; `entity_rank = 3` is reserved for events in the unified drain (13102). |
+| **Collaborators deferred to v2** | The artist orchestrator (13094) does not queue collaborators or events — members, albums, and recordings only. |
+| **Cascade helpers inlined** | The standalone `mb/cascade-from-*` functions were not built; each orchestrator carries its own `mb_cascade` phase. |
+| **`FROM_AREA` country-only** | The hub-edge backfill (13103) maps areas at country granularity only; no city/region mapping in v1. |
+| **`HAS_GENRE` count omitted** | The `count` (community vote) property from the edge spec is not written in v1. |
+| **Cron 60 s × 10 batch** | Design called for a ~2 s tick; Xano cron granularity is 60 s, so Task 180 drains up to 10 rows per tick instead — approximately equivalent throughput. |
+| **Recordings browse unsorted** | The artist cascade takes the **first 50** recordings as returned, not the top 50 by length/date. |
+| **Label browse cap** | `release?label=` browse is capped at 3 pages / 300 releases; hitting the cap is logged. |

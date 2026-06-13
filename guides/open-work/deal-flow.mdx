@@ -32,6 +32,20 @@ The eight requirements that scoped this design, and where each is satisfied:
 | 7 | Share + make it multiplayer | Polymorphic `df_grant` + `resolve_access()` + `df_grant_effective` cache; realtime via existing TipTap/Hocuspocus + `df_presence`; `df_comment`/`df_follower` |
 | 8 | Leverage Orbiter's relationship graph | `df_deal.master_company_id` → graph node, `df_deal_association` stakeholders, `df_deal_intro_path` cached warm-intro paths |
 
+## Implementation contracts
+
+These are the decisions to preserve when this spec turns into Xano tables/functions:
+
+| Contract | Decision |
+| -------- | -------- |
+| Namespace | Every new table is `df_*`; polymorphic `resource_type` values use the same table-name strings (`df_deal`, `df_task`, `df_project`, `df_pipeline`, `df_view`, plus `df_comment` for attachments) so they never collide with existing core/graph tables. |
+| Project state | `df_project.lifecycle_state` is the v1 project status. `df_status` is only the customizable status/stage engine for `df_task` and `df_deal`; add project statuses later only if product needs project-specific workflows. |
+| Custom-field scope | Field definitions use non-null `scope_type` + `scope_id` instead of nullable `df_pipeline_id` / `df_project_id`, avoiding the Postgres "unique + NULL" duplicate-key trap. |
+| Access | All endpoint reads/writes and realtime broadcasts must pass through `resolve_access()` or the `df_grant_effective` cache. Xano has no DB-level RLS safety net. |
+| History | `df_event` is the append-only product timeline; `activity` (218) remains the user-facing notification feed only. |
+| Ordering | All user-reorderable lists use LexoRank stored as `text`, not decimal midpoints. |
+| Build delta | Create 29 new `df_*` tables plus one new composite btree on existing `organization_membership(696)`: `(user_id, organization_id, status)`. |
+
 ## Feature set
 
 <AccordionGroup>
@@ -59,7 +73,7 @@ The eight requirements that scoped this design, and where each is satisfied:
     - Multiple pipelines per org, each with its own stage set (fundraising/sales/partnerships/custom)
     - Stages as rows: free-form name + immutable category(backlog/unstarted/started/done/canceled) + color + LexoRank
     - Per-stage probability (forecast weight) and rotting_days (aging) as data columns
-    - Unified df_status table serves task/project workflow states AND deal stages via scope enum (cross-scope guarded by trigger)
+    - Unified df_status table serves task workflow states AND deal stages via scope enum (project lifecycle stays on df_project in v1)
     - Stage/pipeline invariant enforced by table trigger (a deal's stage must belong to its pipeline)
     - Seeded default pipelines + status sets shipped via df_template at first-run (not Phase 6)
   </Accordion>
@@ -73,7 +87,7 @@ The eight requirements that scoped this design, and where each is satisfied:
   </Accordion>
   <Accordion title="Custom fields (schema-as-data)">
     - User-defined typed fields on projects, tasks, AND deals (text..currency..select..ref..formula/rollup)
-    - Deal fields scoped per-pipeline; project/task fields scoped per-org OR per-project (nullable df_project_id)
+    - Field definitions scoped by non-null scope_type + scope_id: org-wide, one pipeline, or one project
     - Select options as first-class rows (stable id, mutable label/color) — renames never orphan values
     - Hybrid typed-EAV value store (typed columns) + df_custom_field_value_option child join for multi-select (no GIN needed)
     - Formula/rollup fields with config.expr, dependency tracking, dirty-flag recompute into value_number/value_text
@@ -300,7 +314,7 @@ A customizable deal pipeline owned by an org (fundraising/sales/partnerships). C
 
 ##### `df_status`
 
-Unified first-class status/stage row for task/project workflow states AND deal stages. Renamable/recolorable/reorderable with zero migrations; immutable category drives all analytics. scope guarded against cross-attachment by table triggers on df_task/df_deal.
+Unified first-class status/stage row for task workflow states AND deal stages. Renamable/recolorable/reorderable with zero migrations; immutable category drives all analytics. Project lifecycle stays on `df_project.lifecycle_state` in v1; only tasks and deals use `df_status`. Scope is guarded against cross-attachment by table triggers on df_task/df_deal.
 
 | Field | Type | Ref | Notes |
 | ----- | ---- | --- | ----- |
@@ -308,8 +322,8 @@ Unified first-class status/stage row for task/project workflow states AND deal s
 | `created_at` | `timestamp` | — | default now |
 | `updated_at` | `timestamp` | — | nullable |
 | `organization_id` | `int` | `organization` | tenant scope, NOT NULL |
-| `scope` | `enum[task,project,deal]` | — | which surface this status set belongs to; enforced against df_task.status_id (task) and df_deal.df_status_id (deal) |
-| `df_pipeline_id` | `int` | `df_pipeline` | nullable; set when scope=deal (stage belongs to one pipeline). Null = org-level task/project set |
+| `scope` | `enum[task,deal]` | — | which surface this status set belongs to; enforced against df_task.status_id (task) and df_deal.df_status_id (deal) |
+| `df_pipeline_id` | `int` | `df_pipeline` | nullable; set when scope=deal (stage belongs to one pipeline). Null = task status set |
 | `df_project_id` | `int` | `df_project` | nullable; optional per-project task status override set |
 | `name` | `text` | — | free-form, user-renamable (e.g. 'Term Sheet Out') |
 | `category` | `enum[backlog,unstarted,started,done,canceled]` | — | IMMUTABLE semantic bucket. Deal mapping: started=open, done=won, canceled=lost. All rollups/forecasting key off this |
@@ -371,6 +385,8 @@ Labeled many-to-many deal\<->person/company stakeholders (graph-aware roles).
 
 **Indexes:** btree(df_deal_id asc, role asc); btree(organization_id asc, master_person_id asc); btree(organization_id asc, master_company_id asc)
 
+**Integrity guard:** function-layer validation requires exactly one of `master_person_id` or `master_company_id` to be set, so each association points at one graph entity.
+
 ##### `df_deal_intro_path`
 
 Cached FalkorDB warm-intro path — Orbiter's relationship-graph edge surfaced as deal context.
@@ -395,7 +411,7 @@ Cached FalkorDB warm-intro path — Orbiter's relationship-graph edge surfaced a
 
 ##### `df_custom_field_def`
 
-Schema-as-data: one row per user-defined field per target type/scope. Add fields without migrations.
+Schema-as-data: one row per user-defined field per target type/scope. Add fields without migrations. Scope is represented with non-null `scope_type` + `scope_id` so the unique key is enforceable even for org-wide fields.
 
 | Field | Type | Ref | Notes |
 | ----- | ---- | --- | ----- |
@@ -404,8 +420,8 @@ Schema-as-data: one row per user-defined field per target type/scope. Add fields
 | `updated_at` | `timestamp` | — | nullable |
 | `organization_id` | `int` | `organization` | tenant scope, NOT NULL |
 | `entity_type` | `enum[project,task,deal]` | — | what this field attaches to |
-| `df_pipeline_id` | `int` | `df_pipeline` | nullable; deal fields scoped per-pipeline; null = all of entity_type |
-| `df_project_id` | `int` | `df_project` | nullable; project/task fields can be scoped to one project; null = org-wide |
+| `scope_type` | `enum[org,pipeline,project]` | — | non-null; deal fields use pipeline scope at launch, task/project fields use org or project scope |
+| `scope_id` | `int` | — | non-null; 0 for org scope, df_pipeline.id for pipeline scope, df_project.id for project scope; fn-layer validates target table |
 | `key` | `text` | — | stable slug used in filters/views/formulas |
 | `label` | `text` | — | display name |
 | `field_type` | `enum[text,long_text,number,currency,date,checkbox,single_select,multi_select,user_ref,record_ref,url,email,phone,formula,rollup]` | — | drives storage column + handler |
@@ -415,7 +431,7 @@ Schema-as-data: one row per user-defined field per target type/scope. Add fields
 | `is_required` | `bool` | — | default false; first_notnull on read |
 | `is_active` | `bool` | — | default true; soft-delete (first_notnull on read; true-default must not collide with false-default flags) |
 
-**Indexes:** unique(organization_id asc, entity_type asc, df_pipeline_id asc, df_project_id asc, key asc); btree(organization_id asc, entity_type asc, df_pipeline_id asc, is_active asc)
+**Indexes:** unique(organization_id asc, entity_type asc, scope_type asc, scope_id asc, key asc); btree(organization_id asc, entity_type asc, scope_type asc, scope_id asc, is_active asc)
 
 ##### `df_custom_field_option`
 
@@ -466,6 +482,7 @@ Child join for multi_select (and multi-ref) values: replaces the JSON-array+GIN 
 | ----- | ---- | --- | ----- |
 | `id` | `int` | — | PK |
 | `created_at` | `timestamp` | — | default now |
+| `updated_at` | `timestamp` | — | nullable |
 | `organization_id` | `int` | `organization` | tenant scope |
 | `df_custom_field_value_id` | `int` | `df_custom_field_value` | owning value row |
 | `df_custom_field_option_id` | `int` | `df_custom_field_option` | nullable; for single/multi_select |
@@ -511,7 +528,7 @@ Single polymorphic ACL/share row — the one source of truth for 'who can do wha
 | `created_at` | `timestamp` | — | default now |
 | `updated_at` | `timestamp` | — | nullable |
 | `organization_id` | `int` | `organization` | tenant scope, always set |
-| `resource_type` | `enum[pipeline,df_project,deal,task,df_view]` | — | what is shared |
+| `resource_type` | `enum[df_pipeline,df_project,df_deal,df_task,df_view]` | — | what is shared |
 | `resource_id` | `int` | — | id within resource_type table (polymorphic soft ref) |
 | `subject_type` | `enum[user,team,link]` | — | grantee kind |
 | `subject_user_id` | `int` | `user` | nullable; set when subject_type=user |
@@ -534,7 +551,7 @@ Denormalized effective-access cache (user x resource -> max role) computed by re
 | `updated_at` | `timestamp` | — | nullable; recompute stamp |
 | `organization_id` | `int` | `organization` | tenant scope |
 | `user_id` | `int` | `user` | the user |
-| `resource_type` | `enum[pipeline,df_project,deal,task,df_view]` | — | resource |
+| `resource_type` | `enum[df_pipeline,df_project,df_deal,df_task,df_view]` | — | resource |
 | `resource_id` | `int` | — | soft ref |
 | `effective_mode` | `enum[manager,editor,commentor,viewer]` | — | MAX role via role_rank() across org/team/individual/inherited grants |
 | `source` | `enum[org,team,individual,inherited,link]` | — | provenance for UI 'why do I have access' |
@@ -551,7 +568,7 @@ Hashed public/external share token; df_grant rows with subject_type=link referen
 | `created_at` | `timestamp` | — | default now |
 | `updated_at` | `timestamp` | — | nullable |
 | `organization_id` | `int` | `organization` | tenant scope |
-| `resource_type` | `enum[pipeline,df_project,deal,task,df_view]` | — | shared resource |
+| `resource_type` | `enum[df_pipeline,df_project,df_deal,df_task,df_view]` | — | shared resource |
 | `resource_id` | `int` | — | soft ref |
 | `token_hash` | `text` | — | SHA-256; never store raw token |
 | `mode` | `enum[editor,commentor,viewer]` | — | never 'manager' via link (enforced by enum) |
@@ -572,7 +589,7 @@ Threaded, mention-aware comments on any resource. Writes a df_event (verb=commen
 | `updated_at` | `timestamp` | — | nullable |
 | `deleted_at` | `timestamp` | — | nullable; soft-delete |
 | `organization_id` | `int` | `organization` | tenant scope |
-| `resource_type` | `enum[pipeline,df_project,deal,task]` | — | commented resource |
+| `resource_type` | `enum[df_pipeline,df_project,df_deal,df_task]` | — | commented resource |
 | `resource_id` | `int` | — | soft ref |
 | `user_id` | `int` | `user` | author |
 | `parent_comment_id` | `int` | `df_comment` | nullable self-FK for threads |
@@ -626,9 +643,10 @@ Ephemeral who's-viewing/cursor state with short TTL (mirrors existing *-members 
 | Field | Type | Ref | Notes |
 | ----- | ---- | --- | ----- |
 | `id` | `int` | — | PK |
+| `created_at` | `timestamp` | — | default now |
 | `updated_at` | `timestamp` | — | nullable |
 | `organization_id` | `int` | `organization` | tenant scope |
-| `resource_type` | `enum[pipeline,df_project,deal,task,df_view]` | — | viewed resource |
+| `resource_type` | `enum[df_pipeline,df_project,df_deal,df_task,df_view]` | — | viewed resource |
 | `resource_id` | `int` | — | soft ref |
 | `user_id` | `int` | `user` | viewer |
 | `cursor` | `json` | — | nullable; selected card/cell + color |
@@ -664,6 +682,7 @@ Universal append-only record timeline (Linear/Attio activity log). One row per f
 | ----- | ---- | --- | ----- |
 | `id` | `int` | — | PK |
 | `created_at` | `timestamp` | — | default now = event time |
+| `updated_at` | `timestamp` | — | nullable; normally null because events are append-only |
 | `organization_id` | `int` | `organization` | tenant scope |
 | `resource_type` | `enum[df_project,df_task,df_deal,df_pipeline]` | — | subject resource |
 | `resource_id` | `int` | — | soft ref (polymorphic, no DB FK) |
@@ -710,6 +729,7 @@ Append-only automation execution log: observability, idempotency, and debugging.
 | ----- | ---- | --- | ----- |
 | `id` | `int` | — | PK |
 | `created_at` | `timestamp` | — | default now = run time |
+| `updated_at` | `timestamp` | — | nullable; set only when a pending/failed run is retried or annotated |
 | `organization_id` | `int` | `organization` | tenant scope |
 | `df_automation_rule_id` | `int` | `df_automation_rule` | the rule |
 | `resource_type` | `enum[df_project,df_task,df_deal]` | — | target resource |
@@ -766,12 +786,12 @@ Pipeline/project templates (table-stakes onboarding). Seeds default pipelines + 
 Three orthogonal customization axes, all schema-as-data (zero migrations to customize), all re-specced against this workspace's real index primitives (verified: only PK + single-field btrees exist live; `createBtreeIndex`/`createUniqueIndex` accept multi-field arrays so composite indexes ARE buildable; there is NO GIN/partial-index primitive; `createSearchIndex` is full-text only).
 
 ### 1. Statuses & stages — first-class rows with an immutable category
-`df_status` is the single status engine for tasks, projects, and deals (disambiguated by `scope`). Users freely rename (`name`), recolor (`color`), reorder (LexoRank `position`), add/remove stages. The decisive trick (unanimous across Linear/Attio/Pipedrive/Notion): every row carries an **immutable `category` enum** `[backlog,unstarted,started,done,canceled]`. All UX flexibility lives in name/color/position; all logic — forecasting, won/lost rollups, cycle-time, cross-pipeline reporting — keys off `category`, never the name. Deal stages reuse the same enum with a fixed mapping (`started=open, done=won, canceled=lost`). Deal-only forecasting attributes (`probability`, `rotting_days`) ride as nullable columns on the same row.
+`df_status` is the single status engine for tasks and deals (disambiguated by `scope`). Projects keep the simpler `df_project.lifecycle_state` enum in v1. Users freely rename (`name`), recolor (`color`), reorder (LexoRank `position`), add/remove stages. The decisive trick (unanimous across Linear/Attio/Pipedrive/Notion): every row carries an **immutable `category` enum** `[backlog,unstarted,started,done,canceled]`. All UX flexibility lives in name/color/position; all logic — forecasting, won/lost rollups, cycle-time, cross-pipeline reporting — keys off `category`, never the name. Deal stages reuse the same enum with a fixed mapping (`started=open, done=won, canceled=lost`). Deal-only forecasting attributes (`probability`, `rotting_days`) ride as nullable columns on the same row.
 
 **Cross-scope safety (critique fix):** because task and deal statuses share one table, a bug could attach a deal stage to a task. Two table triggers close this: an `df_task` insert/update trigger asserts `status.scope='task'`; an `df_deal` trigger asserts `status.scope='deal' AND status.df_pipeline_id == deal.df_pipeline_id`. `df_deal.status` is a denormalized open/won/lost cache derived from the stage's category (trigger-maintained, never user-edited).
 
 ### 2. Custom fields — hybrid typed-EAV with a child join for multi-value (the deliberate, workspace-correct choice)
-Five tables: `df_custom_field_def` (typed field definitions + `config` JSON), `df_custom_field_option` (first-class select options, stable ids, mutable label/color), `df_custom_field_value` (ONE row per field-per-record, typed columns), `df_custom_field_value_option` (child join for multi-select and multi-ref), and the option/def pair scoping per-pipeline (deals) or per-project/org (tasks/projects via nullable `df_project_id`).
+Five tables: `df_custom_field_def` (typed field definitions + `config` JSON), `df_custom_field_option` (first-class select options, stable ids, mutable label/color), `df_custom_field_value` (ONE row per field-per-record, typed columns), `df_custom_field_value_option` (child join for multi-select and multi-ref), and non-null definition scoping via `scope_type` + `scope_id` (org, pipeline, or project). This avoids nullable columns inside the field-definition unique key.
 
 **The value store is typed-EAV with typed columns** (`value_text`/`value_number`/`value_timestamp`/`value_bool`/`value_ref_id`+`value_ref_table`), NOT a JSON `properties` blob.
 
@@ -868,6 +888,8 @@ Orbiter's edge is the relationship graph, so deals are wired into it at the data
 
 **project-575 collision resolution (explicit, verified).** `project` (575) is an UNRELATED graph artifact (career-history node: node_uuid, master_person_id, start/end year-month objects, contributors_raw). We do NOT touch it. The PM entity is **`df_project`**, and the whole module uses the **`df_` prefix** (df_project, df_task, df_pipeline, df_status, df_deal, df_grant, df_event, df_automation_rule, ...). Rationale for `df_`: it names the whole "Deal Flow" module in one namespace, reads unmistakably alongside core tables, and prevents confusing a module table with core auth/graph tables.
 
+**Polymorphic naming contract.** Any `resource_type` field stores the canonical table-name string (`df_pipeline`, `df_project`, `df_deal`, `df_task`, `df_view`, or `df_comment` where comments can own attachments). Human/product scopes like `df_view.scope` and `df_custom_field_def.entity_type` may stay as `project/task/deal`; polymorphic table references use `df_*` only.
+
 **Convention conformance (verified):** int PK `id`; `created_at` timestamp default now; `updated_at` timestamp nullable on EVERY table including joins/logs (critique fix: df_task_assignee etc. now carry it); FKs are int with a tableref; enums for status/mode/type; snake_case; `is_*` bool flags read via `first_notnull`; LexoRank `text` position for ordering. Realtime channels follow `*`/`*-members`/`*-collaborators` (`deal-flow`, `deal-flow-presence`, `deal-flow-collaborators`).
 
 **Cascade / orphan policy (critique fix).** Polymorphic tables (df_event, df_comment, df_attachment, df_follower, df_grant, df_grant_effective, df_presence, df_custom_field_value, df_reminder) have no DB FK to their resource. Each root resource gets a `cascade_delete(resource_type, resource_id)` fn that runs on `deleted_at` set, removing dependents; a nightly orphan-audit cron sweeps each polymorphic table for rows whose (resource_type, resource_id) no longer resolves. Soft-delete via `deleted_at` precedes hard purge by a restore window.
@@ -890,7 +912,7 @@ Orbiter's edge is the relationship graph, so deals are wired into it at the data
 - df_deal has many stakeholders through df_deal_association (-> master_person 139 / master_company 142, with role)
 - df_deal has many df_deal_intro_path rows (cached FalkorDB warm-intro paths -> master_person 139, connector user 125)
 - df_event records the immutable timeline for any df_project/df_task/df_deal/df_pipeline (stage moves folded in as verb=stage_changed)
-- df_custom_field_def belongs to one organization (695); deal-scoped defs belong to one df_pipeline; project/task defs optionally to one df_project
+- df_custom_field_def belongs to one organization (695); scope_type/scope_id targets org-wide fields, one df_pipeline, or one df_project
 - df_custom_field_option belongs to one df_custom_field_def
 - df_custom_field_value belongs to one df_custom_field_def and polymorphically to one df_project/df_task/df_deal (entity_type + entity_id)
 - df_custom_field_value_option belongs to one df_custom_field_value and references a df_custom_field_option (multi-select) or a polymorphic ref (multi-ref)
@@ -950,7 +972,7 @@ Representative endpoints (all org-scoped and gated by `resolve_access()`):
 
 ### Phase 1 — Core projects & tasks
 
-df_project (nesting via parent + standalone path/depth + lexorank text), df_project_section, df_task (nullable project_id = personal todo, parent_task_id subtasks, section_id, remind_at, recurrence_rule), df_task_assignee, df_status (scope=task/project with immutable category + cross-scope trigger), df_reminder, basic My-Tasks saved filter. Covers requirements 1-4. Reuses organization/user; soft-delete via deleted_at + is_archived.
+df_project (nesting via parent + standalone path/depth + lexorank text), df_project_section, df_task (nullable project_id = personal todo, parent_task_id subtasks, section_id, remind_at, recurrence_rule), df_task_assignee, df_status (scope=task with immutable category + cross-scope trigger), df_reminder, basic My-Tasks saved filter. Covers requirements 1-4. Reuses organization/user; soft-delete via deleted_at + is_archived.
 
 ### Phase 2 — Sharing, teams & multiplayer
 
@@ -962,7 +984,7 @@ df_pipeline (multiple per org), df_status extended to scope=deal (stages with ca
 
 ### Phase 4 — Custom fields & views
 
-df_custom_field_def (per-pipeline + per-project scoping), df_custom_field_option, df_custom_field_value (typed-EAV), df_custom_field_value_option (multi-select/multi-ref child join), formula/rollup compute layer (config.expr + refs + is_dirty + recompute fn), df_view (board/list/calendar/table/timeline). df_search full-text. Completes the 100%-customizable requirement.
+df_custom_field_def (scope_type + scope_id scoping), df_custom_field_option, df_custom_field_value (typed-EAV), df_custom_field_value_option (multi-select/multi-ref child join), formula/rollup compute layer (config.expr + refs + is_dirty + recompute fn), df_view (board/list/calendar/table/timeline). df_search full-text. Completes the 100%-customizable requirement.
 
 ### Phase 5 — Automation & forecasting
 
@@ -978,14 +1000,19 @@ df_task_membership multi-home + Gantt over df_task_dependency, multi-pipeline de
 
 ## Open questions
 
-- Multi-pipeline deal membership: v1 keeps a deal in exactly one pipeline (stage on df_deal). If Attio-style 'one company in many pipelines at different stages' is needed at launch, promote to df_deal_membership (deal_id, pipeline_id, status_id, board_position) and move stage off the deal — flagged as a v2 toggle.
+### Launch blockers
+
 - FX source & cadence for value_base: which provider feeds the FX table and how often is value_base recomputed (daily cron vs on-write)? Affects forecast accuracy at period boundaries.
 - Formula/rollup compute budget: dirty-flag + cron recompute is specified, but deep dependency chains (rollup of a formula of a rollup) need a topological recompute order and a max-depth guard — confirm acceptable recompute latency before exposing nested formulas.
 - Automation safety rails: loop prevention (rule A sets a field that triggers rule B that re-triggers A), per-org rate limits, and dry-run mode — confirm the guardrail policy before enabling webhook/set_field actions.
 - df_grant_effective refresh strategy: full recompute-on-change vs incremental. A team grant on a deep project subtree fans to many (user x resource) rows; confirm whether to materialize the full subtree eagerly or compute lazily on first access per resource.
+- Intro-path compute trigger: on-demand (lazy on deal open) vs scheduled cron vs graph-edge-change event — what staleness window and FalkorDB compute budget are acceptable for strength_score recompute?
+
+### V2 / product policy
+
+- Multi-pipeline deal membership: v1 keeps a deal in exactly one pipeline (stage on df_deal). If Attio-style "one company in many pipelines at different stages" is needed at launch, promote to df_deal_membership (deal_id, pipeline_id, status_id, board_position) and move stage off the deal — flagged as a v2 toggle.
 - record_ref auto-inverse: Attio auto-creates the inverse link on the referenced object. Defer to a paired-def concept in v2, or ship one-directional refs in v1 (current plan)?
 - Guest/external access depth: link tokens cap at editor; do authenticated non-org guests need a first-class role distinct from link tokens, and how do they map onto organization_membership (696)?
-- Intro-path compute trigger: on-demand (lazy on deal open) vs scheduled cron vs graph-edge-change event — what staleness window and FalkorDB compute budget are acceptable for strength_score recompute?
 
 ## Related
 

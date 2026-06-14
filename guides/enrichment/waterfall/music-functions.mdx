@@ -109,7 +109,7 @@ Lookup `label/{mbid}?inc=url-rels+label-rels+ratings+tags+genres` → `Music_Lab
 mb/run-base-artist-enrich — 13094
 ```
 
-Lookup `artist/{mbid}?inc=aliases+tags+genres+ratings+url-rels+artist-rels+event-rels` → artist/group node → `MEMBER_OF` edges (w5 current / w12 past, with `instruments`, `begin`/`end`/`ended`, `original`). Cascade: members T1, Albums capped at 20 chronological T2, recordings capped at 50 T2, and (v1.1, 2026-06-12) **main-performer events T3 — queued only when the artist itself is a depth-0 seed** (the events enter the queue as depth-1 children, so their own artist fanout stops at depth 2, per the depth model). Event discovery rides the same lookup: `inc=event-rels` embeds the full event objects, so no extra browse call is needed. Collaborators are still deferred to v2.
+Lookup `artist/{mbid}?inc=aliases+tags+genres+ratings+url-rels+artist-rels+event-rels` → artist/group node → `MEMBER_OF` edges (w5 current / w12 past, with `instruments`, `begin`/`end`/`ended`, `original`). Cascade: members T1, Albums capped at 20 chronological T2, recordings capped at 50 T2, and (v1.1, 2026-06-12) **main-performer events T3 — queued only when the artist itself is a depth-0 seed** (the events enter the queue as depth-1 children, so their own artist fanout stops at depth 2, per the depth model). Event discovery rides the same lookup: `inc=event-rels` embeds the full event objects, so no extra browse call is needed. Collaborators are still deferred to v2. **v1.3 (2026-06-14):** a depth-0 `Person:Music_Artist` is enqueued for [person-resolution](#person-resolution) via `mb/queue/upsert-person-resolution` (13122) — the same depth-0 gate as the event cascade, so only seed artists run it.
 
 </Card>
 
@@ -307,6 +307,70 @@ Graph-driven, idempotent (gated on `embeddings IS NULL`). Selects `:Entity` node
 
 </Card>
 
+## Person-resolution
+
+Built 2026-06-14. The person-side mirror of the label→Company bridge — resolves a `Person:Music_Artist` node to a `master_person` and unlocks the social/people enrichment that MB artists otherwise miss (they carry no `linkedin_url`). A depth-0 `Person:Music_Artist` is enqueued at enrich time; a **standalone cron** drains the queue and, per artist, runs Exa social discovery cross-checked against the MB url-rels + aliases, mints/links a `master_person` carrying **all** verified socials as `master_link` rows (which auto-fire the twitter/instagram/youtube/linkedin scrapers + `social_insights` + influence), `SAME_AS`-bridges `Music_Artist → master_person`, stamps `mb_artist.master_person_id`, annotates the node `social_links`, and sets a serper.dev avatar. Full writeup: [dev update](/guides/dev-updates/2026-06-14-person-resolution). It builds the person half of [Music Reconciliation](/guides/enrichment/waterfall/music-reconciliation) **as a bridge, not a merge**.
+
+<Card icon="cloud-arrow-up">
+
+```
+mvp/music/find-person-social — 13118
+```
+
+Exa social discovery for one person — the mirror of `find-label-domain`. Searches Exa, then classifies the results into `linkedin[]`, `socials[]`, and `others[]` for the orchestrator's cross-check step.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+mvp/music/save-person-avatar — 13119
+```
+
+GCS converter (the avatar-saver pattern): converts the source image to WebP and uploads it to `music-person-avatar/<mbid>.webp`, returning the public GCS URL.
+
+</Card>
+
+<Card icon="cloud-arrow-up">
+
+```
+mvp/music/fetch-person-avatar — 13120
+```
+
+One person, end-to-end — the mirror of `fetch-group-image` (13109) with the gate **inverted to persons** (`artist_type = Person` only). serper.dev images search → saves the avatar → `SET n.image_url` on the `Person:Music_Artist` graph node.
+
+</Card>
+
+<Card icon="play">
+
+```
+mb/run-person-resolution — 13121
+```
+
+The orchestrator. Builds a verification set from `mb_artist.json` (known social URLs from `relations[]`, aliases / legal names from `aliases[]`, area / birth-year / genres) → calls Exa (13118) → **cross-checks** candidates against the MB set to defeat same-name false positives → mints/links a `master_person` via `mvp/get-add/master-person-new` (#13039) passing **all verified socials in `links`** (each written as a `master_link` row, auto-firing the platform scrapers) → stamps `mb_artist.master_person_id` → writes the `SAME_AS` bridge `Music_Artist -w100-> master_person Person` → annotates the node (`SET n.social_links`, `n.social_resolved_at`) + fetches a serper avatar (13120). `hold_downstream = false` (run the full PDL→EnrichLayer people pipeline) **only when a LinkedIn is verified**; `true` otherwise — the social scrapers still fire from the link writes.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+mb/queue/upsert-person-resolution — 13122
+```
+
+Idempotent enqueue into `queue_person_resolution` (#751), keyed on `mbid` — duplicate discovery upgrades the priority tier rather than inserting a second row.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+mb/queue/process-next-person-resolution — 13123
+```
+
+The claim/retry/backoff worker. Picks the next eligible row (skipping rows whose `next_attempt_at` is in the future), locks it, dispatches `mb/run-person-resolution` (13121), and deletes on success. On failure: `retry_count++` with a `next_attempt_at` backoff; the row is dropped after the retry ceiling.
+
+</Card>
+
 ## Operator endpoints
 
 <Card icon="globe">
@@ -332,6 +396,9 @@ Base URL `https://xh2o-yths-38lt.n7c.xano.io/api:P8PNYYKM`. Manual seeding + ope
 | `tool/backfill-group-images` | POST | 8651 | Run a group-photo batch (13111) |
 | `tool/backfill-node-descriptions` | POST | 8652 | Run a node-description + embedding batch (13113) |
 | `tool/backfill-node-embeddings` | POST | 8655 | Run a node-embeddings dual-write batch (13115) — Gemini `embeddings` + `name_embedding` where missing |
+| `tool/run-person-resolution` | POST | 8660 | Run [person-resolution](#person-resolution) directly on one artist (→ `mb/run-person-resolution` 13121) |
+| `tool/peek-person-node` | GET | 8661 | Inspect a resolved person — `master_person_id`, `social_links`, `SAME_AS` bridge |
+| `tool/drain-person-resolution` | POST | 8663 | Manually drain the `queue_person_resolution` queue (→ 13123) |
 
 Every call requires the standard Xano headers — `X-Data-Source` and `X-Branch`:
 
@@ -362,6 +429,16 @@ backfill-music-edge-descriptions — Task 181   (INACTIVE)
 ```
 
 Runs every **300 s**, processing 20 edges per tick through `mb/tool/backfill-music-edge-descriptions` (13097).
+
+</Card>
+
+<Card icon="clock-rotate-left">
+
+```
+process-queue-person-resolution — Task 182   (INACTIVE)
+```
+
+The [person-resolution](#person-resolution) drain — a **standalone cron** (decoupled from the MB queue drain so Exa/serper pacing is independent of MB's 1 req/s budget). Drains **5 rows per tick** via `mb/queue/process-next-person-resolution` (13123). Shipped `active = false`; pausing it is the kill switch.
 
 </Card>
 

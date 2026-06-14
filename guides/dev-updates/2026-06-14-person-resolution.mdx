@@ -1,0 +1,122 @@
+---
+title: "Person-resolution — master_person + master_link bridge for music artists (Exa-gated social/LinkedIn + serper avatar)"
+description: "Session handoff (2026-06-14): Person:Music_Artist nodes now run an async person-resolution pass — Exa finds socials cross-checked against the artist's MB url-rels + aliases; EVERY resolved person is minted/linked as a master_person with all verified socials saved as master_link rows (auto-firing the twitter/instagram/youtube scrapers + social_insights + influence), SAME_AS-bridged to the Music_Artist node, with a verified LinkedIn additionally running the full people pipeline. Plus node social_links annotation + serper.dev avatar. Built + sandbox-verified."
+---
+
+**Session handoff (2026-06-14).** All changes are live in **Xano workspace 3 (OrbiterV2), branch `v1`**, tagged `musicbrainz`, store-verified (re-fetched after each update), and **smoke-tested green on the `sandbox` data source**. This is the person-side mirror of the label→Company bridge from the [previous session](/guides/dev-updates/2026-06-14-label-company-inline-orchestration), and the build of the person half of [Music Reconciliation](/guides/enrichment/waterfall/music-reconciliation) — **as a bridge, not a merge** (see [Design evolution](#design-evolution)).
+
+## The problem
+
+A `Person:Music_Artist` node created during MusicBrainz enrichment never ran the Orbiter **people pipeline** — it's keyed on `linkedin_url`, which MB artists essentially never carry (MB tracks performers, not business identities). So music persons landed in the graph with no avatar, no socials, and no link to the business-side people graph. Person-resolution closes that gap — and, crucially, **the social enrichment (follower scrapers, social_insights, influence) runs off `master_link`, not off LinkedIn**, so it can enrich music persons even without one.
+
+## What shipped this session
+
+### The feature shape (async, Exa-gated, master_person + master_link)
+A depth-0 `Person:Music_Artist` is **enqueued** at enrichment time; a standalone cron worker drains the queue and, per artist:
+
+1. **Builds a verification set** from `mb_artist.json` (no extra MB call): known social URLs from `relations[]` (`target-type == "url"`), aliases / legal names from `aliases[]`, plus area / birth-year / genres / disambiguation.
+2. **Calls Exa** (`mvp/music/find-person-social`) → classifies results into `linkedin[]`, `socials[]`, `others[]`.
+3. **Cross-checks** candidates against the MB set to defeat same-name false positives (the "Winchester 30-30" problem): a non-LinkedIn social is verified by an exact MB url-rel match (host + handle) or an alias-name match in the result title; a LinkedIn hit is verified only with an alias-name match **and** a corroborating signal (verified social, area, or music role / genre in the title).
+4. **Creates/links a `master_person`** via `mvp/get-add/master-person-new` (#13039), passing **all verified socials in `links`** (LinkedIn first, if any). #13039 writes **every** link as a `master_link` row — which **auto-triggers the platform scrapers** (`x.com`→twitter #2106, `instagram.com`→IG #2108, `youtube.com`→YT #12670, `linkedin.com`→LinkedIn #12556) that feed `social_insights` (#12669) and `social_media_influence` / follower counts (#2495). Then stamp `mb_artist.master_person_id` and write a **`SAME_AS` bridge** `Music_Artist -w100-> master_person Person`.
+   - **`hold_downstream`**: `false` when a LinkedIn is verified (run the full PDL→EnrichLayer people pipeline) — `true` otherwise (skip the LinkedIn-only PDL cascade; the social scrapers still fire from the link writes).
+5. **Annotates the node** (`SET n.social_links = [...]`, `n.social_resolved_at`) for graph display, and fetches a **serper.dev avatar** (`fetch-person-avatar`) → `SET n.image_url` (modeled on the group-image flow #13109).
+
+### Decisions locked
+- **Every resolved music person becomes a `master_person`** (when it has at least one verified social or LinkedIn), with all socials saved as `master_link` rows — *not just* the LinkedIn ones. This is what unlocks the social scrapers + insights + influence for the ~95% of artists who have no LinkedIn. (Reverses the earlier "annotate-node-only for non-LinkedIn" decision — the socials carry real downstream enrichment value.)
+- **Attach ALL verified socials** (not just the high-value twitter/IG/YT/LinkedIn) — the low-value ones (spotify/deezer/bandcamp/apple/…) still feed the platform-agnostic Grok `social_insights`. **IMDb** url-rels are also folded in (v2.1) — `create-master-link` classifies `imdb.com` with a real "IMDb" label + `profile:true`. Database/lyrics/purchase/library-authority rels are excluded. Caps: 25 socials extracted, 20 on the node `social_links`, 25 saved as `master_link`.
+- **`SAME_AS` bridge + `master_person_id` stamp for every resolved person.** Node also keeps a `social_links` property (graph display) + serper avatar (immediate node image, independent of the async master_person avatars).
+- **Depth-0 seed artists only** (mirrors the label→Company gate) — controls Exa/scraper spend.
+- **Standalone cron** (not the MB `process-next` drain) so Exa/serper pacing is decoupled from MB's 1 req/s budget. Batch 5/tick.
+
+### Smoke test (sandbox, Daddy Yankee) ✅
+- `action: "linked_social"` (no LinkedIn, socials drove it), **`master_person_id: 7`** created.
+- **16 socials → `master_link` rows** on person 7, correctly normalized + classified: `x.com`→X, `facebook.com`→Facebook, `instagram.com`→Instagram, `youtube.com`→YouTube all `profile:true` (scraper-eligible); spotify/deezer/apple/etc → "Website".
+- **Scrapers fired & stayed on sandbox** — `scrape-twitter-person` added a `youtu.be` link async (`source: "Twitter"`) to person 7 on sandbox (no live pollution; data_source context propagated).
+- **`SAME_AS` bridge** Music_Artist → master_person Person confirmed via `tool/peek-person-node` (`edge: "SAME_AS"`, `same_as_name: "Daddy Yankee"`).
+- Node keeps 12 `social_links` + serper avatar (`…/music-person-avatar/<mbid>.webp`); `mb_artist.master_person_id = 7` stamped.
+- Verification: 17 known hosts/handles + 14 aliases extracted; accents handled (`Ramón…` → `ramon…`); queue → worker → orchestrator → delete-on-success confirmed; the `#13094` hook re-stored with all existing lambdas byte-intact.
+
+## New / changed inventory
+| Item | ID | Note |
+|---|--:|---|
+| `queue_person_resolution` (table) | **751** | clone of `queue_mb_artist`; unique `mbid`, lock + backoff |
+| `mb_artist` +3 cols | 737 | `master_person_id` (→`master_person` 139), `person_avatar_url`, `gcp_person_avatar_url` |
+| `mvp/music/find-person-social` | **13118** | NEW — Exa social discovery (allowlist + classify) |
+| `mvp/music/save-person-avatar` | **13119** | NEW — GCS `music-person-avatar/<mbid>.webp` |
+| `mvp/music/fetch-person-avatar` | **13120** | NEW — serper.dev avatar → `SET n.image_url` (gate: persons only) |
+| `mb/run-person-resolution` | **13121 v2.1** | NEW — orchestrator: verify → create master_person + attach socials (master_link) + SAME_AS → annotate node + avatar (v2.1: +IMDb, raised caps) |
+| `mb/queue/upsert-person-resolution` | **13122** | NEW — idempotent enqueue |
+| `mb/queue/process-next-person-resolution` | **13123** | NEW — claim/retry/backoff worker |
+| `process-queue-person-resolution` (task) | **182** | NEW — standalone cron, **`active=false`**, batch 5 |
+| `mb/run-base-artist-enrich` | **13094 v1.3** | +depth-0 Person enqueue hook |
+| `tool/run-person-resolution` / `peek-person-node` / `drain-person-resolution` | 8660 / 8661 / 8663 | operator endpoints (keepers) |
+| `mvp/get-add/master-person-new` | 13039 | people-pipeline entry — writes every `links[]` URL as a `master_link` (auto-triggers scrapers) |
+| `mvp/link/create-master-link` | 2541 | the link writer #13039 calls; classifies platform, dedups, dispatches the scraper |
+| `mvp/social/.../get-social-insights` / `scrape_creators/influence-summary` | 12669 / 2495 | downstream consumers of `master_link` / scraped socials |
+
+## Design evolution
+[Music Reconciliation](/guides/enrichment/waterfall/music-reconciliation) originally scoped the person side as a **node merge** (dedup the `Music_Artist` into an existing `Person`). We built a **bridge, not a merge**: MB artists have no `linkedin_url`, so there's rarely an existing business Person to merge into. Instead we **mint/link a `master_person`** (carrying the artist's socials), `SAME_AS`-bridge it to the music node, and let the existing social/people enrichment run on it. The label→Company side remains the `SAME_AS` bridge as scoped.
+
+## Remaining (next session)
+1. **Activate the cron** (`process-queue-person-resolution` #182, `active=false`) when ready to drain in production. Pausing it is the kill switch. Note: at scale this mints one `master_person` + a handful of scraper dispatches **per depth-0 seed artist** — size the batch (currently 5/tick) and watch the ScrapeCreators budget.
+2. **Test the LinkedIn route on a real artist-exec** — the no-LinkedIn → master_person path is validated; the verified-LinkedIn path (`hold_downstream=false` → full people pipeline) is validated by construction (same `#13039` call + the proven SAME_AS pattern) but not exercised on a real LinkedIn-carrying artist.
+3. **data_source caution** — the LinkedIn path runs `enrich-master-person` async (FullEnrich); per the Carl→Robert trap, async writeback can default to live. The no-LinkedIn path (`hold_downstream=true`) avoids the FullEnrich cascade; its scrapers stayed on sandbox in the test. Confirm the LinkedIn-path async respects the data source before bulk runs, or pass `data_source` through `#13039`.
+4. **Restore `mb_artist` `filters=trim`** (optional) — the MCP `updateTableSchema` full-replace dropped the trim validators on `mbid`/`name`/`artist_type`/`node_uuid` (data intact). See [XanoScript trap #16](#xanoscript-traps-discovered).
+5. **Event orchestrator `13105`** (carried over) — still needs `finalize(other)` wired on `Music_Event`.
+
+## XanoScript traps discovered
+Captured in `docs/CLAUDE.md` § XanoScript authoring traps:
+- **#16** — MCP `updateTableSchema` (full-schema replace) silently **drops column `filters=trim`/validators** even when passed; data preserved, only the validator lost. No incremental column-add via the MCP.
+- **#17** — a `var` declared + `var.update`'d **outside** a `try_catch` reads back **empty inside** the try block's `api.lambda`s. Compute/assign the var **inside** the same `try` scope where the lambda consumes it. (Silently zeroed `social_count` until the vset extraction was moved into the try.)
+- **#18** — `function.run` targets can store as `""` **even when the callee already exists** (hit on a task create). Re-store the caller after the callee is confirmed; always re-fetch and check the stored target is non-empty.
+- **#19 🔴** — the **Xano CLI `xano workspace push` WIPES a data source's records** (even with `--include` for one table — it re-imports the workspace). Restoring `mb_artist` `filters=trim` via the CLI **emptied the entire `sandbox` data source**; `live`/`staging` survived. `--dry-run` didn't show it. NEVER `workspace push` for a schema edit on a live workspace — use the Xano UI.
+
+---
+
+## Continuation — session 2 (2026-06-14, IN PROGRESS)
+
+Picks up after the v2 (master_person + master_link) build above. **Start a fresh session and read this section first.** Everything is on workspace 3 / branch `v1`.
+
+### Done since v2 (live, store-verified)
+- **`mb_artist` `filters=trim` RESTORED** on mbid/name/artist_type/node_uuid — via the Xano CLI (`xano workspace push -w 3 -b v1 -i "table/mb_artist.xs"`), which pushes XanoScript (carries the filter, unlike the lossy MCP). **⚠️ But that push WIPED the `sandbox` data source** (trap #19) — `mb_artist`/`master_person`/`master_link` on `sandbox` are all at 0. **`live` (6,291 master_persons) + `staging` (1,000 master_persons, 37 mb_artist seeds) are intact — no production loss.** Sandbox is re-seedable via `seed/artist`.
+- **`mvp/music/find-person-social` → v3 (#13118)** — now runs TWO Exa passes: the music pass (socials) **+ a LinkedIn pass** (`"<legal_name||name>" linkedin`, Exa `category: "linkedin profile"`, **`contents.text`** for the profile body). Confirmed it surfaces LinkedIn profiles (8 for "Pharrell Williams") with their text.
+- **`mb/run-person-resolution` → v2.2 (#13121)** — **content-based LinkedIn verification**: a LinkedIn is accepted ONLY if its profile *text* shows a music-identity signal (music-role regex OR the artist's stage name OR a genre); the old `hasVerifiedSocial` shortcut (which false-accepted same-name strangers) is removed. vset now extracts `stage_name` + `legal_name`; `legal_name` is passed to the LinkedIn query. **STORED BUT NOT YET TESTED.**
+- **`tool/peek-find-social` (#8664)** — TEMP diagnostic endpoint (returns find-person-social raw output). **DELETE when done.**
+- **IMDb `IMDb` filter (v2.1)** already folds `imdb.com/name/nm…` into `social_links` + `master_link` (confirmed on will.i.am).
+
+### Key finding — why the LinkedIn route is hard
+Exa LinkedIn results for a famous name are **dominated by same-name strangers** (the 8 "Pharrell Williams" hits were a Texas staffing consultant, a Penn State student, a Sherwin-Williams cashier, etc. — zero music content). Celebrities (Pharrell, will.i.am) have **no findable personal LinkedIn**. So content-verify (v2.2) will correctly **reject** them. The route is genuinely for **niche artist-execs/founders** whose LinkedIn describes their music work. A clean POSITIVE test needs such a person.
+
+### REMAINING WORK (do these in the fresh session)
+
+**1. Wire IMDb cross-enrichment into the orchestrator → v2.3.** Research found the right call: **`mvp/imdb/add-imdb-to-master-person` #10509** (`{master_person_id, imdb_person_url}`) — it enriches an EXISTING master_person (bio/roles/birthday/avatar + queues film/TV credit titles + awards), creating an `imdb_person` (#394) linked by FK, **no duplicate person**. Do NOT use the seed path (`get-add/imdb-person` #12873 / the queue) — it mints a duplicate master_person. Insert this block in `#13121`'s master_person phase, inside `if (($linksAll|count) > 0)`, right after the `linked_linkedin`/`linked_social` action conditional:
+```
+conditional {
+  if ($masterPersonId > 0) {
+    api.lambda {
+      code = "const urls = $var.annotateSocials || []; for (const u of urls) { const s = String(u || '').toLowerCase(); if (s.indexOf('imdb.com/name/nm') !== -1) return u; } return '';"
+      timeout = 5
+    } as $imdbUrl
+    conditional {
+      if (($imdbUrl|is_empty) == false) {
+        function.run "mvp/imdb/add-imdb-to-master-person" {
+          input = { master_person_id: $masterPersonId, imdb_person_url: $imdbUrl }
+          runtime_mode = "async-shared"
+        } as $imdbResult
+      }
+    }
+  }
+}
+```
+(Verify `runtime_mode = "async-shared"` stores correctly — it's the live pattern; if unsure, run sync and note async as a perf follow-up since #10509 does a Firecrawl scrape + LLM.)
+
+**2. Test v2.2 + IMDb on Pharrell.** Sandbox is empty (clean). Seed `149f91ef-1287-46da-9a8e-87fee02f1471` via `POST seed/artist {mbid, queue:false}` (X-Data-Source: sandbox), then `POST tool/run-person-resolution {mb_artist_id, hold_downstream:true}`. **Expect:** `action: "linked_social"`, `verified_linkedin: ""` (the 8 strangers correctly rejected ← the key negative test); a master_person + socials + SAME_AS; and if Pharrell has an `imdb.com/name/nm…` MB rel, an `imdb_person` (#394) row enriched + linked to his master_person.
+
+**3. LinkedIn POSITIVE test** — find a real artist-exec/founder with an active LinkedIn describing their music work + a MusicBrainz entry, seed + run, confirm `action: "linked_linkedin"` + the LinkedIn `master_link` + the people pipeline. (Celebrities won't trigger it — by design.)
+
+**4. Cleanup:** delete `tool/peek-find-social` #8664; the leftover will.i.am person-resolution queue row (from the seed hook) can be drained or deleted.
+
+**5. Carried over:** activate cron #182 when ready; data_source caution on the LinkedIn full-enrich path; event orchestrator #13105.
+
+### Validated this session (sandbox, before the wipe)
+will.i.am → `master_person #1`, 12 socials → `master_link`s (incl IMDb `profile:true`), X/FB/IG/YT scraper-eligible, twitter scraper fired & stayed on sandbox, `SAME_AS` bridge, serper avatar. (His LinkedIn route correctly did not fire — no findable LinkedIn.)

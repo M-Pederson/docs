@@ -6,7 +6,17 @@ description: "Full node reference for the Music Industry Waterfall — every nod
 The complete node catalog for the [Music Industry Waterfall](/guides/enrichment/waterfall/music-industry-waterfall). Each node is keyed on its MusicBrainz `mbid` (`MERGE (n:Label {mbid})`) and is idempotent on re-enrich. Sample data is from live MusicBrainz responses.
 
 <Note>
-**Every node carries the standard envelope.** At a minimum, **all** nodes below are created with `created_at`, `updated_at`, and `description` — plus `uuid`, `mbid`, `display_label`, `visibility`, and `name_embedding`. The natural-language `description` is generated after the structural write (like [edge descriptions](/guides/enrichment/waterfall/music-edges#edge-descriptions)); it is `null` between create and generation.
+**Every node carries the standard envelope.** At a minimum, **all** nodes below are created with `created_at`, `updated_at`, and `description` — plus `uuid`, `mbid`, `display_label`, `visibility`, and the two embedding vectors `name_embedding` + `embeddings`. The natural-language `description` is generated after the structural write (like [edge descriptions](/guides/enrichment/waterfall/music-edges#edge-descriptions)); it is `null` between create and generation. **`Recording` and `Music_Group` additionally carry `image_url`** (the re-hosted GCS image — see [Media](#media-image_url)).
+</Note>
+
+<Note>
+**Dual embeddings (OpenAI → Gemini migration, 2026-06-14).** Every node now carries **two** vectors built from the *same text*:
+- **`name_embedding`** — OpenAI `text-embedding-3-small`, **1536-dim** (`vectors/create-vectors-string` #4676). Indexed today: a single FalkorDB vector index on the `:Entity` base label covers all node types.
+- **`embeddings`** — Google `gemini-embedding-001`, **3072-dim** (`vectors/create-gemini-vectors` #13114). Written but **not yet indexed** — the `:Entity(embeddings)` 3072 vector index is **deferred until OpenAI `name_embedding` is deprecated and removed** (then it gets created and reads cut over).
+
+The embed text is the node `description` for `Recording`/`Music_Group` and `name + disambiguation` for the other eight types. Forward-path writes happen in the node writers (`add-music-label-node`, `add-music-artist-node`) and the description backfill (`backfill-node-descriptions`); existing nodes and the six types with no ingest-time embedding are filled by [`mvp/music/backfill-node-embeddings`](/guides/enrichment/waterfall/music-functions#node-embeddings) (gated on `embeddings IS NULL`).
+
+⚠️ Before this migration, `name_embedding` was in practice only written for **4** node types (`Music_Label`, `Music_Artist`, `Music_Group`, `Recording`) — the six others never received it at ingest despite the envelope claiming otherwise. The embeddings backfill now backfills **both** vectors for all ten.
 </Note>
 
 <Warning>
@@ -25,10 +35,11 @@ SET n.uuid           = coalesce(n.uuid, randomUUID()),
     n.display_label  = "<Label>",
     n.visibility     = true,
     n.description    = <generated summary | null>,
-    n.name_embedding = vecf32($embedding),
+    n.name_embedding = vecf32($embedding),       // OpenAI 1536
+    n.embeddings     = vecf32($geminiEmbedding),  // Gemini 3072
     n.created_at     = coalesce(n.created_at, timestamp()),
     n.updated_at     = timestamp()
-    // … node-specific properties …
+    // … node-specific properties (+ image_url on Recording / Music_Group) …
 ```
 
 | Field | Type | Required | Notes |
@@ -38,7 +49,9 @@ SET n.uuid           = coalesce(n.uuid, randomUUID()),
 | `display_label` | string | ✅ | UI label |
 | `visibility` | boolean | ✅ | UI flag |
 | `description` | string | ✅ | one-paragraph NL summary; `null` until generated |
-| `name_embedding` | vecf32 | ✅ | semantic embedding (name + disambiguation + description) |
+| `name_embedding` | vecf32 | ✅ | **OpenAI** embedding, 1536-dim (`#4676`); indexed on `:Entity` |
+| `embeddings` | vecf32 | ✅ | **Gemini** embedding, 3072-dim (`#13114`); same text as `name_embedding`; index deferred |
+| `image_url` | string | Recording / Music_Group | re-hosted GCS image URL; `null` when no image — see [Media](#media-image_url) |
 | `created_at` | timestamp | ✅ | `coalesce(n.created_at, timestamp())` |
 | `updated_at` | timestamp | ✅ | `timestamp()` on every write |
 
@@ -114,8 +127,9 @@ A band, orchestra, choir, or other non-person act — a **new** node type (never
 | `genres` | string (csv) | curated — `grunge, alternative rock, noise rock`; also written as `HAS_GENRE` edges to `Genre` nodes (weight 100) |
 | `tags` | string (csv) | free-form folksonomy — **property only, never edges** ([decided](/guides/enrichment/waterfall/music-industry-waterfall#resolved-design-decisions-2026-06-11)) |
 | `disambiguation` | string | `1980s–1990s US grunge band` |
+| `image_url` | string | re-hosted GCS band photo (`music-group-image/<mbid>.webp`); `null` when none found. Sourced from `mb_artist.gcp_music_group_image_url` — see [Media](#media-image_url) |
 | `description` | string | _generated_ |
-| `visibility` · `name_embedding` · `created_at` · `updated_at` | | standard envelope |
+| `visibility` · `name_embedding` · `embeddings` · `created_at` · `updated_at` | | standard envelope (dual vectors) |
 
 <Accordion title="Real example — Nirvana">
 ```json
@@ -158,8 +172,9 @@ A specific audio capture (one performance of a `Work`).
 | `isrcs` | string (csv) | recording identifiers |
 | `first_release_date` | string | `1991-09-10` |
 | `genres` | string (csv) | |
+| `image_url` | string | re-hosted GCS cover art (`music-cover-art/<mbid>.webp`); `null` when no art found. Sourced from `mb_recording.gcp_cover_art_url` — see [Media](#media-image_url) |
 | `description` | string | _generated_ |
-| `uuid` · `display_label` · `visibility` · `name_embedding` · `created_at` · `updated_at` | | envelope |
+| `uuid` · `display_label` · `visibility` · `name_embedding` · `embeddings` · `created_at` · `updated_at` | | envelope (dual vectors) |
 
 <Accordion title="Real example — Smells Like Teen Spirit (recording)">
 ```json
@@ -412,6 +427,21 @@ A controlled-vocabulary hub node (every `HAS_GENRE` edge points here at weight 1
 
 ---
 
+## Media (`image_url`)
+
+Two node types carry a re-hosted image on an **`image_url`** property — matching the `film_tv.image_url` convention on the IMDb side. The value is always the **GCS-hosted WebP** (never the raw external URL, which is retained only on the `mb_*` source row), and it is **explicitly `null` when no image is available** so the property is always present.
+
+| Node | Source field (`mb_*`) | GCS path | Raw source |
+|---|---|---|---|
+| `Recording` | `mb_recording.gcp_cover_art_url` (#738) | `music-cover-art/<mbid>.webp` | Cover Art Archive (`cover_art_url`) |
+| `Music_Group` | `mb_artist.gcp_music_group_image_url` (#737) | `music-group-image/<mbid>.webp` | serper.dev image search (`music_group_image_url`) |
+
+Example value: `https://storage.googleapis.com/<bucket>/music-cover-art/<mbid>.webp` (bucket is environment-specific, e.g. `orbiter-sandbox`).
+
+The node `image_url` is set by the [image fetch functions](/guides/enrichment/waterfall/music-functions#cover-art--group-images) (`fetch-recording-cover-art` 13108, `fetch-group-image` 13109): right after the GCS URL is stamped on the source row, a Cypher `SET n.image_url` writes the node (non-fatal; also self-heals on the `already_done` path so re-running a row catches up existing nodes). When no art/image is found, the same path sets `n.image_url = null`.
+
+---
+
 ## Summary — all node types
 
 | Node | Labels | Seed? | `description` | Reconciles to |
@@ -427,4 +457,4 @@ A controlled-vocabulary hub node (every `HAS_GENRE` edge points here at weight 1
 | Place | `Entity:Place` (+`:Studio`/`:Venue`) | inline | ✅ | — |
 | Genre | `Entity:Genre` | inline | ✅ | — |
 
-**10 node types.** All 10 carry `created_at`, `updated_at`, and `description` (plus `uuid`, `mbid`, `display_label`, `visibility`, `name_embedding`) — the [standard envelope](#standard-node-envelope) — on top of their type-specific properties.
+**10 node types.** All 10 carry `created_at`, `updated_at`, `description`, and **both** embedding vectors — `name_embedding` (OpenAI, 1536) + `embeddings` (Gemini, 3072) — plus `uuid`, `mbid`, `display_label`, `visibility` (the [standard envelope](#standard-node-envelope)) on top of their type-specific properties. `Recording` and `Music_Group` additionally carry [`image_url`](#media-image_url). The Gemini `embeddings` 3072-dim vector index is **deferred** until the OpenAI `name_embedding` is deprecated and removed.

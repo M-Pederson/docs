@@ -75,7 +75,7 @@ Branching: **sync-enrich** (invoke the orchestrator directly) when `cascade_dept
 mb/node/add-music-label-node — 13090
 ```
 
-MERGEs the `Entity:Music_Label` node on `mbid` with the full property set from the [node spec](/guides/enrichment/waterfall/music-nodes), including a `name_embedding` vecf32.
+MERGEs the `Entity:Music_Label` node on `mbid` with the full property set from the [node spec](/guides/enrichment/waterfall/music-nodes), including **both** embedding vecf32s — `name_embedding` (OpenAI #4676) and `embeddings` (Gemini #13114) — built from `name + disambiguation` (v1.2, dual-write for the migration).
 
 </Card>
 
@@ -85,7 +85,7 @@ MERGEs the `Entity:Music_Label` node on `mbid` with the full property set from t
 mb/node/add-music-artist-node — 13092
 ```
 
-Splits on MusicBrainz `type`: a `Person` artist becomes `Entity:Person:Music_Artist`; `Group` / `Orchestra` / `Choir` / etc. become `Entity:Music_Group`. Stamps `artist_type` back onto the `mb_artist` row so the post-ingest reconciliation pass can select person-type artists without parsing `json`.
+Splits on MusicBrainz `type`: a `Person` artist becomes `Entity:Person:Music_Artist`; `Group` / `Orchestra` / `Choir` / etc. become `Entity:Music_Group`. Writes **both** `name_embedding` (OpenAI #4676) and `embeddings` (Gemini #13114) from `name + disambiguation` (v1.2). Stamps `artist_type` back onto the `mb_artist` row so the post-ingest reconciliation pass can select person-type artists without parsing `json`.
 
 </Card>
 
@@ -240,7 +240,7 @@ GCS converters (the IMDB poster-saver pattern, #13044). Each regex-extracts the 
 mvp/music/fetch-recording-cover-art — 13108
 ```
 
-One recording, end-to-end: skip if `gcp_cover_art_url` already set → **1 throttled MB lookup** `recording/{mbid}?inc=releases` → Cover Art Archive JSON (`coverartarchive.org/release/{id}`) for up to 5 releases, `Official` first → saves `cover_art_url` (500px thumbnail preferred, `https`-normalized) → 13104 → saves `gcp_cover_art_url`. `no_art` rows stay null and are re-checked on later runs.
+One recording, end-to-end: skip if `gcp_cover_art_url` already set → **1 throttled MB lookup** `recording/{mbid}?inc=releases` → Cover Art Archive JSON (`coverartarchive.org/release/{id}`) for up to 5 releases, `Official` first → saves `cover_art_url` (500px thumbnail preferred, `https`-normalized) → 13104 → saves `gcp_cover_art_url`. **v1.3 (2026-06-14):** after stamping the GCS URL it writes `SET n.image_url` on the `Recording` graph node via `send-cypher` (non-fatal; the `already_done` skip path *also* self-heals the node, so re-driving an imaged row catches it up). `no_art` → `SET n.image_url = null` on the node and the row is re-checked on later runs.
 
 </Card>
 
@@ -250,7 +250,7 @@ One recording, end-to-end: skip if `gcp_cover_art_url` already set → **1 throt
 mvp/music/fetch-group-image — 13109
 ```
 
-One group, end-to-end (**groups only** — `artist_type = Person` rows are skipped): skip if `gcp_music_group_image_url` set → serper.dev images search (`q = "<name> band <disambiguation>"`, key from env `SERPER_DEV`, same call shape as `mvp/enrich/find-avatar` 12846) → saves `music_group_image_url` (first result) → 13107 → saves `gcp_music_group_image_url`.
+One group, end-to-end (**groups only** — `artist_type = Person` rows are skipped): skip if `gcp_music_group_image_url` set → serper.dev images search (`q = "<name> band <disambiguation>"`, key from env `SERPER_DEV`, same call shape as `mvp/enrich/find-avatar` 12846) → saves `music_group_image_url` (first result) → 13107 → saves `gcp_music_group_image_url`. **v1.3 (2026-06-14):** writes `SET n.image_url` on the `Music_Group` graph node after the GCS stamp (non-fatal; self-heals on the `already_done` path); `no_image` → `SET n.image_url = null`. `serper_error` is transient and leaves the node untouched for retry.
 
 </Card>
 
@@ -289,7 +289,21 @@ The reasoning flag is load-bearing: deepseek-v4-flash is a reasoning model, and 
 mvp/music/backfill-node-descriptions — 13113
 ```
 
-Batch drainer (default 10, clamped 1–50; `kind` = `recording` / `music_group` / empty for both). **Source-table-driven selection** (stub-proof — graph-side `description IS NULL` would loop forever on un-enriched stub nodes): rows with `enrich_success`, a `node_uuid`, and `description_generated_at IS NULL`. Per node: use MB `annotation`/`disambiguation` when ≥ 40 chars (as `"<name> — <text>"`), else 13112 → embed the **final** description via `vectors/create-vectors-string` (4676, string spliced into `vecf32(...)`) → one Cypher `SET n.description, n.description_generated_at (ISO), n.updated_at, n.name_embedding` → stamp the source row. `send-cypher` string returns are thrown as `CYPHER_ERROR`; failures log phase `node_description`.
+Batch drainer (default 10, clamped 1–50; `kind` = `recording` / `music_group` / empty for both). **Source-table-driven selection** (stub-proof — graph-side `description IS NULL` would loop forever on un-enriched stub nodes): rows with `enrich_success`, a `node_uuid`, and `description_generated_at IS NULL`. Per node: use MB `annotation`/`disambiguation` when ≥ 40 chars (as `"<name> — <text>"`), else 13112 → embed the **final** description via **both** `vectors/create-vectors-string` (#4676 → `name_embedding`, 1536) **and** `vectors/create-gemini-vectors` (#13114 → `embeddings`, 3072) → one Cypher `SET n.description, n.description_generated_at (ISO), n.updated_at, n.name_embedding [, n.embeddings]` → stamp the source row. `send-cypher` string returns are thrown as `CYPHER_ERROR`; failures log phase `node_description`. **v1.2 (2026-06-14):** dual-writes the Gemini `embeddings`; both fns surface as a JS array in lambda context, so each is `JSON.stringify`'d into `vecf32(...)` (the old `String(...).startsWith('[')` check was removed — it would now throw on every row).
+
+</Card>
+
+## Node embeddings
+
+Built 2026-06-14. Dual-write of the Gemini `embeddings` vector (and OpenAI `name_embedding` where missing) so every music node carries **both** vectors during the OpenAI → Gemini migration. The four ingest-time writers (13090, 13092, 13113) handle the forward path for `Music_Label` / `Music_Artist` / `Music_Group` / `Recording`; this backfill catches up existing nodes and the six types with no ingest-time embedding.
+
+<Card icon="clock-rotate-left">
+
+```
+mvp/music/backfill-node-embeddings — 13115
+```
+
+Graph-driven, idempotent (gated on `embeddings IS NULL`). Selects `:Entity` nodes carrying one of the 10 music labels (`label` input optionally restricts to one), builds embed text — the node `description` for `Recording`/`Music_Group`, else `name + disambiguation` — then computes `embeddings` via #13114 (always) and `name_embedding` via #4676 (only when the node lacks it, so it never clobbers the description-based one on `Recording`/`Music_Group`). One `SET n.embeddings [, n.name_embedding]` Cypher per node, matched on `uuid`. Both embedding fns return a JS array in lambda context → `JSON.stringify`'d into `vecf32(...)`. Per-row `try_catch` → `log_crash` phase `node_description` (`node_embedding` is not in the strict phase enum). **No vector index is created** — the `:Entity(embeddings)` 3072 index is deferred to OpenAI deprecation.
 
 </Card>
 
@@ -317,6 +331,7 @@ Base URL `https://xh2o-yths-38lt.n7c.xano.io/api:P8PNYYKM`. Manual seeding + ope
 | `tool/backfill-cover-art` | POST | 8650 | Run a recording cover-art batch (13110) |
 | `tool/backfill-group-images` | POST | 8651 | Run a group-photo batch (13111) |
 | `tool/backfill-node-descriptions` | POST | 8652 | Run a node-description + embedding batch (13113) |
+| `tool/backfill-node-embeddings` | POST | 8655 | Run a node-embeddings dual-write batch (13115) — Gemini `embeddings` + `name_embedding` where missing |
 
 Every call requires the standard Xano headers — `X-Data-Source` and `X-Branch`:
 

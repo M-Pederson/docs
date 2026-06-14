@@ -1,0 +1,73 @@
+---
+title: "Music waterfall — label→Company, image_url, Gemini dual-embeddings, inline orchestration"
+description: "Session handoff (2026-06-14): Music_Label nodes now run the company pipeline (Exa domain → master_company → SAME_AS); Recording/Music_Group carry image_url; all 10 node types dual-write OpenAI name_embedding + Gemini embeddings; media/descriptions/embeddings now created inline at orchestration. Resume point + remaining work."
+---
+
+**Session handoff (2026-06-14).** All changes are live in **Xano workspace 3 (OrbiterV2), branch `v1`**, tagged `musicbrainz`, store-verified (re-fetched after each update), and **smoke-tested green on the sandbox data source**. Builds on the [Music Industry Waterfall](/guides/enrichment/waterfall/music-industry-waterfall). The earlier `image_url` + Gemini-embeddings doc edits are already committed; the **detail-page docs for the label→Company + inline-orchestration work below are NOT yet written** (see [Remaining](#remaining-next-session)).
+
+## What shipped this session
+
+### 1. `image_url` on Recording + Music_Group (committed in docs)
+`fetch-recording-cover-art` (**13108 v1.3**) and `fetch-group-image` (**13109 v1.3**) now `SET n.image_url` on the graph node (GCS URL) after stamping the source row — non-fatal, self-heals on `already_done`, and `no_art`/`no_image` → `SET n.image_url = null`. Source fields: `mb_recording.gcp_cover_art_url`, `mb_artist.gcp_music_group_image_url`.
+
+### 2. Gemini dual-embeddings on all 10 node types (committed in docs)
+Every music node carries **both** `name_embedding` (OpenAI `text-embedding-3-small`, 1536, `#4676`) **and** `embeddings` (Gemini `gemini-embedding-001`, 3072, `vectors/create-gemini-vectors` **#13114**), same text.
+- Inline at ingest: `add-music-label-node` (**13090 v1.2**), `add-music-artist-node` (**13092 v1.2**), `backfill-node-descriptions` (**13113 v1.2**, description-based for Recording/Music_Group).
+- Catch-up + greenfield types: `mvp/music/backfill-node-embeddings` (**13115**) + endpoint `POST tool/backfill-node-embeddings` (**8655**). Gated on `embeddings IS NULL`.
+- **The `:Entity(embeddings)` 3072 vector index is DEFERRED** until OpenAI `name_embedding` is deprecated/removed. `embeddings` is written unindexed until then.
+
+### 3. Label → Company (NEW — verified on staging + sandbox)
+`mb/run-base-label-enrich` (**13091 v1.2**) gained a **depth-0-only `mb_company` phase**: resolve a domain (MB `official homepage` url-rel → else **Exa** via `mvp/music/find-label-domain` **#13116**) → `mvp/get-add/master-company-new` (**#12558**, full company pipeline) → stamp `mb_label.master_company_id` → write a **`SAME_AS` bridge** (`Music_Label` —w100→ `Company`).
+- New helper `find-label-domain` (**13116**): context-rich Exa search (name + "music record label" + type + area) → bare domain; filters directory/social/streaming hosts.
+- Verified: **Cinq Music Group LLC → `cinqmusicgroup.com` → master_company #7190 → SAME_AS → Company node**.
+- Topology decision: **SAME_AS bridge** (not a single dual-labeled node — `get-add/master-company-new` creates its own `Company` node). Gated to seed labels (`depth 0`) so a drain's discovered labels don't each fire the full company pipeline.
+
+### 4. Inline at orchestration (NEW — "one drain = complete graph")
+New helper `mvp/music/finalize-music-node` (**#13117**): for a node, composes **image** (recording/group) + **description** (recording/group, MB annotation/disambiguation ≥40 else LLM #13112) + **dual vectors**; for `other` types it writes name+disambiguation dual vectors. Wired into:
+- `mb/run-base-artist-enrich` (**13094 v1.2**) — `Music_Group` → finalize(music_group) [image+desc+vectors]; Person artists keep their 13092 vectors (no music image/description).
+- `mb/run-base-recording-enrich` (**13100 v1.1**) — finalize(recording) [cover art + desc + vectors].
+- `mb/run-base-work-enrich` (**13101 v1.1**) — finalize(other) on the Work node.
+- `mb/run-base-release-group-enrich` (**13099 v1.1**) — finalize(other) on Release_Group + the canonical Release.
+- **NOT wired yet:** `mb/run-base-event-enrich` (**13105**) — see Remaining.
+- `Place`/`Genre` (secondary, embeddings-only, name-keyed) are covered by the `backfill-node-embeddings` (13115) catch-up, not inline.
+
+### Smoke test (sandbox, clean) ✅
+Seeded Cinq label + Daddy Yankee + Farruko + Jowell & Randy:
+- **Cinq** → `SAME_AS` → Company (`cinqmusicgroup.com`) + master_company + company pipeline ✅
+- **Jowell & Randy** (`Music_Group`) → image + description + `name_embedding` + `embeddings`, all inline ✅
+- **Daddy Yankee, Farruko** (`Person:Music_Artist`) → both vectors; no music image/description (correct) ✅
+
+## Decisions locked
+- Label→Company = **SAME_AS bridge**, depth-0 labels only.
+- Domain discovery = **Exa** (`find-label-domain`), context-rich query; the company pipeline's own canonical-domain correction validates downstream.
+- **Inline everything** (images + descriptions + embeddings) at orchestration; backfills remain as catch-up.
+- Gemini 3072 vector index **deferred** to OpenAI deprecation.
+- Person-resolution gate = **any verifiable social** (see below).
+
+## Remaining (next session)
+1. **Event orchestrator `13105`** — wire `finalize(other)` on the `Music_Event` node (+ optionally a Place finalize loop), to match the other orchestrators. Embeddings-only; also covered by the 13115 backfill, so lowest priority.
+2. **Person-resolution feature (async, Exa-gated, "any verifiable social")** — the person-side mirror of label→Company. When a `Person:Music_Artist` is created, the people pipeline isn't run (it needs `linkedin_url`). Build:
+   - an Exa "find person social" helper (by name + "musician" + disambiguation context) that returns a **verified** social link (cross-check against the artist's MB url-rels/aliases to avoid same-name false positives);
+   - an **async** queue/worker: if a verified **LinkedIn** → `mvp/get-add/master-person-new` (**#13039**, full person pipeline) + `SAME_AS` (`Person:Music_Artist` → master_person `Person`); if a verified **non-LinkedIn** social (official/IG/X/Spotify) → a lighter Person link (the person pipeline can't fully run without LinkedIn).
+   - Caveat: pure performers rarely have LinkedIn → few qualify (desired gate); shines for artist-execs/founders (the GoDigital "business side" bridge).
+3. **Detail-page docs** for the label→Company + inline-orchestration + `find-label-domain` + `finalize-music-node` work (music-nodes / music-functions / music-tables + a new label→Company section). The `image_url` + embeddings pages are already updated.
+4. After deep drains, run `tool/backfill-node-embeddings` (8655) for Place/Genre/stub embedding catch-up.
+
+## New / changed inventory
+| Item | ID | Note |
+|---|--:|---|
+| `mvp/music/find-label-domain` | **13116** | NEW — Exa name→domain |
+| `mvp/music/finalize-music-node` | **13117** | NEW — inline image+desc+vectors |
+| `mvp/music/backfill-node-embeddings` | **13115** | NEW — embeddings catch-up (+ endpoint `tool/backfill-node-embeddings` 8655) |
+| `mb/run-base-label-enrich` | 13091 v1.2 | +company phase (Exa→#12558→SAME_AS) |
+| `mb/run-base-artist-enrich` | 13094 v1.2 | +group finalize |
+| `mb/run-base-recording-enrich` | 13100 v1.1 | +recording finalize |
+| `mb/run-base-work-enrich` | 13101 v1.1 | +work finalize |
+| `mb/run-base-release-group-enrich` | 13099 v1.1 | +RG/Release finalize |
+| `mb/run-base-event-enrich` | 13105 | **finalize NOT wired (remaining)** |
+| `add-music-label-node` / `add-music-artist-node` / `backfill-node-descriptions` | 13090 v1.2 / 13092 v1.2 / 13113 v1.2 | Gemini dual-embedding |
+| `fetch-recording-cover-art` / `fetch-group-image` | 13108 v1.3 / 13109 v1.3 | node `image_url` SET |
+| `mvp/get-add/master-company-new` | 12558 | company entry (returns `{master_company_id, node_uuid, …}`) |
+| `mvp/get-add/master-person-new` | 13039 | person entry (needs `linkedin_url`) — for person-resolution |
+
+XanoScript traps discovered this session are in `docs/CLAUDE.md` § XanoScript authoring traps: **#8** (`vectors/create-vectors-string` surfaces as an ARRAY inside lambdas), **#14** (a bare filter-chain in `if()` doesn't evaluate truthy), **#15** (FalkorDB vector indexes are on the `:Entity` base label).

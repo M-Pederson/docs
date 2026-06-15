@@ -1,0 +1,64 @@
+---
+title: "Recording cover-art fallback — Deezer → iTunes → Serper"
+description: "Cover Art Archive alone left ~9% of recordings imageless (24/280 on the Cinq staging run), mostly obscure alternate versions lacking ISRCs. A tiered fallback (Deezer ISRC → Deezer search → iTunes → serper.dev) wired into fetch-recording-cover-art recovered all 24 → 100% cover coverage on staging, with per-node provenance."
+---
+
+**Session (2026-06-15).** Closes the cover-art gap surfaced by the [Cinq staging run](/guides/dev-updates/2026-06-15-cinq-staging-smoke-test) (256/280 recordings had cover art). All changes live in **Xano workspace 3, branch `v1`**, validated on the **staging** data source.
+
+## The gap
+
+`fetch-recording-cover-art` #13108 pulled cover art from **Cover Art Archive only** (community-uploaded, keyed on the recording's MusicBrainz releases). When none of the top-5 releases had a CAA image it set `image_url = null`. On the Cinq run that was **24 of 280** — and they were overwhelmingly **obscure alternate versions** (live/remix/instrumental/promo "call out hooks"/`(silence)`/`[untitled]`) that have no commercial release, so **23 of 24 also lacked an ISRC**.
+
+Empirically (tested against the actual 24), text search by *artist + title* still recovers an official album cover for most, because the track exists on streaming as its parent/studio version. **Wikipedia/Commons was a dead end** for this catalog (no articles for individual reggaeton tracks; covers are non-free, not on Commons), so it was deliberately skipped.
+
+## What shipped
+
+<Card icon="layer-group">
+
+```
+mvp/music/find-cover-art-fallback — 13127
+```
+
+The fallback chain, in one async lambda. Returns `{ url, source }` on the first hit:
+1. **Deezer by ISRC** → `api.deezer.com/track/isrc:…` → exact official album art (`deezer_isrc`)
+2. **Deezer text search** (artist + title) → `album.cover_xl` 1000px (`deezer_search`)
+3. **iTunes/Apple Search** (artist + title) → `artworkUrl` upscaled to 600px (`itunes`)
+4. **serper.dev images** (artist + title + "album cover") → last resort (`serper`)
+
+Deezer and iTunes need **no auth**; Serper uses `$env.SERPER_DEV`. Each fetch is try/catch-isolated.
+
+</Card>
+
+<Card icon="cloud-arrow-up">
+
+```
+mvp/music/fetch-recording-cover-art — 13108   (v1.4)
+```
+
+When the Cover Art Archive loop comes up empty, calls the helper with the recording's artist-credit + first ISRC (now pulled in the **same** MB lookup via `inc=releases+isrcs+artist-credits` — no extra rate-limited call). The resolved URL re-hosts through the existing `save-cover-art` #13104 WebP→GCS path exactly like a CAA hit, and the node is stamped with a **`cover_art_source`** provenance property (`caa | deezer_isrc | deezer_search | itunes | serper`), or `null` when nothing is found.
+
+</Card>
+
+No table schema changed — provenance lives only on the graph node.
+
+## Validation (staging — the 24 Cinq gaps)
+
+Re-ran the cover-art backfill over the `gcp_cover_art_url == null` recordings:
+
+```
+candidates: 24 · processed: 24 · saved: 24 · errors: 0
+```
+
+| Coverage | Before | After |
+| --- | --- | --- |
+| Recordings with cover art | 256 / 280 | **280 / 280** |
+
+Tier breakdown of the recovered 24: `deezer_search` 10 · `itunes` 10 · `serper` 3 · `caa` 1 (resolved on the enriched re-lookup). All re-hosted to GCS WebP (`music-cover-art/<mbid>.webp`).
+
+The 3 `serper` hits are exactly the non-resolvable junk (`[untitled]`, `(silence)`, "call out hook") — they got a plausible generic album image, and the provenance tag makes them auditable / re-pullable if a stricter rule is wanted later.
+
+## Notes
+
+- **Forward path:** every newly-enriched recording now runs the fallback automatically when CAA misses, so the gap won't recur.
+- **Backfill:** `tool/backfill-cover-art` / #13110 (`gcp_cover_art_url == null`) reprocesses historical gaps through the new chain.
+- **Precision lever:** if the `serper` tier proves too loose for junk titles, gate it behind a title-quality check, or fall back to the parent **release-group (album)** cover instead — `cover_art_source = serper` rows are the audit set.

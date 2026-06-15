@@ -1,0 +1,99 @@
+---
+title: "Forward-path Gemini embeddings on business Person / Company nodes"
+description: "The OpenAI→Gemini dual-embedding migration extends from the music graph to the business graph: all four business node writers (add/update × person/company) now dual-write name_embedding (OpenAI 1536) + embeddings (Gemini 3072) on every new/synced node. Forward-path only — no backfill (per directive). Built + sandbox-verified 2026-06-15."
+---
+
+**Session (2026-06-15, PM).** All changes live in **Xano workspace 3 (OrbiterV2), branch `v1`**, store-verified and **sandbox-verified end-to-end**. Picks up the one open task flagged in the [music-hardening handoff](/guides/dev-updates/2026-06-15-music-hardening-and-gemini-handoff#-next-session--add-gemini-embeddings-3072-to-person--company).
+
+<Note>
+**Scope:** forward path only. Mark's directive was *"only implement for nodes moving forward — no backfill."* So every **new or re-synced** business `Person` / `C_Suite` / `Company` node now gets the Gemini `embeddings` vector; the ~6,291 existing `master_person` + company nodes that predate this are **untouched** (they keep `name_embedding`, still `embeddings IS NULL`). A backfill remains deferred — see [What's not done](#whats-not-done).
+</Note>
+
+## The gap this closes
+
+The [music dual-embedding migration](/guides/enrichment/waterfall/music-nodes#embeddings-per-node-type) (2026-06-14) was scoped to the **10 music node types only**. Business-side nodes carried **`name_embedding`** (OpenAI `text-embedding-3-small`, 1536) but **not** the Gemini **`embeddings`** (`google/gemini-embedding-001`, 3072). This session wires the Gemini vector into the four business node writers, using the **same embed text** each already used for `name_embedding`, so the two vectors stay comparable.
+
+## What shipped
+
+<Card icon="cloud-arrow-up">
+
+```
+vectors/create-gemini-vectors-string — 13125
+```
+
+**New shared helper.** A drop-in sibling of `vectors/create-vectors-string` (#4676) with the **identical contract — text in, a Cypher-ready bracket-string `"[f,f,…]"` out** (or `null` on empty/failure). Internally calls `vectors/create-gemini-vectors` (#13114, which returns a raw 3072-float array) and normalizes it to a rounded bracket-string. Because its output type is identical to #4676's, it renders through `vecf32({{…}})` in `util.template_engine` with proven-identical behavior. **Never throws** — a Gemini outage returns `null` so callers can gate the line and still write `name_embedding`.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+mvp/node/add-person-node — 2601   (v1.9)
+```
+
+Person CREATE (lambda-built `MERGE`). Adds the helper call (text = the person name) and the gated `p.embeddings = vecf32(…)` to **both** `ON CREATE SET` and `ON MATCH SET`.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+mvp/node/update-person-node — 2758   (v1.5)
+```
+
+Person SYNC (`util.template_engine` SET). Embed text = `bio_500 → bio → name` (same as `name_embedding`). Gated `n.embeddings` line added to the template.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+mvp/node/add-company-node — 2602   (v1.5)
+```
+
+Company CREATE (`util.template_engine` CREATE-map, active **v4** template). Embed text = `company_name`. Gated `embeddings:` property added; the disabled `!`-prefixed v3 template left untouched.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+mvp/node/update-company-node — 4659   (v1.7)
+```
+
+Company SYNC (`util.template_engine` SET, active **v2** template). Embed text = `about_500 → company_domain`. Gated `n.embeddings` line added between `name_embedding` and `updated_at`.
+
+</Card>
+
+## Design — why one helper, not four inline lambdas
+
+The four writers split across two Cypher-building styles: one builds the query in an `api.lambda` (`add-person-node`), three use `util.template_engine`. Rather than duplicate a 3072-float normalizer four times (and risk the `\x00` / `\n` heredoc-escape traps on each), the work funnels through **one helper whose response is byte-for-byte the same shape as the proven `name_embedding` path**:
+
+- **Template callers** splice `vecf32({{$var.geminiVecString}})` exactly as they already splice `name_embedding` — the helper returns a real bracket-string, which `util.template_engine` renders **with** brackets.
+- **The lambda caller** reads the helper's response as `$var.geminiVecString`; Xano auto-parses the bracket-string back into a JS array (the [#8 embedding trap](/guides/enrichment/waterfall/music-functions#node-embeddings)), so it `JSON.stringify`s it just like `name_embedding`.
+
+Every `embeddings` write is **gated** (`{% if … is not null %}` / `if (gemArg)`), so a Gemini miss degrades to `name_embedding`-only and the node still writes — it can never regress a node creation that succeeds today.
+
+## Gotchas resolved this session
+
+- **Does a bracket-string render with brackets through `util.template_engine`?** Yes — proven live: `vecf32({{$var.geminiVecString}})` rendered `vecf32([-0.0007526…])` with the opening `[` and closing `]),` intact, and the `{% if … is not null %}` gate included/excluded the line cleanly. (The existing `name_embedding` path already relied on this; now confirmed directly.)
+- **Do JS-escape sequences survive the MCP serializer round-trip?** Yes — a throwaway probe confirmed `\x00` regexes and `\n` joins authored with **single** backslashes store correctly (they appear double-escaped only in the JSON view). This unblocked editing the four functions in place.
+- **`vecf32` props don't render in graph browsers** (carried from the prior handoff) — verified via `RETURN n.embeddings` through `tool/run-cypher`, not the node inspector.
+
+## Verification — sandbox end-to-end
+
+Throwaway `master_company` / `master_person` rows were created on the **sandbox** data source, run through the CREATE then SYNC writer, and the resulting graph node's vectors measured via `mvp/falkor/send-cypher`. All four writers, both phases:
+
+| Writer | Cypher style | `name_embedding` | `embeddings` (Gemini) |
+| --- | --- | --- | --- |
+| `add-company-node` #2602 | template CREATE (v4) | 1536 | **3072** |
+| `update-company-node` #4659 | template SET (v2) | 1536 | **3072** |
+| `add-person-node` #2601 | lambda `MERGE` | 1536 | **3072** |
+| `update-person-node` #2758 | template SET | 1536 | **3072** |
+
+`name_embedding` stays 1536 (OpenAI, unchanged); `embeddings` lands at 3072 (Gemini) on every path. Temp test endpoint + probe function were deleted after verifying. (Two throwaway sandbox rows — `master_company` "Gemini Embed Test Co", `master_person` "Gemini Embed Test Person" — were left in the sandbox data source; their graph nodes were `DETACH DELETE`d.)
+
+## What's not done
+
+- **Backfill (deferred, by directive).** Existing business nodes still have `embeddings IS NULL`. When a backfill is wanted, the music `mvp/music/backfill-node-embeddings` (#13115) is the template — widen its label set to `Person` + `Company` (minding its embed-text branch), or write a people-side backfill; gate on `embeddings IS NULL`. Scale check first: ~6,291 `master_person` rows + companies.
+- **The `:Entity(embeddings)` 3072 vector index stays DEFERRED** (write unindexed until the OpenAI `name_embedding` is deprecated) — unchanged from the music migration. The property is stored, just not yet KNN-searchable.

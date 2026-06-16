@@ -1,0 +1,93 @@
+---
+title: "Music node descriptions — fixed, extended to artists, strict ≤127 (table + node + vectors)"
+description: "The node-description feature was ~99% broken (275/279 recording descriptions were 'please provide the record' LLM echoes) and skipped persons entirely. Root cause: the generator dumped raw MusicBrainz JSON truncated at 8000 chars. Rebuilt it with a slim type-aware field-set + strict ≤127-char output, extended it to Music_Artist, store the description on the source table + node, and rebuild the vectors from that description. Staging backfilled (live not yet deployed)."
+---
+
+**Session (2026-06-16).** All changes live in **Xano workspace 3, branch `v1`**, validated in **sandbox**, then backfilled on the **staging** data source (live not deployed yet). The graph node `description` is the embedding source, so fixing it also repairs the vectors.
+
+## The problem
+
+Two things were wrong with music node descriptions:
+
+1. **~99% garbage.** `create-node-description` #13112 built the LLM input by dumping the **raw MusicBrainz JSON sliced to 8000 chars** — which cut big records mid-object, so deepseek replied *"Please provide the MusicBrainz record."* On the staging Cinq fixture **275 of 279** recording descriptions were that echo; only small records (less-famous duos) came out clean.
+2. **Persons had none.** `run-base-artist-enrich` #13094 only called the finalizer for **groups** — `Person:Music_Artist` nodes were skipped (0/146 had a description) and kept their name+disambiguation vectors.
+
+And because **the description is the embedding source** for recordings/groups, those ~275 recordings had their `name_embedding` + Gemini `embeddings` computed from the string *"Please provide the MusicBrainz record"* — near-identical, useless vectors.
+
+## What shipped
+
+<Card icon="filter">
+
+```
+mvp/music/create-node-description — 13112  (v2)
+```
+
+Builds a **slim, type-aware field-set** (name/type/country/life-span/genres/tags for artists+groups; name/artists/first-release/genres for recordings) instead of raw-JSON@8000 — small, complete, parseable. Prompt enforces a **strict ≤127 characters**; output is hard-truncated to 127 and **refusal echoes are rejected**. Handles recording / group / **artist**.
+
+</Card>
+
+<Card icon="play">
+
+```
+mvp/music/finalize-music-node — 13117  (v2.1)
+```
+
+Adds the **`music_artist`** path (persons now get a description); **always** calls #13112 (no MB-annotation short-circuit, so ≤127 always holds); passes the real type through; writes the description text to the **source table + node**; and embeds `name_embedding` (#4676) + `embeddings` (#13114) **on the description**.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+mb/run-base-artist-enrich — 13094  (v1.5)
+```
+
+Forward-path wiring — calls `finalize-music-node` for **persons** (was groups-only), at all depths.
+
+</Card>
+
+<Card icon="clock-rotate-left">
+
+```
+mvp/music/backfill-node-descriptions — 13113  (v2)
+```
+
+Rewritten to **delegate to #13117** (single source of truth). Source-table-driven & stub-proof; `kind: recording | artist`; cursor via `after_id`; `redo=true` re-does already-stamped rows (to repair the v1 garbage). Returns `last_id` + `has_more` for loop-driving.
+
+</Card>
+
+<Card icon="database">
+
+```
+mb_artist.description  +  mb_recording.description   (new columns)
+```
+
+The description text is now stored on the **source table** (parity for artists, groups, and recordings), not just `description_generated_at`. Each is the embedding source for its node's vectors. (The full-schema-replace cosmetically dropped the write-time `trim` validators on existing text columns — the code already trims; no data affected.)
+
+</Card>
+
+## Design notes
+
+- **Strict ≤127.** Enforced in the prompt *and* hard-truncated (LLMs don't reliably count characters). One short factual sentence, starting with the entity name.
+- **Description → vectors.** Recordings, groups, and persons all embed on their description (persons switched from name+disambiguation). A clean description means a meaningful vector.
+- **Stub-proof.** Only `enrich_success` rows with a `node_uuid` are processed. The ~165 collaborator **stub** nodes (graph endpoints of credit edges, no MB record) are correctly skipped — they can't be described without full enrichment.
+
+## Validation (sandbox)
+
+| Entity | Description | ≤127 | In table | Vectors |
+| --- | --- | --- | --- | --- |
+| Daddy Yankee (artist) | Daddy Yankee is a Puerto Rican Latin pop artist born in 1977. | ✅ | ✅ | from desc |
+| Juan Galeano (artist) | Juan Galeano is a Colombian artist. | ✅ | ✅ | from desc |
+| Diamante Eléctrico (group) | Diamante Eléctrico is a Colombian rock band formed in 2012. | ✅ | ✅ | from desc |
+| **Sufjan Stevens** (fresh seed) | Sufjan Stevens is an American art pop artist born in 1975. | ✅ | ✅ | from desc |
+
+The Sufjan Stevens row is the **forward-path** test — a freshly-seeded artist auto-generated the description with no manual step (`seed/artist → #13094 → #13117 → #13112`).
+
+## Staging backfill
+
+Re-ran every **describable** node on the staging Cinq fixture through #13113 v2 (`redo=true`) — ~280 recordings + the enriched artists/groups — replacing the garbage descriptions with clean ≤127 text on the node + source table and rebuilding `name_embedding` + `embeddings` from it. The 165 stubs are excluded by design.
+
+## Status
+
+- **Forward path is live on `v1`** — every newly-enriched recording / group / **artist** now gets a clean ≤127 description (table + node) with description-based vectors. The "please provide the record" garbage is gone.
+- **Live data source not deployed yet** — staging only, by request.

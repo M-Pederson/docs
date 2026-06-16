@@ -1,0 +1,116 @@
+---
+title: "Calendar — Backend Data Model"
+description: "Backend data-model and integration design for the Orbiter Calendar module: reuse the live Nylas-synced model in Xano workspace 3 (event 221 / master_event 222 / calendar 223 / nylas_grant 183), add the small orthogonal cal_* tables (graph linking, webhook idempotency, render prefs), build the missing time-range btree indexes (none exist today), and keep the queryable mirror fresh through one inbound webhook path and one outbound write path — Nylas always wins. Grounded in the live Xano workspace 3 schema."
+---
+
+<Note>
+**Status: design / spec — part of the Calendar plan; nothing built yet.** This page is the backend **data model & integration** slice of the [Calendar plan](/guides/open-work/calendar) — the reused live tables, the new `cal_*` tables, the missing btree indexes, the sync/idempotency flow, and the Event Source → data origin map. It is grounded against the **live Xano workspace 3 (OrbiterV2)** schema: every reused table and every index primitive was verified before designing. The per-account **privacy ladder** (the new `nylas_grant` 183 toggle columns and their server-side `redact_to_rung` enforcement) lives on the sibling [Settings & privacy](/guides/open-work/calendar/settings-privacy) page; the phased rollout that builds these tables and indexes lives on [Build plan](/guides/open-work/calendar/build-plan); the shared natural-language date layer is [NL date picker](/guides/open-work/calendar/nl-date-picker). This is a design explainer, iterated on — every contract here is a proposal to ratify, not a shipped fact.
+</Note>
+
+## Backend — data model & integration
+
+The first move is **reuse**. Orbiter already runs a full Nylas-synced calendar model in Xano workspace 3; the calendar module hangs off it rather than rebuilding it. This pass nails three things the existing model does **not** give us for free: the **missing time-range indexes**, the **org-scoping gap** on the legacy tables, and the **per-account privacy settings** (with their server-side enforcement) that gate team sharing — those privacy toggles and the `redact_to_rung` redaction live on [Settings & privacy](/guides/open-work/calendar/settings-privacy).
+
+## Reused tables (already live)
+
+| Table (id) | Role in the calendar module |
+| ---------- | --------------------------- |
+| `nylas_grant` (183) | **The grant store + per-account settings.** One row per user-connected mailbox/calendar account: `grant_id`, `user_id` → `user` (125), `email_account`, `provider` enum (`google`/`microsoft`/`icloud`/`imap`/`yahoo`), `access_token`/`refresh_token`/`expires_at`, sync bounds (`timerange` default 30, `oldest_sync`), `grant_expired`, and existing feature toggles (`ai_enabled`, `show_in_email_widget`, `signature_enabled`, `primary_for_sending`). The per-user Nylas `grant_id` lives here and nowhere else. **It also gains the three NEW per-account calendar toggle bool columns** (`enable_calendar` / `share_conflicts` / `share_conflict_details`) that form the privacy ladder — see [Settings & privacy](/guides/open-work/calendar/settings-privacy) for the ladder, defaults, and server-side enforcement. |
+| `calendar` (223) | **Per-user calendar container.** One row per connected calendar: `user_id` → `user` (125), `grant_id` (text), `external_id`, `name`, `timezone`, `is_primary`, `active`, `read_only`, `is_owned_by_user`, `is_holiday_calendar`, plus existing UI prefs `event_widget_preference` and `agenda_panel`. Drives the visibility/toggle list (the `use-calendars` + `use-update-calendar-preference` hooks). **No `organization_id`** — org scope resolves via `user_id` → `organization_membership` (696). |
+| `event` (221) | **The queryable event mirror.** Concrete instances: `start` / `end` timestamps (both nullable), `calendar_id` → `calendar` (223), `master_event_id` → `master_event` (222), `title`, `description`, `external_id` (provider event id), `provider`, `url`, `organize` bool, `event_data` JSON (attendees/RSVP/conferencing), soft-delete `deleted_at`. This is where FullCalendar's time-range reads run via `useCalendarEvents()`. **Note: `event` has NO `grant_id`, NO `user_id`, NO `organization_id`** — the grant/owner/org are reached only through `calendar_id`. |
+| `master_event` (222) | **Recurrence backbone.** Series record with `recurrence` (RRULE-like text) + series `start`/`end`; child `event` rows reference it via `master_event_id`. |
+| `calendar_event_activity` (598) | Event-derived activity rows (`event_id`, `activity_timestamp`, `grant_id`, `activity_type_id`) — surfaces meetings into the feed. |
+| `activity` (218) / `activity_type` (217) | The unified **notification feed** (already merges calendar `event_id` and email thread/message; `unread` bool). Calendar reminder firings fan in here; it is **not** the timeline. |
+| `webhook_calendar_log` (618) | Raw inbound calendar webhook payload log (`raw_body` JSON, `status`) — the existing raw-body landing spot; kept as the audit log behind the new idempotency ledger. |
+| `account_provider` (224) | Provider list + logos for the connect-account UI. |
+| `scheduling_link` (601) | External booking URL (Calendly-style) per `master_person` (139) — the existing booking pointer. |
+| `important_date` (242) | Recurring personal dates (birthday/anniversary) + reminder lead-days — a non-Nylas dated source the calendar can render. |
+| `user` (125) | Owner anchor + timezone (`local_timezone`, `settings.working_timezone`, `settings.event_widget_range`) **+ the new `settings.week_start`** (0/1); `tiptap_collab_jwt` for shared-calendar presence. `AuthUser.local_timezone` (read client-side via `useCurrentUser`) maps to this `local_timezone`. |
+| `organization` (695) / `organization_membership` (696) | Org tenant + the **only** user↔org mapping (role admin/member, status). |
+| `team` (613) / `team_member` (614) | Team grouping → the **rows of the resource Timeline** team overlay. |
+| `master_company` (142) / `master_person` (139) | Graph nodes a meeting/attendee resolves to. |
+| `integration_connection` (717) / `integration_meeting` (718) | The **separate** APIANT meeting-intelligence stack (`apiant_connection_id`) — explicitly **not** a Nylas grant; do not cross the wires. |
+| `df_task` / `df_deal` / `df_event` / `df_reminder` / `df_action_def` / `df_view` / `df_focus_entry` / `df_suggestion` | Deal-Flow design tables (all NEW in that doc, `df_` prefix): the task/deal Event Sources, the product timeline, the reminder engine, the `schedule_meeting` write verb, the `view_type='calendar'` lens, the AI attention budget, and the AI proposal lineage. |
+
+## New tables (`cal_*` — NEW, no id)
+
+A small, orthogonal set that fills the gaps the existing model does not cover. Each is **NEW**, `cal_` prefix, no Xano id, `organization_id` → `organization` (695) NOT NULL, `updated_at` nullable, `created_at` default now, int PK, bool flags read via `first_notnull`.
+
+- **`cal_event_link`** (**NEW**) — event ↔ graph/Deal-Flow entity. `event_id` → `event` (221), polymorphic `resource_type` (`df_deal`/`df_task`/`master_company`/`master_person`) + `resource_id`, `link_kind` (binds/about/attendee), `organization_id`. This is the persisted "this meeting is about this deal" edge that Meeting Prep + momentum read, and the target of an **external-chip drop** (and of the **AI binding a meeting to a deal**). Btrees on `(event_id)` and `(resource_type, resource_id)`. *Lands in Phase 2 — see [Build plan](/guides/open-work/calendar/build-plan).*
+- **`cal_calendar_pref`** (**NEW**) — per-user, per-calendar render state FullCalendar needs that `calendar` (223) does not carry: assigned `color` (resolved against `THEME_COLORS`), `is_visible` (toggle), Event-Source order (LexoRank text). Keyed `(user_id, calendar_id)`. Read/written by the existing `use-update-calendar-preference` hook. (Alternatively add `color`/`is_visible` columns to `calendar` 223, which already holds `event_widget_preference`/`agenda_panel`.) *Optional in Phase 1 — see [Build plan](/guides/open-work/calendar/build-plan).*
+- **`cal_webhook_event`** (**NEW**) — inbound Nylas webhook **idempotency + dedupe** ledger, richer than the raw `webhook_calendar_log` (618). Stores the Nylas **delivery id** (`UNIQUE`), `event_type` (`event.created`/`updated`/`deleted`, `grant.expired`), `grant_id`, `external_id`, the provider's reported `updated_at`/sequence (the last-writer-wins guard), `processed_at`, `status`. The unique index makes redelivery a no-op upsert. Keep `webhook_calendar_log` (618) as the raw-body audit log behind it. *Lands in Phase 1 — see [Build plan](/guides/open-work/calendar/build-plan).*
+- **`cal_connection`** (**NEW — default: do NOT create**) — the Nylas grant per user **already lives in `nylas_grant` (183)** and the three privacy toggles + default-calendar pointer extend that row. Create `cal_connection` **only** if calendar-feature state emerges that genuinely does not belong on the mailbox-scoped grant (e.g. a per-org connect policy). Default decision: extend `nylas_grant` (183) instead.
+
+<Note>
+**No new event-mirror table.** The verified schema already has `event` (221) (with `start`/`end`/`calendar_id`/`master_event_id`/`deleted_at`) as the queryable mirror and `master_event` (222) as the recurrence master. A second `cal_event` would duplicate them. The only persisted-event work is **adding indexes** (Phase 1), the org-scope decision (Phase 3 prerequisite), and the `cal_event_link` edge (Phase 2) — not a parallel table. See [Build plan](/guides/open-work/calendar/build-plan) for the phase sequencing.
+</Note>
+
+## New btree indexes (the real gap)
+
+Verified live: every legacy calendar table carries **only** `primary(id)` + `btree(created_at desc)`. FullCalendar's reads are time-range scans (`start`/`end` within a visible window, filtered by `calendar_id`), which today are unindexed table scans. The exact new btrees to add (using the verified column names), with the phase each lands in:
+
+| Table (id) | New index | Phase | Why |
+| ---------- | --------- | ----- | --- |
+| `df_task` (NEW) | `btree(due_date)`, `btree(start_date)` | **P0** | Read-only task layer window scans (from the Deal Flow design) |
+| `df_deal` (NEW) | `btree(expected_close_date)` | **P0** | Read-only deal close-milestone layer |
+| `event` (221) | `btree(calendar_id, start)` | **P1** | The primary read: "events on these calendars in this window." Composite covers the common filter + range in one. |
+| `event` (221) | `btree(start)` and `btree(end)` | **P1** | Cross-calendar window scans and overlap/conflict checks. |
+| `event` (221) | `btree(master_event_id)` | **P1** | Pull all instances of a recurring series. |
+| `event` (221) | `btree(deleted_at)` | **P1** | Soft-delete filtering + the hard-purge sweep on disconnect/delete. |
+| `calendar` (223) | `btree(grant_id)` and `btree(user_id)` | **P1** | List a grant's calendars / a user's calendars; the join hop for org-scope resolution. |
+| `nylas_grant` (183) | `unique(grant_id)` and `btree(user_id)` | **P1** | Webhook routes by `grant_id`; the user → grants lookup feeds the team overlay. |
+| `cal_webhook_event` (NEW) | `unique(delivery_id)` | **P1** | Idempotency — redelivery is a no-op. |
+| `cal_event_link` (NEW) | `btree(event_id)`, `btree(resource_type, resource_id)` | **P2** | The two directions of the graph edge. |
+| `df_reminder` (NEW) | `btree(remind_at)` | **P2** | The reminder firing sweep. |
+| `event`/`calendar` (221/223) | `btree(organization_id, start)` | **P3** | Only if `organization_id` is denormalized for the resource-timeline org-wide feed (see Org-scope decision). |
+
+> If org-level sharing denormalizes an `organization_id` onto `event`/`calendar`, add the composite `btree(organization_id, start)` for org-wide range scans (the resource-timeline feed) — otherwise that scan resolves through the `calendar.user_id → organization_membership` join and indexes the membership composite instead.
+
+## Sync & idempotency flow
+
+The mirror is kept fresh by one inbound path and one outbound path, both reconciling on the same `event` rows:
+
+<Steps>
+  <Step title="Outbound write (the only write path)">
+    `schedule_meeting` (`df_action_def`, `source_engine='calendar'`) → Nylas Events API by `grant_id` (create/update/delete + RSVP). The client gets an optimistic pending state; **no direct `event` (221) mutation.** Whether the caller is a button, a drag, or the AI Copilot, this is the identical path. A write against a grant whose `grant_expired = true` is **blocked**, not queued silently — including AI proposals.
+  </Step>
+  <Step title="Nylas emits the change">
+    Nylas processes the write and emits `event.created` / `event.updated` / `event.deleted` (and `grant.expired` on token failure) to Orbiter's webhook endpoint. Provider-originated changes (a teammate edits the meeting in Google) arrive the same way.
+  </Step>
+  <Step title="Idempotent ingest">
+    The receiver records the raw body in `webhook_calendar_log` (618), then checks `cal_webhook_event(delivery_id)` (unique). If already present → **no-op** (redelivery). Otherwise insert the ledger row and proceed.
+  </Step>
+  <Step title="Upsert the mirror (last-writer-wins by provider state)">
+    Upsert `event` (221) by `external_id` (create / update / set `deleted_at`), expanding recurrence off `master_event` (222) as Nylas reports it. Out-of-order delivery is handled by comparing the payload's `updated_at`/sequence against the stored row — a stale (older) delivery is discarded, so reconciliation is **last-writer-wins on the provider's reported state, not on arrival order**.
+  </Step>
+  <Step title="Backstop reconcile">
+    A periodic delta poll (bounded by `nylas_grant.timerange` / `oldest_sync`, paged) catches **missed** webhooks; `grant.expired` sets `nylas_grant.grant_expired`, surfaces a reconnect prompt, and **pauses writes** for that grant (button and AI alike).
+  </Step>
+</Steps>
+
+## Event Source → data origin map
+
+Each toggleable FullCalendar Event Source maps to exactly one data origin (and the phase it first renders in):
+
+| Event Source (layer) | Data origin | First phase | Notes |
+| -------------------- | ----------- | ----------- | ----- |
+| Task due / start dates | `df_task.due_date` / `df_task.start_date` | P0 | A project-less task is a personal to-do; becomes draggable as an external chip in P2 |
+| Deal close milestones | `df_deal.expected_close_date` | P0 | Close-month forecast lens buckets vs `df_target` windows; draggable as an external chip in P2 |
+| Project / milestone dates | `df_project.start_date` / `target_date`, `df_project_section.target_date` (`is_milestone`) | P0 | Dated markers |
+| Personal recurring dates | `important_date` (242) (`date`, `annual_recurring`, `reminder`) | P0 | Birthdays/anniversaries |
+| Synced calendar events | `event` (221) (mirror of Nylas), filtered by `start`/`end` + `calendar_id` | P1 | The real meetings; writes go out via Nylas `grant_id` (P2). The "my events" layer takes the selected accent (`THEME_COLORS`). |
+| Recurring series instances | `master_event` (222) expanded (Nylas-side) → `event` (221) instances | P1 | `@fullcalendar/rrule` is render-only fallback (added P2) |
+| Reminders / nudges | `df_reminder.remind_at` | P2 | Fired into `activity` (218), not a paint layer by default |
+| Meetings-to-prep (AI budget) | `df_focus_entry` (`entry_type='meeting'`) ranked off `event` (221) | P1 (read) / P2 (deep-link) | The AI attention budget; a non-grid "what needs prep" lane that deep-links into the Copilot |
+| Team rows (resource overlay) | `team_member` (614) → per-teammate `nylas_grant` (183) → `event` (221) **via `redact_to_rung`** | P3 | **Premium** Timeline rows; **exposure gated by the privacy ladder** (`enable_calendar` → busy via `share_conflicts` → detail via `share_conflict_details`), redacted server-side (see [Settings & privacy](/guides/open-work/calendar/settings-privacy)); Free/Busy fills unbookable blocks. N teammates × a week = N Free/Busy fan-outs — cache against the mirror, refresh on webhook, never on scroll |
+
+## Related
+
+- [Calendar plan](/guides/open-work/calendar) — the parent scoping & build plan this data model belongs to
+- [Settings & privacy](/guides/open-work/calendar/settings-privacy) — the new `nylas_grant` (183) toggle columns and the server-side `redact_to_rung` privacy ladder that gates team sharing
+- [Build plan](/guides/open-work/calendar/build-plan) — the four-phase, dependency-ordered rollout that builds these tables and the missing btree indexes
+- [NL date picker](/guides/open-work/calendar/nl-date-picker) — the shared natural-language date entry layer across the calendar surfaces
+- [Deal Flow — Backend Design](/guides/open-work/deal-flow) — the `df_*` data model, AI-first ethos, and `resolve_access()` conventions this plan mirrors
+- [Meeting Prep mode](/guides/modes/meeting-prep) — the shipped calendar-driven AI briefing pipeline the prep ranking deep-links into
+- [Nylas integration](/guides/third-party-apis/nylas) — OAuth grants, calendar/email sync, webhooks, Availability/Free-Busy
+- [FalkorDB Graph Ontology](/guides/ontology) — the relationship graph calendar context plugs into

@@ -67,6 +67,8 @@ tags:
     description: AI-generated email thread summaries.
   - name: Calendars
     description: Calendar and event management via Nylas.
+  - name: GetStream
+    description: Inbound Stream Chat (GetStream) webhooks recording chat messages as comments.
 paths:
   /sign-up:
     post:
@@ -76,8 +78,11 @@ paths:
       description: |
         Creates a WorkOS identity, mints the local users.users row, and
         fans out provisioning side-effects (Knock identify, personal org,
-        graph node) via Pub/Sub. Returns the user; the client should
-        immediately call /sign-in to get tokens.
+        graph node) via Pub/Sub. WorkOS emails a verification code and the
+        response carries a `pending_authentication_token`: the client posts
+        that token plus the code to /verify-email to verify and log in (no
+        second sign-in round-trip). If verification isn't required, `tokens`
+        is returned directly and the user is already logged in.
       operationId: signUp
       security: []
       requestBody:
@@ -88,11 +93,11 @@ paths:
               $ref: '#/components/schemas/SignUpRequest'
       responses:
         '201':
-          description: User created.
+          description: User created (verification pending, or logged in).
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/UserResponseEnvelope'
+                $ref: '#/components/schemas/SignUpResponseEnvelope'
         '400':
           $ref: '#/components/responses/BadRequest'
         '409':
@@ -1170,6 +1175,149 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/OrganizationWebhookResponseEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /getstream/webhooks/message-new:
+    post:
+      tags:
+        - GetStream
+      summary: GetStream message.new webhook
+      description: |
+        Receives GetStream (Stream Chat) `message.new` events and records each
+        message as a comment on the entity named by the channel id. Verified via
+        the `X-Signature` HMAC header (HMAC-SHA256 of the raw body under the app
+        API secret), not a bearer token.
+
+        The channel id is `<kind>-<id>`: `collection-<uuid>`, `note-<uuid>`,
+        `email-template-<uuid>`, or `email-thread-<thread_id>`. The message
+        author (`message.user.id`) is the local `users.id` UUID; an
+        unprovisioned author is recorded with a null `user_id`.
+
+        Idempotent under GetStream retries (keyed on `message.id` /
+        `getstream_message_id`). Non-`message.new` events, unknown channel
+        prefixes, and unroutable ids return 200 (acked, no-op) so GetStream
+        does not retry a permanently-unroutable event.
+      operationId: getstreamMessageNew
+      security: []
+      parameters:
+        - in: header
+          name: X-Signature
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: GetStream event envelope ({ type, channel_id, message }).
+              properties:
+                type:
+                  type: string
+                  example: message.new
+                channel_id:
+                  type: string
+                  example: collection-018f9c2e-7b3a-7e21-9c0a-1f2e3d4c5b6a
+                message:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                    text:
+                      type: string
+                    user:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+      responses:
+        '200':
+          description: Event recorded, acked, or ignored.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmptyEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /getstream/webhooks/message-updated:
+    post:
+      tags:
+        - GetStream
+      summary: GetStream message.updated webhook
+      description: |
+        Receives GetStream `message.updated` events and edits the comment
+        carrying `message.id` (keyed on `getstream_message_id`) in the table
+        named by the channel. HMAC-verified via `X-Signature`, no bearer auth.
+        No-op (still 200) when no comment matches.
+      operationId: getstreamMessageUpdated
+      security: []
+      parameters:
+        - in: header
+          name: X-Signature
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: GetStream event envelope ({ type, channel_id, message }).
+      responses:
+        '200':
+          description: Comment updated, acked, or ignored.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmptyEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /getstream/webhooks/message-deleted:
+    post:
+      tags:
+        - GetStream
+      summary: GetStream message.deleted webhook
+      description: |
+        Receives GetStream `message.deleted` events and deletes the comment
+        carrying `message.id` (keyed on `getstream_message_id`) in the table
+        named by the channel. HMAC-verified via `X-Signature`, no bearer auth.
+        No-op (still 200) when no comment matches.
+      operationId: getstreamMessageDeleted
+      security: []
+      parameters:
+        - in: header
+          name: X-Signature
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: GetStream event envelope ({ type, channel_id, message }).
+      responses:
+        '200':
+          description: Comment deleted, acked, or ignored.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmptyEnvelope'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -5575,7 +5723,45 @@ components:
         updated_at:
           type: string
           format: date-time
-    UserResponseEnvelope:
+    AuthTokensResponse:
+      type: object
+      required:
+        - user
+        - access_token
+        - refresh_token
+      properties:
+        user:
+          $ref: '#/components/schemas/UserResponse'
+        access_token:
+          type: string
+          description: 'Send as Authorization: Bearer on subsequent requests.'
+        refresh_token:
+          type: string
+    SignUpResponse:
+      type: object
+      required:
+        - user
+        - email_verification_required
+        - pending_authentication_token
+        - email_verification_id
+        - tokens
+      properties:
+        user:
+          $ref: '#/components/schemas/UserResponse'
+        email_verification_required:
+          type: boolean
+          description: When true, post pending_authentication_token + the emailed code to /verify-email.
+        pending_authentication_token:
+          type: string
+          description: Token for /verify-email. Empty when verification is not required.
+        email_verification_id:
+          type: string
+        tokens:
+          oneOf:
+            - $ref: '#/components/schemas/AuthTokensResponse'
+            - type: 'null'
+          description: Set (and the user logged in) only when verification was not required; null otherwise.
+    SignUpResponseEnvelope:
       type: object
       required:
         - data
@@ -5583,7 +5769,7 @@ components:
         - meta
       properties:
         data:
-          $ref: '#/components/schemas/UserResponse'
+          $ref: '#/components/schemas/SignUpResponse'
         error:
           type: 'null'
         meta:
@@ -5606,20 +5792,6 @@ components:
             - string
             - 'null'
           maxLength: 64
-    AuthTokensResponse:
-      type: object
-      required:
-        - user
-        - access_token
-        - refresh_token
-      properties:
-        user:
-          $ref: '#/components/schemas/UserResponse'
-        access_token:
-          type: string
-          description: 'Send as Authorization: Bearer on subsequent requests.'
-        refresh_token:
-          type: string
     AuthTokensResponseEnvelope:
       type: object
       required:
@@ -5734,6 +5906,19 @@ components:
       properties:
         data:
           $ref: '#/components/schemas/ListUsersResponse'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+    UserResponseEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          $ref: '#/components/schemas/UserResponse'
         error:
           type: 'null'
         meta:

@@ -11,12 +11,53 @@ description: "Backend data-model and integration design for the Orbiter Calendar
 
 The first move is **reuse**. Orbiter already runs a full Nylas-synced calendar model in Xano workspace 3; the calendar module hangs off it rather than rebuilding it. This pass nails three things the existing model does **not** give us for free: the **missing time-range indexes**, the **org-scoping gap** on the legacy tables, and the **per-account privacy settings** (with their server-side enforcement) that gate team sharing — those privacy toggles and the `redact_to_rung` redaction live on [Settings & privacy](/guides/open-work/calendar/settings-privacy).
 
+The data model has one product test: does it make the operator's scheduling loop correct, fast, and explainable? A table earns its place only if it supports one of four jobs: render a trustworthy time window, reconcile provider truth, enforce sharing/privacy, or bind the meeting to Orbiter work. That is why the plan adds `cal_webhook_event` and indexes before write-back, adds `cal_event_link` only when meetings need graph context, and defaults away from `cal_connection` unless a real connection-policy job appears. A parallel event store, calendar-specific task table, or speculative preference table would increase drift without serving the loop.
+
+## Invariant placement
+
+The model keeps each invariant at the layer that can actually enforce it. The settings UI can explain a toggle, but only the read projection can redact; the client can show a pending block, but only webhook ingest can make the mirror durable.
+
+| Invariant | Lives in | Data-model implication |
+| --------- | -------- | ---------------------- |
+| Privacy ladder | `nylas_grant` flags plus `redact_to_rung` projection | Phase 1 may persist the toggles; the first team-facing read or Availability fan-out waits until Phase 3 server-side redaction exists. |
+| Org access | `resolve_access()` / `df_grant`, with org resolved through membership or denormalized org scope | A calendar row being in the same org is not enough; every team read still needs the grant check and redaction. |
+| Provider authority | Nylas event id plus `cal_webhook_event` delivery ledger | `event` (221) is upserted by provider state, not edited directly by the client. |
+| Time correctness | `event.start` / `event.end` UTC plus IANA timezone on calendar/user/source | Named-zone math happens before storage and render; DST is not repaired by indexes later. |
+| Grant lifecycle | `nylas_grant.grant_expired`, `event.deleted_at`, purge sweep | Revoke hides immediately, marks cached rows deleted, then physically purges detail inside the retention window. |
+| Audit without PII hoarding | `webhook_calendar_log` plus `cal_webhook_event` | Raw logs need a scrub decision; the idempotency ledger can retain redacted delivery facts after mirror purge. |
+
+## AI proposal lineage
+
+AI scheduling does not need a parallel calendar table. The durable objects already exist in the Deal-Flow layer: `df_suggestion` for the proposal and rationale, `df_action_def` for the verb, `df_event` for the product timeline, and `cal_event_link` for the graph binding once confirmed. The model should record enough lineage to answer four audit questions later:
+
+| Audit question | Stored on / derived from |
+| -------------- | ------------------------ |
+| What did the AI propose? | `df_suggestion` payload: candidate slot, invite draft, binding target, confidence, rationale, and redacted context summary. |
+| What did the operator change? | Accepted payload vs proposed payload, including edited time, attendees, title, body, calendar, or graph link. |
+| What actually wrote? | `schedule_meeting` action result and Nylas provider id after webhook reconciliation. |
+| What failed or was undone? | Failed action result, rollback reason, retry metadata, and any later repair or undo proposal. |
+
+The lineage stores redacted context summaries, not raw hidden teammate event detail. A failed AI proposal is still useful audit data, but it must not create an `event` (221) row until Nylas accepts a write and the webhook reconciles the mirror.
+
+## Data-model build economics
+
+The cheapest safe data model is the one that avoids durable state until a phase can prove it needs that state:
+
+| Decision | Default | Promote only when |
+| -------- | ------- | ----------------- |
+| Event mirror | Reuse `event` (221) / `master_event` (222) | Never create a parallel `cal_event`; add indexes and edges around the existing mirror. |
+| Connection state | Extend `nylas_grant` (183) | Create `cal_connection` only for a real org-level connection policy that cannot live on the grant. |
+| Calendar render prefs | Prefer existing `calendar` prefs or thin `cal_calendar_pref` | Add the table only if per-user color, visibility, or order cannot fit safely on `calendar` (223). |
+| Org scope | Resolve through membership until Phase 3 | Denormalize `organization_id` only when team-resource reads need the range-scan speed. |
+| Graph linking | Add `cal_event_link` in Phase 2 | Link only after write-back and Meeting Prep need a persisted meeting-to-work edge. |
+| Availability cache | Cache against the mirror in Phase 3 | Do not introduce cache tables before team fan-out and Nylas rate limits make them necessary. |
+
 ## Reused tables (already live)
 
 | Table (id) | Role in the calendar module |
 | ---------- | --------------------------- |
 | `nylas_grant` (183) | **The grant store + per-account settings.** One row per user-connected mailbox/calendar account: `grant_id`, `user_id` → `user` (125), `email_account`, `provider` enum (`google`/`microsoft`/`icloud`/`imap`/`yahoo`), `access_token`/`refresh_token`/`expires_at`, sync bounds (`timerange` default 30, `oldest_sync`), `grant_expired`, and existing feature toggles (`ai_enabled`, `show_in_email_widget`, `signature_enabled`, `primary_for_sending`). The per-user Nylas `grant_id` lives here and nowhere else. **It also gains the three NEW per-account calendar toggle bool columns** (`enable_calendar` / `share_conflicts` / `share_conflict_details`) that form the privacy ladder — see [Settings & privacy](/guides/open-work/calendar/settings-privacy) for the ladder, defaults, and server-side enforcement. |
-| `calendar` (223) | **Per-user calendar container.** One row per connected calendar: `user_id` → `user` (125), `grant_id` (text), `external_id`, `name`, `timezone`, `is_primary`, `active`, `read_only`, `is_owned_by_user`, `is_holiday_calendar`, plus existing UI prefs `event_widget_preference` and `agenda_panel`. Drives the visibility/toggle list (the `use-calendars` + `use-update-calendar-preference` hooks). **No `organization_id`** — org scope resolves via `user_id` → `organization_membership` (696). |
+| `calendar` (223) | **Per-user calendar container.** One row per connected calendar: `user_id` → `user` (125), `grant_id` (text), `external_id`, `name`, `timezone`, `is_primary`, `active`, `read_only`, `is_owned_by_user`, `is_holiday_calendar`, plus existing UI prefs `event_widget_preference` and `agenda_panel`. Drives the visibility/toggle list through `useCalendars()` and `useUpdateCalendarPreference()` in `src/features/events/api/`. **No `organization_id`** — org scope resolves via `user_id` → `organization_membership` (696). |
 | `event` (221) | **The queryable event mirror.** Concrete instances: `start` / `end` timestamps (both nullable), `calendar_id` → `calendar` (223), `master_event_id` → `master_event` (222), `title`, `description`, `external_id` (provider event id), `provider`, `url`, `organize` bool, `event_data` JSON (attendees/RSVP/conferencing), soft-delete `deleted_at`. This is where FullCalendar's time-range reads run via `useCalendarEvents()`. **Note: `event` has NO `grant_id`, NO `user_id`, NO `organization_id`** — the grant/owner/org are reached only through `calendar_id`. |
 | `master_event` (222) | **Recurrence backbone.** Series record with `recurrence` (RRULE-like text) + series `start`/`end`; child `event` rows reference it via `master_event_id`. |
 | `calendar_event_activity` (598) | Event-derived activity rows (`event_id`, `activity_timestamp`, `grant_id`, `activity_type_id`) — surfaces meetings into the feed. |
@@ -37,7 +78,7 @@ The first move is **reuse**. Orbiter already runs a full Nylas-synced calendar m
 A small, orthogonal set that fills the gaps the existing model does not cover. Each is **NEW**, `cal_` prefix, no Xano id, `organization_id` → `organization` (695) NOT NULL, `updated_at` nullable, `created_at` default now, int PK, bool flags read via `first_notnull`.
 
 - **`cal_event_link`** (**NEW**) — event ↔ graph/Deal-Flow entity. `event_id` → `event` (221), polymorphic `resource_type` (`df_deal`/`df_task`/`master_company`/`master_person`) + `resource_id`, `link_kind` (binds/about/attendee), `organization_id`. This is the persisted "this meeting is about this deal" edge that Meeting Prep + momentum read, and the target of an **external-chip drop** (and of the **AI binding a meeting to a deal**). Btrees on `(event_id)` and `(resource_type, resource_id)`. *Lands in Phase 2 — see [Build plan](/guides/open-work/calendar/build-plan).*
-- **`cal_calendar_pref`** (**NEW**) — per-user, per-calendar render state FullCalendar needs that `calendar` (223) does not carry: assigned `color` (resolved against `THEME_COLORS`), `is_visible` (toggle), Event-Source order (LexoRank text). Keyed `(user_id, calendar_id)`. Read/written by the existing `use-update-calendar-preference` hook. (Alternatively add `color`/`is_visible` columns to `calendar` 223, which already holds `event_widget_preference`/`agenda_panel`.) *Optional in Phase 1 — see [Build plan](/guides/open-work/calendar/build-plan).*
+- **`cal_calendar_pref`** (**NEW**) — per-user, per-calendar render state FullCalendar needs that `calendar` (223) does not carry: assigned `color` (resolved against `THEME_COLORS`), `is_visible` (toggle), Event-Source order (LexoRank text). Keyed `(user_id, calendar_id)`. Read/written by the existing `useUpdateCalendarPreference()` hook (`src/features/events/api/use-update-calendar-preference.ts`). (Alternatively add `color`/`is_visible` columns to `calendar` 223, which already holds `event_widget_preference`/`agenda_panel`.) *Optional in Phase 1 — see [Build plan](/guides/open-work/calendar/build-plan).*
 - **`cal_webhook_event`** (**NEW**) — inbound Nylas webhook **idempotency + dedupe** ledger, richer than the raw `webhook_calendar_log` (618). Stores the Nylas **delivery id** (`UNIQUE`), `event_type` (`event.created`/`updated`/`deleted`, `grant.expired`), `grant_id`, `external_id`, the provider's reported `updated_at`/sequence (the last-writer-wins guard), `processed_at`, `status`. The unique index makes redelivery a no-op upsert. Keep `webhook_calendar_log` (618) as the raw-body audit log behind it. *Lands in Phase 1 — see [Build plan](/guides/open-work/calendar/build-plan).*
 - **`cal_connection`** (**NEW — default: do NOT create**) — the Nylas grant per user **already lives in `nylas_grant` (183)** and the three privacy toggles + default-calendar pointer extend that row. Create `cal_connection` **only** if calendar-feature state emerges that genuinely does not belong on the mailbox-scoped grant (e.g. a per-org connect policy). Default decision: extend `nylas_grant` (183) instead.
 
@@ -69,6 +110,14 @@ Verified live: every legacy calendar table carries **only** `primary(id)` + `btr
 ## Sync & idempotency flow
 
 The mirror is kept fresh by one inbound path and one outbound path, both reconciling on the same `event` rows:
+
+| Path | Source of truth | Idempotency key | Ordering rule | Failure behavior |
+| ---- | --------------- | --------------- | ------------- | ---------------- |
+| Initial backfill | Nylas list response | `(grant_id, external_id)` | Provider `updated_at` / sequence | Page and resume inside `timerange` / `oldest_sync`; do not block webhook receiver. |
+| Provider webhook | Nylas webhook payload | `delivery_id` in `cal_webhook_event` | Provider `updated_at` / sequence, not arrival time | Duplicate is no-op; stale delivery is discarded; malformed payload lands in raw log with failed status. |
+| UI / AI write | Nylas Events API response + later webhook | Pending client write id, then provider `external_id` | Webhook-confirmed provider state wins over optimistic state | Roll back optimistic UI on Nylas failure, expired grant, read-only calendar, or reconcile timeout. |
+| Delta poll | Nylas list / delta response | `(grant_id, external_id)` | Same upsert comparator as webhook | Repairs missed webhooks; never creates a second ingest code path. |
+| Disconnect / revoke | Grant lifecycle event | `grant_id` | Revoke beats all later stale event deliveries | Pause writes, hide rows, mark `deleted_at`, then hard-purge. |
 
 <Steps>
   <Step title="Outbound write (the only write path)">

@@ -11,6 +11,8 @@ description: "The Calendar settings surface and the per-account privacy ladder f
 
 Calendar Settings live in the user account modal as **one row per connected account** (one `nylas_grant` 183). Each connected mailbox/calendar account (Google / Microsoft / iCloud / IMAP / Yahoo) renders a single settings row carrying three toggles that form a **strict privacy ladder**, plus an optional default-calendar pointer. The settings UI renders the toggles as a **strict cascade** — flipping a parent OFF visually disables and zeroes its children — but that cascade is **convenience, not enforcement**: the server-side projection is the authoritative gate (see [Privacy ladder — enforcement & redaction](#privacy-ladder--enforcement--redaction) below).
 
+The settings job is narrow: let an operator connect real calendars without accidentally exposing more than they meant to, and let teammates schedule around each other without turning private calendars into shared documents. That makes this page a safety contract, not a preference drawer. If a setting does not answer **participate**, **share busy**, **share detail**, **where do new events land**, or **which week shape do I prefer**, it is out of scope for v1.
+
 ## New columns on `nylas_grant` (183) — the per-account privacy ladder
 
 Calendar Settings live in the user account modal as **one row per connected account** (one `nylas_grant` 183), each with three toggles forming a **strict privacy ladder**. They are plain bool columns on `nylas_grant` (183) — the same pattern as the existing `ai_enabled` / `show_in_email_widget` / `signature_enabled` bools — read with `first_notnull` so a `false` is never coerced back to its default:
@@ -22,6 +24,21 @@ Calendar Settings live in the user account modal as **one row per connected acco
 | `share_conflict_details` | **OFF** (`false`) | Reveals **titles / attendees / location** instead of an opaque busy block. Requires `share_conflicts`. |
 
 The ladder is **monotonic and enforced server-side** in the team-overlay read: a teammate sees nothing unless `enable_calendar`; sees busy blocks only if `share_conflicts`; sees details only if `share_conflict_details`. The client must never be the gate. The settings UI renders the toggles as a strict cascade — flipping a parent OFF visually disables and zeroes its children — but that is convenience, not enforcement. (A separate, optional **default-calendar pointer** for "where do new events land" is the only other piece of grant-scoped calendar state — also a thin addition to `nylas_grant` 183, not a new table.)
+
+Settings writes mutate only Orbiter preference state on `nylas_grant` (183); they never mutate provider events and never touch the `event` (221) mirror directly. A toggle save must invalidate the calendar-settings query, the team-overlay projection, and any cached Availability computation that used that grant. If two settings writes race, the later saved grant row is authoritative, and the read uses `first_notnull` on the stored bools rather than client-local cascade state.
+
+Phase boundary: Phase 1 may persist the toggles and use them for the owner's settings/self-view experience. The first team-facing read, teammate overlay, or Availability fan-out is Phase 3 work and must ship with server-side `redact_to_rung`; no team sharing ships earlier.
+
+## Settings rollout economics
+
+The settings surface ships in two deliberately separate moments:
+
+| Phase | What ships | What is held back |
+| ----- | ---------- | ----------------- |
+| P1 | Per-account toggles persist on `nylas_grant` (183), owner self-view respects `enable_calendar`, default-calendar pointer can be saved, and week-start lands on `user` (125). | No teammate read consumes the toggles yet, so no teammate can receive busy or detail data. |
+| P3 | `redact_to_rung` turns the saved toggles into server-side team projections and Availability inputs. | No team overlay ships unless network responses prove detail is absent below the detail rung. |
+
+This split makes the account modal useful early without pretending the privacy system is complete before the team read exists.
 
 ## Privacy ladder — enforcement & redaction
 
@@ -42,6 +59,15 @@ Three rules make this safe:
 
 Both the human resource-timeline read and the AI Availability path call the **same** projection, so there is no second, looser code path to drift. And because everything is `resolve_access()`-gated on top of the ladder, a teammate outside the org (or without a `df_grant`) never reaches even the busy-only rung.
 
+| Invariant | Enforcement rule |
+| --------- | ---------------- |
+| Owner self-view stays full fidelity | Viewer-vs-owner check bypasses team redaction only for the owning user. |
+| Parent OFF collapses children | Server computes the effective rung; the UI cascade is not trusted. |
+| Detail redacts before serialization | Busy-only responses omit title, attendees, description, location, URL, conferencing, and raw `event_data`. |
+| Availability and AI share the same projection | Slot search consumes the same redacted event shape as the team timeline, with no separate context path. |
+| Revoke hides before purge | Disconnect, revoke, or `grant.expired` removes the grant from reads immediately, then the purge sweep deletes cached detail. |
+| Admin override defaults to no | Any future compliance override must be explicit, audited, and treated as a separate policy decision. |
+
 ## Week start
 
 Week start is **one user-level preference**, not per-calendar and not per-grant. It lives on `user` (125) `settings.week_start` ∈ `{0,1}` and maps straight onto FullCalendar `firstDay` (0 = Sun, 1 = Mon). Both the full-screen canvas and the docked side-panel read the same value, so they never disagree on which day a week begins.
@@ -57,6 +83,12 @@ The mirror caches real calendar content (titles, descriptions, attendees, locati
 - **Every read is `resolve_access()`-gated** (or resolved through the `df_grant_effective` cache) on top of the ladder. Org↔user mapping resolves only through `organization_membership` (696); a teammate outside the org (or without a `df_grant`) never reaches even the busy-only rung. The legacy `event`/`calendar` tables still need the org-scope decision before any org-wide sharing — until then, team reads resolve org through the membership join and still redact per the ladder.
 - **`calendar.read_only` is respected on writes.** A drop onto a `read_only` calendar (or a teammate row the ladder does not expose) is rejected both client-side and server-side with a rollback toast — never a half-written state.
 - **The Copilot inherits the gates.** Calendar context handed to the AI (Thesys C1 wrapping Claude via the Robert API group `Bd_dCiOz`, id 1261) inherits the same `resolve_access()` gates and the privacy ladder; it must never carry content the operator could not see in the UI, and never a teammate's detail below their shared rung. The same `redact_to_rung` projection feeds Availability fan-outs and any AI context.
+
+### AI context privacy
+
+The AI explanation is part of the privacy surface. If a teammate shares busy-only, the Copilot may explain "Dana is busy then" but may not name the meeting, attendees, location, description, conferencing link, or any field derived from raw `event_data`. If a context-relative phrase depends on an event the viewer cannot access, the AI must ask for a different anchor or say the anchor is unavailable; it must not infer hidden detail from timing alone.
+
+Preference memory is scoped to the operator who supplied it. Learning "Mark prefers 30-minute buffers" can shape Mark's future proposals; it cannot be used to expose a teammate's private scheduling pattern unless that teammate independently shared the relevant availability through the ladder. Correction logs for model tuning must store redacted summaries and accepted values, not raw teammate event payloads.
 
 ### Hard-purge on disconnect / `grant.expired` / account-delete
 

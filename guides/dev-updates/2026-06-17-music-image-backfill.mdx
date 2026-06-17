@@ -1,0 +1,61 @@
+---
+title: "Music image backfill — artist avatars + groups (2026-06-17)"
+description: "Why cascade-discovered music artists were missing avatars, the new person-avatar backfill, the live backfill result, and the temporary sweep cron."
+---
+
+## TL;DR
+
+Cascade-discovered `Music_Artist` nodes (band members, credited performers — e.g. Janet Jackson) were landing on the graph with **no `image_url`**. Avatars only auto-populate for **depth-0 seed** artists (inline at ingest) and via the **person-resolution drain** (cron #182, currently inactive) — so everything pulled in by cascade was imageless. This was expected pipeline behavior, not a deploy bug. We built the missing batch tool, drained the live backlog, and added a temporary sweep cron.
+
+## Root cause
+
+Artist avatars come from `mvp/music/fetch-person-avatar` (#13120, serper.dev), which runs only:
+- **inline at ingest** for depth-0 `Person` seeds (`mb/run-base-artist-enrich` #13094 v1.4), and
+- inside the **person-resolution** orchestrator (#13121), drained by cron **#182 (inactive)**.
+
+There was a batch backfill for **group** photos (`mvp/music/backfill-group-images` #13111 / `tool/backfill-group-images` #8651) but **no equivalent for person avatars** — so cascade artists never got swept.
+
+## What was built
+
+<Card icon="clock-rotate-left">
+
+```
+mvp/music/backfill-person-avatars — 13135
+```
+
+Batch backfill of `Person:Music_Artist` avatars. Selects `mb_artist` rows with `artist_type == "Person"` + `enrich_success` + `!gone` + `gcp_person_avatar_url == null`, processes up to `limit` (default 10, one serper.dev call each) via `fetch-person-avatar` #13120. Per-row `try_catch` → `log_crash` (phase `image_fetch`). Idempotent. Mirror of the group batch #13111.
+
+</Card>
+
+<Card icon="globe">
+
+```
+tool/backfill-person-avatars — 8693
+```
+
+Operator endpoint wrapping #13135. `POST {limit}`, respects `X-Data-Source`. Pair it with the existing `tool/backfill-group-images` (#8651) for groups.
+
+</Card>
+
+<Card icon="clock-rotate-left">
+
+```
+TEMP-backfill-music-images-live — task 184
+```
+
+**Temporary** scheduled task on the **`live`** data source (30-min cadence). Each tick re-runs both image backfills (person avatars limit 25 + group images limit 25), each wrapped in `try_catch`. Sweeps newly-enriched artists/groups as the MusicBrainz drain finishes them. **Delete once the stub-node image gap stops growing.**
+
+</Card>
+
+## Live backfill result (2026-06-17)
+
+Drained the full reachable backlog — **462 `mb_artist` Person rows, 0 errors**. Live artist image coverage went from **~1 → 474** (Janet Jackson included: `…/music-person-avatar/6be2828f….webp`). Groups: the existing #8651 backfill reports `candidates: 0` — every fully-enriched group already has its image.
+
+## What a table-driven backfill can't reach
+
+Both image backfills are **table-driven** (they iterate `mb_artist` rows and are keyed on `mb_artist_id`). The large imageless-**node** remainder — on the order of ~700 artists / ~250 groups on live — are **stub / not-yet-fully-enriched nodes** created as edge endpoints during release/recording enrichment, with **no qualifying `mb_artist` row**. They cannot be reached by an avatar pass; they get images only when they are **fully enriched** (full `get-add/artist` run) or via the **person-resolution drain (#182)** once it is activated. The durable fix for cascade artists specifically is enabling #182, which does avatars + socials together.
+
+## Operating notes
+
+- Both endpoints are **idempotent** (skip rows that already have the GCS image column set) — safe to re-run anytime.
+- In a **scheduled task** larger batches are fine; over **HTTP** keep `limit ≤ 15–20` — big batches can exceed the gateway timeout under concurrent-drain contention (the server still commits the work; the HTTP response just returns empty).

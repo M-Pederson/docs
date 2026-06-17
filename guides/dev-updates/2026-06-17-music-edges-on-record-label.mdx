@@ -1,0 +1,74 @@
+---
+title: "Music edges — ON_RECORD_LABEL + edge-description hardening (deepseek), live backfill"
+description: "Session 2026-06-17: built the ON_RECORD_LABEL Recording→Music_Label derived edge (writer #13131 / endpoint #8688), hardened the music edge describer (output cleanup + GOOD-or-null reject guard) and swapped its model gpt-oss-120b → deepseek-v4-flash to kill the ~15% dropped-space artifact, and kicked off the live edge-description backfill. Sandbox-verified throughout."
+---
+
+**Session (2026-06-17).** All changes on **Xano workspace 3, branch `v1`**, sandbox-verified, then applied to **live**. Builds on the node-description GOOD-or-null work in the [2026-06-16 update](/guides/dev-updates/2026-06-16-music-node-descriptions).
+
+## 1. `ON_RECORD_LABEL` edge — built
+
+A direct **`(Recording)-[:ON_RECORD_LABEL]->(Music_Label)`** edge (weight **55**), so a recording exposes its record label without a 2-hop traversal. Named `ON_RECORD_LABEL` (not generic `ON_LABEL`) to avoid label-term collision. It's a **derived convenience edge** — no MusicBrainz fetch (the recording lookup #13100 doesn't pull label data); it's materialized in-graph from the canonical-release path `(Recording)-[:APPEARS_ON]->(Release)-[:RELEASED_ON]->(Music_Label)`. Since only canonical releases become `Release` nodes, that path *is* the canonical-release label. `RELEASED_ON` (Release→Label, w50) stays source of truth.
+
+<Card icon="clock-rotate-left">
+
+```
+mvp/music/backfill-on-record-label-edges — 13131
+```
+
+Single idempotent Cypher via send-cypher: `MATCH (rec:Recording)-[:APPEARS_ON]->(rel:Release)-[ro:RELEASED_ON]->(lbl:Music_Label) MERGE (rec)-[r:ON_RECORD_LABEL]->(lbl)` — `ON CREATE SET` `uuid`/`created_at`; always sets `weight=55`, `updated_at`, `via_release=rel.mbid`, `catalog_number=ro.catalog_number`. `MERGE` per (recording,label) → idempotent. Optional `recording_mbid` scopes to one recording; omit for a full sweep.
+
+</Card>
+
+<Card icon="globe">
+
+```
+tool/backfill-on-record-label-edges — 8688   (musicbrainz group, no-auth)
+```
+
+Operator wrapper. `X-Data-Source` selects the graph (default live). **Sandbox-verified:** 12 edges, weight 55, `via_release` + `catalog_number` carried, idempotent re-run (0 dupes), scoped mode 1-for-labeled / 0-for-unlabeled.
+
+</Card>
+
+Catalog entry: [Music Edges → ON_RECORD_LABEL](/guides/enrichment/waterfall/music-edges#structural-music-hub-aware) (the catalog is now **25** edge types).
+
+## 2. Edge describer — hardened + model swapped
+
+The generic music edge describer ([#13095/#13096/#13097](/guides/enrichment/waterfall/music-functions#llm-edge-descriptions)) gained an output-cleanup pass and a new model.
+
+<Card icon="filter">
+
+```
+mb/edge/create-music-edge-description — 13095   (v1.4)
+mb/tool/backfill-music-edge-descriptions — 13097   (v1.4)
+tool/backfill-edge-descriptions — 8645   (v1.1)
+```
+
+- **#13095 v1.3** — output cleanup: strip wrapping quotes + leading meta-preambles ("According to the knowledge graph,", "Based on…"), normalize U+2011/U+2010 → `-`, strip the opaque `via_release` mbid from the prompt, and a **GOOD-or-null reject guard** (refusal/meta-commentary → empty → #13096 skips → edge retries). **#13095 v1.4** — model swap **`openai/gpt-oss-120b` → `deepseek/deepseek-v4-flash`** (`reasoning:{enabled:false}` + `max_tokens:200`, per trap #13) to eliminate the gpt-oss **~15% dropped-space** tokenizer artifact ("Stevensis", "Themusicgroup").
+- **#13097 v1.3** — added `ON_RECORD_LABEL` to the edge-type allowlist (now 25). **v1.4** — `mode:"reset"` (string-gated to dodge the bool-in-`if` serializer trap #14) nulls already-stamped music-edge descriptions in the target graph so a normal drain re-describes them with the current model.
+- **#8645 v1.1** — forwards `mode`.
+
+</Card>
+
+**Why the swap:** the sandbox sample showed gpt-oss dropping spaces in ~15% of descriptions (a tokenizer quirk a prompt can't fix). deepseek-v4-flash produces clean, concise output — *"Sufjan Stevens is a member of the music group Danielson."*, *"Def Jam South is a subsidiary of Def Jam Recordings."* — with the preamble + U+2011 issues already handled by the v1.3 cleanup.
+
+<Note>
+**Shared-function coordination.** #13095 and #13097 are also used by the parallel **[label-owner `OWNED_BY`](/guides/enrichment/waterfall/music-reconciliation#build-spec--label-owner-resolution-owned_by)** work. The merge was clean (verified by re-fetch): #13097 **v1.5** adds `OWNED_BY` to the allowlist on top of this session's `ON_RECORD_LABEL` + `mode:"reset"`, and `OWNED_BY` edges ride the same deepseek describer — e.g. live *"Cinq Music Group LLC is owned by GoDigital."* The live edge-description drain covers all of `ON_RECORD_LABEL`, `OWNED_BY`, and the pre-existing music edges in one pass.
+</Note>
+
+## Sandbox verification
+
+- `ON_RECORD_LABEL`: 12 edges created + described clean, e.g. *"The recording Smells Like Teen Spirit was issued by DGC Records under catalog number DGCD-24425."*
+- Edge-description re-drain on deepseek: 0 errors, dropped-space gone across the sample.
+
+## 3. Live backfill
+
+Live turned out to **already have a music graph** (~**2,165** music nodes, **3,802** music edges) — clean (0 description artifacts), but **none of the edges were described** (the edge-description cron never ran on live). Today:
+
+- ✅ **574 `ON_RECORD_LABEL` edges created on live** (`#8688`, `X-Data-Source: live`).
+- ⏳ **Live edge-description backfill in progress** — ~4,376 music edges (3,802 existing + 574 new), deepseek, via `tool/backfill-edge-descriptions` in `limit`-batched loops. Each batch's `SELECT` scans the full live graph (no edge-property index), so it runs ~150 s/batch → multi-hour drain. Batch 1 clean (40, 0 errors).
+
+## Open follow-ups (not done this pass)
+
+- **Edge-description cron #181** still **INACTIVE** — activate so new/undescribed edges describe on a schedule (now safe — hardened describer).
+- **`ON_RECORD_LABEL` forward-path wiring** — currently a post-enrichment backfill; not wired into the orchestrator, so newly-enriched recordings don't auto-get the edge.
+- **People-graph edge describers** (`#13006`/`#13011`/`#13018`, still `gpt-oss-120b`) carry the same dropped-space + U+2011 artifacts ([edge-audit item 5b](/guides/robert-mark/edge-audit#audit-findings)) — same fix available (deepseek swap + port the #13095 cleanup lambda).

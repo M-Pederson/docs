@@ -19,20 +19,20 @@ And because **the description is the embedding source** for recordings/groups, t
 <Card icon="filter">
 
 ```
-mvp/music/create-node-description — 13112  (v2.1)
+mvp/music/create-node-description — 13112  (v2.2)
 ```
 
-Builds a **slim, type-aware field-set** (name/type/country/life-span/genres/tags for artists+groups; name/artists/first-release/genres for recordings) instead of raw-JSON@8000 — small, complete, parseable. Prompt enforces a **strict ≤127 characters**; output is hard-truncated to 127 and **refusal echoes are rejected**. Handles recording / group / **artist**. **v2.1:** recordings cap performing-artist lists at 3 names + "and others" (in both the slim input and the prompt) so multi-collab tracks read cleanly instead of being cut mid-list.
+Builds a **slim, type-aware field-set** (name/type/country/life-span/genres/tags for artists+groups; name/artists/first-release/genres for recordings) instead of raw-JSON@8000 — small, complete, parseable. Prompt enforces a **strict ≤127 characters**. Two code-level guards enforce [GOOD-or-null](#good-or-null-invariant): an **input-empty short-circuit** (returns `null` before the LLM is called when the record/name is missing) and an **output reject-guard** (strips wrapping quotes, hard-truncates to 127, and maps any refusal/meta-commentary to `null`). **v2.2 (2026-06-17):** expanded the reject phrase list — first-person + `the user`/`please provide`/`structured`/`musicbrainz` markers — so stall echoes like *"the user hasn't provided… I must wait…"* are rejected even when they lack the literal `provide the`. **v2.1:** recordings cap performing-artist lists at 3 names + "and others" (in both the slim input and the prompt) so multi-collab tracks read cleanly instead of being cut mid-list.
 
 </Card>
 
 <Card icon="play">
 
 ```
-mvp/music/finalize-music-node — 13117  (v2.1)
+mvp/music/finalize-music-node — 13117  (v2.2)
 ```
 
-Adds the **`music_artist`** path (persons now get a description); **always** calls #13112 (no MB-annotation short-circuit, so ≤127 always holds); passes the real type through; writes the description text to the **source table + node**; and embeds `name_embedding` (#4676) + `embeddings` (#13114) **on the description**.
+Adds the **`music_artist`** path (persons now get a description); **always** calls #13112 (no MB-annotation short-circuit, so ≤127 always holds); passes the real type through; writes the description text to the **source table + node**; and embeds `name_embedding` (#4676) + `embeddings` (#13114) **on the description**. **v2.2 (2026-06-17):** a **belt-and-suspenders re-check** re-validates #13112's output against the same reject phrase list (and re-truncates to ≤127) *before* the persistence gate — so a stall echo can never reach the node or source table even if a future caller bypasses #13112. This is the second of two independent [GOOD-or-null](#good-or-null-invariant) checkpoints.
 
 </Card>
 
@@ -65,6 +65,21 @@ mb_artist.description  +  mb_recording.description   (new columns)
 The description text is now stored on the **source table** (parity for artists, groups, and recordings), not just `description_generated_at`. Each is the embedding source for its node's vectors. (The full-schema-replace cosmetically dropped the write-time `trim` validators on existing text columns — the code already trims; no data affected.)
 
 </Card>
+
+## GOOD-or-null invariant
+
+**A music node `description` is EITHER a GOOD description OR exactly `null` — never anything in between.** A GOOD description is one short factual sentence, **≤127 characters, beginning with the entity name**, derived only from the provided source fields. It must **never** be LLM meta-commentary, a refusal, a stall echo, or a placeholder. Because the description is the **embedding source**, anything other than GOOD-or-null poisons the node's `name_embedding` + Gemini `embeddings`. (This rule extends to all node and edge descriptions across the graph.)
+
+The canonical artifact this rule exists to kill — observed on a live recording node and **mapped to `null` going forward**:
+
+> *"Wait, the user hasn't provided the MusicBrainz record yet. I must wait for the structured data before I can write the description. Please provide the structured MusicBrainz record for the entity."*
+
+Enforced in **code, not the prompt** (the prompt asks for clean output, but LLMs don't reliably comply), at **two independent checkpoints**:
+
+1. **Input-empty short-circuit** (#13112) — if the record is missing/not an object or the name is falsy, return `null` *before* the LLM is ever called on an empty stub.
+2. **Output reject-guard** (#13112 **and** re-checked in #13117 before persistence) — strip wrapping quotes/backticks, hard-truncate >127, and map any text containing a refusal/meta-commentary marker to `null`. The marker list is first-person + meta-vocabulary that never appears in a clean third-person description: `provide the`, `please provide`, `i need the`/`i need a`, `musicbrainz record`, `structured musicbrainz`/`structured data`/`structured record`, `no record`, `the user has`, `hasn't provided`/`has not provided`/`have not provided`, `i must wait`, `wait for the structured`, `before i can write`/`before i can generate`, `as an ai`, `i cannot`/`i can't`, `i am unable`/`i'm unable`, `i do not have`/`i don't have`.
+
+A node that fails validation is left `description = null` and **unstamped** (`description_generated_at IS NULL`) so the next backfill retries it. **Null always beats garbage.**
 
 ## Design notes
 
@@ -102,4 +117,5 @@ The 280 recordings were then re-run once more with the **v2.1 artist cap** — *
 ## Status
 
 - **Forward path is live on `v1`** — every newly-enriched recording / group / **artist** now gets a clean ≤127 description (table + node) with description-based vectors. The "please provide the record" garbage is gone.
-- **Live data source not deployed yet** — staging only, by request.
+- **GOOD-or-null guard hardened (2026-06-17, v2.2).** #13112 and #13117 bumped to v2.2 — expanded reject phrase list + an independent pre-persist re-check (see [GOOD-or-null invariant](#good-or-null-invariant)). Both verified by re-fetch/diff of the stored XanoScript.
+- **Stale v1 artifacts — swept & repaired (2026-06-17).** Blast-radius probe across every data source found the poison was **isolated to `sandbox`**: **live 0, staging 0, sandbox 82** (all `Recording`). Repaired sandbox via #13113 `redo=true` (operator endpoint #8652 extended to forward `redo` + `after_id`): **95/95 recordings re-described, 82 → 0** (verified with both a narrow and a wide refusal-phrase net), all ≤127 and clean, **both vectors rebuilt** — confirmed on the originally-reported node *Made for Now (Latin version)* (*"…is a 2018 recording by Janet Jackson and Daddy Yankee."*). Notably **all 95 re-described to clean text (0 null)**, confirming the v1 failure was raw-JSON@8000 truncation, not missing MB data. **live & staging independently re-verified clean (0 artifacts) — no backfill needed there.**

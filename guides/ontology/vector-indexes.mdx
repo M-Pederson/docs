@@ -33,6 +33,112 @@ YIELD node, score
 
 ---
 
+## Keeping the index healthy
+
+<Warning>
+  **A node can have a valid `vecf32` and still be invisible to search.** Writing a `vecf32` property only adds the node to the HNSW index if a healthy index for that label/property **already exists** in the data source at write time. A node written into a source whose index is missing/unhealthy gets a perfectly good vector that is **never indexed** — `IS NOT NULL` is true, `vec.cosineDistance` works, but `queryNodes` never returns it. This was the root cause of the 2026-06-17 incident where music nodes had embeddings but `"who is …"` returned nothing on `staging`.
+</Warning>
+
+**Incremental maintenance is reliable — once the index exists.** With a healthy index, every write path indexes on write (verified across `MERGE … SET vector … SET :Entity`, `:Entity` in the MERGE label set, and stub-then-backfill). So this class of failure is a **provisioning/state gap, not a writer-code bug.** The fixes below all target index *state*.
+
+<Steps>
+  <Step title="Provision the index before seeding">
+    Run **`tool/create-indexes` (#4669)** on every data source (`sandbox` / `staging` / `live`) **before** any node writes, and at the top of any seed/migration. It is idempotent. New data source → indexes first, then seed.
+  </Step>
+  <Step title="Verify (or rebuild) after every bulk operation">
+    Snapshot/restore, data-source copy, and large backfills can land `vecf32` properties **without** populating HNSW. After any seed-to-new-source or copy, run a coverage check or a one-time rebuild as a gate — don't assume the copy carried the index.
+  </Step>
+  <Step title="Detect drift with a per-node self-probe — never full enumeration">
+    `queryNodes` is **approximate** (HNSW, `efRuntime` ≈ 100). Trying to list every member from a single probe vector silently omits the farthest nodes, producing **false "missing" counts**. The ground-truth membership test is to query a node with **its own** vector — an indexed node returns itself at score ≈ 0:
+
+    ```cypher
+    // is THIS node in the index? indexed ⇒ returns itself@~0
+    CALL db.idx.vector.queryNodes('Entity', 'name_embedding', 1, vecf32($node_own_vector))
+    YIELD node, score
+    WHERE node.uuid = $node_uuid
+    RETURN score
+    ```
+  </Step>
+  <Step title="Repair">
+    **Drop + recreate** the index for a full backfill (≈1s for ~25k vectors; brief search-degradation window on live):
+
+    ```cypher
+    DROP VECTOR INDEX FOR (n:Entity) ON (n.name_embedding)
+    CREATE VECTOR INDEX FOR (n:Entity) ON (n.name_embedding)
+      OPTIONS {dimension: 1536, similarityFunction: 'cosine', M: 16, efConstruction: 200, efRuntime: 100}
+    ```
+
+    For a few stragglers, force a per-node re-index by `null`-then-restoring the **same** value (a same-value re-set is a no-op and won't trigger reindexing):
+
+    ```cypher
+    MATCH (n {uuid: $uuid}) SET n.name_embedding = null;
+    MATCH (n {uuid: $uuid}) SET n.name_embedding = vecf32($same_vector)
+    ```
+
+    Backfill is async — `queryNodes` returns empty for a few seconds after `CREATE`, then populates.
+  </Step>
+</Steps>
+
+<Note>
+  A rare residual: a handful of otherwise-valid nodes can resist both rebuild and re-set (a FalkorDB HNSW edge case — observed on 2 old `VC_Firm` nodes, 2 of ~25k). If business-critical, recreate the node (re-enrich) so it inserts fresh; otherwise it's safe to leave.
+</Note>
+
+---
+
+## Automated monitoring & tooling
+
+The steps above are wired into three live Xano artifacts so this failure mode can't recur silently.
+
+### Daily monitor (cron)
+
+<Card icon="clock-rotate-left">
+
+```
+vector-index-health-check — task #183
+```
+
+**Runs daily on `live`** (first fire 2026-06-18 00:00 UTC). Samples 300 `Entity.name_embedding` nodes and self-probes each for index membership. **Read-only** (`repair=false`) — it never mutates graph data; it only writes a `log_crash` alert row (phase `node_stamp`) **when more than 5 of the sample are unindexed**, which tolerates the rare HNSW-edge-case stragglers while catching systemic drift. ~3 min runtime, then idle. Leave it enabled.
+
+</Card>
+
+### On-demand audit / repair (endpoint)
+
+<Card icon="globe">
+
+```
+POST /api:rlSvC4qe/vector-index-health   →  vectors/audit-vector-index #13128
+```
+
+Data-source-aware via `X-Data-Source`. Self-probes a sample (or an explicit `uuids` list) and reports `{ total_with_vector, checked, missing_count, missing[], repaired[] }`. Pass `repair: true` to re-index any miss via the `null`→restore trick. **This is the canonical, reliable membership check** — use it instead of ad-hoc `queryNodes` enumeration.
+
+</Card>
+
+```bash
+# audit a sample on staging (read-only)
+curl -X POST https://xh2o-yths-38lt.n7c.xano.io/api:rlSvC4qe/vector-index-health \
+  -H "Content-Type: application/json" -H "X-Data-Source: staging" -H "X-Branch: v1" \
+  -d '{"sample": 300}'
+
+# audit + auto-heal specific nodes on live
+curl -X POST https://xh2o-yths-38lt.n7c.xano.io/api:rlSvC4qe/vector-index-health \
+  -H "Content-Type: application/json" -H "X-Data-Source: live" -H "X-Branch: v1" \
+  -d '{"uuids": ["<uuid1>", "<uuid2>"], "repair": true}'
+```
+
+### Seed-path guarantee
+
+<Card icon="wrench">
+
+```
+vectors/ensure-vector-indexes — #13129
+```
+
+Idempotent — checks `db.indexes()` and creates the `Entity` `name_embedding` + `expertise_embedding` vector indexes **only if missing**. Wired (non-fatal) into the entry of all six MusicBrainz seed endpoints (`seed/artist`, `seed/recording`, `seed/release-group`, `seed/work`, `seed/label`, `seed/event`), so seeding into a fresh data source provisions the index **before** the first node write — closing the gap that caused the 2026-06-17 incident.
+
+</Card>
+
+---
+
 ## Embedding properties by node type
 
 All embeddings are type `vecf32`. Dimension is determined by the embedding model used during ingestion.

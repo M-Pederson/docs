@@ -22,6 +22,63 @@ Why a bridge, not a merge: a music identity (`Music_Artist`) and a business iden
 The scoping content below (reusable infra, proposed flows, open questions) is **historical** — superseded by the Built section above. Several open questions are now resolved: **#2** (added `mb_artist.master_person_id`), and the person flow (Q1/Q3 auto-merge vs review, embedding threshold) is moot under the bridge approach. The label-side open questions (#4 create-on-miss) are answered by the built flow (`master-company-new` creates on miss, depth-0 only).
 </Note>
 
+## Build spec — label owner resolution (`OWNED_BY`)
+
+<Note>
+**Status: BUILT + sandbox-verified, forward-path-live 2026-06-17.** Resolver `mvp/music/resolve-label-owner` (**#13132**, Exa + `deepseek/deepseek-v4-flash`) + linker `mb/resolve-and-link-label-owner` (**#13133**) ship live; the linker is wired into `mb/run-base-label-enrich` (**#13091**) as a depth-0 phase after the company `SAME_AS`, so seeding a label now auto-resolves and links its owner. `OWNED_BY` was added to the edge-description allowlist (**#13097**), and those edges get LLM descriptions via the deepseek describer (**#13095**). Verified end-to-end on sandbox: `Hardly Art —OWNED_BY→ Sub Pop Records` and `Matador —OWNED_BY→ Beggars Group` (both `mb_subsidiary`, w15), Tier-1→Tier-2 fallback (Def Jam → Universal Music Group), idempotency, and graceful degradation. Manual link endpoint: `tool/link-label-owner` (#8689).
+</Note>
+
+**Goal.** When a `Music_Label` is created, resolve **two** companies: (1) the label *as* a company — `SAME_AS` (done) — and (2) the company that *owns* it — new `OWNED_BY`. Owner resolution is **tiered** so it works whether or not MusicBrainz records the parent.
+
+**Why a new edge.** An Exa-discovered corporate parent (e.g. Sub Pop → Warner Music Group) usually has **no MB mbid**, so a clean label→label `SUBSIDIARY_OF` isn't writable. Decision (2026-06-17): `OWNED_BY` `(:Music_Label)→(:Company)` is **the** canonical owner edge, written in *both* tiers. `SUBSIDIARY_OF` stays for music-label lineage only. See the [edge spec](/guides/enrichment/waterfall/music-edges#identity--ownership-bridges).
+
+### 1. Schema — add to `mb_label`
+
+Add via the Xano **UI** (the MCP full-replace strips `filters=trim`; **never** `xano workspace push` — it wipes the data source):
+
+| Column | Type | Notes |
+|---|---|---|
+| `owner_company_id` | int → `master_company` | `0` = unresolved |
+| `owner_match_method` | text | `mb_subsidiary` / `exa_llm` / `none` |
+| `owner_confidence` | float | 0–1 |
+| `owner_resolved_at` | timestamp | null until resolved |
+
+### 2. New resolver `mb/resolve-label-owner` (side-effect-free)
+
+Mirrors `find-label-domain` (#13116). **In:** `label_name`, `label_domain?`, `label_area?`, `label_mbid`. Exa search → LLM extract → `{owner_name, owner_domain, confidence, source_url}` or `null`. **Accept only** when `source_url` is present **and** `confidence ≥ 0.7` (anti-hallucination, same cross-check ethos as person-resolution). LLM call sets `reasoning:{enabled:false}` + a `max_tokens` cap (reasoning models otherwise return empty `content`). Writes nothing — pure resolver.
+
+### 3. Hook into `mb/run-base-label-enrich` (#13091)
+
+New `try_catch` phase **`mb_owner`** (append the value to the `log_crash.phase` enum *first* via the whole-schema Metadata PUT — it's a strict enum). Runs after the existing `SAME_AS` block; **skips when `owner_company_id != 0`** (idempotent re-enrich).
+
+1. **Tier 1 — MB-native:** find a *parent* in `label-rels` — an **incoming `label ownership`** relation **or** a **backward `imprint`** relation (⚠️ the common *forward* `label ownership` points at labels this label **owns**, i.e. children — do not invert the hierarchy). Keep the existing `SUBSIDIARY_OF` (w15) + parent-queued-T1; take the parent's **name**, resolve its **domain** via `find-label-domain` (#13116). `match_method = mb_subsidiary`.
+2. **Tier 2 — Exa:** no MB parent → `mb/resolve-label-owner`. `match_method = exa_llm`.
+3. **Converge:** `(owner_name, owner_domain)` → `master-company-new` (#12558, `hold_downstream=true`, create-on-miss) → stamp the four `mb_label` fields → write the edge via `mvp/falkor/send-cypher` (#2815; guard `typeof r === 'string'` before reading `.data`):
+
+```cypher
+MERGE (l:Music_Label {uuid: $label_uuid})
+MERGE (c:Company {uuid: $owner_company_uuid})
+MERGE (l)-[r:OWNED_BY]->(c)
+SET r += {match_method: $mm, confidence: $conf, source: $src, weight: 15}
+// + standard edge envelope: uuid, created_at, updated_at, description, description_generated_at
+```
+
+### 4. Coverage gate — result (probed 2026-06-17)
+
+The graph is too sparsely seeded to measure from (live 17 labels / 0 `SUBSIDIARY_OF`, staging 1, sandbox 5 / 2 `SUBSIDIARY_OF`), so coverage was probed against the **live MusicBrainz API** on the named cases:
+
+| Label | `label-rels` returned | Owner found by Tier 1? |
+|---|---|---|
+| **Sub Pop Records** | 2× `label ownership` **forward** → Hardly Art, Next Ambiance (labels Sub Pop *owns*) | ❌ — corporate parent (Warner Music Group) **absent from MB** |
+| **Matador** | `imprint` **backward** → Beggars Group; `label distribution` (both ways); `label ownership` forward → True Panther | ✅ — but via **`imprint`/backward**, not `label ownership` |
+
+**Findings that shaped the spec:**
+- **Direction is load-bearing** — MB's prevalent `label ownership` **forward** edge points at *children*, not the parent. The owner is an **incoming `label ownership`** or **backward `imprint`** (see Tier 1 above).
+- **Ownership spans ≥2 relation types** (`label ownership`, `imprint`, arguably `business association`).
+- **MB structurally misses the ultimate corporate parent** (Sub Pop→Warner is simply not modeled). → **Tier 2 (Exa) is required, not optional** — it's the only path to the major-label/holding-co parent for a large fraction of labels.
+
+**Before scaling:** seed a representative batch of labels through #13091 and re-run the graph counts to size the real Tier-1 hit-rate; the MB probe above already confirms Tier 2 must exist.
+
 ## The two reconciliation jobs
 
 | Job | Mechanism | Why different |
@@ -102,3 +159,4 @@ These need decisions before build (the same design-first gate as the [original s
 3. **Embedding threshold.** 12566's general threshold is 0.65. Person-name collisions (common names) argue for a stricter bar + mandatory LLM confirm; what's the floor?
 4. **Create-on-miss for companies.** 12558 *creates* a `master_company` when nothing matches. Should an unmatched `Music_Label` create a new company (Sub Pop deserves one) or only link to existing companies in v1?
 5. **Embedding source mismatch.** Node descriptions (13113) now overwrite `name_embedding` with description-based vectors for `Music_Group`/`Recording` — person artists keep name+disambiguation embeddings from 13092. Reconciliation KNN should run against `Person` embeddings, which are name-based — consistent today, but worth pinning before descriptions expand to more node types.
+6. **Owner-company resolution for labels MB doesn't link.** ✅ *Resolved 2026-06-17* — decided to build a tiered owner resolver writing a direct `(:Music_Label)-[:OWNED_BY]->(:Company)` edge. Promoted to its own [Build spec — label owner resolution](#build-spec--label-owner-resolution-owned_by) section above.

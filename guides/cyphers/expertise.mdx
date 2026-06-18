@@ -7,6 +7,98 @@ All Cypher queries related to expertise — domain and sub-domain node creation,
 
 ---
 
+## Improvement Plan
+
+This is a refactor plan only. Do not change live Xano functions, model configs, Cypher blocks, or build new functions from this section without a separate implementation pass.
+
+The goal is to make person expertise extraction more powerful by rebuilding the input context, making refresh behavior explicitly idempotent from the person-enrich pipeline, and using different OpenRouter models for different phases instead of forcing one model to do every job. Model candidates below were checked against the live OpenRouter model API on 2026-06-17; re-run the model/pricing audit before implementation.
+
+### Six Review Loops
+
+1. **Refresh semantics loop** — Treat every person-enrich expertise run as a full replacement pass. Before any new expertise signals are resolved, delete all existing `(Person)-[:HAS_EXPERTISE]->(Expertise)` edges for that person so the graph reflects the latest evidence instead of accreting stale skills.
+2. **Mirror consistency loop** — Because `resolve-person-expertise-v2` dual-writes to `person_has_expertise` (table 711), the cleanup plan should also clear that person's mirror rows before re-resolution. Otherwise the graph can be clean while the relational mirror still exposes stale expertise.
+3. **Context quality loop** — Replace the current broad text blob with a purpose-built one-hop context package: all non-embedding properties from the `Person` graph node, all one-hop edge descriptions only, and `master_person.deep_bio` when available.
+4. **Prompt contract loop** — Keep extraction strict JSON, but expand the contract to distinguish direct evidence, graph-inferred evidence, deep-bio evidence, and weak inferred evidence. Add source fields only if they survive validation and improve QA.
+5. **Model ladder loop** — Split the work by phase. Use cheaper long-context models for context normalization and routine extraction, and reserve the best reasoning models for adjudication, ambiguity, or high-value records. Kimi, DeepSeek, and Qwen should be first-class benchmark candidates alongside OpenAI, Gemini, and Claude.
+6. **Evaluation loop** — Add a golden set before shipping: compare current vs proposed output for precision, duplicate rate, stale-edge removal, created-node rate, graph/mirror parity, token cost, and manual spot-check quality.
+
+### Refactor Shape
+
+1. **Build a separate A/B function first**
+
+   Do not refactor #12666 in place. Plan a separate sandbox-first function, tentatively `mvp/expertise/llm-identify-person-expertise-ab`, with the same person inputs plus `run_label`, `model_profile`, and `mode`.
+
+   Suggested modes:
+
+   | Mode | Behavior | Purpose |
+   |------|----------|---------|
+   | `dry_run` | Build context, call models, validate JSON, and return proposed signals without graph/table writes. | Compare old vs new extraction on the same sandbox person safely. |
+   | `shadow_write` | Write proposed signals to an A/B log table or temporary candidate edge type keyed by `run_label`; do not touch canonical `HAS_EXPERTISE`. | Inspect results across batches without corrupting canonical graph state. |
+   | `commit_refresh` | Delete canonical expertise edges/mirror rows, then call #12926 to write the accepted replacement set. | Promotion path after the A/B winner is selected. |
+
+   The first benchmark should run current #12666 and the new A/B function against the same sandbox `master_person` / `Person` node, then diff signal count, evidence quality, duplicate rate, created-node risk, model cost, and runtime.
+
+2. **Centralize the pre-run cleanup**
+
+   Once the A/B function graduates, ensure every person-enrich path that invokes the canonical expertise extractor runs cleanup first. The live person orchestrator is `mvp/enrich/enrich-master-person` (#13040); legacy `run-base-person-enrich` (#12554) and IMDB Phase 4b callers should either route through the same canonical entry point or be audited as compatibility callers.
+
+   Target graph cleanup shape:
+
+   ```cypher
+   MATCH (p:Entity:Person {uuid: $personUuid})-[r:HAS_EXPERTISE]->()
+   DELETE r
+   RETURN count(r) AS deleted_count
+   ```
+
+   Implementation note: keep the canonical direction as `Person -> Expertise`, but run a one-time audit for accidental reverse `HAS_EXPERTISE` edges before deciding whether the cleanup should delete both directions.
+
+3. **Clear the relational mirror in the same refresh**
+
+   Since #12926 writes `person_has_expertise`, the refactor should delete that person's table-711 rows before the resolver loop creates replacements. Confirm the exact key field during implementation (`master_person_id`, `person_node_uuid`, or equivalent) and log both graph deleted count and mirror deleted count.
+
+4. **Build a one-hop graph context package**
+
+   Replace the prompt input with a deterministic context builder. The graph query should start from the person node, gather only one-hop relationship descriptions, and avoid neighbor-node properties entirely.
+
+   Target read shape:
+
+   ```cypher
+   MATCH (p:Entity:Person {uuid: $personUuid})
+   OPTIONAL MATCH (p)-[r]-(n:Entity)
+   RETURN properties(p) AS person_properties,
+          collect(r.description) AS one_hop_edge_descriptions
+   ```
+
+   Post-query shaping should strip `embeddings`, `name_embedding`, `expertise_embedding`, and any future `*_embedding` vector fields from `person_properties`; drop blank/null edge descriptions; dedupe descriptions; and cap the final list by a deterministic token/character budget. The prompt context should contain relationship descriptions only, not neighbor node params or raw edge metadata.
+
+5. **Merge in `master_person.deep_bio`**
+
+   The one-hop Cypher cannot read Xano table data, so the context builder should fetch the `master_person` row separately and append `deep_bio` when present. Treat `deep_bio` as a high-signal narrative source, but label it separately from graph edge descriptions so QA can tell whether an expertise came from the graph or the deep-bio record.
+
+6. **Use different OpenRouter models by phase**
+
+   Proposed candidates to benchmark:
+
+   | Phase | Default candidate | Escalation candidate | Notes |
+   |-------|-------------------|----------------------|-------|
+   | Context normalization / over-budget compression | `google/gemini-3.1-flash-lite` or `qwen/qwen3.7-plus` | `openai/gpt-5.4-nano` or `deepseek/deepseek-v4-flash` | Only needed if the one-hop package exceeds the extraction budget. Use structured outputs and keep reasoning minimal/none unless compression quality fails. |
+   | Main expertise extraction | `google/gemini-3.1-flash-lite`, `openai/gpt-5-mini`, or `qwen/qwen3.7-plus` | `openai/gpt-5.4-mini`, `qwen/qwen3.7-max`, or `deepseek/deepseek-v4-pro` | Benchmark against current `google/gemini-3-flash-preview`. Gemini 3.1 Flash Lite is cheaper than the current Gemini 3 Flash Preview on the live OpenRouter list and keeps 1M context. |
+   | Ambiguity adjudication / reasoning pass | none by default | `anthropic/claude-sonnet-4.6`, `google/gemini-3.1-pro-preview`, `moonshotai/kimi-k2.7-code`, `deepseek/deepseek-v4-pro`, or `qwen/qwen3.7-max` | Run only when extraction returns low confidence, too many inferred signals, schema repair, or unusually high created-node risk. Use the strongest reasoning model that wins the golden-set eval, not the most familiar vendor. Do not attach `openrouter:web_search` for private graph context. |
+   | New expertise node description | `google/gemini-3.1-flash-lite` | `openai/gpt-5-mini` | Keep short, generic, and taxonomy-safe. This is not the same as person-specific edge copy. |
+   | HAS_EXPERTISE edge description | `google/gemini-3.1-flash-lite` or `openai/gpt-5-nano` | none unless quality fails | One sentence per edge should stay on a cheap model with a strict word cap. |
+
+   Reasoning-model guardrail: when testing Kimi, DeepSeek, Qwen thinking models, GPT reasoning models, or Gemini Pro, set an explicit completion budget and validate that `choices.0.message.content` contains parseable JSON. If a model spends the budget on hidden reasoning and returns empty `content`, retry with a lower reasoning effort, higher completion cap, or a non-reasoning fallback before marking the person as having no expertise.
+
+7. **Tighten extraction output and resolver handoff**
+
+   Keep `expertise_area`, `evidence`, `signal_type`, `depth`, `recency`, and `confidence`, but consider adding `evidence_source` (`person_property`, `edge_description`, `deep_bio`) and `source_span` for auditability. Validate schema before calling #12926. Reject duplicate expertise at the prompt boundary before vector search so the resolver does less merge cleanup.
+
+8. **Define rollout gates**
+
+   Before replacing the current path, run the old and new extractors side-by-side on a representative set of sandbox people: sparse profiles, rich C-suite profiles, creators, investors, film/TV profiles, and records with deep_bio. Promote only if the new path improves accepted expertise quality without materially increasing duplicate nodes, mirror drift, or average cost per person.
+
+---
+
 ## mvp/expertise/llm-identify-person-expertise — #12666
 
 ```text

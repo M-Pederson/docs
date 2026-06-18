@@ -99,6 +99,93 @@ The goal is to make person expertise extraction more powerful by rebuilding the 
 
 ---
 
+## Dry-run experiments (2026-06-18)
+
+> **Status: sandbox QA in progress — we are NOT backfilling or migrating live.** The only live change to date is the edge-description model swap (§1). The name-vs-name resolver fix (§5) is proven on the **sandbox** graph only; no live `match_name_embedding` index, backfill, or resolver change has been made. The migration plan below (§"Migration plan") is a proposal pending QA sign-off.
+
+Sandbox-first experiments validating parts of the Improvement Plan above. All extraction/probe work ran **read-only** via a throwaway harness in the **LLM Test Harness** API group (workspace 3); the only production change shipped was the edge-description model swap (§1). FalkorDB reads/writes were scoped by the `X-Data-Source` header (sandbox vs live).
+
+### 1. Edge-description model → DeepSeek v4 Flash (SHIPPED, live)
+
+`enrich/create-expertise-edge-description-from-graph` (#13019) **v1.2** switched from `openai/gpt-oss-120b` to **`deepseek/deepseek-v4-flash`** ($0.09 / $0.18 per Mtok). Forward-path: affects inline descriptions from #12926 and the backfill chain (task #176 → #13021 → #13020 → #13019).
+
+⚠️ **Guardrail required.** deepseek-v4-flash burns its completion budget on hidden reasoning tokens and returns empty `content` for short structured outputs. The fix (verified live on two real edges): pass `reasoning: {enabled: false}` + `max_tokens: 300`. Without it, every edge description returns null.
+
+### 2. Extraction context A/B — relational vs graph + deep_bio
+
+A dry-run A/B compared the current extraction context (relational YAML from `mvp/context/full-person-context` #12667) against a new one-hop graph context (`MATCH (p:Person)-[r]-() RETURN collect(r.description)`) + joined `master_person.deep_bio`, adding an `evidence_source` field per signal.
+
+**Key finding:** the new context only helps where the graph is populated — a thinly-connected node (1 one-hop edge, empty deep_bio) degraded to scalar-props-only and *underperformed* the relational context. **Fix:** a **blend fallback** — when a person has `< 3` one-hop edge descriptions, fold the relational profile back in as a `## RELATIONAL_PROFILE` section. Verified: the fallback fires exactly at the threshold.
+
+> Deviation from Plan step 4: the new context takes person scalar props from the `master_person` row, **not** `properties(p)`, to avoid dragging the 1536-/3072-dim embedding vectors over the wire.
+
+### 3. Extraction model A/B + qwen3 verdict
+
+`gemini-3.1-flash-lite` (current) vs candidates, new context, dry-run:
+
+| Model | signals (Megan / Vinny) | $in / $out per Mtok | reliability | note |
+|---|---|---|---|---|
+| `google/gemini-3.1-flash-lite` | 8 / 10 | 0.25 / 1.50 | 4/4 ✅ | conservative baseline |
+| `qwen/qwen3-235b-a22b-2507` | 20 / 19 | 0.09 / 0.10 | 2/4 ❌ | cheap, high recall, flaky |
+| `openai/gpt-5-mini` | 14 / 8 | 0.25 / 2.00 | ok | middle |
+| `deepseek/deepseek-v4-flash` | 0 / 0 | 0.09 / 0.18 | ❌ | empty content (reasoning trap) |
+
+Fragmentation gate (Megan #2, cluster @0.40): gemini `8 → 6` distinct (0.25 frag); qwen `20 → 13` distinct (**0.35 frag**) — qwen's worst cluster fragmented one concept into 6 signals (`music label management` / `music distribution` / `artist management` / …).
+
+**Verdict:** qwen3 surfaces ~2× distinct coverage at ~15× lower cost, but is (a) unreliable as-called (50% empty-content failures → needs `reasoning:{enabled:false}`) and (b) more fragmented (worsens node bloat). Its fragmentation is **harmless once the name-vs-name dedup fix (§5) ships** (that collapses exactly these near-dups at resolution). **So: keep `gemini-3.1-flash-lite` for now; qwen3 becomes attractive only after the dedup fix + reasoning guardrail.**
+
+### 4. Auto-creation node-bloat diagnosis
+
+The resolver CREATE branch (#12926) has spawned **2,265 of 2,435 `SubDomainExpertise` nodes as `llm_identified`** (93%), with heavy near-duplication. Three root causes:
+
+**🔴 Embedding asymmetry (calibration bug).** The resolver matches `embed(name)` against stored vectors built from *different text* — `embed(name + ": " + description)` for llm_identified nodes, `embed(description)` for synced nodes. So even an exact-name match never reaches ~0 distance:
+
+| pair | name-vs-name | name-vs-stored (current) |
+|---|---|---|
+| AI strategy ↔ AI strategy (self) | **0.0000** | 0.3196 |
+| product manager ↔ Product Management | 0.2129 | 0.3414 |
+| AI-native worldbuilding ↔ AI-native platforms | 0.3271 | 0.4613 |
+| AI agents for accounting ↔ AI agents | 0.2407 | 0.4194 |
+| Product Management ↔ venture capital (distinct) | **0.7797** | — |
+
+Matching on **name-only embeddings** collapses self-match to 0, pulls near-dups well under threshold, and keeps distinct concepts far apart.
+
+**🟠 Creation-order bloat.** Many dups would match *today* but were created before their parent existed (`AI agents for accounting` is 0.42 from `AI agents`). Needs a one-time merge pass.
+
+**🟡 The 0.45 threshold is roughly right** — don't lower it (would miss paraphrases like `product manager`→`Product Management` at 0.34); on the name-vs-name scale it can tighten to ~0.40.
+
+### 5. Name-vs-name fix — sandbox-validated
+
+Built a `match_name_embedding` vector index on the sandbox `:Entity`, backfilled `embed(name)` onto 50 real expertise nodes, then probed @0.40:
+
+| candidate | nearest | distance | decision |
+|---|---|---|---|
+| cybersecurity | cybersecurity industry operations | 0.311 | MATCH |
+| information security | network security | 0.357 | MATCH |
+| commercial real estate | real estate | 0.321 | MATCH |
+| sales leadership | revenue leadership | 0.295 | MATCH |
+| molecular gastronomy | gluten-free recipe development | 0.646 | CREATE ✓ |
+
+Every near-dup the current resolver would spawn now correctly MATCHES; a genuinely distinct concept correctly CREATEs. Mechanism proven end-to-end.
+
+### Migration plan (not yet shipped)
+
+1. **Backfill as a Xano task** (batched `UNWIND` SET — the HTTP drainer is ~4s/node, too slow for 2,435 live nodes).
+2. Create the `match_name_embedding` index on **live**, run the backfill.
+3. Patch the **three resolvers** (#12926, #12668, #12746) to write `match_name_embedding` on new nodes and match name-vs-name @~0.40.
+4. One-time **historical merge pass** to collapse the ~2,265 existing near-dups.
+5. Then revisit qwen3 for extraction (now safe).
+
+### Harness endpoints (workspace 3, "LLM Test Harness" group — throwaway)
+
+- `tool/expertise-identify-ab` (#8694) — extraction context + model A/B (`dry_run`)
+- `tool/expertise-resolve-probe` (#8696) — KNN threshold probe
+- `tool/expertise-embed-distance` (#8697) — name-vs-name cosine calibration
+- `tool/expertise-match-name` (#8698) — sandbox name-only index / backfill / probe
+- `tool/expertise-dedup-analyze` (#8699) — fragmentation / cluster analyzer
+
+---
+
 ## mvp/expertise/llm-identify-person-expertise — #12666
 
 ```text

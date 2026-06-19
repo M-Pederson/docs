@@ -339,6 +339,205 @@ Beyond expertise: every node writer writes `embeddings` (Gemini) + stops `name_e
 
 ---
 
+## Taxonomy completion — orphan SubDomain → DomainExpertise (2026-06-19)
+
+Domain-level search ("show me experts in AI") rolls up as a free 2-hop traversal: `(Person)-[:HAS_EXPERTISE]->(SubDomainExpertise)<-[:HAS_SUBDOMAIN]-(DomainExpertise)`. That traversal returned almost nobody because **2,265 of 2,435 `SubDomainExpertise` nodes were orphans** (no parent `DomainExpertise`) — all `source:llm_identified`, created by the resolver CREATE branch, which (until this work) never wrote `HAS_SUBDOMAIN`. Only the sync (#12663), driven by the relational `domain_expertise_id` FK, ever created parents (170 edges).
+
+**Decision (settled — not relitigated):** keep person→subdomain edges (specific, best for GraphRAG); do **not** add person→domain edges (bloats the person ~2× and pollutes RAG with coarse domain descriptions). Instead **complete the SUBDOMAIN→DOMAIN taxonomy** so the domain rollup is a free 2-hop and person edges stay specific.
+
+**Curated-set guard:** the resolver attaches a subdomain to an **existing** `DomainExpertise` only — it **never auto-creates a domain** (the 119-domain set is curated). No-fit subdomains are flagged `parent_unresolved=true` for human review, not forced into a wrong parent.
+
+### Parent-domain resolver — `mvp/expertise/resolve-parent-domain` (#13141)
+
+```text
+mvp/expertise/resolve-parent-domain — 13141
+```
+
+Given a subdomain (`name` + `description`), picks the best parent from the curated `DomainExpertise` set via a single `google/gemini-3.1-flash-lite` call (`reasoning:{enabled:false}`, the full domain list fits one prompt). The 119 domains are fetched live and presented as a numbered list; the model returns a **JSON index** (`{"index": N}`, 0 = NONE), mapped deterministically back to a uuid (a digit-scan parse + index→uuid map — robust to formatting, regex-free per the escaping traps). KNN over `expert_embeddings` was rejected as the primary mechanism: with 2,435 subdomains vs 119 domains, KNN top-K is crowded out by other subdomains, whereas the full curated list fits one cheap prompt.
+
+**Calibration (two adversarial judge-panel audits, 73 + 71 sampled assignments each judged by an independent strict judge + a second adjudicator on disputes):**
+
+| prompt | precision | NONE rate | failure mode |
+|---|---|---|---|
+| v1.0 (assign-by-default) | 79.5% | 16% | **"AI Strategy & Transformation" magnet** — generic leadership / M&A / startup terms forced in |
+| v1.1 (strong NONE-preference) | — | **49%** ❌ | over-corrected — abstained on `Python`, `communications`, `education` |
+| **v1.2 (assign-default + scope-guard vetoes + bounded NONE)** | **83.1%** | ~39% | residual = fine-grained sibling-domain calls (judges themselves split) |
+
+v1.2 keeps the magnet/qualifier fixes as **targeted vetoes** (AI Strategy is AI-only; AI-native systems → `AI Infrastructure` not `Software Engineering`; DB perf → `Data Science`, mobile ops → `Mobile Development` not `DevOps`; finance qualifiers `institutions`/`advisory`/`investment` are load-bearing) while defaulting to *assign* and reserving NONE for genuinely uncovered industries (agriculture, retail, hospitality, generic business, academic humanities, grassroots advocacy). The 14/15 known-wrong v1.0 cases flipped to the judge-preferred outcome; the dangerous **systematic magnet is eliminated** (the remaining errors are scattered sibling-domain disagreements at the noise floor of taxonomy ambiguity). Erring toward NONE is the safe error: a wrong parent permanently pollutes rollup, while a NONE is flagged and recoverable.
+
+### Forward-fix helper — `mvp/expertise/attach-subdomain-parent` (#13142)
+
+```text
+mvp/expertise/attach-subdomain-parent — 13142
+```
+
+Called from the CREATE branch of #12926 (person) and #12746 (company), right after a new `SubDomainExpertise` row is written. Resolves the parent via #13141 and writes `HAS_SUBDOMAIN {weight:100}`, or flags `parent_unresolved` on NONE. Same edge shape as the sync (#12663). Keeps every newly-created subdomain parented going forward, so the orphan pool does not regrow. (Each resolver gets only a single added `function.run` line — minimal, DRY with the drainer.)
+
+```cypher
+// Version v1 — attach to an EXISTING domain only (never auto-creates)
+MATCH (d:Entity:DomainExpertise {uuid: "{{$var.du}}"})
+MATCH (s:Entity:SubDomainExpertise {uuid: "{{$input.sub_node_uuid}}"})
+MERGE (d)-[r:HAS_SUBDOMAIN]->(s)
+ON CREATE SET r.created_at = timestamp(), r.updated_at = timestamp(), r.weight = 100
+RETURN d.uuid AS domain_uuid
+```
+
+```cypher
+// NONE → flag for review (skipped by the drainer on later runs; converges to 0)
+MATCH (s:Entity:SubDomainExpertise {uuid: "{{$input.sub_node_uuid}}"})
+SET s.parent_unresolved = true, s.parent_unresolved_at = timestamp()
+RETURN s.uuid AS uuid
+```
+
+### Orphan backfill drainer — `tool/expertise-backfill-parents` (#8718, API group 42)
+
+```text
+tool/expertise-backfill-parents — 8718
+```
+
+Idempotent drainer (clone of the #8709/#8716 pattern). `action=count` reports total / with_parent / orphans / flagged / processable; `action=backfill` processes the next `limit` *processable* orphans (orphan AND not yet flagged), resolving + writing `HAS_SUBDOMAIN` or flagging NONE; `action=reset_flags` clears `parent_unresolved` to re-attempt NONE cases after resolver/taxonomy improvements. NONE-flagging is what lets the drainer **converge to 0** instead of looping forever on the unresolvable tail. Scoped by `X-Data-Source`.
+
+```cypher
+// fetch next batch of processable orphans
+MATCH (s:Entity:SubDomainExpertise)
+WHERE (NOT (:DomainExpertise)-[:HAS_SUBDOMAIN]->(s)) AND s.parent_unresolved IS NULL
+RETURN s.uuid AS uuid, s.name AS name, s.description AS description
+LIMIT {{$var.lim}}
+```
+
+### Verification (sandbox, then live)
+
+**Sandbox drain** converged cleanly: orphans 1,227 → **0 processable** (744 assigned / 479 flagged-NONE, ~61% assign); subdomains with a parent 134 → **881**; people reachable via domain rollup **20 / 22 (91%)** of expertise-tagged people.
+
+**Per-fixture rollup** confirmed the design: the in-scope subject (Kyle) rolls up richly, while the niche-science subjects correctly abstain. The two worked examples below (re-run fresh end-to-end through #12666 → #12926, then rolled up after the backfill) show both the `HAS_EXPERTISE` edge data and the resulting 2-hop domain rollup.
+
+#### Worked example A — Kyle Jackson (in-scope: AI / tech / media)
+
+`HAS_EXPERTISE` edges, ranked by `expertise_strength` (high = strong depth × recency × tenure). Note the **weight↔strength decoupling**: `Generative AI & LLMs` has a looser vector match (`weight` 45) but solid depth (`strength` 61), while `venture building` has `weight` 36 yet `strength` 90 from a 20-year creator tenure — exactly the independence the spec intends (`weight` = graph path-cost, low = strong; `expertise_strength` = human-facing depth, high = strong).
+
+| Expertise (SubDomain) | strength | weight | match_score | depth / recency |
+|---|--:|--:|--:|---|
+| venture building | 90 | 36 | .164 | creator / current |
+| XR simulation platforms | 83 | 28 | .111 | creator / recent |
+| enterprise storage architecture | 62 | 21 | .072 | creator / historical |
+| Generative AI & LLMs | 61 | 45 | .216 | expert / current |
+| GPU-accelerated post-production | 59 | 19 | .057 | creator / historical |
+| studio campus design | 54 | 15 | .030 | expert / recent |
+| video infrastructure | 49 | 31 | .131 | expert / historical |
+| Final Cut Pro | 49 | 25 | .097 | expert / historical |
+| Computer Animation | 31 | 39 | .179 | practitioner / historical |
+
+Sample edge descriptions (deepseek `v4-flash`, #13019): *"Kyle Jackson is a creator of venture building, founding and partnering at Being Human, an AI-native venture studio."* · *"…an expert in generative AI, currently serving as VP of Product Management for AI, GenAI, and Spatial at Cornerstone OnDemand."*
+
+2-hop domain rollup (after backfill) — **7 domains**:
+
+| SubDomainExpertise | ──▶ DomainExpertise |
+|---|---|
+| Generative AI & LLMs | AI Infrastructure |
+| XR simulation platforms | AR/VR/XR |
+| Computer Animation | Animation & Motion Graphics |
+| enterprise storage architecture | DevOps & Infrastructure |
+| GPU-accelerated post-production · Final Cut Pro | Editing & Post-Production |
+| studio campus design | Film & Television Production |
+| video infrastructure | Streaming Technology |
+| venture building | *(NONE — flagged for review)* |
+
+So "show me experts in **AI Infrastructure**" / **AR/VR/XR** / **Streaming Technology** now returns Kyle via the free 2-hop traversal.
+
+#### Worked example B — Christophe Laudamiel (out-of-scope: perfumery)
+
+| Expertise (SubDomain) | strength | weight | match_score | depth / recency |
+|---|--:|--:|--:|---|
+| fine fragrance creation | 76 | 30 | .124 | expert / current |
+| perfumery ethics | 65 | 10 | .000 | creator / current |
+| fragrance education | 55 | 15 | .032 | expert / current |
+| chemistry | 49 | 26 | .099 | expert / historical |
+| scent engineering | 49 | 22 | .072 | practitioner / current |
+| intellectual property | 40 | 29 | .121 | practitioner / current |
+| flavor chemistry | 28 | 25 | .093 | practitioner / historical |
+
+Sample edge descriptions: *"Christophe Laudamiel is an expert in fine fragrance creation, currently working as a Master Perfumer at Osmo NYC and BélAirLab Tokyo."* · *"…a creator of perfumery ethics, having founded the Perfumery Code of Ethics."*
+
+2-hop domain rollup (after backfill) — **1 domain**:
+
+| SubDomainExpertise | ──▶ DomainExpertise |
+|---|---|
+| intellectual property | Legal |
+| fine fragrance creation · perfumery ethics · fragrance education · chemistry · scent engineering · flavor chemistry | *(NONE — flagged for review)* |
+
+Only `intellectual property → Legal` resolves; every fragrance/chemistry subdomain correctly returns **NONE** rather than being forced into a wrong parent. This is the conservative behavior working as intended.
+
+**Coverage-gap signal:** the three niche-science fixtures (fusion, volcanology, perfumery) resolve most subdomains to NONE because the curated 119-domain set has **no Physics / Earth-Science / Chemistry / Fragrance** vertical. Expand the curated `DomainExpertise` set if those verticals matter; everything flagged NONE is recoverable via `reset_flags`. (Francesco/fusion → `Hard Tech`; Allan/volcanology → empty rollup.)
+
+**Live backfill (2026-06-19):** orphans 2,265 → **0 processable** (1,549 assigned / 711 flagged-NONE, ~69% assign in 76 batches); subdomains with a parent **170 → 1,724**; **people reachable via domain rollup 714 (27%) → 2,417 / 2,614 (92.5%)**. The forward-fix (#13142 in #12926/#12746) keeps it complete as new expertise lands. Top domains by reachable people: Venture Capital & Private Equity (809), Corporate Finance (605), Medical Devices & Biomedical Engineering (584), Clinical Medicine (375), Software Engineering (366).
+
+### Domain-set expansion — closing the coverage gap (2026-06-19)
+
+The 711 NONE-flagged subdomains were analyzed for coverage gaps via a multi-agent clustering pass (3 independent proposers over the full pool + the 119 existing domains → consensus synthesis with dedup + granularity + threshold gates). It surfaced **17 candidate parent domains** (16 at full 3/3 consensus) plus 54 *resolver-misses* (orphans that actually fit an existing domain — the resolver was too conservative; re-resolve, don't mint) and a long-tail held back.
+
+**Honest impact framing:** net-new *binary* reachability is modest (most orphan-pool people already carry an in-scope expertise), so the value is **new browse facets** (`gross` people who gain a correct rollup), not raw reachability. The standout gap was general business/management — entirely absent from the curated set.
+
+**Tier-1 minted (reviewed + approved)** via `tool/mint-domain-expertise` (#8719 — creates the node with all 3 vectors matching the existing 119, attaches the approved member subdomains, clears their flags):
+
+| New domain | members | people (browse facet) |
+|---|--:|--:|
+| Business Management & Leadership | 56 | **1,405** |
+| Entrepreneurship & Startups | 34 | 671 |
+| Sales & Revenue Operations | 38 | 450 |
+| Human Resources & Talent Acquisition | 33 | 120 |
+
+Result: **119 → 123 domains**, parented subdomains **1,724 → 1,885**, NONE-flagged **711 → 550**, **reachable 92.5% → 97.1%** (2,537 / 2,614). `Business Management & Leadership` (1,405) is now the most-populous domain in the taxonomy. The forward-fix means new business/sales/HR subdomains auto-attach to these going forward. **Deferred (reviewed, not minted):** Tier-2 sector domains (Education, Marketplaces, Natural Sciences, Nonprofit, Supply Chain, Energy, Government) and small/niche Tier-3 (Retail, Hospitality, Insurance, Sports, Maritime); the 54 resolver-misses re-resolution. The remaining 550 NONE stay the review queue.
+
+---
+
+## Company SPECIALIZES_IN edge descriptions (2026-06-19)
+
+Mirror of the person-side edge-description writer (#13019/#13020), for `(Company)-[:SPECIALIZES_IN]->(Entity)` edges. Those edges previously carried only `specialty / weight / match_score / match_type` — **no description**, unlike person `HAS_EXPERTISE` edges. The new writer produces one complete natural-language sentence that **names the company** and is grounded in the company's own node description.
+
+<Card icon="cloud-arrow-up">
+
+```
+enrich/create-company-specialty-description-from-graph — 13143
+```
+
+Generator — one complete NL sentence naming the company. `deepseek-v4-flash`, `reasoning:{enabled:false}`, `max_tokens` cap, out-of-credits guard (#13136). Keyed on (company_uuid, expertise_uuid).
+
+</Card>
+
+<Card icon="play">
+
+```
+enrich/write-company-specialty-description-to-graph — 13144
+```
+
+Idempotent writer (`description_generated_at` marker) → sets `r.description` on the edge. **Wired into #12746** after each `SPECIALIZES_IN` MERGE (matched + created), same hook as the taxonomy forward-fix.
+
+</Card>
+
+<Card icon="clock-rotate-left">
+
+```
+tool/backfill-company-specialty-descriptions — 8722
+```
+
+Drainer for existing edges (`count` / `backfill`). Harnesses: `tool/test-company-edge-desc` #8721 (dry-run, no writes) · `tool/run-company-specialties` #8720 (drives #12746 with overrides).
+
+</Card>
+
+Example output: *"Being Human, an AI-native venture studio, specializes in venture building, systematically creating and scaling new companies from the ground up."* · *"NVIDIA specializes in GPU computing, designing massively parallel architectures and a full-stack computing platform for AI, gaming, and high-performance workloads."*
+
+<Warning>
+**Not run on live — pending decision.** Live has **0 `SPECIALIZES_IN` edges** (11,976 companies exist, but the company-specialty path — `run-base-company-process` #12699 §5.5 → #12746 — has only ever run on **sandbox**, validated on Being Human + NVIDIA). So the live backfill is a **no-op** today and these descriptions populate only **forward**, as companies are enriched.
+
+To populate existing live companies, either:
+1. **Run companies through `run-base-company-process` (#12699)** — specialties → `SPECIALIZES_IN` edges → forward-fix (HAS_SUBDOMAIN) → inline edge descriptions are all created together. No code change. This is a data/coverage run, not a pipeline gap.
+2. **Build a bulk company-specialty runner** (the analog of person `tool/run-identify` #8706) to sweep the ~8,985 live companies that have edges through #12746, then run `tool/backfill-company-specialty-descriptions` (#8722) for any pre-existing edges.
+
+Neither has been done. The writer (#13144) is wired into live #12746, so it is forward-ready the moment any company is processed.
+</Warning>
+
+---
+
 ## mvp/expertise/llm-identify-person-expertise — #12666
 
 ```text

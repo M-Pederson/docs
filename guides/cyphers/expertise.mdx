@@ -3,13 +3,40 @@ title: "Expertise"
 description: "Cypher queries for DomainExpertise and SubDomainExpertise nodes, HAS_EXPERTISE edges, SPECIALIZES_IN edges, and HAS_SUBDOMAIN taxonomy edges"
 ---
 
-All Cypher queries related to expertise — domain and sub-domain node creation, vector search for matching, HAS_EXPERTISE edge resolution (person skills), SPECIALIZES_IN edge resolution (company specialties), and HAS_SUBDOMAIN taxonomy edges.
+All Cypher queries related to expertise — domain and sub-domain node creation, vector search for matching, HAS_EXPERTISE edge resolution (person skills), SPECIALIZES_IN edge resolution (company specialties), HAS_SUBDOMAIN taxonomy edges, and the current expertise-vector migration plan.
+
+---
+
+## Current Migration Decision (2026-06-18)
+
+This is the implementation runbook. The migration is worth doing because it fixes the resolver's core calibration bug: live matching compares incoming `name` embeddings against node vectors built from different text. The new path keeps the comparison symmetric and isolates expertise matching from graph-wide node search.
+
+### Locked Decisions
+
+| Area | Decision | Reason |
+|---|---|---|
+| Scope | Migrate expertise matching only; keep graph-wide `name_embedding` untouched. | Avoids changing 17k+ non-expertise node search behavior in the same release. |
+| Match vector | Use dedicated Gemini 3072-dim `expert_embeddings`. | A dedicated property keeps KNN structurally scoped to expertise nodes. |
+| Representation | Node side embeds `"{name}: {description}"`; query side embeds `"{expertise_area}: {generated_blurb}"`. | Symmetric definitional text separates synonyms from sibling concepts better than name-only. |
+| Blurb generator | Use `google/gemini-3.1-flash-lite` for generated definitional blurbs and new-node descriptions in this migration. | This is the create-domain winner from the golden-set model assessment; do not mix in DeepSeek without recalibrating thresholds. |
+| Thresholds | Auto-MATCH `< 0.15`; adjudicate `0.15–0.25`; auto-CREATE `> 0.25`. | Matches the validated Gemini `name + definitional text` scale. |
+| Edge weight | Use `min(round(10 + score * 160), 50)` on the Gemini score scale. | Keeps `0.25` at the max weak weight of `50` while preserving stronger matches below the guard band. |
+| Rollback | Keep OpenAI `expertise_embedding` writes and index live through cutover. | Reverting remains a one-line KNN target change. |
+
+### Release Sequence
+
+1. **Preflight.** Re-count live expertise nodes, confirm #13129 has provisioned `expert_embeddings`, verify the generator used for calibration is the same generator used in the resolver, and keep `name_embedding` untouched.
+2. **Backfill.** Populate `expert_embeddings` from existing `name + description` with an LLM-free batched task. Flag nodes missing descriptions instead of silently treating name-only vectors as equivalent.
+3. **Shadow compare.** Before flipping live reads, run a representative batch through both old and new matchers and log old decision, new decision, score, tier, adjudication result, and final action.
+4. **Cut over writes and reads.** Port #12926 and #12746 to the new resolver flow, update #12663 for vector writes, deprecate #12668 rather than porting it unless a live caller still needs it, and wire the OpenRouter out-of-credits guard into #12666/#12926.
+5. **Monitor.** Watch near-duplicate creation rate, adjudication volume, created-node descriptions, mirror parity, and any known-distinct pairs that drift into MATCH.
+6. **Merge historical duplicates.** Only after new writes stop creating fresh duplicates, run the historical merge as its own dry-run-reviewed project.
 
 ---
 
 ## Improvement Plan
 
-This is a refactor plan only. Do not change live Xano functions, model configs, Cypher blocks, or build new functions from this section without a separate implementation pass.
+This is an exploratory refactor plan only. The locked vector-migration choices live in **Current Migration Decision** above; if this section conflicts with that runbook or the golden-set model assessment, treat this section as historical context. Do not change live Xano functions, model configs, Cypher blocks, or build new functions from this section without a separate implementation pass.
 
 The goal is to make person expertise extraction more powerful by rebuilding the input context, making refresh behavior explicitly idempotent from the person-enrich pipeline, and using different OpenRouter models for different phases instead of forcing one model to do every job. Model candidates below were checked against the live OpenRouter model API on 2026-06-17; re-run the model/pricing audit before implementation.
 
@@ -82,7 +109,7 @@ The goal is to make person expertise extraction more powerful by rebuilding the 
    | Phase | Default candidate | Escalation candidate | Notes |
    |-------|-------------------|----------------------|-------|
    | Context normalization / over-budget compression | `google/gemini-3.1-flash-lite` or `qwen/qwen3.7-plus` | `openai/gpt-5.4-nano` or `deepseek/deepseek-v4-flash` | Only needed if the one-hop package exceeds the extraction budget. Use structured outputs and keep reasoning minimal/none unless compression quality fails. |
-   | Main expertise extraction | `google/gemini-3.1-flash-lite`, `openai/gpt-5-mini`, or `qwen/qwen3.7-plus` | `openai/gpt-5.4-mini`, `qwen/qwen3.7-max`, or `deepseek/deepseek-v4-pro` | Benchmark against current `google/gemini-3-flash-preview`. Gemini 3.1 Flash Lite is cheaper than the current Gemini 3 Flash Preview on the live OpenRouter list and keeps 1M context. |
+   | Main expertise extraction | `google/gemini-3.1-flash-lite`, `openai/gpt-5-mini`, or `qwen/qwen3.7-plus` | `openai/gpt-5.4-mini`, `qwen/qwen3.7-max`, or `deepseek/deepseek-v4-pro` | Benchmark against current `google/gemini-3.1-flash-lite` (the live model in #12666, confirmed 2026-06-18). It keeps 1M context at the lowest viable cost on the live OpenRouter list. |
    | Ambiguity adjudication / reasoning pass | none by default | `anthropic/claude-sonnet-4.6`, `google/gemini-3.1-pro-preview`, `moonshotai/kimi-k2.7-code`, `deepseek/deepseek-v4-pro`, or `qwen/qwen3.7-max` | Run only when extraction returns low confidence, too many inferred signals, schema repair, or unusually high created-node risk. Use the strongest reasoning model that wins the golden-set eval, not the most familiar vendor. Do not attach `openrouter:web_search` for private graph context. |
    | New expertise node description | `google/gemini-3.1-flash-lite` | `openai/gpt-5-mini` | Keep short, generic, and taxonomy-safe. This is not the same as person-specific edge copy. |
    | HAS_EXPERTISE edge description | `google/gemini-3.1-flash-lite` or `openai/gpt-5-nano` | none unless quality fails | One sentence per edge should stay on a cheap model with a strict word cap. |
@@ -101,13 +128,15 @@ The goal is to make person expertise extraction more powerful by rebuilding the 
 
 ## Dry-run experiments (2026-06-18)
 
-> **Status: sandbox QA in progress — we are NOT backfilling or migrating live.** The only live change to date is the edge-description model swap (§1). The name-vs-name resolver fix (§5) is proven on the **sandbox** graph only; no live `match_name_embedding` index, backfill, or resolver change has been made. The migration plan below (§"Migration plan") is a proposal pending QA sign-off.
+> **Status: sandbox QA in progress — we are NOT backfilling or migrating live.** The only live change to date is the edge-description model swap (§1). The name-vs-name resolver fix (§5) is proven on the **sandbox** graph only — and §5's original OpenAI `match_name_embedding` mechanism has since been **superseded** by the all-Gemini `expert_embeddings` plan locked in **Current Migration Decision** above. §5 is proof-of-mechanism only. No live index, backfill, or resolver change has been made.
 
 Sandbox-first experiments validating parts of the Improvement Plan above. All extraction/probe work ran **read-only** via a throwaway harness in the **LLM Test Harness** API group (workspace 3); the only production change shipped was the edge-description model swap (§1). FalkorDB reads/writes were scoped by the `X-Data-Source` header (sandbox vs live).
 
 ### 1. Edge-description model → DeepSeek v4 Flash (SHIPPED, live)
 
-`enrich/create-expertise-edge-description-from-graph` (#13019) **v1.2** switched from `openai/gpt-oss-120b` to **`deepseek/deepseek-v4-flash`** ($0.09 / $0.18 per Mtok). Forward-path: affects inline descriptions from #12926 and the backfill chain (task #176 → #13021 → #13020 → #13019).
+`enrich/create-expertise-edge-description-from-graph` (#13019) **v1.3** switched from `openai/gpt-oss-120b` to **`deepseek/deepseek-v4-flash`** ($0.09 / $0.18 per Mtok); v1.3 also wired the out-of-credits guard so a 402 now **throws** (see *Out-of-credits guard*, below). Forward-path: affects inline descriptions from #12926 plus the backfill chain (#13021 → #13020 → #13019).
+
+⚠️ **The expertise-edge backfill is not currently running.** The old drainer task #176 was deleted as buggy; its replacement — task **#177** (`backfill-expertise-edge-descriptions-v2`, #13046) — is **inactive**. So the ~16,683 undescribed expertise edges are not being drained yet, and the ~723 already-described edges keep their old `gpt-oss-120b` text (mixed-model corpus).
 
 ⚠️ **Guardrail required.** deepseek-v4-flash burns its completion budget on hidden reasoning tokens and returns empty `content` for short structured outputs. The fix (verified live on two real edges): pass `reasoning: {enabled: false}` + `max_tokens: 300`. Without it, every edge description returns null.
 
@@ -132,7 +161,9 @@ A dry-run A/B compared the current extraction context (relational YAML from `mvp
 
 Fragmentation gate (Megan #2, cluster @0.40): gemini `8 → 6` distinct (0.25 frag); qwen `20 → 13` distinct (**0.35 frag**) — qwen's worst cluster fragmented one concept into 6 signals (`music label management` / `music distribution` / `artist management` / …).
 
-**Verdict:** qwen3 surfaces ~2× distinct coverage at ~15× lower cost, but is (a) unreliable as-called (50% empty-content failures → needs `reasoning:{enabled:false}`) and (b) more fragmented (worsens node bloat). Its fragmentation is **harmless once the name-vs-name dedup fix (§5) ships** (that collapses exactly these near-dups at resolution). **So: keep `gemini-3.1-flash-lite` for now; qwen3 becomes attractive only after the dedup fix + reasoning guardrail.**
+**Superseded verdict:** this pass made qwen3 look attractive on raw distinct coverage, but the later golden-set assessment overturned that read. Treat these numbers as historical context only; the current plan keeps qwen out of extraction.
+
+> ⚠️ **Superseded by the golden-set eval** (see *Model-choice assessment §①*, below). Rigorous P/R judging later **dropped qwen for extraction** — worst on F1, flaky (empty content), and it emitted employers as expertise. The favorable read here was based on noisy internal-dedup counts; **do not revisit qwen.**
 
 ### 4. Auto-creation node-bloat diagnosis
 
@@ -156,6 +187,8 @@ Matching on **name-only embeddings** collapses self-match to 0, pulls near-dups 
 
 ### 5. Name-vs-name fix — sandbox-validated
 
+> **Superseded mechanism (read as proof-of-concept).** §5 proved the *name-vs-name* principle on an OpenAI `match_name_embedding` sandbox index @0.40. The production design has since moved to the all-Gemini `expert_embeddings` vector with `name + definitional text` and no new `summary` property (see *Current Migration Decision* above). The numbers below are OpenAI-scale and do **not** match what will ship. **Do not build `match_name_embedding`.**
+
 Built a `match_name_embedding` vector index on the sandbox `:Entity`, backfilled `embed(name)` onto 50 real expertise nodes, then probed @0.40:
 
 | candidate | nearest | distance | decision |
@@ -168,21 +201,24 @@ Built a `match_name_embedding` vector index on the sandbox `:Entity`, backfilled
 
 Every near-dup the current resolver would spawn now correctly MATCHES; a genuinely distinct concept correctly CREATEs. Mechanism proven end-to-end.
 
-### Migration plan (not yet shipped)
+### Migration plan → superseded
 
-1. **Backfill as a Xano task** (batched `UNWIND` SET — the HTTP drainer is ~4s/node, too slow for 2,435 live nodes).
-2. Create the `match_name_embedding` index on **live**, run the backfill.
-3. Patch the **three resolvers** (#12926, #12668, #12746) to write `match_name_embedding` on new nodes and match name-vs-name @~0.40.
-4. One-time **historical merge pass** to collapse the ~2,265 existing near-dups.
-5. Then revisit qwen3 for extraction (now safe).
+The original five-step OpenAI `match_name_embedding` migration has been **replaced** by the hardened, all-Gemini keystone in **Embedding architecture — migration target** (below) — one canonical plan with a calibration gate, sequencing invariant, backfill spec, and rollback. Do not build `match_name_embedding`; do not revisit qwen for extraction (rejected by the golden-set eval).
 
-### Harness endpoints (workspace 3, "LLM Test Harness" group — throwaway)
+### Harness endpoints (workspace 3, "LLM Test Harness" API group #42, canonical `7LJisE8R` — throwaway)
 
-- `tool/expertise-identify-ab` (#8694) — extraction context + model A/B (`dry_run`)
-- `tool/expertise-resolve-probe` (#8696) — KNN threshold probe
-- `tool/expertise-embed-distance` (#8697) — name-vs-name cosine calibration
-- `tool/expertise-match-name` (#8698) — sandbox name-only index / backfill / probe
-- `tool/expertise-dedup-analyze` (#8699) — fragmentation / cluster analyzer
+> **These are API-endpoint IDs, not function IDs.** They live in API group 42; a *function*-namespace lookup of e.g. #8698 lands on an unrelated Nylas function. Always resolve them via `listAPIs(apigroup_id: 42)`.
+
+- `tool/expertise-identify-ab` (#8694, v1.2) — extraction context + model A/B (`dry_run`, reasoning off)
+- `tool/expertise-resolve-probe` (#8696) — resolver KNN threshold probe (top-K nearest + MATCH/CREATE decision)
+- `tool/expertise-embed-distance` (#8697) — cosine calibration; proves the query=name vs stored=name+desc asymmetry
+- `tool/expertise-match-name` (#8698, **v2 — Gemini**) — sandbox `expert_embeddings` index / backfill `embed(name)` / probe (renamed from `match_name_embedding`; embed helper switched OpenAI→Gemini #13114, 3072)
+- `tool/expertise-dedup-analyze` (#8699) — fragmentation / cluster analyzer (union-find @ threshold)
+- `tool/ensure-vector-indexes` (#8700) — wrapper for #13129 v3 (provisions all four `:Entity` vector indexes)
+- `tool/expertise-create-domain-ab` (#8702, v1.1) — create-domain blurb model A/B (read-only)
+- `tool/find-master-person` (#8703) — source/seed real people as eval fixtures
+- `tool/test-edge-desc` (#8705) — wrapper for #13019 edge-description
+- `tool/run-identify` (#8706) — runs the full live pipeline (#12666 → #12926 → #13019) for a person; **WRITES** to the targeted graph (use sandbox)
 
 ---
 
@@ -222,22 +258,84 @@ Quality was **uniform** across working models; differentiators are length, cost,
 
 **Recommendation (high confidence):** switch create-domain `claude-sonnet-4` → `google/gemini-3.1-flash-lite` — comparable quality, **~14× cheaper**, best length adherence. (All models overshoot 150–350; relax target to ~350–500 or tighten the prompt.)
 
+> **Decided, but bundled.** This swap is approved, but it ships **inside the keystone resolver migration** (see *Embedding architecture — migration target*), not as a standalone edit — #12926/#12746 hold delicate 4-level-escaped regex lambdas that are risky to hand-replace twice. Live today is still `anthropic/claude-sonnet-4` (#12926 create branch, confirmed 2026-06-18).
+
 **Caveats:** identify eval is 3 niche fixtures with short context (directionally strong, widen before a hard commit); create-domain length target universally violated.
 
 ---
 
 ## Embedding architecture — migration target (2026-06-18)
 
-Decision: move the graph **all-Gemini** (3072-dim, `gemini-embedding-001`), retiring both OpenAI 1536 vectors. Two distinct Gemini vectors, by purpose:
+This section holds the supporting evidence and implementation detail behind **Current Migration Decision**. It supersedes the OpenAI `match_name_embedding` migration in §5. **Not shipped; live state unchanged.**
+
+#### Live reality (deployed today)
+
+- Live match vector = **`expertise_embedding`** (OpenAI `text-embedding-3-small`, 1536), read by all three resolvers (#12926 / #12668 / #12746) at the **0.45** threshold.
+- It is **asymmetric** — the §4 calibration bug. Nodes embed **name + description** (`embed("{name}: {description}")`); the query embeds **name only**. So an exact-name hit never reaches ~0 distance (the 0.32 self-distance in §4). Confirmed by harness #8697.
+- **`expert_embeddings`** (Gemini `gemini-embedding-001`, 3072) is **provisioned but unpopulated** — #13129 v3 creates the index; **no live function writes or reads it.** Only the sandbox prototype (#8698 v2) populates it, with Gemini `embed(name)` on ~60 of ~1,329 nodes.
+
+#### Decision: fix the asymmetry with *symmetry*
+
+Embed the **same kind of representation on both sides: `name + definitional text`.** **LOCKED 2026-06-18** by the sandbox calibration below — name-only is rejected, and no separate `summary` property is part of this migration.
+
+**Calibration results** (Gemini `gemini-embedding-001` 3072, real sandbox descriptions, cosine distance — query representation vs node `name+description`):
+
+| query representation | SYNONYM (want low) | SIBLING | DISTINCT | synonym→sibling gap |
+|---|---|---|---|---|
+| name only (current live, asymmetric) | 0.260 | 0.292 | 0.474 | +0.032 ❌ |
+| **name + generated definitional text** (locked) | **0.104** | 0.246 | 0.435 | **+0.142** ✅ (4.4×) |
+
+Concrete: incoming `"artificial intelligence"` vs existing node `"AI"` = **0.313** today (spawns a duplicate) → **0.038** locked (clean match). (Fully-symmetric name+desc-vs-name+desc hit synonym **0.016**; Gemini name-only gave only +0.118 — half the separation, and on OpenAI name-only actually *inverts*: synonym 0.46 > sibling 0.41.)
+
+**End-to-end pipeline validation (sandbox, 2026-06-18).** Ran the real flow (identify #8694 → blurb #8702 → KNN #8710) on 4 fixtures (Francesco/fusion, Allan/volcanology, Christophe/perfumery, Kyle/AI-venture) against all **1,464 vectored nodes**: **24 MATCH / 1 ADJUDICATE / 2 CREATE**. True matches landed 0.02–0.11; `"generative AI"` → `"Generative AI & LLMs"` (0.211) correctly hit **ADJUDICATE**; `"perfumery ethics"` (0.289) correctly CREATEd. One miss: `"3D animation"` → `"3D Animation & Character Animation"` scored **0.232** — a near-dup that fell just past a 0.22 cutoff, so **CREATE was widened to > 0.25** (adjudicate band 0.15–0.25), and it confirms the **dual-signal name tripwire** (near-identical names) is worth shipping. Also surfaced **pre-existing duplicate `chemistry` nodes** (3 of them) — concrete evidence for the keystone step-4 historical merge. Query blurbs must come from the *same generator* as node descriptions: an off-distribution ad-hoc blurb for "artificial intelligence" scored 0.17 vs 0.04 for the #8702-generated one.
+
+**Keystone resolver built + validated (v3, sandbox).** `mvp/expertise/resolve-person-expertise-v3` (#13137) implements the locked flow — blurb up-front via `gemini-3.1-flash-lite` → embed `name: blurb` (Gemini) → `expert_embeddings` KNN → guard band + LLM adjudication → CREATE writes `expert_embeddings` only, keeps `name_embedding`, drops `expertise_embedding`, rescaled `edgeWeight` (`min(round(10+score*160),50)`). Run on all 4 fixtures against the 1,464-node catalog: **~22 matched / ~7 created**, with the adjudication band resolving 9 gray-zone cases. Wins: `"Artificial Intelligence"` → `"AI"` (0.143, auto-match — the dup the old binary-@0.45 resolver would have spawned); `"Computer Animation"` → `"Animation"` (0.234, adjudicated-match — caught by the widened 0.25 band). Verified a created node carries `expert_embeddings` + `name_embedding` and **no** `expertise_embedding`, blurb stored as its description. Caveat: `gemini-3.1-flash-lite` blurbs match looser than `sonnet` (synonyms ~0.10–0.18 vs ~0.04–0.10), so more true matches land in the adjudication band — acceptable (cheap LLM confirms), and it tightens as the catalog refills with gemini-generated descriptions. Live #12926 untouched; next: port to #12668/#12746/#12663 + promote. Test harness: `tool/test-resolve-v3` (#8711).
+
+**Company resolver also built + validated (v3, sandbox).** `mvp/expertise/resolve-company-specialties-v3` (#13138, wrapper `tool/test-resolve-company-v3` #8712) applies the same locked spec to SPECIALIZES_IN (simpler edges, no table-711/taxonomy). On Being Human (AI venture studio, 10 specialties): **9 matched / 1 created** — `artificial intelligence`→`AI` (0.146), `AI agents`→`AI Agent Engineering` (0.129), `property investment`→`Real Estate Investment` (0.215, adjudicated), `venture studio operations`→`venture building` (0.193, adjudicated); only `personalized storytelling` (0.253) created. SPECIALIZES_IN edges verified with rescaled weights (25–50). Both person + company resolvers proven; live functions still untouched. Remaining sandbox-first item: sync `#12663` (vector-only — write `expert_embeddings`, drop `expertise_embedding`). `#12668` (legacy v1) is superseded by #12926/v3 → deprecate rather than port.
+
+**Locked mechanics — no new `summary` property:**
+1. **Node side (backfill, LLM-free):** embed **`"{name}: {description}"`** using the node's *existing* stored `description` (Gemini 3072) → `expert_embeddings`. Pure mechanical re-embedding of data we already have — no per-node LLM call.
+2. **Query side:** the incoming `expertise_area` has no description (extraction #12666 emits only name + a ≤100-char person-specific `evidence`), so **generate a definitional blurb from the name** with `google/gemini-3.1-flash-lite`, and embed **`"{expertise_area}: {blurb}"`**. The blurb does **double duty**: discard/cache it on MATCH; on CREATE it *becomes the new node's `description`* (zero wasted generation). Do not swap in DeepSeek or another generator without re-running calibration, because thresholds depend on the generator distribution.
+3. **Tiered + cached:** Tier 0 exact/normalized-name → instant MATCH (no LLM, no embed); Tier 1 generate-blurb + KNN. Cache `name → blurb → vector` so repeats are free and deterministic. Tier 0 is required, not a nice-to-have.
+
+**🔒 GATE — calibrated 2026-06-18 (no longer blind).** The margin test (harness #8697 OpenAI / #8708 Gemini / #8702 generator) ran on a labeled synonym/sibling/distinct set from real sandbox descriptions: `name + definitional text` wins decisively, **name-only is rejected**. Siblings sharing vocabulary (e.g. "AI Governance & Risk" vs "AI Regulatory Affairs" ≈ 0.21) stay clear of synonyms (≤0.17), but that gap is only ~0.04 — so ship a **guard band, not a hard cutoff**: **auto-MATCH < 0.15, auto-CREATE > 0.25, cheap LLM adjudication ("same domain? y/n") in 0.15–0.25** (widened from 0.22 after the pipeline validation below), plus a **dual-signal tripwire** (keep a name-only distance alongside; if name+blurb says MATCH but name-only strongly disagrees — or the names are near-identical — route to adjudication).
+
+#### Two vectors, by purpose
 
 | Vector | Embeds | Index scope | Purpose | Replaces |
 |---|---|---|---|---|
-| `embeddings` | name (graph-wide) | `:Entity` (all node types) | **graph-wide node/name search** | `name_embedding` (OpenAI 1536) |
-| `expert_embeddings` | **name only** | `:Entity`, but only expertise nodes have it → expertise-only | **expertise match** ("do we have this domain, or create one?") | `expertise_embedding` (OpenAI 1536) |
+| `embeddings` | name (graph-wide) | `:Entity` (all node types) | graph-wide node/name search | `name_embedding` (OpenAI 1536) |
+| `expert_embeddings` | **`name + description`** (node) / **`name + generated blurb`** (query) | `:Entity`, but only expertise nodes set it → expertise-only | expertise match | `expertise_embedding` (OpenAI 1536) |
 
-**Why two vectors (keep `expert_embeddings`):** the resolver needs an *expertise-only* KNN. That scoping works because a `:Entity` vector index only contains nodes that **set the property** — only Sub/DomainExpertise nodes write `expert_embeddings`, so the query structurally returns only expertise nodes (one index covers both Sub + Domain). A graph-wide `embeddings` index returns any node type; scoping it to expertise would need over-fetch+label-filter (unreliable — expertise nodes crowded out among 17k+ nodes) or per-label vector indexes (more indexes, unverified FalkorDB coexistence). The dedicated name-only `expert_embeddings` is the clean method, and name-only avoids the name-vs-name+desc asymmetry that mis-calibrated the old `expertise_embedding` match.
+**Why a dedicated `expert_embeddings`:** the resolver needs an *expertise-only* KNN. A `:Entity` vector index only contains nodes that **set the property**, so a dedicated expertise vector structurally returns only Sub/DomainExpertise nodes (one index covers both). A graph-wide `embeddings` index returns any node type; scoping it would need over-fetch+label-filter (unreliable — expertise crowded out among 17k+ nodes) or per-label indexes (unverified FalkorDB coexistence). The representation inside the vector is **locked to `name + definitional text`** (node uses its stored description; query generates a blurb from the name — see calibration results above).
 
-**Migration work (graph-wide, not started):** every node writer writes `embeddings` (Gemini) + stops `name_embedding`; expertise writers (`#12926`/`#12668`/`#12746`/`#12663`) also write name-only `expert_embeddings` + stop `expertise_embedding`; every `name_embedding` KNN search repoints to the `embeddings` index; full-graph backfill of `embeddings` + expertise-node backfill of `expert_embeddings` (via Xano tasks); retire both OpenAI indexes after cutover. This is product-affecting (changes node-search quality everywhere) → warrants a search-quality eval, not a mechanical swap. `vectors/ensure-vector-indexes` (#13129 v3) already provisions all four indexes per data source.
+#### Threshold legend (three scales — never mix)
+
+| Scale | Threshold | State |
+|---|---|---|
+| OpenAI name-vs-(name+desc), live `expertise_embedding` | **0.45** | deployed |
+| OpenAI name-vs-name, §5 sandbox POC | **~0.40** | superseded |
+| Gemini `expert_embeddings`, name-only | rejected (gap only +0.118) | superseded |
+| **Gemini `expert_embeddings`, name + definitional text** (LOCKED) | **MATCH < 0.15 · adjudicate 0.15–0.25 · CREATE > 0.25** | calibrated + pipeline-validated 2026-06-18 |
+
+#### Keystone migration — hardened (not started). Scope = **expertise vectors only.**
+
+0. **Calibrate (the gate) — ✅ DONE + pipeline-validated 2026-06-18.** Representation = `name + definitional text`; guard band = MATCH < 0.15 / adjudicate 0.15–0.25 / CREATE > 0.25 (Gemini scale). Validated on 4 fixtures: 24 MATCH / 1 ADJUDICATE / 2 CREATE. Re-confirm at scale by logging borderline `match_score`s post-cutover.
+1. **Backfill task (LLM-free).** Reuse the #13021 drainer pattern: a `tool/` fetching the next N nodes `WHERE n.expert_embeddings IS NULL` (`SubDomainExpertise` + `DomainExpertise`), embed **`"{name}: {description}"`** (Gemini #13114) — no per-node LLM — batched `UNWIND SET`, return remaining count; driven by a task (`active=false` per trap #9) at `limit` ~30–50. **Re-count live nodes first** (~1,329 in memory vs 2,435 in §5). Mind serializer trap #8 + the bare-filter-in-`if` trap #14. Nodes lacking a `description` should be flagged for description repair; do not silently treat name-only fallback vectors as calibrated equivalents.
+2. **Indexes BEFORE backfill** (so progress is searchable). Create via #13129 / endpoint #8700, naming the exact data source(s). #13129 v3 provisions all four `:Entity` indexes per data source: `name_embedding`@1536, `expertise_embedding`@1536, `expert_embeddings`@3072, `embeddings`@3072. (Trap #15: a `vecf32` property without an index is silently non-searchable.)
+3. **Shadow compare before cutover.** For a representative batch, log old resolver decision, new resolver decision, Gemini score, tier (`exact`, `auto_match`, `adjudicate`, `auto_create`), adjudication result, final action, and whether a canonical node already existed by normalized name. Review the disagreement set before live reads move to `expert_embeddings`.
+4. **Rebuild resolvers in one pass** — `#12926`, `#12746`, and `#12663`. Deprecate `#12668` unless a live caller still requires it. Per function, only what fits: **generate the candidate blurb up-front** with `google/gemini-3.1-flash-lite` and move it *before* the match; embed `name + blurb` for the KNN; on CREATE reuse that blurb as the new node's `description` and write `expert_embeddings` = embed(`name + description`); stop writing `expertise_embedding`; **keep `name_embedding` (see invariant)**; repoint KNN to `expert_embeddings`; add the **Tier 0 exact-name short-circuit + cache** and the **guard band + adjudication + dual-signal tripwire**; **recompute `edgeWeight`** (`min(round(10+bestScore*160),50)`) for the new Gemini scale; create-domain model → `gemini-3.1-flash-lite`; wire the out-of-credits guard; guard the `foreach` against malformed items (`Unable to locate var: item.expertise_area`). The create-domain swap is **bundled here on purpose** (delicate 4-level-escaped regex lambdas, risky to edit twice). Re-fetch + diff after every `updateFunction` (trap #1). `#12663` gets only: write `expert_embeddings` + stop `expertise_embedding` + repoint KNN if it has one.
+5. **Historical merge** (its own sub-project, AFTER cutover is validated so new writes stop adding dups). Collapse the ~2,265 near-dups: cluster via `expert_embeddings` KNN self-join at the calibrated threshold; pick a survivor (canonical name); `MERGE` incoming `HAS_EXPERTISE`/`SPECIALIZES_IN` onto the survivor + `DELETE` the dup; reconcile `person_has_expertise` (table 711); dry-run the merge plan for review; batch + idempotent.
+
+**🔒 Sequencing invariant.** Keystone = **expertise vectors only. Do NOT retire `name_embedding` in this pass** — it still backs graph-wide node/name search across 17k+ non-expertise nodes. Retiring it is a **separate later project**, gated on (1) the graph-wide Gemini `embeddings` backfill complete and (2) every `name_embedding` KNN caller repointed + a search-quality eval passed. OpenAI vectors are written by: #12926 CREATE, #12663 (both CREATEs), #12746 CREATE; the live KNN reads `expertise_embedding` in #12926 / #12746.
+
+**↩️ Rollback.** Keep OpenAI `expertise_embedding` writes **and its index live through cutover** — reverting is then a one-line KNN-target change back to `expertise_embedding`. Don't drop the OpenAI index until a validation window passes with lower near-dup creation, acceptable adjudication volume, clean graph/mirror parity, and no spurious merges of known-distinct pairs.
+
+**Guard rollout.** The out-of-credits guard (#13136) is live only in #13019. Roll it into **#12666 (identify)** and **#12926 (resolve)** — a 402 on #12666 silently empties extraction (the whole `$env.openRouter` chain goes quiet on 402). #12666 isn't part of the embedding edits, so track its guard wiring separately.
+
+#### Graph-wide all-Gemini end-state (separate, later)
+
+Beyond expertise: every node writer writes `embeddings` (Gemini) + stops `name_embedding`; every `name_embedding` KNN repoints to `embeddings`; full-graph backfill; retire both OpenAI indexes. Product-affecting (changes node-search quality everywhere) → warrants a search-quality eval, not a mechanical swap. Gated behind the invariant above.
 
 ---
 
@@ -265,6 +363,8 @@ RETURN count(r) AS deleted_count
 Takes LLM-identified expertise, vector-searches against existing nodes, matches or creates new nodes, and connects the person via HAS_EXPERTISE edges.
 
 **Active implementation** — adds `r.weight` to every edge and dual-writes each resolved expertise to `person_has_expertise` (table 711). Supersedes `resolve-person-expertise — #12668` (v1, graph-only, no `r.weight`), which is preserved in Xano for reference. The v5 Cyphers below are from #12926; the v1 vector-search and node-create blocks are identical across both functions.
+
+> **Migration note:** this resolver writes the OpenAI `name_embedding` + `expertise_embedding` vectors and reads the `expertise_embedding` KNN at the current **0.45** threshold. The keystone migration (see *Embedding architecture — migration target*) repoints it to Gemini `expert_embeddings` (write `expert_embeddings`, stop `expertise_embedding`, **keep `name_embedding`**) and recomputes `edgeWeight` for the new scale. Read that section before editing.
 
 ```text
 mvp/expertise/resolve-person-expertise-v2 — #12926
@@ -397,6 +497,8 @@ For created edges, `$var.safeScore` defaults to `1` when no vector match was fou
 
 Syncs all `domain_expertise` and `sub_domain_expertise` records to FalkorDB. Only creates nodes for records missing a `node_uuid`. Safe to run repeatedly.
 
+> **Migration note:** the sync writer also writes `name_embedding` + `expertise_embedding`. In the keystone migration it gets only the vector changes (write `expert_embeddings`, stop `expertise_embedding`, repoint any KNN) — **no LLM edits**, since it has no create-domain LLM branch.
+
 ```text
 mvp/node/sync-domain-expertise-nodes — #12663
 ```
@@ -454,6 +556,8 @@ RETURN d.uuid AS domain_uuid, s.uuid AS sub_uuid
 ## mvp/expertise/resolve-company-specialties — #12746
 
 Takes a company's specialties from the `speciality_join` table, embeds each specialty string, vector searches against existing SubDomainExpertise nodes, matches or creates new nodes, and connects the company via SPECIALIZES_IN edges. Called as Section 5.5 of `run-base-company-process` (#12699).
+
+> **Migration note:** same vector changes as the person resolver (#12926) — repoints from `expertise_embedding` to Gemini `expert_embeddings` in the keystone migration, keeps `name_embedding`. The create-domain model swap (sonnet-4 → gemini) ships here too.
 
 ```text
 mvp/expertise/resolve-company-specialties — #12746
@@ -585,7 +689,7 @@ Edges with `match_score IS NULL` (created branch, no vector hit) get `weight = 5
 
 ## enrich/create-expertise-edge-description-from-graph — #13019
 
-Reads all structured properties from a live `(Person)-[HAS_EXPERTISE]->(Entity)` edge plus the expertise node's generic description, then calls Gemini Flash Lite to write a 15–30 word person-specific sentence. Returns the description string. Keyed on `(person_uuid, expertise_uuid)` — HAS_EXPERTISE edges carry no `r.uuid`.
+Reads all structured properties from a live `(Person)-[HAS_EXPERTISE]->(Entity)` edge plus the expertise node's generic description, then calls **DeepSeek v4 Flash** (`deepseek/deepseek-v4-flash`, since v1.2; reasoning disabled + `max_tokens: 300` to defeat the empty-content reasoning trap) to write a person-specific sentence. The ≤30-word length is enforced by the **prompt** — the token cap is a safety ceiling, not the length contract. Returns the description string. Keyed on `(person_uuid, expertise_uuid)` — HAS_EXPERTISE edges carry no `r.uuid`.
 
 ```text
 enrich/create-expertise-edge-description-from-graph — #13019
@@ -618,7 +722,7 @@ LIMIT 1
 
 ## enrich/write-expertise-edge-description-to-graph — #13020
 
-Wraps #13019. Checks `description_generated_at` guard first — no-op if already set. On success writes `r.description` and `r.description_generated_at` to the edge. Called inline from `resolve-person-expertise-v2` (#12926) after every MERGE so new edges get descriptions immediately. Backfill for pre-existing edges is handled by task #176 via #13021.
+Wraps #13019. Checks `description_generated_at` guard first — no-op if already set. On success writes `r.description` and `r.description_generated_at` to the edge. Called inline from `resolve-person-expertise-v2` (#12926) after every MERGE so new edges get descriptions immediately. Backfill for pre-existing edges runs through #13021, driven by task **#177** (replaces the deleted #176) — currently **inactive**.
 
 ```text
 enrich/write-expertise-edge-description-to-graph — #13020
@@ -646,7 +750,7 @@ RETURN e.description AS description
 
 ## tool/backfill-expertise-edge-descriptions — #13021
 
-Batch drainer for edges missing `description_generated_at`. Safe to call repeatedly — each call fetches the next `limit` undone edges and processes them via #13020. Per-edge errors are caught, logged to `log_crash`, and skipped so one failure doesn't stall the batch. Task #176 (`backfill-expertise-edge-descriptions`) calls this every 5 min at `limit: 30`.
+Batch drainer for edges missing `description_generated_at`. Safe to call repeatedly — each call fetches the next `limit` undone edges and processes them via #13020. Per-edge errors are caught, logged to `log_crash`, and skipped so one failure doesn't stall the batch. Task **#177** (`backfill-expertise-edge-descriptions-v2`, #13046 — replaces the deleted #176) is the drainer at `limit: 30`, but is **currently inactive**, so no expertise-edge backfill is running.
 
 ```text
 tool/backfill-expertise-edge-descriptions — #13021

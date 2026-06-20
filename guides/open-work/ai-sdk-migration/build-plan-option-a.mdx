@@ -1,0 +1,785 @@
+---
+title: "Build Plan — Option A"
+sidebarTitle: "Build Plan Option A"
+description: "Sequenced build plan for an AI coding agent to implement Scope A: stream the copilot chat turn through a Vercel AI SDK agent loop in a TanStack Start route."
+icon: "list-checks"
+---
+
+This is the executable build plan for **Scope A** of the copilot orchestration migration.
+
+<Note>
+  This page is a **plan only** — execute it phase by phase, verifying each acceptance check before moving on. It covers `cards.ts`, the route, typed data tools over the Robert API, `emitCard`, `prompts.ts`, `toCrayonSSE`, auth forwarding, and persistence: replace the blocking Xano `/chat` call with a streaming Vercel AI SDK (`ai@^6`) agent loop in a TanStack Start route, while Xano stays as data, auth, and tools. The Crayon renderer and all 18 template cards are **out of scope** and must not change beyond the ~10-line client repoint. For the rationale, architecture diagrams, scope boundaries, and the [current-state audit](/guides/open-work/ai-sdk-migration#current-state-verified), see the parent design page: [/guides/open-work/ai-sdk-migration](/guides/open-work/ai-sdk-migration).
+</Note>
+
+<Info>
+  All `pnpm`, `grep`, and other shell commands in this plan run from the frontend repo root: `/Users/markl.pederson/Documents/Projects/orbiter-frontend`. The executing agent's cwd resets between calls — `cd` there (or prefix paths with `orbiter-frontend/`) before each command.
+</Info>
+
+## Before you start
+
+Read this section in full before Phase 0. These constraints hold across every phase.
+
+<CardGroup cols={2}>
+  <Card title="Rollout flag" icon="toggle-on">
+    Every new path is gated behind a flag, default **off**. Until Phase 8, the existing Xano `/chat` flow is the live path for all four modes. The repoint decision happens client-side in `copilot-app.tsx`.
+
+    {/* TODO: verify the canonical flag name/location and whether the rollback requirement below can be met. The codebase digest does not name an existing feature-flag mechanism. A `VITE_COPILOT_AI_SDK` env var is build-time inlined by Vite, so flipping it requires a rebuild/redeploy (NOT an instant rollback). If instant rollback is a hard requirement, resolve the flag to a RUNTIME source instead — e.g. a `copilot_config` row read at runtime, a value returned from an existing bootstrap/me endpoint, or a localStorage/query-param override for dev. The choice changes every "Rollback" note in Phases 6/8. */}
+  </Card>
+  <Card title="Branch" icon="git-branch">
+    Work on a feature branch off `dev` (per repo convention, PRs target `dev`, never `main`). Suggested `feat/copilot-ai-sdk-scope-a`.
+  </Card>
+  <Card title="Auth forwarding" icon="key">
+    The new server route runs server-side and **cannot** use `copilotFetch()` (it reads `localStorage.xano_auth_token` + `import.meta.env`, both client-only). Tools must read the user's `Authorization: Bearer` from the incoming request headers and forward it verbatim to the Robert API so Xano acts **as the user**. Also forward `X-Data-Source` and `X-Branch` from the request headers (the client sends them).
+  </Card>
+  <Card title="Lambda retirement gate" icon="shield-check">
+    The hardened Xano `api.lambda` (fence-stripping + `JSON.parse` into `{response:[...]}`) is retired **only** in Phase 9, and **only** after card validation via `cards.ts` + `emitCard` is proven at parity with the old output. Do not delete it earlier.
+  </Card>
+</CardGroup>
+
+<Warning>
+  The client-side SSE event names are load-bearing. The existing `processStreamedMessage` (from `@crayonai/react-core`, imported dynamically at `copilot-app.tsx:1160`) parses exactly `event: text` and `event: tpl`. The server adapter `toCrayonSSE` must emit those **exact** event names or the renderer fails silently. Do not "improve" the event names in Scope A.
+</Warning>
+
+<Warning>
+  **Not every mode is an ordinary agent-loop chat turn.** Verified in `copilot-app.tsx`: **meeting** mode never calls `/chat` — it is a deterministic 2-step client interceptor (lines ~542-665). The first meeting message returns a synthetic `meeting_goal_card`; selecting a goal sends a `[MEETING_GOAL] ...` prompt that calls `/meeting-prep` directly and returns a `meeting_prep_card`. Likewise the **quick-leverage** dispatch (`"in every possible way"`, lines ~480-540) is a deterministic dispatch, not an LLM turn. The phrase "all 4 modes served by the route" does **not** mean a like-for-like agent-loop migration for these paths — see Phase 8 Step 3 for what "served" means per mode.
+</Warning>
+
+### Tools to build
+
+Each typed tool wraps an existing Robert API endpoint (group `Bd_dCiOz`, id 1261). The `execute()` forwards the user's bearer token. These are the data tools for the agent loop — start with the first three behind the flag (Phase 8 rollout step 1).
+
+| Tool (typed, Zod `inputSchema`) | Wraps Robert API endpoint | Method | Notes |
+| --- | --- | --- | --- |
+| `searchPersons(q, scope)` | `/search` | GET | Network/universe person search. `scope` selects network vs. universe. |
+| `getPersonContext(master_person_id)` | `/person-context/{id}` | GET | Enriched person context (currently fetched client-side, passed as `person_context` string). |
+| `getConnectionPath(target_master_person_id)` | `/connection-path` | GET | 2nd/3rd-degree path to a target. |
+| `getNetwork()` | `/network` | GET | Network summary (currently fetched client-side, passed as `network_data` string). See Phase 3 / Risks for parity. |
+| `getMeetingPrep(...)` | `/meeting-prep` | POST | Meeting prep generation (mode `meeting`). May stay behind the client interceptor — see Phase 8 Step 3. |
+| `memory(op, ...)` | `/memory`, `/memory/{id}` | GET/POST/PATCH/DELETE | Memory read/write. {/* TODO: verify whether one tool with an `op` discriminator or separate tools is preferred. */} |
+| `triggerGeneration(kind, ...)` | `/generate-leverage-loop`, `/generate-outcome`, `/generate-serendipity` | POST | Async generation; pair with `/process-status` polling. |
+| `emitCard(card)` | none (local) | n/a | Validates a `CardEnvelope` against `cards.ts` before SSE. The only non-network tool. |
+
+<Tip>
+  `emitCard` is not a Robert API wrapper — it is the validation gate. The model calls it (or the route calls it on every model-emitted card) to run the `CardEnvelope` discriminated union through Zod. Reject/retry malformed cards **before** they reach `toCrayonSSE`.
+</Tip>
+
+## The plan
+
+<Steps>
+  <Step title="Housekeeping">
+    <Note>Phase 0.</Note>
+
+    Clear the dead C1/Thesys cruft and confirm the dependency baseline so later phases build on a clean tree. Nothing here is behind the flag — it is pure cleanup. Run all commands from `/Users/markl.pederson/Documents/Projects/orbiter-frontend`.
+
+    <Steps>
+      <Step title="Delete (and fix) the C1/Thesys README sections">
+        **File:** `/Users/markl.pederson/Documents/Projects/orbiter-frontend/src/features/copilot/README.md`
+
+        Delete the Thesys C1 / GenUI section (digest: lines ~28-55, including the `### Thesys C1` heading and `Thesys provides...`/`GenUI` prose) and the section importing from the nonexistent `@/features/copilot/api/server/chat.ts` (`chatServerFn`, `clearChatHistoryFn`; digest: lines ~264-285). No code imports these — they are stale docs only.
+
+        Also delete the **`THESYS_API_KEY` env-table row** (README line ~229, under "Required (Server-side)") — it is outside both line ranges above and is dead (the key is unused in code). While here, **correct** (not just delete) any remaining stale architecture description so the README reflects the current reality: `/chat` is **blocking** (not SSE) today, and the new streaming target is `routes/api/copilot/chat.ts`. Keep edits to this README only — do **not** touch `CLAUDE.md`.
+
+        <Check>
+          - `grep -rin "thesys\|genui\|\bc1\b\|api/server\|chatServerFn\|clearChatHistoryFn" src/features/copilot/README.md` returns nothing (case-insensitive — catches `### Thesys C1`, `GenUI`, and the `THESYS_API_KEY` row).
+          - The README no longer describes `/chat` as "SSE streaming"; it states `/chat` is blocking and names `routes/api/copilot/chat.ts` as the streaming target.
+        </Check>
+      </Step>
+      <Step title="Remove the phantom dependency">
+        **File:** `/Users/markl.pederson/Documents/Projects/orbiter-frontend/package.json`
+
+        Remove `@thesysai/genui-sdk` (`^0.8.2`) — installed but imported nowhere. Keep `ai` (`^6.0.135`), `@ai-sdk/react` (`^3.0.137`), `@ai-sdk/openai` (`^3.0.47`), and all `@crayonai/*` packages.
+
+        ```bash
+        # from /Users/markl.pederson/Documents/Projects/orbiter-frontend
+        pnpm remove @thesysai/genui-sdk
+        ```
+
+        <Check>
+          - **First**, `grep -rn "@thesysai/genui-sdk" src/` returns nothing — proving zero imports BEFORE removal (this is the gating assertion; verified true in the digest).
+          - **Then** `pnpm remove @thesysai/genui-sdk` + `pnpm install` succeed and `pnpm build` still passes.
+        </Check>
+      </Step>
+      <Step title="Add the model provider for the route">
+        **File:** `/Users/markl.pederson/Documents/Projects/orbiter-frontend/package.json`
+
+        The target route uses OpenRouter to keep model parity with the current `anthropic/claude-sonnet-4`. `@openrouter/ai-sdk-provider` is **not** installed (digest confirms). Add it.
+
+        ```bash
+        # from /Users/markl.pederson/Documents/Projects/orbiter-frontend
+        pnpm add @openrouter/ai-sdk-provider
+        ```
+
+        {/* TODO: verify the provider decision with the team — the parent doc keeps OpenRouter (claude-sonnet-4). If switching to first-party Anthropic, install @ai-sdk/anthropic instead and update prompts.ts/route accordingly. */}
+
+        <Check>
+          `@openrouter/ai-sdk-provider` appears in `package.json` dependencies and `pnpm install` succeeds.
+        </Check>
+      </Step>
+      <Step title="Register the server env vars (schema + runtimeEnv)">
+        **File:** `/Users/markl.pederson/Documents/Projects/orbiter-frontend/src/env.ts`
+
+        This repo's `env.ts` uses `@t3-oss/env-core` `createEnv` with a **separate** `runtimeEnv` mapping object (verified env.ts:76-118) — every server var needs **two** edits: a schema entry AND a `runtimeEnv: process.env.KEY` line. A schema entry without a matching `runtimeEnv` line makes `createEnv` **throw at startup**, crashing the route on import of `@/env`.
+
+        Add **both** `OPENROUTER_API_KEY` (the model key) and `XANO_API_URL` (a server-readable Xano base URL — `VITE_API_URL` is client-only `import.meta.env` and is `undefined` server-side, so the route needs its own). Neither carries the `VITE_` prefix.
+
+        ```ts
+        // src/env.ts — 1) server schema section (next to OPENAI_API_KEY)
+        OPENROUTER_API_KEY: z.string().min(1).optional(),
+        XANO_API_URL: z.string().url(), // e.g. https://xh2o-yths-38lt.n7c.xano.io/api
+
+        // src/env.ts — 2) runtimeEnv block (next to OPENAI_API_KEY: process.env.OPENAI_API_KEY, at ~line 92)
+        OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
+        XANO_API_URL: process.env.XANO_API_URL,
+        ```
+
+        <Check>
+          - `env.OPENROUTER_API_KEY` and `env.XANO_API_URL` both resolve at runtime with no `createEnv` validation error.
+          - The schema **and** the `runtimeEnv` block each contain both keys.
+          - The values are set in `.env` server-side.
+        </Check>
+      </Step>
+    </Steps>
+
+    **Rollback:** revert the README/package/env edits with `git checkout -- <file>`; no runtime path changed.
+  </Step>
+
+  <Step title="The Zod card contract (cards.ts)">
+    <Note>Phase 1.</Note>
+
+    Author the seam: one Zod schema per card plus a `CardEnvelope` discriminated union keyed on `name`. This is the single artifact [reused verbatim by a later Scope B (OpenUI)](/guides/open-work/ai-sdk-migration#scope-b-renderer-crayon-openui). No runtime wiring yet — just the contract and its inferred types.
+
+    **File to create:** `/Users/markl.pederson/Documents/Projects/orbiter-frontend/src/features/copilot/contracts/cards.ts`
+
+    The contract targets **zod@^4** (the installed version, `package.json:137`). `z.discriminatedUnion`, `z.enum`, and `z.infer` are all valid in v4 — do not pull v3 idioms.
+
+    Define a Zod object for each of the **18** card names (exact names from `/Users/markl.pederson/Documents/Projects/orbiter-frontend/src/features/copilot/components/crayon/templates.ts`, lines 25-43), then a `z.discriminatedUnion("name", [...])` envelope where each member is `{ name: "<card>", templateProps: <CardSchema> }`. Export `CardEnvelope` plus the inferred TS types.
+
+    ```ts
+    // src/features/copilot/contracts/cards.ts
+    import { z } from "zod"; // zod@^4
+
+    // 1. outcome_card
+    export const OutcomeCardProps = z.object({
+      title: z.string(),
+      context: z.string(),
+      status: z.string(),
+      createdAt: z.string(),
+      dispatchedAt: z.string().optional(),
+      completedAt: z.string().optional(),
+      resultText: z.string().optional(),
+      personName: z.string().optional(),
+      personTitle: z.string().optional(),
+      personAvatar: z.string().optional(),
+      isExpanded: z.boolean().optional(),
+      // onDispatch / onArchive / onToggleExpand are client-side handlers — NOT modeled in the contract
+    });
+
+    // 2. leverage_loop_card
+    export const LeverageLoopCardProps = z.object({
+      trigger: z.string(),
+      opportunity: z.string(),
+      suggestedAction: z.string(),
+      suggestedMessage: z.string(),
+      targetPerson: z.string(),
+      urgency: z.enum(["high", "medium", "low"]),
+      masterPersonId: z.number().optional(),
+      personAvatar: z.string().optional(),
+    });
+
+    // ... 16 more (see the per-card list below) ...
+
+    export const CardEnvelope = z.discriminatedUnion("name", [
+      z.object({ name: z.literal("outcome_card"), templateProps: OutcomeCardProps }),
+      z.object({ name: z.literal("leverage_loop_card"), templateProps: LeverageLoopCardProps }),
+      // ... one literal per card name ...
+    ]);
+
+    export type CardEnvelope = z.infer<typeof CardEnvelope>;
+    ```
+
+    <Warning>
+      Model **props only**, never client handlers. Props like `onDispatch`, `onArchive`, `onToggleExpand` (outcome_card), `onRetry`, `onDismiss`, `onSubmit` are wired client-side by the Crayon components — they are not part of the wire contract and must be omitted from the Zod schemas. The card names must match `/Users/markl.pederson/Documents/Projects/orbiter-frontend/src/features/copilot/components/crayon/templates.ts` (lines 25-43) 1:1.
+    </Warning>
+
+    <AccordionGroup>
+      <Accordion title="The 18 cards — seed props from the digest">
+        Seed each schema from these enumerated prop fields (verified in the digest, cross-referenced against `/Users/markl.pederson/Documents/Projects/orbiter-frontend/src/features/copilot/components/crayon/templates.ts:25-43`). Where a field's exact optionality/shape is unclear, mark it with `{/* TODO: verify ... */}` in `cards.ts` rather than inventing it.
+
+        1. **outcome_card** — `title, context, status, createdAt, dispatchedAt?, completedAt?, resultText?, personName?, personTitle?, personAvatar?, isExpanded?` (handlers `onDispatch?, onArchive?, onToggleExpand?` excluded)
+        2. **leverage_loop_card** — `trigger, opportunity, suggestedAction, suggestedMessage, targetPerson, urgency: "high"|"medium"|"low", masterPersonId?, personAvatar?`
+        3. **contact_card** — `name, role, company, relationshipContext, lastInteraction?, mutualConnections?, bondStrength: "strong"|"warm"|"cold"|"new", actionItems?, insight?, linkedIn?, masterPersonId?, personAvatar?`
+        4. **serendipity_card** — `personA, personARole, personACompany, personB, personBRole, personBCompany, whyTheyMatch, sharedContext: string[], suggestedIntro, confidence: "high"|"medium"|"speculative", masterPersonId?`
+        5. **meeting_prep_card** — `personName, personTitle?, personCompany?, personAvatar?, summary, talkingPoints: { topic, opener, why_they_care }[], listenFor: string[], landmines: string[], sharedContext?, masterPersonId?`
+        6. **meeting_goal_card** — `personName, personTitle?, personAvatar?, masterPersonId, suggestedGoals: string[]`
+        7. **memory_card** — `memoryKey, value, category, memoryId, source?`
+        8. **button_group** — `question?, options?: { label, value, emoji?, avatar_url?, subtitle? }[], masterPersonId?, buttons?: { text, action }[]`
+        9. **submit_button** — `summary?, label?` (handler `onSubmit?` excluded)
+        10. **error_message** — `message` (handlers `onRetry?, onDismiss?` excluded)
+        11. **question_card** — `image_url?, icon?, title, description?, buttons: { label, value, emoji?, subtitle?, helpText? }[], autoImage?, allowDontKnow?`
+        12. **question_card_enhanced** — same shape as `question_card`: `image_url?, icon?, title, description?, buttons: { label, value, emoji?, subtitle?, helpText? }[], autoImage?, allowDontKnow?`
+        13. **quick_result_card** — `matches: { name, title, company, avatar?, reason, confidence: "high"|"medium"|"low", masterPersonId? }[], stillSearching?`
+        14. **scanning_card** — `title?, subtitle?, connections_analyzed?, potential_matches?`
+        15. **loading_indicator** — _no props_ (reads `useThreadState()` client-side). Model as `z.object({})` (empty templateProps).
+        16. **error_card** — `title?, message?` (handlers `onRetry?, onDismiss?` excluded; reads `useThreadState().error` client-side)
+        17. **interview_card** — `question, stage: "identify_person"|"clarify_outcome"|"extract_context"|"confirm", context?: { personName?, personId?, outcome?, constraints? }, examples?, helpText?`
+        18. **dispatch_confirmation** — `person_name?, goal?, context?, master_person_id?`
+
+        {/* TODO: verify the element types of the loosely-typed fields the digest left unspecified — mutualConnections, actionItems (contact_card), examples (interview_card), sharedContext (meeting_prep_card), connections_analyzed/potential_matches (scanning_card). Confirm against the component prop types before tightening past z.unknown()/z.array(z.string()). */}
+      </Accordion>
+    </AccordionGroup>
+
+    <Check>
+      - `cards.ts` exports a `CardEnvelope` discriminated union with exactly **18** members whose `name` literals match `src/features/copilot/components/crayon/templates.ts` (lines 25-43) 1:1.
+      - `CardEnvelope.parse({ name: "leverage_loop_card", templateProps: { ...valid } })` succeeds.
+      - A `CardEnvelope.parse(...)` with a missing required prop **throws**.
+      - The Vitest spec round-tripping one known-good card per name passes. {/* TODO: confirm a `pnpm test` script exists in package.json (the digest does not establish one); if absent, run vitest directly. */}
+      - No client handler appears in any schema.
+    </Check>
+
+    **Rollback:** delete `contracts/cards.ts`; nothing imports it yet.
+  </Step>
+
+  <Step title="Move prompts out of Xano (prompts.ts)">
+    <Note>Phase 2.</Note>
+
+    The four mode system prompts currently live in the Xano `copilot_config` table and are selected by the `mode` string. Move them into a server module so the route owns them. **Capture them verbatim first** to preserve parity.
+
+    **File to create:** `/Users/markl.pederson/Documents/Projects/orbiter-frontend/src/features/copilot/server/prompts.ts`
+
+    ```ts
+    // src/features/copilot/server/prompts.ts
+    export type CopilotMode = "default" | "leverage" | "meeting" | "outcome";
+
+    export const COPILOT_SYSTEM: Record<CopilotMode, string> = {
+      default: `...`,  // copied verbatim from copilot_config (mode: default)
+      leverage: `...`, // copied verbatim from copilot_config (mode: leverage)
+      meeting: `...`,  // copied verbatim from copilot_config (mode: meeting)
+      outcome: `...`,  // copied verbatim from copilot_config (mode: outcome)
+    };
+    ```
+
+    <Warning>
+      Do **not** paraphrase. Pull each prompt verbatim from the Xano `copilot_config` table for its mode and paste it in. Prompt parity is a named risk — any drift changes model behavior and breaks the parity comparison in Phase 8.
+    </Warning>
+
+    {/* TODO: verify the exact copilot_config row keys per mode AND every runtime placeholder Xano injects. Enumerate each injected context (memory / person_context / network_data) and decide per-placeholder whether it becomes a tool result (e.g. getPersonContext, getNetwork) or a string interpolation the route fills before streamText. See Phase 3 + the person_context/network_data parity Risk. */}
+
+    <Check>
+      `COPILOT_SYSTEM` has all four mode keys; each string is a byte-for-byte copy of the corresponding `copilot_config` prompt (diff against a copy pulled from Xano). The module imports cleanly server-side.
+    </Check>
+
+    **Rollback:** delete `server/prompts.ts`; Xano `copilot_config` remains the live source of prompts until the route is wired.
+  </Step>
+
+  <Step title="The streaming route + typed tools">
+    <Note>Phase 3.</Note>
+
+    Stand up the server route that runs the agent loop with `streamText`, plus the typed data tools it calls. The callees (`cards.ts`, `prompts.ts`) already exist from Phases 1-2.
+
+    <Warning>
+      **Resolve the route primitive before writing any handler — it gates this entire phase.** The parent doc specifies `createServerFileRoute("/api/copilot/chat").methods({ POST })`, but the digest found **zero** `createServerFileRoute` usages in the repo; only `createFileRoute` (routing) and `createServerFn` (server logic, e.g. `tiptap-editor/server/ai-review.ts`) exist, on `@tanstack/react-start ^1.159.5`. Spike this first: grep the installed package for an API-route export.
+
+      - **If `createServerFileRoute` exists** in 1.159 (likely under `@tanstack/react-start/server` or via the `routes/api/*.ts` file convention) — use it, and Phase 6 calls it with `fetch('/api/copilot/chat')`.
+      - **If absent** — fall back to a `createServerFn({ method: "POST" })...handler()` returning a streaming `Response` (the verified codebase pattern; `createServerFn` CAN return a raw streaming Response, see `collections/server/stream-token.ts` and `tiptap-editor/server/ai-review.ts`), and Phase 6 calls it via the server-fn client, **not** raw `fetch`.
+
+      The handler **must** be able to read raw `Authorization` / `X-Data-Source` / `X-Branch` request headers for auth forwarding. This is non-trivial with `createServerFn` (it wraps input via `inputValidator`); read headers via `getWebRequest()` / `getRequestHeaders()` from `@tanstack/react-start/server`. **Prove header access in the spike** — the whole auth-forwarding model depends on it. Commit the snippet to ONE concrete primitive and make Phase 6's client call match it.
+    </Warning>
+
+    <Steps>
+      <Step title="Create the tools module">
+        **File to create:** `/Users/markl.pederson/Documents/Projects/orbiter-frontend/src/features/copilot/server/tools.ts`
+
+        Each tool has a Zod `inputSchema` and an `execute()` that calls the Robert API directly with the forwarded bearer token — **not** via `copilotFetch()` (client-only). The base URL comes from `env.XANO_API_URL` + the hardcoded group id `:Bd_dCiOz` (matches `xano-copilot.ts:13`). **Do not** use `process.env.VITE_API_URL` — `VITE_*` vars are client-only (`import.meta.env`) and resolve to `undefined` server-side, which would make the base `:Bd_dCiOz` (no host). Start with the three data tools for the rollout.
+
+        ```ts
+        // src/features/copilot/server/tools.ts
+        import { tool } from "ai";
+        import { z } from "zod";
+        import { env } from "@/env";
+        import { CardEnvelope } from "../contracts/cards";
+
+        const ROBERT_BASE = `${env.XANO_API_URL}:Bd_dCiOz`; // group id matches xano-copilot.ts:13
+
+        export function buildTools(authHeader: string, dataSource: string, branch: string) {
+          const headers = {
+            "Content-Type": "application/json",
+            Authorization: authHeader,        // forwarded verbatim from the request
+            "X-Data-Source": dataSource,      // forwarded from the request
+            "X-Branch": branch,               // forwarded from the request
+          };
+
+          return {
+            searchPersons: tool({
+              description: "Search the user's network or the wider universe for people.",
+              inputSchema: z.object({ q: z.string(), scope: z.enum(["network", "universe"]).optional() }),
+              execute: async ({ q, scope }) => {
+                const url = new URL(`${ROBERT_BASE}/search`);
+                url.searchParams.set("q", q);
+                if (scope) url.searchParams.set("scope", scope);
+                const res = await fetch(url, { headers });
+                return res.json();
+              },
+            }),
+            getPersonContext: tool({
+              description: "Fetch enriched context for a person by master_person_id.",
+              inputSchema: z.object({ master_person_id: z.number() }),
+              execute: async ({ master_person_id }) => {
+                const res = await fetch(`${ROBERT_BASE}/person-context/${master_person_id}`, { headers });
+                return res.json();
+              },
+            }),
+            getConnectionPath: tool({
+              description: "Find the 2nd/3rd-degree connection path to a target person.",
+              inputSchema: z.object({ target_master_person_id: z.number() }),
+              execute: async ({ target_master_person_id }) => {
+                const url = new URL(`${ROBERT_BASE}/connection-path`);
+                url.searchParams.set("target_master_person_id", String(target_master_person_id));
+                const res = await fetch(url, { headers });
+                return res.json();
+              },
+            }),
+            emitCard: tool({
+              description: "Emit a UI card. Validates against the card contract before rendering.",
+              // Wrap the union in an object so the tool input is a JSON object — all
+              // provider tool-schema serializers expect an object at the top level.
+              inputSchema: z.object({ card: CardEnvelope }),
+              execute: async ({ card }) => CardEnvelope.parse(card), // throws on malformed
+            }),
+            // getNetwork, getMeetingPrep, memory, triggerGeneration added in later rollout steps
+          };
+        }
+        ```
+
+        {/* TODO: verify ai@^6 tool() accepts the wrapped object schema for OpenRouter/Anthropic serialization. A top-level z.discriminatedUnion as a tool input may not serialize for every provider; the z.object({ card: CardEnvelope }) wrapper above avoids that. */}
+
+        <Check>
+          `buildTools()` returns the three data tools + `emitCard`, each with a Zod `inputSchema`. A unit test calling `emitCard.execute({ card })` with a malformed card throws; with a valid `{ card: CardEnvelope }` it returns the parsed object. `ROBERT_BASE` resolves to a full host (not `:Bd_dCiOz`).
+        </Check>
+      </Step>
+      <Step title="Map history + create the route">
+        **File to create:** `/Users/markl.pederson/Documents/Projects/orbiter-frontend/src/routes/api/copilot/chat.ts` (primitive per the Warning above)
+
+        Inside the handler: read `Authorization` / `X-Data-Source` / `X-Branch` from the request headers, build tools, select the system prompt by `mode`, **map the incoming Crayon-shaped messages to AI SDK `ModelMessage[]`**, and run `streamText`.
+
+        <Warning>
+          **Message shape mismatch — this will not type-check or stream without a mapping step.** Crayon thread messages are shaped `{ id, role, message?: unknown }` (verified: `copilot-app.tsx:1149` `newMessage = { id: crypto.randomUUID(), ...message }`; `processMessage`'s own type at `:465` is `Array<{ role: string; message?: unknown }>`). AI SDK v6 `streamText` requires `ModelMessage[]` (`{ role, content }`). Passing Crayon-shaped items (a `message` field, not `content`, plus an `id`) produces empty content / type errors. The existing `processMessage` only works because it extracts `lastMessage.message` into a `prompt` string (`:473-477`) — it never passes the array to a model. The history-shaping in Phase 5 owns the `{role, message}` → `{role, content}` conversion (ported from `copilot-app.tsx:668-711`); the route must call it **before** `streamText`.
+        </Warning>
+
+        ```ts
+        // src/routes/api/copilot/chat.ts  (primitive resolved in the spike above)
+        import { streamText, stepCountIs } from "ai";
+        import { createOpenRouter } from "@openrouter/ai-sdk-provider";
+        import { env } from "@/env";
+        import { COPILOT_SYSTEM, type CopilotMode } from "@/features/copilot/server/prompts";
+        import { buildTools } from "@/features/copilot/server/tools";
+        import { shapeHistory } from "@/features/copilot/server/history"; // Phase 5
+        import { toCrayonSSE } from "@/features/copilot/server/to-crayon-sse"; // Phase 4
+
+        export async function handler(request: Request) {
+          const auth = request.headers.get("Authorization") ?? "";
+          const dataSource = request.headers.get("X-Data-Source") ?? "";
+          const branch = request.headers.get("X-Branch") ?? "";
+          const { messages, mode = "default" } = await request.json();
+
+          // Crayon {role, message} -> AI SDK ModelMessage {role, content}.
+          // shapeHistory (Phase 5) ports copilot-app.tsx:668-711 (last-10, text-only,
+          // assistant card parts dropped). Final guard mirrors the prompt extraction at :473-477.
+          const modelMessages = shapeHistory(messages).map((m) => ({
+            role: m.role,
+            content: typeof m.message === "string" ? m.message : String(m.message ?? ""),
+          }));
+
+          // NOTE: env.OPENROUTER_API_KEY depends on the Phase 0 runtimeEnv mapping.
+          // If unset it should 401/500 gracefully — never crash the @/env import.
+          const openrouter = createOpenRouter({ apiKey: env.OPENROUTER_API_KEY });
+
+          const result = streamText({
+            model: openrouter("anthropic/claude-sonnet-4"),
+            system: COPILOT_SYSTEM[mode as CopilotMode],
+            messages: modelMessages,
+            tools: buildTools(auth, dataSource, branch),
+            stopWhen: stepCountIs(6),
+            experimental_telemetry: { isEnabled: true, functionId: `copilot-${mode}` },
+          });
+
+          return toCrayonSSE(result); // Phase 4
+        }
+        ```
+
+        <Warning>
+          The handler must reject (401) if the `Authorization` header is absent — tools must never call Xano unauthenticated. Do not fall back to a service token; the whole point is to act as the user.
+        </Warning>
+
+        <Note>
+          The route reads the model key via `env.OPENROUTER_API_KEY` (the `@/env` pattern, matching `voice-settings/server/*.ts`). This is the cleaner pattern, but it **depends on the Phase 0 `runtimeEnv` mapping** — without it, importing `@/env` throws for the whole route. (The bare `process.env.OPENAI_API_KEY` idiom in `tiptap-editor/server/ai-review.ts:11` also works but is less consistent with `voice-settings/server`.)
+        </Note>
+
+        <Info>
+          **person_context / network_data parity.** Today the client pre-fetches person context (`personContextRef`, set at `copilot-app.tsx:1310/1321`) and a network summary (`networkSummary`, set at `:453`) and passes them to `/chat` as the load-bearing `person_context` and `network_data` string params. If the prompts in `prompts.ts` were written assuming Xano interpolated these, dropping them silently changes behavior. Decide and document, tied to the Phase 2 TODO: (1) add a `getNetwork` tool (wrapping `/network`) or pass `networkSummary` through as initial context; (2) inject the selected-person context either as a first message / system suffix or via the `getPersonContext` tool. See the Risks accordion.
+        </Info>
+
+        <Check>
+          - With the flag on, `POST /api/copilot/chat` with a valid bearer + `{ messages, mode: "default" }` returns a `text/event-stream` response.
+          - With no bearer it returns 401.
+          - `streamText` selects `COPILOT_SYSTEM.default` and receives `ModelMessage[]` with `content` (no `message`/`id` fields leaking through).
+        </Check>
+      </Step>
+    </Steps>
+
+    **Rollback:** delete `routes/api/copilot/chat.ts` and `server/tools.ts`; the client still points at Xano `/chat` (no repoint until Phase 6 + flag).
+  </Step>
+
+  <Step title="The toCrayonSSE adapter">
+    <Note>Phase 4.</Note>
+
+    Re-emit the AI SDK stream as the exact `event: text` / `event: tpl` SSE the client already parses. This is the **only** Crayon-coupled server code — what [Scope B](/guides/open-work/ai-sdk-migration#scope-b-renderer-crayon-openui) later swaps.
+
+    **File to create:** `/Users/markl.pederson/Documents/Projects/orbiter-frontend/src/features/copilot/server/to-crayon-sse.ts`
+
+    Map text deltas to `event: text` and validated card outputs (from `emitCard`) to `event: tpl` with `data: {"name", "templateProps"}`. Match the response headers the current client expects.
+
+    ```ts
+    // src/features/copilot/server/to-crayon-sse.ts
+    import { CardEnvelope } from "../contracts/cards";
+
+    export function toCrayonSSE(result: /* StreamTextResult */ unknown): Response {
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream({
+        async start(controller) {
+          const emit = (event: "text" | "tpl", data: string) =>
+            controller.enqueue(encoder.encode(`event: ${event}\ndata: ${data}\n\n`));
+
+          // Iterate result.fullStream parts IN ORDER so prose/card interleave is preserved:
+          //   - text-delta part  -> emit("text", delta)
+          //   - emitCard tool-result part -> const card = CardEnvelope.parse(toolResult.card);
+          //                                   emit("tpl", JSON.stringify({ name: card.name, templateProps: card.templateProps }));
+          // A turn that goes text -> card -> more text must emit text, tpl, text in that order.
+          // {/* TODO: verify exact AI SDK v6 stream-part iteration API (fullStream parts vs textStream)
+          //    for ai@^6.0.135, and the per-part type discriminators for text-delta vs tool-result. */}
+
+          controller.close();
+        },
+      });
+
+      return new Response(stream, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache, no-transform",
+          Connection: "keep-alive",
+        },
+      });
+    }
+    ```
+
+    <Warning>
+      Validate **every** card against `CardEnvelope` before emitting `event: tpl`. A card that fails validation must be rejected/retried, never streamed. This is the replacement for the hardened lambda's fence-stripping — but stricter, because it is schema-checked.
+    </Warning>
+
+    <Info>
+      **Streaming granularity + error parity.** The current client emitter streams text **word-by-word** with a specific newline protocol (verified `copilot-app.tsx:963-998`: splits on `\n`, emits `event: text\ndata: \ndata: \n\n` for blank lines, space-prefixes words). With `streamText` the natural unit is token deltas. Token deltas are fine for Crayon as long as the `event: text\ndata: <chunk>\n\n` framing holds — but **confirm `processStreamedMessage` tolerates partial-word chunks** (vs. the current word-boundary chunks) and preserves newlines. Also port the client's error mapper (`copilot-app.tsx:1010-1051`) here: wrap the `streamText`/tool execution so auth/permission/429/network failures emit a friendly `event: text` (or an `error_card` via `emitCard`) instead of dropping the stream.
+    </Info>
+
+    <Check>
+      - A scripted stream of `text → card → more text` produces, in order: `event: text\ndata: ...\n\n`, then `event: tpl\ndata: {"name":...,"templateProps":...}\n\n`, then another `event: text\ndata: ...\n\n`.
+      - Response headers are `text/event-stream`, `no-cache, no-transform`, `keep-alive`.
+      - A partial-word text chunk is rendered correctly by a stub `processStreamedMessage` (granularity parity).
+      - A 401 raised inside a tool surfaces as a friendly streamed `event: text` message, not a dropped stream.
+    </Check>
+
+    **Rollback:** delete `server/to-crayon-sse.ts`; the route from Phase 3 has nothing to return, so keep it flagged off.
+  </Step>
+
+  <Step title="Persistence + history shaping server-side">
+    <Note>Phase 5.</Note>
+
+    Move the history-shaping and conversation persistence that the client does today into the route, reusing the existing Robert conversation endpoints.
+
+    <Steps>
+      <Step title="Shape history in a server module">
+        **File to create:** `/Users/markl.pederson/Documents/Projects/orbiter-frontend/src/features/copilot/server/history.ts`
+
+        Port the current shaping rule **verbatim** from `copilot-app.tsx` lines ~668-711 into a `shapeHistory(messages)` function the route calls before `streamText` (Phase 3): convert Crayon `{role, message}` items to `{role, content}`, extracting assistant text parts from card messages, substituting the `"I provided a card response."` fallback for assistant turns that were card-only, keeping the **last 10** messages, and filtering to **text-only** (drop assistant card parts). No `message` field may leak downstream.
+
+        <Check>
+          - Given a thread with assistant **card parts** and >10 messages, `shapeHistory` returns at most 10 messages, all `{role, content}` with **no `message` field**.
+          - Assistant card-only turns are represented by the `"I provided a card response."` fallback text (parity with `copilot-app.tsx:668-711`).
+          - The output is valid AI SDK `ModelMessage[]` (no Crayon `id`/`message` keys).
+        </Check>
+      </Step>
+      <Step title="Persist turns via the existing endpoints">
+        **File:** `/Users/markl.pederson/Documents/Projects/orbiter-frontend/src/routes/api/copilot/chat.ts` (calling Robert API directly with the forwarded token)
+
+        On first user message, `POST /conversations` (returns `{id, mode, title, master_person_id}`); after each turn, `POST /conversations/{id}/messages` — exactly the contract the client uses today (`xano-copilot.ts:702`, `:725`). Persist the assistant's text and, when a card is emitted, its `template_name` + `template_props` as separate fields.
+
+        <Warning>
+          The existing client (`addMessage`, `xano-copilot.ts:725`) injects `conversation_id` into the **body** as well as the path: `body: { conversation_id: conversationId, ...data }`. The route's reimplementation should match — send `{ conversation_id, role, content, template_name?, template_props? }` — unless verified the Xano endpoint reads the id only from the path. Persistence is **not** automatic; it happens only if the route calls these endpoints. Guard against duplicate conversation creation on fast re-sends (the client uses `conversationIdRef`; the route needs an equivalent idempotency check).
+        </Warning>
+
+        <Check>
+          - After a turn, `GET /conversations/{id}/messages` returns the user message and the assistant message with `template_name`/`template_props` populated when a card was emitted.
+          - The persist body includes `conversation_id` (matching the client contract).
+          - A rapid double-send creates exactly **one** conversation.
+        </Check>
+      </Step>
+    </Steps>
+
+    **Rollback:** stop calling the conversation endpoints from the route; the Xano `/chat` path (still live) persists as before.
+  </Step>
+
+  <Step title="Client repoint (~10 lines)">
+    <Note>Phase 6.</Note>
+
+    Repoint the client to the new route **behind the flag**. The Crayon shell, 18 templates, voice, and CSS all stay. The change is confined to the `onProcessMessage` callback wiring.
+
+    **File:** `/Users/markl.pederson/Documents/Projects/orbiter-frontend/src/features/copilot/components/copilot-app.tsx`
+
+    Splice **into the existing `onProcessMessage` body**. Verified, the callback destructures `{ message, threadManager: tm, abortController }` (`copilot-app.tsx:1144-1148`) — there is **no** `threadId` or `messages` param; `threadId` is derived locally as `loadThreadId || 'new'` (`:1152`), `newMessage` is built at `:1149`, and `processStreamedMessage` is already imported at `:1160`. So: replace the single `const response = await processMessage({...})` at `:1154-1158` with a `useAiSdk ? fetch(...) : processMessage(...)` ternary, reusing the `newMessage`, `tm`, and `threadId` already in scope. **Do not** re-import `processStreamedMessage` — reuse the existing `:1160` import.
+
+    ```tsx
+    // copilot-app.tsx — splice into the existing onProcessMessage, replacing the
+    // `const response = await processMessage({...})` at :1154-1158. newMessage / tm /
+    // threadId are already in scope; processStreamedMessage is already imported at :1160.
+
+    // getAuthToken is MODULE-PRIVATE in xano-copilot.ts (`function getAuthToken()` at :17, NOT
+    // exported), so it is not importable here. Read the token inline the way the module does.
+    // The token may be a RAW string OR a JSON-stringified string — unwrap before building Bearer,
+    // or the header gets a quoted string.
+    const rawToken = localStorage.getItem("xano_auth_token") ?? "";
+    let token = rawToken;
+    try { const p = JSON.parse(rawToken); if (typeof p === "string") token = p; } catch { /* raw token */ }
+    {/* TODO: alternatively export getAuthToken from xano-copilot.ts and import it at :53 */}
+
+    // env reads use the @/env object (the codebase pattern, e.g. xano-copilot.ts:845), NOT bare
+    // import.meta.env. VITE_BRANCH is .optional() in env.ts:62 — fall back so X-Branch isn't empty.
+    const useAiSdk = env.VITE_COPILOT_AI_SDK === "true"
+      && selectedModeRef.current === "default"; // rollout step 1: default only
+
+    const response = useAiSdk
+      ? await fetch("/api/copilot/chat", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+            "X-Data-Source": env.VITE_DATA_SOURCE,
+            "X-Branch": env.VITE_BRANCH ?? "", // optional in env.ts; provide a fallback
+          },
+          // send the RAW Crayon messages; the route's shapeHistory maps {role,message}->{role,content}
+          body: JSON.stringify({ messages: [...tm.messages, newMessage], mode: selectedModeRef.current }),
+          signal: abortController.signal,
+        })
+      : await processMessage({ threadId, messages: [...tm.messages, newMessage], abortController });
+
+    // existing import at :1160 is reused as-is — do NOT add a second dynamic import
+    await processStreamedMessage({
+      response,
+      createMessage: tm.appendMessages,
+      updateMessage: tm.updateMessage,
+      deleteMessage: tm.deleteMessage,
+    });
+    ```
+
+    <Warning>
+      **Voice TTS will be dead on the new path unless you shim it.** Voice TTS fires **client-side inside `processMessage`** (verified `copilot-app.tsx:942-953`, `voiceRef.current.speak(fullText)`), **not** inside `processStreamedMessage`. The flag-on branch bypasses `processMessage` entirely and hands the raw `Response` to `processStreamedMessage`, so on the AI-SDK path `speak()` is never reached — a silent functional regression. Add an explicit shim: accumulate the streamed `event: text` chunks (e.g. in an `onProcessMessage`-side callback or a per-text-item callback into `processStreamedMessage`) and call `voiceRef.current.speak(fullText)` after `processStreamedMessage` resolves. Decide and document the shim; do not leave TTS dead.
+    </Warning>
+
+    <Warning>
+      Do **not** touch `processMessage` itself, `templates.ts`, the voice refs wiring (`voiceRef`, `voiceInputRef`), or `copilot-crayon.css`. The client-side interceptors stay as **explicit shims** for now — they only run on the Xano path because the flag-on branch bypasses `processMessage`. Note that `selectedMode` **state** is typed `'default'|'leverage'|'outcome'` (`:213-215`) with **no `'meeting'`**; meeting only exists via `selectedModeRef` (typed `string`, used at `:545/:619`). Always read `selectedModeRef.current`, not the narrower state union.
+    </Warning>
+
+    <Check>
+      - Flag off: byte-identical behavior to today (all four modes via Xano).
+      - Flag on: `default` mode streams from `/api/copilot/chat`, renders through Crayon, and the other three modes still hit Xano.
+      - `processStreamedMessage` arguments are unchanged and the `:1160` import is not duplicated.
+      - **Voice TTS fires on the AI-SDK default path** (the shim accumulates streamed text and calls `voiceRef.current.speak`).
+    </Check>
+
+    <Warning>
+      **Rollback is only instant if the flag is a runtime source.** `VITE_COPILOT_AI_SDK` as written is an `import.meta.env` value that Vite **inlines at build time** — flipping it requires a **rebuild/redeploy**, not an instant flip. If the rollout safety story needs instant, no-deploy rollback, resolve the flag to a runtime source (see the "Rollout flag" TODO in *Before you start*). Until then, every "flag flip" note below means a rebuild.
+    </Warning>
+
+    **Rollback:** flip `VITE_COPILOT_AI_SDK` off (or revert the `onProcessMessage` diff). **Note:** with a `VITE_` env var this requires a rebuild/redeploy — not instant.
+  </Step>
+
+  <Step title="Observability (OTel exporter)">
+    <Note>Phase 7.</Note>
+
+    Turn on tracing for the agent loop. `streamText` already sets `experimental_telemetry: { isEnabled: true, functionId: ... }` (Phase 3). Wire a thin OTel span processor that exports to the observability sink.
+
+    **File to create:** `/Users/markl.pederson/Documents/Projects/orbiter-frontend/src/features/copilot/server/telemetry.ts`
+
+    Register a tracer provider with a span processor that ships spans over OTLP, initialized once at server startup so the route's telemetry is captured.
+
+    <Note>
+      `experimental_telemetry` with no registered exporter is a **no-op** until this phase — that is intentional. Phase 8 Step 1 can ship default traffic before the exporter lands; traces simply do not flow until `telemetry.ts` is wired. (If you want the exporter present before any flagged traffic, run this phase as 3.5, before Phase 6.)
+    </Note>
+
+    <Warning>
+      This phase is **not executable as written** until the sink is chosen. The parent doc targets a generic OTLP sink (e.g. Langfuse / Braintrust). Resolve the concrete package + endpoint + env-var names before marking it done; do not invent Arize-specific values.
+
+      {/* TODO: verify the observability sink, the exact OTLP exporter package (e.g. an OpenTelemetry OTLP-HTTP exporter, or @arizeai/openinference if Arize is chosen), the ingest endpoint, and the space/api-key env var names — none are present in the codebase digest. */}
+    </Warning>
+
+    <Note>
+      Telemetry is additive and safe to enable independently of the rollout. Per-mode `functionId` is `copilot-${mode}`, so traces are filterable by mode.
+    </Note>
+
+    <Check>
+      A `default`-mode turn through the route produces a trace with the `copilot-default` function id, including tool-call spans (e.g. `searchPersons`) and the model generation span. No traces appear for turns served by the Xano path.
+    </Check>
+
+    **Rollback:** set `experimental_telemetry.isEnabled` to `false` or remove the telemetry import; the route still streams.
+  </Step>
+
+  <Step title="Flagged rollout (default first, then mode-by-mode)">
+    <Note>Phase 8.</Note>
+
+    Promote the route from default-only to all four modes, validating quality, latency, and Crayon parity at each step. Each sub-step is reversible by narrowing the flag condition.
+
+    <Steps>
+      <Step title="Step 1 — Default mode, 3 data tools">
+        Flag on, `selectedModeRef.current === "default"` only (the condition shipped in Phase 6), with `searchPersons` / `getPersonContext` / `getConnectionPath` + `emitCard`. Keep Xano `/chat` for `leverage`, `meeting`, `outcome`.
+
+        <Check>
+          - Default-mode conversations stream end-to-end through the route.
+          - All relevant cards render via Crayon and persist.
+          - The other three modes are unaffected.
+        </Check>
+      </Step>
+      <Step title="Step 2 — Validate quality, latency, parity; turn on telemetry">
+        Compare route output against the Xano path for a fixed prompt set: card parity (same cards, same props validated by `cards.ts`), agent-loop quality, and per-turn latency (watch the extra client→server→Xano tool hop). Confirm traces are flowing (Phase 7 exporter must be live for this).
+
+        <Check>
+          - For the comparison prompt set, the route produces cards that pass `CardEnvelope` validation and match the Xano path's intent.
+          - p95 latency is within the agreed budget.
+          - Traces are flowing to the sink.
+        </Check>
+      </Step>
+      <Step title="Step 3 — Roll mode-by-mode: leverage → meeting → outcome">
+        Widen the flag condition one mode at a time, in this order, adding mode-specific tools as needed. **But "served by the route" does not mean the same thing for every mode** — some modes are deterministic, non-LLM paths and may legitimately stay client-side.
+
+        <AccordionGroup>
+          <Accordion title="meeting — decide: keep the interceptor, or replicate the 2-step flow">
+            Meeting mode is a deterministic 2-step client interceptor (`copilot-app.tsx:542-665`), not an agent-loop turn: message 1 returns a synthetic `meeting_goal_card`; selecting a goal sends `[MEETING_GOAL] ...` which calls `/meeting-prep` and returns a `meeting_prep_card`. Choose one:
+            - **(a)** Keep the meeting goal/prep interceptor client-side as a **declared permanent shim** that calls the `getMeetingPrep` tool's underlying endpoint (`/meeting-prep`), and scope meeting **out** of the `streamText` agent loop. "Served" here means "served by the declared deterministic path."
+            - **(b)** Replicate the forced two-step flow as agent behavior: a system prompt that emits a `meeting_goal_card` on turn 1 and a `meeting_prep_card` on turn 2.
+
+            Either way the agent/interceptor must read `selectedModeRef.current` (meeting is not in the `selectedMode` state union, `:213-215`).
+          </Accordion>
+          <Accordion title="leverage — quick-leverage stays a client interceptor">
+            The quick-leverage dispatch (`"in every possible way"`, lines ~480-540) is a deterministic dispatch that bypasses the LLM. Beyond returning a synthetic stream, it schedules **client-only UI side effects**: `handlePersonClearRef.current()` + a `chatKey` bump via `setTimeout`, and removes the dispatched person from the grid / `suggestedPeople`. These **cannot** move server-side (they are not pure SSE). Keep quick-leverage as a **permanent client interceptor**, and scope only the **conversational** leverage turns to the route. Do not try to fold the deterministic dispatch into the agent loop.
+          </Accordion>
+        </AccordionGroup>
+
+        For the conversational portions: `leverage`/`outcome` need `triggerGeneration` (`/generate-*`) + `memory`; `meeting` (if path (b)) needs `getMeetingPrep` (`/meeting-prep`). Re-run the parity/latency check after each mode.
+
+        <Warning>
+          The mode-specific client interceptors are still live on the Xano path. As each mode moves to the route, decide per interceptor: formalize as a server tool/card, or keep as an explicit **declared** shim. Do **not** leave the logic running in two places implicitly — that is the named "quietly duplicating logic" risk.
+        </Warning>
+
+        <Check>
+          - All four modes are **served** (per the meeting/leverage definitions above) — conversational turns token-stream and render via Crayon; deterministic interceptors run their declared client-side path.
+          - Every card passes `CardEnvelope` validation.
+          - No mode silently runs both the route and a client interceptor for the same turn.
+        </Check>
+      </Step>
+    </Steps>
+
+    **Rollback (any step):** narrow the flag condition back to the previously-validated mode set (or off). Xano `/chat` remains intact for every not-yet-promoted mode. **Note:** with a `VITE_` flag this rollback requires a rebuild/redeploy (see the Phase 6 rollback warning); resolve the flag to a runtime source if instant rollback is required.
+  </Step>
+
+  <Step title="Retire the hardened lambda + exit-criteria sign-off">
+    <Note>Phase 9.</Note>
+
+    Only after all four modes are validated at parity on the route: retire the hardened Xano `api.lambda` (fence-stripping + `JSON.parse`), since `cards.ts` + `emitCard` now guarantee well-formed, schema-valid cards.
+
+    <Steps>
+      <Step title="Confirm validation parity before touching the lambda">
+        Verify that every card the four modes can emit passes `CardEnvelope` validation in production traffic (no rejects/retries indicating a contract gap). Only then is the lambda redundant.
+
+        <Check>
+          - Over a representative window, zero cards bypass `emitCard`/`CardEnvelope`.
+          - The reject/retry rate is at or below the agreed threshold.
+        </Check>
+      </Step>
+      <Step title="Retire the lambda and demote Xano">
+        Remove/disable the hardened `api.lambda` on the Xano `/chat` path (or retire `/chat` for copilot use entirely). Xano is now data/auth/tools only. Remove the client-side Xano `/chat` branch and any interceptors that were formalized as server tools/cards in Phase 8.
+
+        <Warning>
+          This is the destructive, irreversible-ish step. Keep the lambda code in version control and keep `/chat` callable for a deprecation window before deleting, in case a mode regresses.
+        </Warning>
+
+        <Warning>
+          **Do not break historical conversation hydration.** The thread-recovery logic (`copilot-app.tsx` ~1065-1139) handles BOTH stored `template_name`/`template_props` AND raw JSON accidentally stored in `content` (from earlier lambda-era rows). Retiring the lambda must **preserve** the raw-JSON-in-`content` recovery path so `loadThread`/`getMessages` still renders pre-migration conversations. Confirm old card rows still hydrate after the lambda is gone.
+        </Warning>
+
+        <Check>
+          - The copilot serves all four modes through `/api/copilot/chat` (per the Phase 8 per-mode definitions); the hardened lambda is no longer in the live path; Xano performs only data, auth, and tool calls.
+          - Pre-migration conversations (including raw-JSON-in-`content` card rows) still hydrate and render.
+        </Check>
+      </Step>
+    </Steps>
+
+    **Rollback:** re-enable the lambda and re-point the client to Xano `/chat` via the flag. This is why the lambda code and `/chat` endpoint are kept (not deleted) through the deprecation window.
+  </Step>
+</Steps>
+
+## Exit criteria
+
+Sign off Scope A only when all of the following hold (mirrors the parent doc).
+
+<Check>
+  All four modes (`default`, `leverage`, `meeting`, `outcome`) are **served** by `routes/api/copilot/chat.ts` — where "served" for the deterministic meeting and quick-leverage paths may legitimately mean a declared client-side interceptor calling the route's tool endpoints, not an LLM agent turn (see Phase 8 Step 3).
+</Check>
+<Check>
+  Conversational responses token-stream (not blocking) via `streamText` + `toCrayonSSE`, and voice TTS fires on the streamed path.
+</Check>
+<Check>
+  Crayon renders the streamed cards unchanged — `processStreamedMessage` + the 18 templates, voice, and CSS untouched.
+</Check>
+<Check>
+  Every model-emitted card is Zod-validated against `contracts/cards.ts` before SSE; the hardened Xano lambda is retired and historical conversations still hydrate.
+</Check>
+<Check>
+  OTel traces flow to the observability sink with per-mode `functionId` (`copilot-${mode}`), including tool-call and generation spans.
+</Check>
+<Check>
+  Xano is demoted to data, auth, and tools — no orchestration or prompt logic remains in `/chat` for copilot, and `person_context`/`network_data` parity is preserved via tools or interpolation.
+</Check>
+
+## Risks & watch-items
+
+<AccordionGroup>
+  <Accordion title="Route primitive unresolved (blocks Phase 3)">
+    `createServerFileRoute` has zero usages in the repo; only `createFileRoute` and `createServerFn` exist on `@tanstack/react-start ^1.159.5`. Every later phase depends on the handler signature (Request vs `createServerFn {data}`) and on reading raw `Authorization`/`X-*` headers for forwarding. Resolve in a Phase 3 spike before writing the handler — see the Phase 3 Warning.
+  </Accordion>
+  <Accordion title="Message-shape mismatch (Crayon vs ModelMessage)">
+    Crayon thread messages are `{ id, role, message? }`; `streamText` requires `{ role, content }`. The client sends raw Crayon messages and `shapeHistory` (Phase 5) maps them before `streamText` (Phase 3) — porting `copilot-app.tsx:668-711` (assistant text-part extraction, the `"I provided a card response."` fallback, last-10, text-only). No `message`/`id` may leak into the model call. Check: a thread with assistant card parts converts to valid `ModelMessage[]`.
+  </Accordion>
+  <Accordion title="Voice TTS dead on the streamed path">
+    TTS fires inside `processMessage` (`:942-953`), which the flag-on branch bypasses. Without the Phase 6 shim (accumulate streamed text, `voiceRef.current.speak(fullText)` after `processStreamedMessage`), voice silently stops working in default mode once flagged on.
+  </Accordion>
+  <Accordion title="Flag mechanism vs instant rollback">
+    `VITE_COPILOT_AI_SDK` is build-time inlined by Vite — flipping it requires a rebuild/redeploy, so the "instant, no-deploy rollback" promise does not hold. If instant rollback is required, source the flag at runtime (copilot_config row, bootstrap/me endpoint, or localStorage/query-param). See *Before you start*.
+  </Accordion>
+  <Accordion title="Server-readable Xano base URL">
+    `VITE_API_URL` is client-only (`import.meta.env`) and `undefined` server-side. Tools must read `env.XANO_API_URL` (added in Phase 0, schema + runtimeEnv) — never `process.env.VITE_API_URL`, which yields the host-less base `:Bd_dCiOz`.
+  </Accordion>
+  <Accordion title="Extra hop latency (client → server → Xano per tool call)">
+    Each tool call now traverses client → the new route → Robert API, instead of the client fetching context and passing it inline to one blocking `/chat`. Measure p95 per-turn latency in Phase 8 step 2 against the Xano baseline. Mitigations: parallelize independent tool calls, cap `stopWhen: stepCountIs(6)`, and pre-resolve cheap context (e.g. `getPersonContext`) where the prompt already implies it.
+  </Accordion>
+  <Accordion title="Prompt parity + injected context (person_context / network_data)">
+    The four system prompts move from [`copilot_config`](/guides/open-work/ai-sdk-migration#current-state-verified) to `prompts.ts`. Any paraphrase changes behavior — copy verbatim (Phase 2). Critically, today the client pre-fetches **person_context** (`personContextRef`, set at `:1310/1321`) and **network_data** (`networkSummary`, set at `:453`) and passes them as load-bearing `/chat` string params. Enumerate every Xano-injected context (memory / person / network) and map each to a tool result or interpolation — do **not** drop them silently. Add a `getNetwork` tool (wrapping `/network`) or pass `networkSummary` as initial context; inject selected-person context as a first message/system suffix or via `getPersonContext`. {/* TODO: verify the injected-context placeholders in each copilot_config prompt. */}
+  </Accordion>
+  <Accordion title="Preserving client-side enrichment / fallbacks / interceptors">
+    Today the client does network-avatar enrichment of `button_group` (lines ~796-847), a `dispatch_confirmation` fallback via regex on the last user messages (lines ~900-939), `BLOCKED_DURING_INTERVIEW` filtering, the meeting-goal interceptor (`:542-665`), and the quick-leverage interceptor (`:480-540`, with `handlePersonClear` + `chatKey` bump + grid removal side effects that cannot move server-side). Each must be either formalized as a server tool/card or kept as an **explicit, declared** shim — never quietly duplicated across client and server. Track each one to a decision before Phase 9.
+  </Accordion>
+  <Accordion title="Error-path SSE parity">
+    The current `processMessage` has a client-side error mapper (`:1010-1051`) that converts auth/permission/429/network errors into friendly `event: text` messages. On the AI-SDK path a thrown tool/model error would surface differently. Port the classification into `toCrayonSSE`/the route (Phase 4) so failures emit a friendly `event: text` (or `error_card`) instead of dropping the stream.
+  </Accordion>
+  <Accordion title="SSE event-name + granularity coupling">
+    `event: text` / `event: tpl` are the only names the existing Crayon parser understands. `toCrayonSSE` must emit them exactly. The current emitter is word-by-word (`:963-998`); token deltas are acceptable if framing/newlines hold — confirm `processStreamedMessage` tolerates partial-word chunks. Changing event names is a [Scope B](/guides/open-work/ai-sdk-migration#scope-b-renderer-crayon-openui) concern, not Scope A.
+  </Accordion>
+  <Accordion title="Historical conversation hydration after lambda retirement">
+    Thread-recovery (`:1065-1139`) handles both stored `template_name`/`template_props` and raw JSON in `content` from lambda-era rows. Retiring the lambda (Phase 9) must keep the raw-JSON-in-`content` recovery path so old conversations still render.
+  </Accordion>
+</AccordionGroup>

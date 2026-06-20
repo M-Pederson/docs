@@ -8,12 +8,25 @@ icon: "list-checks"
 This is the executable build plan for **Scope A** of the copilot orchestration migration.
 
 <Note>
-  This page is a **plan only** — execute it phase by phase, verifying each acceptance check before moving on. It covers `cards.ts`, the route, typed data tools over the Robert API, `emitCard`, `prompts.ts`, `toCrayonSSE`, auth forwarding, and persistence: replace the blocking Xano `/chat` call with a streaming Vercel AI SDK (`ai@^6`) agent loop in a TanStack Start route, while Xano stays as data, auth, and tools. The Crayon renderer and all 18 template cards are **out of scope** and must not change beyond the ~10-line client repoint. For the rationale, architecture diagrams, scope boundaries, and the [current-state audit](/guides/open-work/ai-sdk-migration#current-state-verified), see the parent design page: [/guides/open-work/ai-sdk-migration](/guides/open-work/ai-sdk-migration).
+  This page is a **plan only** — execute it phase by phase, verifying each acceptance check before moving on. It covers `cards.ts`, the route, typed data tools over the Robert API, `emitCard`, `prompts.ts`, `toCrayonSSE`, auth forwarding, and persistence: replace the blocking Xano `/chat` call with a streaming Vercel AI SDK (`ai@^6`) agent loop in a TanStack Start route, while Xano stays as data, auth, and tools. The Crayon renderer and all 18 template cards are **out of scope** and must not change beyond the client repoint + explicit TTS shim. For the rationale, architecture diagrams, scope boundaries, and the [current-state audit](/guides/open-work/ai-sdk-migration#current-state-verified), see the parent design page: [/guides/open-work/ai-sdk-migration](/guides/open-work/ai-sdk-migration).
 </Note>
 
 <Info>
   All `pnpm`, `grep`, and other shell commands in this plan run from the frontend repo root: `/Users/markl.pederson/Documents/Projects/orbiter-frontend`. The executing agent's cwd resets between calls — `cd` there (or prefix paths with `orbiter-frontend/`) before each command.
 </Info>
+
+<Tip>
+  This plan has been hardened from four lenses: **source-code parity** (verified against `orbiter-frontend`), **route/API correctness** (TanStack Start server routes use `createFileRoute(...).server.handlers`, not `createServerFileRoute`), **AI executability** (no phase imports files created by a later phase), and **rollback/safety** (flagged, reversible, and no renderer/template edits).
+</Tip>
+
+### Agent execution rules
+
+- Treat the repository as the source of truth. Before editing any phase, re-open the referenced file and confirm the nearby line numbers still match.
+- Do not edit `src/features/copilot/components/crayon/templates.ts`, any of the 18 template components, `copilot-crayon.css`, voice hook internals, or `CLAUDE.md` in Scope A unless this page explicitly says to.
+- Do not change existing Robert/Xano endpoint behavior in Scope A. If the migration needs an API shape the current endpoints do not provide, create a **new additive endpoint** (prefer a versioned or clearly named path such as `/ai-sdk/...`, `/copilot-ai-sdk/...`, or `/conversations-ai-sdk/...`) and leave the existing endpoint callable for rollback.
+- If the worktree is dirty, preserve unrelated user changes. Rollback instructions mean "revert the changes you just made on your branch", not "blindly reset the repo".
+- After each phase, run the phase checks before continuing. If a check needs network or missing secrets, record the exact blocker and continue only where the next step is independent.
+- Prefer `rg` over `grep` when implementing; the `grep` commands below are written because they are easy to copy into docs and CI shells.
 
 ## Before you start
 
@@ -23,7 +36,7 @@ Read this section in full before Phase 0. These constraints hold across every ph
   <Card title="Rollout flag" icon="toggle-on">
     Every new path is gated behind a flag, default **off**. Until Phase 8, the existing Xano `/chat` flow is the live path for all four modes. The repoint decision happens client-side in `copilot-app.tsx`.
 
-    {/* TODO: verify the canonical flag name/location and whether the rollback requirement below can be met. The codebase digest does not name an existing feature-flag mechanism. A `VITE_COPILOT_AI_SDK` env var is build-time inlined by Vite, so flipping it requires a rebuild/redeploy (NOT an instant rollback). If instant rollback is a hard requirement, resolve the flag to a RUNTIME source instead — e.g. a `copilot_config` row read at runtime, a value returned from an existing bootstrap/me endpoint, or a localStorage/query-param override for dev. The choice changes every "Rollback" note in Phases 6/8. */}
+    Default implementation: `VITE_COPILOT_AI_SDK`, added in Phase 0. Important: this is build-time inlined by Vite, so rollback requires rebuild/redeploy. If instant no-deploy rollback is required, replace this with a runtime source before Phase 6 (for example a `copilot_config` row, bootstrap/me field, or dev-only localStorage/query-param override).
   </Card>
   <Card title="Branch" icon="git-branch">
     Work on a feature branch off `dev` (per repo convention, PRs target `dev`, never `main`). Suggested `feat/copilot-ai-sdk-scope-a`.
@@ -33,6 +46,9 @@ Read this section in full before Phase 0. These constraints hold across every ph
   </Card>
   <Card title="Lambda retirement gate" icon="shield-check">
     The hardened Xano `api.lambda` (fence-stripping + `JSON.parse` into `{response:[...]}`) is retired **only** in Phase 9, and **only** after card validation via `cards.ts` + `emitCard` is proven at parity with the old output. Do not delete it earlier.
+  </Card>
+  <Card title="Additive API rule" icon="plus">
+    Scope A must be additive. Reuse existing Robert endpoints by calling them as tools, but do **not** change their request/response contracts. If a new contract is required, create a new endpoint and keep the old path live until Phase 9+ deprecation.
   </Card>
 </CardGroup>
 
@@ -44,19 +60,50 @@ Read this section in full before Phase 0. These constraints hold across every ph
   **Not every mode is an ordinary agent-loop chat turn.** Verified in `copilot-app.tsx`: **meeting** mode never calls `/chat` — it is a deterministic 2-step client interceptor (lines ~542-665). The first meeting message returns a synthetic `meeting_goal_card`; selecting a goal sends a `[MEETING_GOAL] ...` prompt that calls `/meeting-prep` directly and returns a `meeting_prep_card`. Likewise the **quick-leverage** dispatch (`"in every possible way"`, lines ~480-540) is a deterministic dispatch, not an LLM turn. The phrase "all 4 modes served by the route" does **not** mean a like-for-like agent-loop migration for these paths — see Phase 8 Step 3 for what "served" means per mode.
 </Warning>
 
+### Critical details to not miss
+
+<Warning>
+  These are the highest-risk implementation details. Re-check this list before every coding session and before opening the PR.
+</Warning>
+
+- **New endpoints only:** Scope A is additive. Create the new frontend route `/api/copilot/chat`; wrap existing Robert endpoints as tools; if a different backend contract is required, add a new versioned/additive Robert endpoint instead of changing an existing one.
+- **TanStack route primitive:** use `createFileRoute("/api/copilot/chat")({ server: { handlers: { POST }}})`. Do not use `createServerFileRoute`.
+- **Exact SSE events:** Crayon only understands `event: text` and `event: tpl`. Do not rename them or add a required third event.
+- **No renderer edits:** `templates.ts`, the 18 template components, `copilot-crayon.css`, and voice hook internals stay untouched in Scope A.
+- **Card schema gotchas:** `outcome_card.createdAt/dispatchedAt/completedAt` are numbers, not strings; several avatar/result fields accept `null`; `dispatch_confirmation.master_person_id` may be `null` from the existing fallback.
+- **Search tool gotcha:** `searchPersons` uses `/search?q=&mode=&limit=`, not `scope`; preserve the `/person-search?query=&limit=` fallback.
+- **Route body must carry context:** send `conversation_id`, `master_person_id`, `person_context`, and `network_data` from the client, or route-side persistence/prompt parity will regress.
+- **Conversation id comes back in a header:** the route creates/reuses the conversation before streaming and returns `X-Copilot-Conversation-Id`; the client must copy it into `conversationIdRef.current`.
+- **TTS needs a stream clone:** `processStreamedMessage` consumes the `Response`; clone/tee it first if you need to collect text for `voiceRef.current.speak`.
+- **Build-time flag:** `VITE_COPILOT_AI_SDK` is not instant rollback. Use a runtime flag source if no-deploy rollback is required.
+
+### Unresolved choices before execution
+
+These are the remaining decisions. Defaults are provided so an AI agent can continue in a dev branch, but production rollout should not proceed past the listed phase until each is confirmed.
+
+| Choice | Default in this plan | Blocks | Decision needed |
+| --- | --- | --- | --- |
+| Rollout flag source | `VITE_COPILOT_AI_SDK` build-time flag | Phase 6 production rollout | Accept rebuild/redeploy rollback, or switch to a runtime flag source for instant rollback. |
+| Model provider | OpenRouter via `@openrouter/ai-sdk-provider` | Phase 0 dependency/env work | Confirm staying on OpenRouter for parity, or switch the plan to first-party Anthropic before coding. |
+| Prompt placeholder mapping | Copy `copilot_config` prompts verbatim, add separate `CARD_TOOL_INSTRUCTIONS`, pass `person_context`/`network_data` through body first | Phase 5 route | Pull live `copilot_config` rows and enumerate every injected placeholder so none are dropped. |
+| Observability sink | Generic OTLP placeholder | Phase 7 | Choose Langfuse, Braintrust, Arize, or another sink; then set package + endpoint + env var names. |
+| Meeting mode migration | Keep deterministic client shim unless explicitly choosing agent replication | Phase 8 meeting rollout | Decide client shim vs route/agent-owned two-step flow. If a new backend contract is needed, add a new endpoint. |
+| Quick-leverage dispatch | Keep deterministic client shim | Phase 8 leverage rollout | Confirm it remains a client shim because it owns UI side effects, or design a new additive endpoint + client UI callback contract. |
+| Conversation idempotency | Reuse existing `/conversations` and `/conversations/{id}/messages` contracts | Phase 5 route | If existing endpoints cannot prevent duplicate first-turn conversations server-side, create a new additive `ensure` endpoint rather than changing old endpoints. |
+
 ### Tools to build
 
-Each typed tool wraps an existing Robert API endpoint (group `Bd_dCiOz`, id 1261). The `execute()` forwards the user's bearer token. These are the data tools for the agent loop — start with the first three behind the flag (Phase 8 rollout step 1).
+Each typed tool wraps an existing Robert API endpoint (group `Bd_dCiOz`, id 1261). The `execute()` forwards the user's bearer token. These are the data tools for the agent loop — start with the first three behind the flag (Phase 8 rollout step 1). Wrapping an endpoint is allowed; changing an existing endpoint contract is not. If parity requires a different payload or response, add a new Robert endpoint and call that from the tool.
 
 | Tool (typed, Zod `inputSchema`) | Wraps Robert API endpoint | Method | Notes |
 | --- | --- | --- | --- |
-| `searchPersons(q, scope)` | `/search` | GET | Network/universe person search. `scope` selects network vs. universe. |
+| `searchPersons(q, mode, limit?)` | `/search` + `/person-search` fallback | GET | Match `src/features/copilot/lib/xano-copilot.ts:305-348`: `/search` uses `q`, `mode`, `limit`; fallback `/person-search` uses `query`, `limit` and normalizes the response. |
 | `getPersonContext(master_person_id)` | `/person-context/{id}` | GET | Enriched person context (currently fetched client-side, passed as `person_context` string). |
 | `getConnectionPath(target_master_person_id)` | `/connection-path` | GET | 2nd/3rd-degree path to a target. |
-| `getNetwork()` | `/network` | GET | Network summary (currently fetched client-side, passed as `network_data` string). See Phase 3 / Risks for parity. |
+| `getNetwork(query?, page?, per_page?)` | `/network` | GET | Network summary (currently fetched client-side, passed as `network_data` string). See Phase 5 / Risks for parity. |
 | `getMeetingPrep(...)` | `/meeting-prep` | POST | Meeting prep generation (mode `meeting`). May stay behind the client interceptor — see Phase 8 Step 3. |
-| `memory(op, ...)` | `/memory`, `/memory/{id}` | GET/POST/PATCH/DELETE | Memory read/write. {/* TODO: verify whether one tool with an `op` discriminator or separate tools is preferred. */} |
-| `triggerGeneration(kind, ...)` | `/generate-leverage-loop`, `/generate-outcome`, `/generate-serendipity` | POST | Async generation; pair with `/process-status` polling. |
+| `memory(op, ...)` | `/memory`, `/memory/{id}` | GET/POST/PATCH/DELETE | Memory read/write. Prefer separate tools (`getMemories`, `createMemory`, `updateMemory`, `deleteMemory`) unless the model quality tests show an `op` discriminator is easier to control. |
+| `triggerGeneration(suggestion_request_id, mode)` | `/generate-leverage-loop`, `/generate-outcome`, `/generate-serendipity` | POST | Async generation. `mode` is `loop`, `outcome`, or `serendipity`; body is `{ suggestion_request_id }`. Pair with `/process-status` polling. |
 | `emitCard(card)` | none (local) | n/a | Validates a `CardEnvelope` against `cards.ts` before SSE. The only non-network tool. |
 
 <Tip>
@@ -109,33 +156,47 @@ Each typed tool wraps an existing Robert API endpoint (group `Bd_dCiOz`, id 1261
         pnpm add @openrouter/ai-sdk-provider
         ```
 
-        {/* TODO: verify the provider decision with the team — the parent doc keeps OpenRouter (claude-sonnet-4). If switching to first-party Anthropic, install @ai-sdk/anthropic instead and update prompts.ts/route accordingly. */}
+        <Warning>
+          Provider decision gate: this plan keeps OpenRouter for parity with the live Xano path. If the team chooses first-party Anthropic instead, install `@ai-sdk/anthropic`, update the route model provider, and update every OpenRouter-specific env/check in this plan before implementation.
+        </Warning>
 
         <Check>
           `@openrouter/ai-sdk-provider` appears in `package.json` dependencies and `pnpm install` succeeds.
         </Check>
       </Step>
-      <Step title="Register the server env vars (schema + runtimeEnv)">
+      <Step title="Register the env vars (schema + runtimeEnv)">
         **File:** `/Users/markl.pederson/Documents/Projects/orbiter-frontend/src/env.ts`
 
-        This repo's `env.ts` uses `@t3-oss/env-core` `createEnv` with a **separate** `runtimeEnv` mapping object (verified env.ts:76-118) — every server var needs **two** edits: a schema entry AND a `runtimeEnv: process.env.KEY` line. A schema entry without a matching `runtimeEnv` line makes `createEnv` **throw at startup**, crashing the route on import of `@/env`.
+        This repo's `env.ts` uses `@t3-oss/env-core` `createEnv` with a **separate** `runtimeEnv` mapping object (verified `src/env.ts:76-129`) — every env var needs **two** edits: a schema entry AND a runtime mapping. A schema entry without a matching `runtimeEnv` line makes `createEnv` **throw at startup**, crashing imports of `@/env`.
 
-        Add **both** `OPENROUTER_API_KEY` (the model key) and `XANO_API_URL` (a server-readable Xano base URL — `VITE_API_URL` is client-only `import.meta.env` and is `undefined` server-side, so the route needs its own). Neither carries the `VITE_` prefix.
+        Add:
+
+        - `OPENROUTER_API_KEY` — server-side model key. Keep it optional in the schema so importing `@/env` does not crash every route in dev; the copilot route must return a friendly error if it is missing.
+        - `XANO_API_URL` — server-readable Xano base URL. `VITE_API_URL` is client-only `import.meta.env` and is not a safe server dependency, so the route needs its own non-`VITE_` value.
+        - `VITE_COPILOT_AI_SDK` — client-side build-time rollout flag used in Phase 6. It is intentionally `VITE_` because `copilot-app.tsx` reads it from the browser bundle.
+
+        Also remove the dead `THESYS_API_KEY` entries from both the server schema and `runtimeEnv` after `rg "THESYS_API_KEY" src package.json` confirms only `src/env.ts` and stale docs mention it.
 
         ```ts
         // src/env.ts — 1) server schema section (next to OPENAI_API_KEY)
         OPENROUTER_API_KEY: z.string().min(1).optional(),
         XANO_API_URL: z.string().url(), // e.g. https://xh2o-yths-38lt.n7c.xano.io/api
 
-        // src/env.ts — 2) runtimeEnv block (next to OPENAI_API_KEY: process.env.OPENAI_API_KEY, at ~line 92)
+        // src/env.ts — 2) client schema section (near VITE_API_URL)
+        VITE_COPILOT_AI_SDK: z.enum(["true", "false"]).optional(),
+
+        // src/env.ts — 3) runtimeEnv block
         OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
         XANO_API_URL: process.env.XANO_API_URL,
+        VITE_COPILOT_AI_SDK: import.meta.env.VITE_COPILOT_AI_SDK,
         ```
 
         <Check>
           - `env.OPENROUTER_API_KEY` and `env.XANO_API_URL` both resolve at runtime with no `createEnv` validation error.
-          - The schema **and** the `runtimeEnv` block each contain both keys.
-          - The values are set in `.env` server-side.
+          - `env.VITE_COPILOT_AI_SDK` type-checks in client code and defaults to off when unset.
+          - The schema **and** the `runtimeEnv` block each contain all three new keys.
+          - `THESYS_API_KEY` no longer appears in `src/env.ts`.
+          - The server values are set in `.env` / deploy config before the route is tested.
         </Check>
       </Step>
     </Steps>
@@ -163,13 +224,13 @@ Each typed tool wraps an existing Robert API endpoint (group `Bd_dCiOz`, id 1261
       title: z.string(),
       context: z.string(),
       status: z.string(),
-      createdAt: z.string(),
-      dispatchedAt: z.string().optional(),
-      completedAt: z.string().optional(),
-      resultText: z.string().optional(),
+      createdAt: z.number(),
+      dispatchedAt: z.number().nullable().optional(),
+      completedAt: z.number().nullable().optional(),
+      resultText: z.string().nullable().optional(),
       personName: z.string().optional(),
       personTitle: z.string().optional(),
-      personAvatar: z.string().optional(),
+      personAvatar: z.string().nullable().optional(),
       isExpanded: z.boolean().optional(),
       // onDispatch / onArchive / onToggleExpand are client-side handlers — NOT modeled in the contract
     });
@@ -183,7 +244,7 @@ Each typed tool wraps an existing Robert API endpoint (group `Bd_dCiOz`, id 1261
       targetPerson: z.string(),
       urgency: z.enum(["high", "medium", "low"]),
       masterPersonId: z.number().optional(),
-      personAvatar: z.string().optional(),
+      personAvatar: z.string().nullable().optional(),
     });
 
     // ... 16 more (see the per-card list below) ...
@@ -203,13 +264,13 @@ Each typed tool wraps an existing Robert API endpoint (group `Bd_dCiOz`, id 1261
 
     <AccordionGroup>
       <Accordion title="The 18 cards — seed props from the digest">
-        Seed each schema from these enumerated prop fields (verified in the digest, cross-referenced against `/Users/markl.pederson/Documents/Projects/orbiter-frontend/src/features/copilot/components/crayon/templates.ts:25-43`). Where a field's exact optionality/shape is unclear, mark it with `{/* TODO: verify ... */}` in `cards.ts` rather than inventing it.
+        Seed each schema from these enumerated prop fields, verified against `/Users/markl.pederson/Documents/Projects/orbiter-frontend/src/features/copilot/components/crayon/templates.ts:25-43` and the corresponding component prop interfaces.
 
-        1. **outcome_card** — `title, context, status, createdAt, dispatchedAt?, completedAt?, resultText?, personName?, personTitle?, personAvatar?, isExpanded?` (handlers `onDispatch?, onArchive?, onToggleExpand?` excluded)
-        2. **leverage_loop_card** — `trigger, opportunity, suggestedAction, suggestedMessage, targetPerson, urgency: "high"|"medium"|"low", masterPersonId?, personAvatar?`
-        3. **contact_card** — `name, role, company, relationshipContext, lastInteraction?, mutualConnections?, bondStrength: "strong"|"warm"|"cold"|"new", actionItems?, insight?, linkedIn?, masterPersonId?, personAvatar?`
+        1. **outcome_card** — `title, context, status, createdAt: number, dispatchedAt?: number|null, completedAt?: number|null, resultText?: string|null, personName?, personTitle?, personAvatar?: string|null, isExpanded?` (handlers `onDispatch?, onArchive?, onToggleExpand?` excluded)
+        2. **leverage_loop_card** — `trigger, opportunity, suggestedAction, suggestedMessage, targetPerson, urgency: "high"|"medium"|"low", masterPersonId?, personAvatar?: string|null`
+        3. **contact_card** — `name, role, company, relationshipContext, lastInteraction?, mutualConnections?: number, bondStrength: "strong"|"warm"|"cold"|"new", actionItems?: string[], insight?, linkedIn?, masterPersonId?, personAvatar?: string|null`
         4. **serendipity_card** — `personA, personARole, personACompany, personB, personBRole, personBCompany, whyTheyMatch, sharedContext: string[], suggestedIntro, confidence: "high"|"medium"|"speculative", masterPersonId?`
-        5. **meeting_prep_card** — `personName, personTitle?, personCompany?, personAvatar?, summary, talkingPoints: { topic, opener, why_they_care }[], listenFor: string[], landmines: string[], sharedContext?, masterPersonId?`
+        5. **meeting_prep_card** — `personName, personTitle?, personCompany?, personAvatar?: string|null, summary, talkingPoints: { topic, opener, why_they_care }[], listenFor: string[], landmines: string[], sharedContext?: string, masterPersonId?`
         6. **meeting_goal_card** — `personName, personTitle?, personAvatar?, masterPersonId, suggestedGoals: string[]`
         7. **memory_card** — `memoryKey, value, category, memoryId, source?`
         8. **button_group** — `question?, options?: { label, value, emoji?, avatar_url?, subtitle? }[], masterPersonId?, buttons?: { text, action }[]`
@@ -222,9 +283,9 @@ Each typed tool wraps an existing Robert API endpoint (group `Bd_dCiOz`, id 1261
         15. **loading_indicator** — _no props_ (reads `useThreadState()` client-side). Model as `z.object({})` (empty templateProps).
         16. **error_card** — `title?, message?` (handlers `onRetry?, onDismiss?` excluded; reads `useThreadState().error` client-side)
         17. **interview_card** — `question, stage: "identify_person"|"clarify_outcome"|"extract_context"|"confirm", context?: { personName?, personId?, outcome?, constraints? }, examples?, helpText?`
-        18. **dispatch_confirmation** — `person_name?, goal?, context?, master_person_id?`
+        18. **dispatch_confirmation** — `person_name?, goal?, context?, master_person_id?: number|null`
 
-        {/* TODO: verify the element types of the loosely-typed fields the digest left unspecified — mutualConnections, actionItems (contact_card), examples (interview_card), sharedContext (meeting_prep_card), connections_analyzed/potential_matches (scanning_card). Confirm against the component prop types before tightening past z.unknown()/z.array(z.string()). */}
+        These prop types were verified against the template component interfaces. Keep schemas tolerant of current nullable data where the components already accept or emit `null` (`personAvatar`, `resultText`, timestamps, `master_person_id` fallback).
       </Accordion>
     </AccordionGroup>
 
@@ -232,7 +293,7 @@ Each typed tool wraps an existing Robert API endpoint (group `Bd_dCiOz`, id 1261
       - `cards.ts` exports a `CardEnvelope` discriminated union with exactly **18** members whose `name` literals match `src/features/copilot/components/crayon/templates.ts` (lines 25-43) 1:1.
       - `CardEnvelope.parse({ name: "leverage_loop_card", templateProps: { ...valid } })` succeeds.
       - A `CardEnvelope.parse(...)` with a missing required prop **throws**.
-      - The Vitest spec round-tripping one known-good card per name passes. {/* TODO: confirm a `pnpm test` script exists in package.json (the digest does not establish one); if absent, run vitest directly. */}
+      - The Vitest spec round-tripping one known-good card per name passes via `pnpm test` (script exists in `package.json`).
       - No client handler appears in any schema.
     </Check>
 
@@ -256,40 +317,40 @@ Each typed tool wraps an existing Robert API endpoint (group `Bd_dCiOz`, id 1261
       meeting: `...`,  // copied verbatim from copilot_config (mode: meeting)
       outcome: `...`,  // copied verbatim from copilot_config (mode: outcome)
     };
+
+    export const CARD_TOOL_INSTRUCTIONS = `
+    When you need to render UI, call the emitCard tool with exactly one CardEnvelope.
+    Do not write raw template JSON in prose. Use normal text for prose and emitCard for cards.
+    `;
     ```
 
     <Warning>
-      Do **not** paraphrase. Pull each prompt verbatim from the Xano `copilot_config` table for its mode and paste it in. Prompt parity is a named risk — any drift changes model behavior and breaks the parity comparison in Phase 8.
+      Do **not** paraphrase the four `COPILOT_SYSTEM` strings. Pull each prompt verbatim from the Xano `copilot_config` table for its mode and paste it in. Prompt parity is a named risk — any drift changes model behavior and breaks the parity comparison in Phase 8. Put new AI-SDK/tool instructions in a separate exported suffix such as `CARD_TOOL_INSTRUCTIONS`, then concatenate `COPILOT_SYSTEM[mode] + CARD_TOOL_INSTRUCTIONS` in the route. This makes parity diffs obvious.
     </Warning>
 
-    {/* TODO: verify the exact copilot_config row keys per mode AND every runtime placeholder Xano injects. Enumerate each injected context (memory / person_context / network_data) and decide per-placeholder whether it becomes a tool result (e.g. getPersonContext, getNetwork) or a string interpolation the route fills before streamText. See Phase 3 + the person_context/network_data parity Risk. */}
+    <Warning>
+      Decision gate before implementation: verify the exact `copilot_config` row keys per mode AND every runtime placeholder Xano injects. Enumerate each injected context (`memory`, `person_context`, `network_data`, `master_person_id`, selected mode) and decide per-placeholder whether it becomes a tool result or a string interpolation the route fills before `streamText`. Do not start the route until this mapping exists.
+    </Warning>
 
     <Check>
-      `COPILOT_SYSTEM` has all four mode keys; each string is a byte-for-byte copy of the corresponding `copilot_config` prompt (diff against a copy pulled from Xano). The module imports cleanly server-side.
+      `COPILOT_SYSTEM` has all four mode keys; each string is a byte-for-byte copy of the corresponding `copilot_config` prompt (diff against a copy pulled from Xano). `CARD_TOOL_INSTRUCTIONS` is separate from the copied strings. The module imports cleanly server-side.
     </Check>
 
     **Rollback:** delete `server/prompts.ts`; Xano `copilot_config` remains the live source of prompts until the route is wired.
   </Step>
 
-  <Step title="The streaming route + typed tools">
+  <Step title="Server utilities: typed tools + history">
     <Note>Phase 3.</Note>
 
-    Stand up the server route that runs the agent loop with `streamText`, plus the typed data tools it calls. The callees (`cards.ts`, `prompts.ts`) already exist from Phases 1-2.
-
-    <Warning>
-      **Resolve the route primitive before writing any handler — it gates this entire phase.** The parent doc specifies `createServerFileRoute("/api/copilot/chat").methods({ POST })`, but the digest found **zero** `createServerFileRoute` usages in the repo; only `createFileRoute` (routing) and `createServerFn` (server logic, e.g. `tiptap-editor/server/ai-review.ts`) exist, on `@tanstack/react-start ^1.159.5`. Spike this first: grep the installed package for an API-route export.
-
-      - **If `createServerFileRoute` exists** in 1.159 (likely under `@tanstack/react-start/server` or via the `routes/api/*.ts` file convention) — use it, and Phase 6 calls it with `fetch('/api/copilot/chat')`.
-      - **If absent** — fall back to a `createServerFn({ method: "POST" })...handler()` returning a streaming `Response` (the verified codebase pattern; `createServerFn` CAN return a raw streaming Response, see `collections/server/stream-token.ts` and `tiptap-editor/server/ai-review.ts`), and Phase 6 calls it via the server-fn client, **not** raw `fetch`.
-
-      The handler **must** be able to read raw `Authorization` / `X-Data-Source` / `X-Branch` request headers for auth forwarding. This is non-trivial with `createServerFn` (it wraps input via `inputValidator`); read headers via `getWebRequest()` / `getRequestHeaders()` from `@tanstack/react-start/server`. **Prove header access in the spike** — the whole auth-forwarding model depends on it. Commit the snippet to ONE concrete primitive and make Phase 6's client call match it.
-    </Warning>
+    Create the server-only helpers the route will import in Phase 5. Do **not** create the route in this phase; keeping utilities first means every phase can compile without forward imports.
 
     <Steps>
       <Step title="Create the tools module">
         **File to create:** `/Users/markl.pederson/Documents/Projects/orbiter-frontend/src/features/copilot/server/tools.ts`
 
-        Each tool has a Zod `inputSchema` and an `execute()` that calls the Robert API directly with the forwarded bearer token — **not** via `copilotFetch()` (client-only). The base URL comes from `env.XANO_API_URL` + the hardcoded group id `:Bd_dCiOz` (matches `xano-copilot.ts:13`). **Do not** use `process.env.VITE_API_URL` — `VITE_*` vars are client-only (`import.meta.env`) and resolve to `undefined` server-side, which would make the base `:Bd_dCiOz` (no host). Start with the three data tools for the rollout.
+        Each tool has a Zod `inputSchema` and an `execute()` that calls the Robert API directly with the forwarded bearer token — **not** via `copilotFetch()` (client-only). The base URL comes from `env.XANO_API_URL` + the hardcoded group id `:Bd_dCiOz` (matches `src/features/copilot/lib/xano-copilot.ts:13`). **Do not** use `process.env.VITE_API_URL` or `import.meta.env.VITE_API_URL` server-side.
+
+        Scope A wraps existing endpoints. If a tool needs a response shape the existing endpoint does not provide, create a new additive Robert endpoint and call that from the tool; do not modify the existing endpoint in place.
 
         ```ts
         // src/features/copilot/server/tools.ts
@@ -298,135 +359,107 @@ Each typed tool wraps an existing Robert API endpoint (group `Bd_dCiOz`, id 1261
         import { env } from "@/env";
         import { CardEnvelope } from "../contracts/cards";
 
-        const ROBERT_BASE = `${env.XANO_API_URL}:Bd_dCiOz`; // group id matches xano-copilot.ts:13
+        const ROBERT_BASE = `${env.XANO_API_URL.replace(/\/$/, "")}:Bd_dCiOz`;
 
-        export function buildTools(authHeader: string, dataSource: string, branch: string) {
+        type ForwardedHeaders = {
+          authHeader: string;
+          dataSource: string;
+          branch?: string;
+        };
+
+        async function robertFetch<T>(
+          path: string,
+          { authHeader, dataSource, branch }: ForwardedHeaders,
+          init: RequestInit = {},
+        ): Promise<T> {
           const headers = {
             "Content-Type": "application/json",
-            Authorization: authHeader,        // forwarded verbatim from the request
-            "X-Data-Source": dataSource,      // forwarded from the request
-            "X-Branch": branch,               // forwarded from the request
+            Authorization: authHeader,
+            "X-Data-Source": dataSource,
+            ...(branch ? { "X-Branch": branch } : {}),
+            ...(init.headers ?? {}),
           };
+          const res = await fetch(`${ROBERT_BASE}${path}`, { ...init, headers });
+          if (!res.ok) throw new Error(`Robert API ${res.status} on ${path}`);
+          const contentType = res.headers.get("content-type") ?? "";
+          return contentType.includes("application/json")
+            ? ((await res.json()) as T)
+            : ((await res.text()) as T);
+        }
 
+        export function buildTools(forwarded: ForwardedHeaders) {
           return {
             searchPersons: tool({
               description: "Search the user's network or the wider universe for people.",
-              inputSchema: z.object({ q: z.string(), scope: z.enum(["network", "universe"]).optional() }),
-              execute: async ({ q, scope }) => {
-                const url = new URL(`${ROBERT_BASE}/search`);
-                url.searchParams.set("q", q);
-                if (scope) url.searchParams.set("scope", scope);
-                const res = await fetch(url, { headers });
-                return res.json();
+              inputSchema: z.object({
+                q: z.string(),
+                mode: z.enum(["network", "universe"]).default("network"),
+                limit: z.number().int().positive().max(50).default(20),
+              }),
+              execute: async ({ q, mode, limit }) => {
+                const qs = new URLSearchParams({ q, mode, limit: String(limit) });
+                try {
+                  return await robertFetch(`/search?${qs}`, forwarded);
+                } catch {
+                  // Preserve the client fallback in lib/xano-copilot.ts:315-345.
+                  const fallback = new URLSearchParams({ query: q, limit: String(limit) });
+                  return robertFetch(`/person-search?${fallback}`, forwarded);
+                }
               },
             }),
             getPersonContext: tool({
               description: "Fetch enriched context for a person by master_person_id.",
               inputSchema: z.object({ master_person_id: z.number() }),
               execute: async ({ master_person_id }) => {
-                const res = await fetch(`${ROBERT_BASE}/person-context/${master_person_id}`, { headers });
-                return res.json();
+                return robertFetch(`/person-context/${master_person_id}`, forwarded);
               },
             }),
             getConnectionPath: tool({
               description: "Find the 2nd/3rd-degree connection path to a target person.",
               inputSchema: z.object({ target_master_person_id: z.number() }),
               execute: async ({ target_master_person_id }) => {
-                const url = new URL(`${ROBERT_BASE}/connection-path`);
-                url.searchParams.set("target_master_person_id", String(target_master_person_id));
-                const res = await fetch(url, { headers });
-                return res.json();
+                const qs = new URLSearchParams({
+                  target_master_person_id: String(target_master_person_id),
+                });
+                return robertFetch(`/connection-path?${qs}`, forwarded);
               },
             }),
             emitCard: tool({
               description: "Emit a UI card. Validates against the card contract before rendering.",
-              // Wrap the union in an object so the tool input is a JSON object — all
-              // provider tool-schema serializers expect an object at the top level.
               inputSchema: z.object({ card: CardEnvelope }),
-              execute: async ({ card }) => CardEnvelope.parse(card), // throws on malformed
+              execute: async ({ card }) => CardEnvelope.parse(card),
             }),
             // getNetwork, getMeetingPrep, memory, triggerGeneration added in later rollout steps
           };
         }
         ```
 
-        {/* TODO: verify ai@^6 tool() accepts the wrapped object schema for OpenRouter/Anthropic serialization. A top-level z.discriminatedUnion as a tool input may not serialize for every provider; the z.object({ card: CardEnvelope }) wrapper above avoids that. */}
-
         <Check>
-          `buildTools()` returns the three data tools + `emitCard`, each with a Zod `inputSchema`. A unit test calling `emitCard.execute({ card })` with a malformed card throws; with a valid `{ card: CardEnvelope }` it returns the parsed object. `ROBERT_BASE` resolves to a full host (not `:Bd_dCiOz`).
+          - `buildTools()` returns the three data tools + `emitCard`, each with a Zod `inputSchema`.
+          - `searchPersons` uses `mode`, not `scope`, and preserves the `/person-search` fallback.
+          - A unit test calling `emitCard.execute({ card })` with a malformed card throws; with a valid `{ card: CardEnvelope }` it returns the parsed object.
+          - `ROBERT_BASE` resolves to a full host (not `:Bd_dCiOz`) and trims a trailing slash from `XANO_API_URL`.
         </Check>
       </Step>
-      <Step title="Map history + create the route">
-        **File to create:** `/Users/markl.pederson/Documents/Projects/orbiter-frontend/src/routes/api/copilot/chat.ts` (primitive per the Warning above)
+      <Step title="Shape Crayon history into ModelMessage[]">
+        **File to create:** `/Users/markl.pederson/Documents/Projects/orbiter-frontend/src/features/copilot/server/history.ts`
 
-        Inside the handler: read `Authorization` / `X-Data-Source` / `X-Branch` from the request headers, build tools, select the system prompt by `mode`, **map the incoming Crayon-shaped messages to AI SDK `ModelMessage[]`**, and run `streamText`.
-
-        <Warning>
-          **Message shape mismatch — this will not type-check or stream without a mapping step.** Crayon thread messages are shaped `{ id, role, message?: unknown }` (verified: `copilot-app.tsx:1149` `newMessage = { id: crypto.randomUUID(), ...message }`; `processMessage`'s own type at `:465` is `Array<{ role: string; message?: unknown }>`). AI SDK v6 `streamText` requires `ModelMessage[]` (`{ role, content }`). Passing Crayon-shaped items (a `message` field, not `content`, plus an `id`) produces empty content / type errors. The existing `processMessage` only works because it extracts `lastMessage.message` into a `prompt` string (`:473-477`) — it never passes the array to a model. The history-shaping in Phase 5 owns the `{role, message}` → `{role, content}` conversion (ported from `copilot-app.tsx:668-711`); the route must call it **before** `streamText`.
-        </Warning>
-
-        ```ts
-        // src/routes/api/copilot/chat.ts  (primitive resolved in the spike above)
-        import { streamText, stepCountIs } from "ai";
-        import { createOpenRouter } from "@openrouter/ai-sdk-provider";
-        import { env } from "@/env";
-        import { COPILOT_SYSTEM, type CopilotMode } from "@/features/copilot/server/prompts";
-        import { buildTools } from "@/features/copilot/server/tools";
-        import { shapeHistory } from "@/features/copilot/server/history"; // Phase 5
-        import { toCrayonSSE } from "@/features/copilot/server/to-crayon-sse"; // Phase 4
-
-        export async function handler(request: Request) {
-          const auth = request.headers.get("Authorization") ?? "";
-          const dataSource = request.headers.get("X-Data-Source") ?? "";
-          const branch = request.headers.get("X-Branch") ?? "";
-          const { messages, mode = "default" } = await request.json();
-
-          // Crayon {role, message} -> AI SDK ModelMessage {role, content}.
-          // shapeHistory (Phase 5) ports copilot-app.tsx:668-711 (last-10, text-only,
-          // assistant card parts dropped). Final guard mirrors the prompt extraction at :473-477.
-          const modelMessages = shapeHistory(messages).map((m) => ({
-            role: m.role,
-            content: typeof m.message === "string" ? m.message : String(m.message ?? ""),
-          }));
-
-          // NOTE: env.OPENROUTER_API_KEY depends on the Phase 0 runtimeEnv mapping.
-          // If unset it should 401/500 gracefully — never crash the @/env import.
-          const openrouter = createOpenRouter({ apiKey: env.OPENROUTER_API_KEY });
-
-          const result = streamText({
-            model: openrouter("anthropic/claude-sonnet-4"),
-            system: COPILOT_SYSTEM[mode as CopilotMode],
-            messages: modelMessages,
-            tools: buildTools(auth, dataSource, branch),
-            stopWhen: stepCountIs(6),
-            experimental_telemetry: { isEnabled: true, functionId: `copilot-${mode}` },
-          });
-
-          return toCrayonSSE(result); // Phase 4
-        }
-        ```
+        Port the current shaping rule **verbatim** from `copilot-app.tsx:667-711`: convert Crayon `{role, message}` items to AI SDK `{role, content}` model messages, extract assistant text parts from card messages, substitute `"I provided a card response."` for assistant card-only turns, keep the **last 10** messages, and drop `id` / `message` / template parts.
 
         <Warning>
-          The handler must reject (401) if the `Authorization` header is absent — tools must never call Xano unauthenticated. Do not fall back to a service token; the whole point is to act as the user.
+          This function returns `ModelMessage[]` directly. Do not return `{role, message}` and then map it again in the route. That double-map bug was present in an earlier draft of this plan and would send empty/incorrect content to `streamText`.
         </Warning>
-
-        <Note>
-          The route reads the model key via `env.OPENROUTER_API_KEY` (the `@/env` pattern, matching `voice-settings/server/*.ts`). This is the cleaner pattern, but it **depends on the Phase 0 `runtimeEnv` mapping** — without it, importing `@/env` throws for the whole route. (The bare `process.env.OPENAI_API_KEY` idiom in `tiptap-editor/server/ai-review.ts:11` also works but is less consistent with `voice-settings/server`.)
-        </Note>
-
-        <Info>
-          **person_context / network_data parity.** Today the client pre-fetches person context (`personContextRef`, set at `copilot-app.tsx:1310/1321`) and a network summary (`networkSummary`, set at `:453`) and passes them to `/chat` as the load-bearing `person_context` and `network_data` string params. If the prompts in `prompts.ts` were written assuming Xano interpolated these, dropping them silently changes behavior. Decide and document, tied to the Phase 2 TODO: (1) add a `getNetwork` tool (wrapping `/network`) or pass `networkSummary` through as initial context; (2) inject the selected-person context either as a first message / system suffix or via the `getPersonContext` tool. See the Risks accordion.
-        </Info>
 
         <Check>
-          - With the flag on, `POST /api/copilot/chat` with a valid bearer + `{ messages, mode: "default" }` returns a `text/event-stream` response.
-          - With no bearer it returns 401.
-          - `streamText` selects `COPILOT_SYSTEM.default` and receives `ModelMessage[]` with `content` (no `message`/`id` fields leaking through).
+          - Given a thread with assistant **card parts** and >10 messages, `shapeHistory` returns at most 10 messages.
+          - Every returned item has `{ role, content }`; no `id`, `message`, `templateProps`, or card objects leak downstream.
+          - Assistant card-only turns become `"I provided a card response."`.
+          - The output type is valid AI SDK `ModelMessage[]`.
         </Check>
       </Step>
     </Steps>
 
-    **Rollback:** delete `routes/api/copilot/chat.ts` and `server/tools.ts`; the client still points at Xano `/chat` (no repoint until Phase 6 + flag).
+    **Rollback:** delete `server/tools.ts` and `server/history.ts`; no runtime path changed.
   </Step>
 
   <Step title="The toCrayonSSE adapter">
@@ -436,28 +469,71 @@ Each typed tool wraps an existing Robert API endpoint (group `Bd_dCiOz`, id 1261
 
     **File to create:** `/Users/markl.pederson/Documents/Projects/orbiter-frontend/src/features/copilot/server/to-crayon-sse.ts`
 
-    Map text deltas to `event: text` and validated card outputs (from `emitCard`) to `event: tpl` with `data: {"name", "templateProps"}`. Match the response headers the current client expects.
+    Iterate `result.fullStream` in order so prose/card interleaving is preserved. AI SDK v6 text parts use `type: "text"` with a text delta; executed tool outputs appear as `type: "tool-result"` parts. For `emitCard`, parse the tool output with `CardEnvelope` and emit `event: tpl` with `data: {"name","templateProps"}`.
 
     ```ts
     // src/features/copilot/server/to-crayon-sse.ts
-    import { CardEnvelope } from "../contracts/cards";
+    import { CardEnvelope, type CardEnvelope as CardEnvelopeType } from "../contracts/cards";
 
-    export function toCrayonSSE(result: /* StreamTextResult */ unknown): Response {
+    type CrayonCallbacks = {
+      onText?: (delta: string) => void;
+      onCard?: (card: CardEnvelopeType) => void;
+      onFinish?: () => Promise<void> | void;
+      onError?: (error: unknown) => void;
+    };
+
+    export function formatCopilotError(error: unknown): string {
+      const raw = error instanceof Error ? error.message : String(error ?? "Unknown error");
+      if (raw.includes("Authentication expired") || raw.includes("Unauthorized")) {
+        return "Session expired. Please refresh the page and try again.";
+      }
+      if (raw.includes("permission") || raw.includes("403")) {
+        return "You don't have permission to perform this action.";
+      }
+      if (raw.includes("Too many requests") || raw.includes("429")) {
+        return "Too many requests. Please wait a moment and try again.";
+      }
+      if (raw.includes("Failed to fetch") || raw.includes("NetworkError")) {
+        return "Network error. Check your connection and try again.";
+      }
+      return `Something went wrong: ${raw}`;
+    }
+
+    export function toCrayonSSE(
+      result: { fullStream: AsyncIterable<any> },
+      callbacks: CrayonCallbacks = {},
+      headers: HeadersInit = {},
+    ): Response {
       const encoder = new TextEncoder();
       const stream = new ReadableStream({
         async start(controller) {
-          const emit = (event: "text" | "tpl", data: string) =>
+          const emit = (event: "text" | "tpl", data: string) => {
             controller.enqueue(encoder.encode(`event: ${event}\ndata: ${data}\n\n`));
+          };
 
-          // Iterate result.fullStream parts IN ORDER so prose/card interleave is preserved:
-          //   - text-delta part  -> emit("text", delta)
-          //   - emitCard tool-result part -> const card = CardEnvelope.parse(toolResult.card);
-          //                                   emit("tpl", JSON.stringify({ name: card.name, templateProps: card.templateProps }));
-          // A turn that goes text -> card -> more text must emit text, tpl, text in that order.
-          // {/* TODO: verify exact AI SDK v6 stream-part iteration API (fullStream parts vs textStream)
-          //    for ai@^6.0.135, and the per-part type discriminators for text-delta vs tool-result. */}
+          try {
+            for await (const part of result.fullStream) {
+              if (part.type === "text" && part.text) {
+                callbacks.onText?.(part.text);
+                emit("text", part.text);
+              }
 
-          controller.close();
+              if (part.type === "tool-result" && part.toolName === "emitCard") {
+                const card = CardEnvelope.parse(part.output);
+                callbacks.onCard?.(card);
+                emit("tpl", JSON.stringify({
+                  name: card.name,
+                  templateProps: card.templateProps,
+                }));
+              }
+            }
+            await callbacks.onFinish?.();
+          } catch (error) {
+            callbacks.onError?.(error);
+            emit("text", formatCopilotError(error));
+          } finally {
+            controller.close();
+          }
         },
       });
 
@@ -466,74 +542,176 @@ Each typed tool wraps an existing Robert API endpoint (group `Bd_dCiOz`, id 1261
           "Content-Type": "text/event-stream",
           "Cache-Control": "no-cache, no-transform",
           Connection: "keep-alive",
+          "X-Accel-Buffering": "no",
+          ...headers,
         },
       });
     }
     ```
 
-    <Warning>
-      Validate **every** card against `CardEnvelope` before emitting `event: tpl`. A card that fails validation must be rejected/retried, never streamed. This is the replacement for the hardened lambda's fence-stripping — but stricter, because it is schema-checked.
-    </Warning>
-
     <Info>
-      **Streaming granularity + error parity.** The current client emitter streams text **word-by-word** with a specific newline protocol (verified `copilot-app.tsx:963-998`: splits on `\n`, emits `event: text\ndata: \ndata: \n\n` for blank lines, space-prefixes words). With `streamText` the natural unit is token deltas. Token deltas are fine for Crayon as long as the `event: text\ndata: <chunk>\n\n` framing holds — but **confirm `processStreamedMessage` tolerates partial-word chunks** (vs. the current word-boundary chunks) and preserves newlines. Also port the client's error mapper (`copilot-app.tsx:1010-1051`) here: wrap the `streamText`/tool execution so auth/permission/429/network failures emit a friendly `event: text` (or an `error_card` via `emitCard`) instead of dropping the stream.
+      The current client emitter streams text word-by-word (`copilot-app.tsx:963-998`). Token deltas are acceptable if `processStreamedMessage` renders partial-word chunks correctly. Include a small test/stub that feeds `event: text` partial-word chunks and confirms they render in order.
     </Info>
 
     <Check>
-      - A scripted stream of `text → card → more text` produces, in order: `event: text\ndata: ...\n\n`, then `event: tpl\ndata: {"name":...,"templateProps":...}\n\n`, then another `event: text\ndata: ...\n\n`.
-      - Response headers are `text/event-stream`, `no-cache, no-transform`, `keep-alive`.
-      - A partial-word text chunk is rendered correctly by a stub `processStreamedMessage` (granularity parity).
-      - A 401 raised inside a tool surfaces as a friendly streamed `event: text` message, not a dropped stream.
+      - A scripted stream of `text → emitCard result → more text` produces `event: text`, then `event: tpl`, then `event: text`, in that order.
+      - `event: tpl` is emitted only after `CardEnvelope.parse` succeeds.
+      - Response headers include `text/event-stream`, `no-cache, no-transform`, `keep-alive`, and `X-Accel-Buffering: no`.
+      - A thrown tool/model error becomes a friendly streamed `event: text` message.
     </Check>
 
-    **Rollback:** delete `server/to-crayon-sse.ts`; the route from Phase 3 has nothing to return, so keep it flagged off.
+    **Rollback:** delete `server/to-crayon-sse.ts`; no runtime path changed until Phase 5 + Phase 6.
   </Step>
 
-  <Step title="Persistence + history shaping server-side">
+  <Step title="The TanStack route + persistence">
     <Note>Phase 5.</Note>
 
-    Move the history-shaping and conversation persistence that the client does today into the route, reusing the existing Robert conversation endpoints.
+    Create the new additive frontend route and move conversation persistence for the AI-SDK path into it. This route is **new** and does not modify any existing Xano `/chat` or Robert endpoint.
 
-    <Steps>
-      <Step title="Shape history in a server module">
-        **File to create:** `/Users/markl.pederson/Documents/Projects/orbiter-frontend/src/features/copilot/server/history.ts`
+    **File to create:** `/Users/markl.pederson/Documents/Projects/orbiter-frontend/src/routes/api/copilot/chat.ts`
 
-        Port the current shaping rule **verbatim** from `copilot-app.tsx` lines ~668-711 into a `shapeHistory(messages)` function the route calls before `streamText` (Phase 3): convert Crayon `{role, message}` items to `{role, content}`, extracting assistant text parts from card messages, substituting the `"I provided a card response."` fallback for assistant turns that were card-only, keeping the **last 10** messages, and filtering to **text-only** (drop assistant card parts). No `message` field may leak downstream.
+    TanStack Start server routes are defined with `createFileRoute` and a `server.handlers` object. Do **not** use `createServerFileRoute`; it has no usage in this repo and the current TanStack Start docs use `createFileRoute('/api/chat')({ server: { handlers: { POST }}})`.
 
-        <Check>
-          - Given a thread with assistant **card parts** and >10 messages, `shapeHistory` returns at most 10 messages, all `{role, content}` with **no `message` field**.
-          - Assistant card-only turns are represented by the `"I provided a card response."` fallback text (parity with `copilot-app.tsx:668-711`).
-          - The output is valid AI SDK `ModelMessage[]` (no Crayon `id`/`message` keys).
-        </Check>
-      </Step>
-      <Step title="Persist turns via the existing endpoints">
-        **File:** `/Users/markl.pederson/Documents/Projects/orbiter-frontend/src/routes/api/copilot/chat.ts` (calling Robert API directly with the forwarded token)
+    ```ts
+    // src/routes/api/copilot/chat.ts
+    import { createFileRoute } from "@tanstack/react-router";
+    import { createOpenRouter } from "@openrouter/ai-sdk-provider";
+    import { streamText, stepCountIs } from "ai";
+    import { z } from "zod";
+    import { env } from "@/env";
+    import {
+      CARD_TOOL_INSTRUCTIONS,
+      COPILOT_SYSTEM,
+      type CopilotMode,
+    } from "@/features/copilot/server/prompts";
+    import { shapeHistory } from "@/features/copilot/server/history";
+    import { buildTools } from "@/features/copilot/server/tools";
+    import { toCrayonSSE } from "@/features/copilot/server/to-crayon-sse";
 
-        On first user message, `POST /conversations` (returns `{id, mode, title, master_person_id}`); after each turn, `POST /conversations/{id}/messages` — exactly the contract the client uses today (`xano-copilot.ts:702`, `:725`). Persist the assistant's text and, when a card is emitted, its `template_name` + `template_props` as separate fields.
+    const RequestBody = z.object({
+      messages: z.array(z.unknown()),
+      mode: z.enum(["default", "leverage", "meeting", "outcome"]).default("default"),
+      conversation_id: z.number().nullable().optional(),
+      master_person_id: z.number().nullable().optional(),
+      person_context: z.string().optional(),
+      network_data: z.string().optional(),
+    });
 
-        <Warning>
-          The existing client (`addMessage`, `xano-copilot.ts:725`) injects `conversation_id` into the **body** as well as the path: `body: { conversation_id: conversationId, ...data }`. The route's reimplementation should match — send `{ conversation_id, role, content, template_name?, template_props? }` — unless verified the Xano endpoint reads the id only from the path. Persistence is **not** automatic; it happens only if the route calls these endpoints. Guard against duplicate conversation creation on fast re-sends (the client uses `conversationIdRef`; the route needs an equivalent idempotency check).
-        </Warning>
+    export const Route = createFileRoute("/api/copilot/chat")({
+      server: {
+        handlers: {
+          POST: async ({ request }) => handleCopilotChat(request),
+        },
+      },
+    });
 
-        <Check>
-          - After a turn, `GET /conversations/{id}/messages` returns the user message and the assistant message with `template_name`/`template_props` populated when a card was emitted.
-          - The persist body includes `conversation_id` (matching the client contract).
-          - A rapid double-send creates exactly **one** conversation.
-        </Check>
-      </Step>
-    </Steps>
+    async function handleCopilotChat(request: Request): Promise<Response> {
+      const authHeader = request.headers.get("Authorization") ?? "";
+      const dataSource = request.headers.get("X-Data-Source") ?? "";
+      const branch = request.headers.get("X-Branch") ?? "";
+
+      if (!authHeader.startsWith("Bearer ")) return new Response("Unauthorized", { status: 401 });
+      if (!dataSource) return new Response("Missing X-Data-Source", { status: 400 });
+      if (!env.OPENROUTER_API_KEY) {
+        return toCrayonSSE({
+          fullStream: (async function* () {
+            throw new Error("OPENROUTER_API_KEY is not configured");
+          })(),
+        });
+      }
+
+      const body = RequestBody.parse(await request.json());
+      const mode = body.mode as CopilotMode;
+      const modelMessages = shapeHistory(body.messages);
+
+      // Create/reuse conversation before streaming so the id can be returned as a response header.
+      // Use existing Robert endpoints exactly as the client does today:
+      //   POST /conversations
+      //   POST /conversations/{id}/messages with conversation_id in the body
+      // If those endpoints cannot support route-side idempotency, create a NEW additive endpoint
+      // such as /conversations-ai-sdk/ensure. Do not change /conversations in place.
+      const { conversationId } = await ensureConversationAndPersistUser({
+        authHeader,
+        dataSource,
+        branch,
+        conversationId: body.conversation_id ?? null,
+        mode,
+        masterPersonId: body.master_person_id ?? null,
+        messages: body.messages,
+      });
+
+      const assistantText: string[] = [];
+      const assistantCards: Array<{ name: string; templateProps: Record<string, unknown> }> = [];
+      const openrouter = createOpenRouter({ apiKey: env.OPENROUTER_API_KEY });
+
+      const contextSuffix = [
+        body.person_context ? `[PERSON CONTEXT]\n${body.person_context}` : "",
+        body.network_data ? `[NETWORK DATA]\n${body.network_data}` : "",
+      ].filter(Boolean).join("\n\n");
+
+      const result = streamText({
+        model: openrouter("anthropic/claude-sonnet-4"),
+        system: [COPILOT_SYSTEM[mode], CARD_TOOL_INSTRUCTIONS, contextSuffix]
+          .filter(Boolean)
+          .join("\n\n"),
+        messages: modelMessages,
+        tools: buildTools({ authHeader, dataSource, branch }),
+        stopWhen: stepCountIs(6),
+        experimental_telemetry: { isEnabled: true, functionId: `copilot-${mode}` },
+      });
+
+      return toCrayonSSE(
+        result,
+        {
+          onText: (delta) => assistantText.push(delta),
+          onCard: (card) => assistantCards.push({
+            name: card.name,
+            templateProps: card.templateProps,
+          }),
+          onFinish: async () => {
+            await persistAssistantMessage({
+              authHeader,
+              dataSource,
+              branch,
+              conversationId,
+              text: assistantText.join(""),
+              firstCard: assistantCards[0],
+            });
+          },
+        },
+        { "X-Copilot-Conversation-Id": String(conversationId) },
+      );
+    }
+    ```
+
+    <Warning>
+      `ensureConversationAndPersistUser` and `persistAssistantMessage` must be implemented in this same route file or a server-only helper. They should call Robert directly with the forwarded bearer token, mirroring `src/features/copilot/lib/xano-copilot.ts:702-740`. Include `conversation_id` in the message body, because the current client does.
+    </Warning>
+
+    <Info>
+      The client must send `conversation_id`, `master_person_id`, `person_context`, and `network_data` in Phase 6. Without those, the route cannot preserve persistence or prompt-context parity with the current `chat(prompt, personContext, history, masterPersonId, networkData, mode)` call.
+    </Info>
+
+    <Check>
+      - `POST /api/copilot/chat` with a valid bearer + `{ messages, mode: "default" }` returns `text/event-stream`.
+      - The response includes `X-Copilot-Conversation-Id`, and the client can read it before passing the response to `processStreamedMessage`.
+      - With no bearer it returns 401 and does not call Robert.
+      - `streamText` receives `ModelMessage[]` from `shapeHistory` with `content` fields only.
+      - After a turn, `GET /conversations/{id}/messages` returns the user message and the assistant message with `template_name`/`template_props` populated when a card was emitted.
+      - No existing Robert endpoint contract is changed. Any new backend endpoint is additive and named separately from the old path.
+    </Check>
 
     **Rollback:** stop calling the conversation endpoints from the route; the Xano `/chat` path (still live) persists as before.
   </Step>
 
-  <Step title="Client repoint (~10 lines)">
+  <Step title="Client repoint + TTS shim">
     <Note>Phase 6.</Note>
 
-    Repoint the client to the new route **behind the flag**. The Crayon shell, 18 templates, voice, and CSS all stay. The change is confined to the `onProcessMessage` callback wiring.
+    Repoint the client to the new route **behind the flag**. The Crayon shell, 18 templates, voice, and CSS all stay. The change is confined to the `onProcessMessage` callback wiring plus an `env` import and a small streamed-text collector for voice.
 
     **File:** `/Users/markl.pederson/Documents/Projects/orbiter-frontend/src/features/copilot/components/copilot-app.tsx`
 
-    Splice **into the existing `onProcessMessage` body**. Verified, the callback destructures `{ message, threadManager: tm, abortController }` (`copilot-app.tsx:1144-1148`) — there is **no** `threadId` or `messages` param; `threadId` is derived locally as `loadThreadId || 'new'` (`:1152`), `newMessage` is built at `:1149`, and `processStreamedMessage` is already imported at `:1160`. So: replace the single `const response = await processMessage({...})` at `:1154-1158` with a `useAiSdk ? fetch(...) : processMessage(...)` ternary, reusing the `newMessage`, `tm`, and `threadId` already in scope. **Do not** re-import `processStreamedMessage` — reuse the existing `:1160` import.
+    Add `import { env } from "@/env";` near the other absolute imports. Then splice **into the existing `onProcessMessage` body**. Verified, the callback destructures `{ message, threadManager: tm, abortController }` (`copilot-app.tsx:1144-1148`) — there is **no** `threadId` or `messages` param; `threadId` is derived locally as `loadThreadId || 'new'` (`:1152`), `newMessage` is built at `:1149`, and `processStreamedMessage` is already imported at `:1160`. Replace the single `const response = await processMessage({...})` at `:1154-1158` with the flagged fetch path below. **Do not** re-import `processStreamedMessage` — reuse the existing `:1160` import.
 
     ```tsx
     // copilot-app.tsx — splice into the existing onProcessMessage, replacing the
@@ -547,15 +725,16 @@ Each typed tool wraps an existing Robert API endpoint (group `Bd_dCiOz`, id 1261
     const rawToken = localStorage.getItem("xano_auth_token") ?? "";
     let token = rawToken;
     try { const p = JSON.parse(rawToken); if (typeof p === "string") token = p; } catch { /* raw token */ }
-    {/* TODO: alternatively export getAuthToken from xano-copilot.ts and import it at :53 */}
 
     // env reads use the @/env object (the codebase pattern, e.g. xano-copilot.ts:845), NOT bare
     // import.meta.env. VITE_BRANCH is .optional() in env.ts:62 — fall back so X-Branch isn't empty.
     const useAiSdk = env.VITE_COPILOT_AI_SDK === "true"
       && selectedModeRef.current === "default"; // rollout step 1: default only
 
-    const response = useAiSdk
-      ? await fetch("/api/copilot/chat", {
+    let response: Response;
+
+    if (useAiSdk) {
+      response = await fetch("/api/copilot/chat", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -563,23 +742,83 @@ Each typed tool wraps an existing Robert API endpoint (group `Bd_dCiOz`, id 1261
             "X-Data-Source": env.VITE_DATA_SOURCE,
             "X-Branch": env.VITE_BRANCH ?? "", // optional in env.ts; provide a fallback
           },
-          // send the RAW Crayon messages; the route's shapeHistory maps {role,message}->{role,content}
-          body: JSON.stringify({ messages: [...tm.messages, newMessage], mode: selectedModeRef.current }),
+          // Send RAW Crayon messages; the route's shapeHistory maps {role,message}->{role,content}.
+          // Also send current context because the old Xano /chat call received these as params.
+          body: JSON.stringify({
+            messages: [...tm.messages, newMessage],
+            mode: selectedModeRef.current,
+            conversation_id: conversationIdRef.current
+              ?? (threadId !== "new" ? Number(threadId) : null),
+            master_person_id: masterPersonIdRef.current,
+            person_context: personContextRef.current || undefined,
+            network_data: networkSummary || undefined,
+          }),
           signal: abortController.signal,
-        })
-      : await processMessage({ threadId, messages: [...tm.messages, newMessage], abortController });
+        });
+
+      if (!response.ok) {
+        throw new Error(`Copilot AI-SDK route failed: ${response.status}`);
+      }
+
+      const routedConversationId = Number(response.headers.get("X-Copilot-Conversation-Id"));
+      if (Number.isFinite(routedConversationId)) {
+        conversationIdRef.current = routedConversationId;
+        fetchConversations();
+      }
+    } else {
+      response = await processMessage({ threadId, messages: [...tm.messages, newMessage], abortController });
+    }
 
     // existing import at :1160 is reused as-is — do NOT add a second dynamic import
+    // For TTS, clone the Response before Crayon consumes the stream. Response.clone()
+    // tees the body; collect only `event: text` chunks from the clone.
+    const ttsResponse = useAiSdk && voiceRef.current.voiceEnabled ? response.clone() : null;
+
     await processStreamedMessage({
       response,
       createMessage: tm.appendMessages,
       updateMessage: tm.updateMessage,
       deleteMessage: tm.deleteMessage,
     });
+
+    if (ttsResponse) {
+      const fullText = await collectCrayonText(ttsResponse);
+      if (fullText) voiceRef.current.speak(fullText);
+    }
+    ```
+
+    Add this helper in the component file or a tiny local utility near `processMessage`:
+
+    ```ts
+    async function collectCrayonText(response: Response): Promise<string> {
+      if (!response.body) return "";
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let text = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const events = buffer.split("\n\n");
+        buffer = events.pop() ?? "";
+        for (const event of events) {
+          if (!event.startsWith("event: text")) continue;
+          const data = event
+            .split("\n")
+            .filter((line) => line.startsWith("data:"))
+            .map((line) => (line.startsWith("data: ") ? line.slice(6) : line.slice(5)))
+            .join("\n");
+          text += data;
+        }
+      }
+      return text.trim();
+    }
     ```
 
     <Warning>
-      **Voice TTS will be dead on the new path unless you shim it.** Voice TTS fires **client-side inside `processMessage`** (verified `copilot-app.tsx:942-953`, `voiceRef.current.speak(fullText)`), **not** inside `processStreamedMessage`. The flag-on branch bypasses `processMessage` entirely and hands the raw `Response` to `processStreamedMessage`, so on the AI-SDK path `speak()` is never reached — a silent functional regression. Add an explicit shim: accumulate the streamed `event: text` chunks (e.g. in an `onProcessMessage`-side callback or a per-text-item callback into `processStreamedMessage`) and call `voiceRef.current.speak(fullText)` after `processStreamedMessage` resolves. Decide and document the shim; do not leave TTS dead.
+      **Voice TTS will be dead on the new path unless you shim it.** Voice TTS fires **client-side inside `processMessage`** (verified `copilot-app.tsx:942-953`, `voiceRef.current.speak(fullText)`), **not** inside `processStreamedMessage`. The flag-on branch bypasses `processMessage` entirely. Clone/tee the `Response` before `processStreamedMessage` consumes it, collect streamed `event: text` chunks from the clone, then call `voiceRef.current.speak(fullText)` after Crayon finishes processing.
     </Warning>
 
     <Warning>
@@ -589,12 +828,14 @@ Each typed tool wraps an existing Robert API endpoint (group `Bd_dCiOz`, id 1261
     <Check>
       - Flag off: byte-identical behavior to today (all four modes via Xano).
       - Flag on: `default` mode streams from `/api/copilot/chat`, renders through Crayon, and the other three modes still hit Xano.
+      - The request body includes `conversation_id`, `master_person_id`, `person_context`, and `network_data` when available.
+      - `conversationIdRef.current` is updated from `X-Copilot-Conversation-Id`.
       - `processStreamedMessage` arguments are unchanged and the `:1160` import is not duplicated.
       - **Voice TTS fires on the AI-SDK default path** (the shim accumulates streamed text and calls `voiceRef.current.speak`).
     </Check>
 
     <Warning>
-      **Rollback is only instant if the flag is a runtime source.** `VITE_COPILOT_AI_SDK` as written is an `import.meta.env` value that Vite **inlines at build time** — flipping it requires a **rebuild/redeploy**, not an instant flip. If the rollout safety story needs instant, no-deploy rollback, resolve the flag to a runtime source (see the "Rollout flag" TODO in *Before you start*). Until then, every "flag flip" note below means a rebuild.
+      **Rollback is only instant if the flag is a runtime source.** `VITE_COPILOT_AI_SDK` as written is an `import.meta.env` value that Vite **inlines at build time** — flipping it requires a **rebuild/redeploy**, not an instant flip. If the rollout safety story needs instant, no-deploy rollback, resolve the flag to a runtime source (see the "Rollout flag" card in *Before you start*). Until then, every "flag flip" note below means a rebuild.
     </Warning>
 
     **Rollback:** flip `VITE_COPILOT_AI_SDK` off (or revert the `onProcessMessage` diff). **Note:** with a `VITE_` env var this requires a rebuild/redeploy — not instant.
@@ -603,20 +844,18 @@ Each typed tool wraps an existing Robert API endpoint (group `Bd_dCiOz`, id 1261
   <Step title="Observability (OTel exporter)">
     <Note>Phase 7.</Note>
 
-    Turn on tracing for the agent loop. `streamText` already sets `experimental_telemetry: { isEnabled: true, functionId: ... }` (Phase 3). Wire a thin OTel span processor that exports to the observability sink.
+    Turn on tracing for the agent loop. `streamText` already sets `experimental_telemetry: { isEnabled: true, functionId: ... }` (Phase 5). Wire a thin OTel span processor that exports to the observability sink.
 
     **File to create:** `/Users/markl.pederson/Documents/Projects/orbiter-frontend/src/features/copilot/server/telemetry.ts`
 
     Register a tracer provider with a span processor that ships spans over OTLP, initialized once at server startup so the route's telemetry is captured.
 
     <Note>
-      `experimental_telemetry` with no registered exporter is a **no-op** until this phase — that is intentional. Phase 8 Step 1 can ship default traffic before the exporter lands; traces simply do not flow until `telemetry.ts` is wired. (If you want the exporter present before any flagged traffic, run this phase as 3.5, before Phase 6.)
+      `experimental_telemetry` with no registered exporter is a **no-op** until this phase — that is intentional. Phase 8 Step 1 can ship default traffic before the exporter lands; traces simply do not flow until `telemetry.ts` is wired. (If you want the exporter present before any flagged traffic, run this phase after Phase 5 and before Phase 6.)
     </Note>
 
     <Warning>
-      This phase is **not executable as written** until the sink is chosen. The parent doc targets a generic OTLP sink (e.g. Langfuse / Braintrust). Resolve the concrete package + endpoint + env-var names before marking it done; do not invent Arize-specific values.
-
-      {/* TODO: verify the observability sink, the exact OTLP exporter package (e.g. an OpenTelemetry OTLP-HTTP exporter, or @arizeai/openinference if Arize is chosen), the ingest endpoint, and the space/api-key env var names — none are present in the codebase digest. */}
+      This phase is **not executable as written** until the sink is chosen. The parent doc targets a generic OTLP sink (e.g. Langfuse / Braintrust). Resolve the concrete package, endpoint, API-key env var, and space/project env var before marking it done. Do not invent Arize-specific values unless Arize is explicitly selected.
     </Warning>
 
     <Note>
@@ -660,7 +899,7 @@ Each typed tool wraps an existing Robert API endpoint (group `Bd_dCiOz`, id 1261
         <AccordionGroup>
           <Accordion title="meeting — decide: keep the interceptor, or replicate the 2-step flow">
             Meeting mode is a deterministic 2-step client interceptor (`copilot-app.tsx:542-665`), not an agent-loop turn: message 1 returns a synthetic `meeting_goal_card`; selecting a goal sends `[MEETING_GOAL] ...` which calls `/meeting-prep` and returns a `meeting_prep_card`. Choose one:
-            - **(a)** Keep the meeting goal/prep interceptor client-side as a **declared permanent shim** that calls the `getMeetingPrep` tool's underlying endpoint (`/meeting-prep`), and scope meeting **out** of the `streamText` agent loop. "Served" here means "served by the declared deterministic path."
+            - **(a)** Keep the meeting goal/prep interceptor client-side as a **declared permanent shim** that calls the existing Robert endpoint (`/meeting-prep`) or a new additive wrapper endpoint if server ownership is required. Scope meeting **out** of the `streamText` agent loop. "Served" here means "served by the declared deterministic path."
             - **(b)** Replicate the forced two-step flow as agent behavior: a system prompt that emits a `meeting_goal_card` on turn 1 and a `meeting_prep_card` on turn 2.
 
             Either way the agent/interceptor must read `selectedModeRef.current` (meeting is not in the `selectedMode` state union, `:213-215`).
@@ -673,13 +912,14 @@ Each typed tool wraps an existing Robert API endpoint (group `Bd_dCiOz`, id 1261
         For the conversational portions: `leverage`/`outcome` need `triggerGeneration` (`/generate-*`) + `memory`; `meeting` (if path (b)) needs `getMeetingPrep` (`/meeting-prep`). Re-run the parity/latency check after each mode.
 
         <Warning>
-          The mode-specific client interceptors are still live on the Xano path. As each mode moves to the route, decide per interceptor: formalize as a server tool/card, or keep as an explicit **declared** shim. Do **not** leave the logic running in two places implicitly — that is the named "quietly duplicating logic" risk.
+          The mode-specific client interceptors are still live on the Xano path. As each mode moves to the route, decide per interceptor: formalize as a server tool/card, keep as an explicit **declared** shim, or create a new additive wrapper endpoint. Do **not** leave the logic running in two places implicitly, and do **not** change existing Robert endpoint contracts to force the migration.
         </Warning>
 
         <Check>
-          - All four modes are **served** (per the meeting/leverage definitions above) — conversational turns token-stream and render via Crayon; deterministic interceptors run their declared client-side path.
+          - All four modes have an explicit owner (per the meeting/leverage definitions above) — conversational turns token-stream and render via Crayon; deterministic interceptors run their declared path.
           - Every card passes `CardEnvelope` validation.
           - No mode silently runs both the route and a client interceptor for the same turn.
+          - Any new backend capability was added through a new endpoint; no existing endpoint contract was changed.
         </Check>
       </Step>
     </Steps>
@@ -702,10 +942,10 @@ Each typed tool wraps an existing Robert API endpoint (group `Bd_dCiOz`, id 1261
         </Check>
       </Step>
       <Step title="Retire the lambda and demote Xano">
-        Remove/disable the hardened `api.lambda` on the Xano `/chat` path (or retire `/chat` for copilot use entirely). Xano is now data/auth/tools only. Remove the client-side Xano `/chat` branch and any interceptors that were formalized as server tools/cards in Phase 8.
+        Remove/disable the hardened `api.lambda` on the Xano `/chat` path (or retire `/chat` for copilot use entirely) only after a deprecation window. Xano is now data/auth/tools only. Remove the client-side Xano `/chat` branch and any interceptors that were formalized as server tools/cards in Phase 8.
 
         <Warning>
-          This is the destructive, irreversible-ish step. Keep the lambda code in version control and keep `/chat` callable for a deprecation window before deleting, in case a mode regresses.
+          This is the destructive, irreversible-ish step. Keep the lambda code in version control and keep `/chat` callable for a deprecation window before deleting, in case a mode regresses. Do not repurpose the old `/chat` endpoint for the AI-SDK flow; the rollback path depends on the old endpoint remaining old until retirement.
         </Warning>
 
         <Warning>
@@ -713,7 +953,7 @@ Each typed tool wraps an existing Robert API endpoint (group `Bd_dCiOz`, id 1261
         </Warning>
 
         <Check>
-          - The copilot serves all four modes through `/api/copilot/chat` (per the Phase 8 per-mode definitions); the hardened lambda is no longer in the live path; Xano performs only data, auth, and tool calls.
+          - The copilot serves conversational turns through `/api/copilot/chat` and has declared deterministic shims where needed; the hardened lambda is no longer in the live path; Xano performs only data, auth, and tool calls.
           - Pre-migration conversations (including raw-JSON-in-`content` card rows) still hydrate and render.
         </Check>
       </Step>
@@ -728,7 +968,7 @@ Each typed tool wraps an existing Robert API endpoint (group `Bd_dCiOz`, id 1261
 Sign off Scope A only when all of the following hold (mirrors the parent doc).
 
 <Check>
-  All four modes (`default`, `leverage`, `meeting`, `outcome`) are **served** by `routes/api/copilot/chat.ts` — where "served" for the deterministic meeting and quick-leverage paths may legitimately mean a declared client-side interceptor calling the route's tool endpoints, not an LLM agent turn (see Phase 8 Step 3).
+  All four modes (`default`, `leverage`, `meeting`, `outcome`) have an explicit Scope-A owner: conversational turns use `routes/api/copilot/chat.ts`; deterministic meeting/quick-leverage paths are declared shims or additive wrapper endpoints, not accidental duplicate logic (see Phase 8 Step 3).
 </Check>
 <Check>
   Conversational responses token-stream (not blocking) via `streamText` + `toCrayonSSE`, and voice TTS fires on the streamed path.
@@ -743,20 +983,23 @@ Sign off Scope A only when all of the following hold (mirrors the parent doc).
   OTel traces flow to the observability sink with per-mode `functionId` (`copilot-${mode}`), including tool-call and generation spans.
 </Check>
 <Check>
-  Xano is demoted to data, auth, and tools — no orchestration or prompt logic remains in `/chat` for copilot, and `person_context`/`network_data` parity is preserved via tools or interpolation.
+  Xano is demoted to data, auth, and tools — no orchestration or prompt logic remains in `/chat` for copilot, `person_context`/`network_data` parity is preserved via tools or interpolation, and any new backend contracts were added as new endpoints rather than changing existing ones.
 </Check>
 
 ## Risks & watch-items
 
 <AccordionGroup>
-  <Accordion title="Route primitive unresolved (blocks Phase 3)">
-    `createServerFileRoute` has zero usages in the repo; only `createFileRoute` and `createServerFn` exist on `@tanstack/react-start ^1.159.5`. Every later phase depends on the handler signature (Request vs `createServerFn {data}`) and on reading raw `Authorization`/`X-*` headers for forwarding. Resolve in a Phase 3 spike before writing the handler — see the Phase 3 Warning.
+  <Accordion title="Additive endpoint discipline">
+    Scope A must not mutate existing Robert/Xano endpoint contracts. Existing endpoints may be wrapped by tools exactly as-is. If route-side persistence, idempotency, or deterministic shims need a different contract, create a new additive endpoint and leave the old one callable until Phase 9+ retirement.
+  </Accordion>
+  <Accordion title="Route primitive resolved">
+    TanStack Start server routes use `createFileRoute("/api/copilot/chat")({ server: { handlers: { POST }}})`, which gives the handler a raw `Request` for `Authorization` / `X-Data-Source` / `X-Branch` forwarding. Do not use the old draft's `createServerFileRoute` placeholder.
   </Accordion>
   <Accordion title="Message-shape mismatch (Crayon vs ModelMessage)">
-    Crayon thread messages are `{ id, role, message? }`; `streamText` requires `{ role, content }`. The client sends raw Crayon messages and `shapeHistory` (Phase 5) maps them before `streamText` (Phase 3) — porting `copilot-app.tsx:668-711` (assistant text-part extraction, the `"I provided a card response."` fallback, last-10, text-only). No `message`/`id` may leak into the model call. Check: a thread with assistant card parts converts to valid `ModelMessage[]`.
+    Crayon thread messages are `{ id, role, message? }`; `streamText` requires `{ role, content }`. The client sends raw Crayon messages and `shapeHistory` (Phase 3) maps them before `streamText` (Phase 5) — porting `copilot-app.tsx:667-711` (assistant text-part extraction, the `"I provided a card response."` fallback, last-10, text-only). No `message`/`id` may leak into the model call. Check: a thread with assistant card parts converts to valid `ModelMessage[]`.
   </Accordion>
   <Accordion title="Voice TTS dead on the streamed path">
-    TTS fires inside `processMessage` (`:942-953`), which the flag-on branch bypasses. Without the Phase 6 shim (accumulate streamed text, `voiceRef.current.speak(fullText)` after `processStreamedMessage`), voice silently stops working in default mode once flagged on.
+    TTS fires inside `processMessage` (`:941-953`), which the flag-on branch bypasses. Without the Phase 6 shim (`response.clone()` before `processStreamedMessage`, collect `event: text` chunks from the clone, then `voiceRef.current.speak(fullText)`), voice silently stops working in default mode once flagged on.
   </Accordion>
   <Accordion title="Flag mechanism vs instant rollback">
     `VITE_COPILOT_AI_SDK` is build-time inlined by Vite — flipping it requires a rebuild/redeploy, so the "instant, no-deploy rollback" promise does not hold. If instant rollback is required, source the flag at runtime (copilot_config row, bootstrap/me endpoint, or localStorage/query-param). See *Before you start*.
@@ -768,7 +1011,7 @@ Sign off Scope A only when all of the following hold (mirrors the parent doc).
     Each tool call now traverses client → the new route → Robert API, instead of the client fetching context and passing it inline to one blocking `/chat`. Measure p95 per-turn latency in Phase 8 step 2 against the Xano baseline. Mitigations: parallelize independent tool calls, cap `stopWhen: stepCountIs(6)`, and pre-resolve cheap context (e.g. `getPersonContext`) where the prompt already implies it.
   </Accordion>
   <Accordion title="Prompt parity + injected context (person_context / network_data)">
-    The four system prompts move from [`copilot_config`](/guides/open-work/ai-sdk-migration#current-state-verified) to `prompts.ts`. Any paraphrase changes behavior — copy verbatim (Phase 2). Critically, today the client pre-fetches **person_context** (`personContextRef`, set at `:1310/1321`) and **network_data** (`networkSummary`, set at `:453`) and passes them as load-bearing `/chat` string params. Enumerate every Xano-injected context (memory / person / network) and map each to a tool result or interpolation — do **not** drop them silently. Add a `getNetwork` tool (wrapping `/network`) or pass `networkSummary` as initial context; inject selected-person context as a first message/system suffix or via `getPersonContext`. {/* TODO: verify the injected-context placeholders in each copilot_config prompt. */}
+    The four system prompts move from [`copilot_config`](/guides/open-work/ai-sdk-migration#current-state-verified) to `prompts.ts`. Any paraphrase changes behavior — copy verbatim (Phase 2). Critically, today the client pre-fetches **person_context** (`personContextRef`, set at `:1310/1321`) and **network_data** (`networkSummary`, set at `:453`) and passes them as load-bearing `/chat` string params. Enumerate every Xano-injected context (memory / person / network) and map each to a tool result or interpolation — do **not** drop them silently. Add a `getNetwork` tool (wrapping `/network`) or pass `networkSummary` as initial context; inject selected-person context as a first message/system suffix or via `getPersonContext`.
   </Accordion>
   <Accordion title="Preserving client-side enrichment / fallbacks / interceptors">
     Today the client does network-avatar enrichment of `button_group` (lines ~796-847), a `dispatch_confirmation` fallback via regex on the last user messages (lines ~900-939), `BLOCKED_DURING_INTERVIEW` filtering, the meeting-goal interceptor (`:542-665`), and the quick-leverage interceptor (`:480-540`, with `handlePersonClear` + `chatKey` bump + grid removal side effects that cannot move server-side). Each must be either formalized as a server tool/card or kept as an **explicit, declared** shim — never quietly duplicated across client and server. Track each one to a decision before Phase 9.

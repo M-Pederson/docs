@@ -1,0 +1,197 @@
+---
+title: "How I Know X"
+description: "The relationship-interview feature — a warm one-question-at-a-time interview that distills how the user knows a contact into durable, scannable memory, backed by Mem0."
+---
+
+"How I Know X" turns the open question *"how do you actually know this person?"* into a short, warm interview and distills the answer into durable relationship memory. It is **not** a resume or an enrichment fact sheet — those are facts *about* the person from the enrichment pipeline. This is the **relationship**: how you met, what they are unusually good at, where they have a blind spot, how much you trust them, and the overall shape of the bond.
+
+It runs only for people who are **your contacts**, persists a structured summary plus distilled "nuggets" to Xano, and writes the closing reflection to **Mem0** so every other surface (outcomes, leverage loops, the suggestion "why") can recall it later.
+
+<Note>
+The interview model is **`claude-sonnet-4-6`**. The whole flow is gated on `$env.MEM0_API_KEY`: with the key unset, the interview still runs but the Mem0 read/write steps are dormant and behavior is identical to the pre-Mem0 build.
+</Note>
+
+## The experience
+
+<Steps>
+  <Step title="Gated on contacts">
+    The section only appears if the person is one of **your contacts** (the table formerly called `my_person`). If they are not a contact, you don't "know" them — the whole section, including the full-screen pop-out trigger, is hidden.
+  </Step>
+  <Step title="One question at a time">
+    The interviewer opens with something specific to the person (it has done its homework via the YAML context), then asks how you met. It moves **one warm question at a time**, breadth over depth — grab one good fact, move to the next dimension. Target length is **4–8 exchanges**, never more than 8.
+  </Step>
+  <Step title="Superpower & kryptonite first">
+    The two most valuable things to walk away with are the person's **superpower** and their **kryptonite** (honest blind spot, not a humble-brag). The prompt drives toward these early rather than grinding through every dimension.
+  </Step>
+  <Step title="Save & close anytime">
+    An always-visible **"I'm done — save & close"** button is pinned under the chat input the entire time. You can stop at any point; the running transcript is persisted and the section collapses to the summary.
+  </Step>
+  <Step title="Nuggets + closing reflection">
+    On close, the model emits a `nuggets` object (how met, superpower, kryptonite, cadence, trust, milestones) and a **closing reflection** — 2–4 sentences capturing the *shape* of the relationship, not a bulleted list.
+  </Step>
+  <Step title="First open shows the summary">
+    Re-open the contact and the section is already expanded to the saved nuggets + summary. A manual collapse persists; switching person or writing a fresh summary re-expands it.
+  </Step>
+</Steps>
+
+## Data model
+
+<CardGroup cols={3}>
+  <Card title="contacts" icon="address-book">
+    The per-user contact table (renamed from `my_person`, 2026-06-22). Its row **id** is the per-user subject key: Ray Deck is master person #1 for everyone, but *your* contact id for him is unique to you.
+  </Card>
+  <Card title="master_person_relationship" icon="table" >
+    Table **729**. One row per `(user_id, master_person_id)` holding `my_person_id` (the contact id), `transcript`, `relationship_summary`, `interview_complete`, and `relationship_nuggets` (JSON).
+  </Card>
+  <Card title="Mem0" icon="brain">
+    The retrieval layer for distilled memories. The closing summary is pushed here keyed on the per-user contact id via metadata `contacts_id` — so you can "call all the memories" for a contact.
+  </Card>
+</CardGroup>
+
+<Note>
+**Mem0 keys on the per-user contact id, never the global `master_person_id`.** The contact id is **backend-derived** (Option B, Mark 6/18): both endpoints resolve the `contacts` row for `($auth.id, master_person_id)` themselves and fall back to `master_person_id` when the person isn't a contact. A caller can never pass the wrong id, and the design is portable to the GCP migration.
+</Note>
+
+## Backend reference (Xano → GCP rebuild)
+
+Three endpoints on instance `xh2o-yths-38lt`, workspace 3. No new tables or endpoints were created for the June 18 work — two existing endpoints were patched.
+
+<CardGroup cols={3}>
+  <Card title="Interview + Mem0 read" icon="comments">
+    **ep 8581** · `POST api:1276/openui05/how-i-know-interview`
+  </Card>
+  <Card title="Upsert + Mem0 write" icon="floppy-disk">
+    **ep 8583** · `POST api:1261/relationships`
+  </Card>
+  <Card title="Get relationship" icon="download">
+    **ep 8582** · `GET api:1261/relationships/{master_person_id}`
+  </Card>
+</CardGroup>
+
+### ep 8581 — interview turn
+
+Called once per user turn. Resolves the contact id, recalls relevant Mem0 memories (user-scope + contact-scope), builds the system prompt, calls Anthropic, and returns the next question (or the closing reflection) plus refined nuggets.
+
+<ParamField path="master_person_id" type="int" required>The master person being interviewed about.</ParamField>
+<ParamField path="transcript" type="text" required>The full running conversation so far (newline-delimited).</ParamField>
+<ParamField path="current_summary" type="text">Prior running summary, to refine rather than parrot.</ParamField>
+<ParamField path="target_yaml_context" type="text">Enrichment context about the person (so the opener is specific).</ParamField>
+<ParamField path="target_name" type="text">The person's display name.</ParamField>
+<ParamField path="self_yaml_context" type="text">Context about the user doing the reflecting.</ParamField>
+<ParamField path="self_company_yaml_context" type="text">Context about the user's current company.</ParamField>
+
+**Model:** `claude-sonnet-4-6` · `max_tokens: 1000` · `temperature: 0.3` · `anthropic-version: 2023-06-01`
+
+The Mem0 contact-scope recall filters on the per-user contact id:
+
+```json Mem0 search filter (contact scope)
+{
+  "query": "<last user line, prefixed with target name>",
+  "filters": {
+    "AND": [
+      { "user_id": "<workos_id | user-{auth.id}>" },
+      { "metadata": { "contacts_id": "<derived contact id>" } }
+    ]
+  },
+  "top_k": 8, "threshold": 0.1, "rerank": false
+}
+```
+
+<Accordion title="The exact system prompt ($shared_rules) — verbatim">
+
+This is the literal `$shared_rules` string concatenated with the self / company / target / prior-summary / recalled-memory blocks to form the Anthropic `system` prompt.
+
+```text
+You are a warm, curious interviewer helping the user reflect on their relationship with a specific person. Your job is to draw out a textured, honest portrait of who this person is in the user's life — not a resume, but a relationship.
+
+What you are trying to learn (touch a few of these — breadth over depth; you do NOT need to cover them all):
+- Origin: how, when, where they first met. The actual moment, not the timeline.
+- Connective tissue: what keeps them in each other's orbit.
+- Cadence: how often they connect, in what mediums, who initiates.
+- Trust: would the user put them on speed-dial in a crisis? Vouch for them? Lend them $10K?
+- Superpower: what is this person unusually good at?
+- Kryptonite: where do they struggle, get tripped up, have a blind spot? Honest weakness, not humble-brag.
+- Affective signal: how does the user actually feel when this person's name comes up? Energized, drained, warm, wary, complicated?
+- Trajectory: is this relationship growing, steady, or fading?
+
+Priority: superpower and kryptonite are the two most valuable things to walk away with — make sure you get them, ideally early. Origin makes a good opener. Everything else is a bonus; do not grind through the whole list.
+
+Length budget: keep this SHORT. Aim for 4-8 exchanges total and never exceed 8. Grab ONE good fact per dimension, then move to the next — do not keep mining the same thread. The moment you have origin + superpower + kryptonite plus one more dimension, OR the user signals they are done, wrap immediately. When unsure, ask fewer questions, not more — closing warm and early beats over-interviewing.
+
+Style:
+- One question at a time, then MOVE ON to a fresh dimension — breadth over depth. Do not re-probe an answer you already got.
+- Use the target's first name. Conversation with a friend, not HR intake.
+- One good specific is enough. If they hand you a real answer, take it and advance — don't ask them to elaborate just to fill space.
+- Don't moralize, don't validate every answer, don't over-summarize.
+- Complicated, ambivalent, or unflattering answers are signal, not friction.
+- Don't lead. Don't bury the answer in the question.
+- If an answer is thin, accept it and move to the next dimension rather than digging. If the user signals they're done or wants to move on, wrap right away.
+
+Open: start with something specific to the target from the context to show you've done your homework. Then ask how they met. Avoid 'tell me about them'.
+
+Close: when you've covered the territory (or the user signals done), thank them and offer a short reflection of what you heard — the SHAPE of the relationship, not a bulleted list.
+```
+
+The prompt then specifies the JSON contract (below).
+
+</Accordion>
+
+**Response contract.** The endpoint emits exactly one JSON object:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `ready` | bool | `false` while interviewing, `true` on close |
+| `next_question` | text | The next warm question (empty on close) |
+| `summary` | text | Running summary, or the closing reflection on close |
+| `nuggets` | object | `how_met`, `superpower`, `kryptonite`, `cadence`, `trust`, `milestones[]` — refined every turn; empty strings/arrays for anything not yet covered (never invented) |
+| `options` | array | Always `[]` — this is a freetext interview, not MCQ |
+| `allow_freetext` | bool | `true` while interviewing |
+| `exchange_count` | int | User turns so far |
+
+<Tip>
+The interview is **freetext by design** — `options` is always empty to force the user to type in their own words. The closing `summary` is deliberately a *reflection of the relationship's shape*, not a bulleted recap.
+</Tip>
+
+### ep 8583 — upsert + Mem0 write
+
+Called when the user saves (mid-interview save, or on completion). Upserts the table 729 row and, on a completed interview with a non-empty summary, writes the reflection to Mem0.
+
+<ParamField path="master_person_id" type="int" required />
+<ParamField path="transcript" type="text" required />
+<ParamField path="relationship_summary" type="text">The closing reflection.</ParamField>
+<ParamField path="interview_complete" type="bool">Gates the Mem0 write.</ParamField>
+<ParamField path="relationship_nuggets" type="json">The distilled nuggets object.</ParamField>
+
+The row is upserted with `my_person_id` set to the backend-derived contact id. On completion the summary is pushed to Mem0 with `infer:true` (Mem0 splits it into individual facts) and this metadata:
+
+```json Mem0 add metadata ($meta)
+{
+  "source_id": "how_i_know:<master_person_id>:<hash>",
+  "memory_hash": "<hash of summary>",
+  "schema_version": "2026-06-10",
+  "category": "relationship",
+  "confidence": "high",
+  "flow_type": "how_i_know",
+  "source_type": "chat",
+  "contacts_id": "<derived contact id>"
+}
+```
+
+Returns `{ success, record, mem_ingested }`. `mem_ingested:true` confirms the memory landed in Mem0.
+
+## June 18 punch list
+
+Built to Mark's own recap on the June 18 call and verified live against the production instance.
+
+| Item | Ask | Delivered |
+| --- | --- | --- |
+| 1A | A "let me get out of here, I'm done" button under the input | Always-visible **"I'm done — save & close"** |
+| 1B | Try Sonnet 4.6 | ep 8581 model → `claude-sonnet-4-6` |
+| 1C | Tighten the system prompt | 4–8 exchanges, breadth over depth, superpower + kryptonite early |
+| 1D | First-open always shows the summary | Section auto-expands to nuggets + summary |
+| 1E | Hide it when not a contact (`my_person == null`) | Section + pop-out gated on contact existence |
+| 1F | Save the contact id to Mem0 so we can recall all memories | Mem0 keyed on backend-derived `contacts_id`; `my_person_id` persisted to table 729 |
+
+<Note>
+Verified live 2026-06-22: Chris Crompton (master_person `1054`) resolved to contacts row `35`; table 729 stored `my_person_id: 35`, `interview_complete: true`; ep 8583 returned `mem_ingested: true`; both endpoints returned HTTP 200 after the `my_person → contacts` rename.
+</Note>

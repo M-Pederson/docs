@@ -1,25 +1,25 @@
 ---
 title: "build-investment-thesis function"
-description: "Xano orchestrator that gathers investor context and hands off to the GCP Cloud Run backend to build (and persist) an investment thesis. Under active dev + testing."
+description: "Xano orchestrator that gathers investor context and hands off to the GCP Cloud Run backend to build and persist an investment thesis, with June 2026 QA handoff notes."
 ---
 
 <div style={{padding: '20px', border: '3px solid #6B9FE8', borderRadius: '10px', background: 'rgba(107,159,232,0.08)', color: '#fff', margin: '16px 0'}}>
 
-<div style={{color: '#9BBDE8', fontSize: '1.3em', fontWeight: 'bold', marginBottom: '8px'}}>GOALS FOR NEXT BUILD PASS</div>
+<div style={{color: '#9BBDE8', fontSize: '1.3em', fontWeight: 'bold', marginBottom: '8px'}}>REMAINING PERSON-SIDE GOALS</div>
 
 - **Person first:** enforce a person-side Signal NFX attempt before the investment thesis build relies on `master_person_id` context.
-- **Profile table writes:** make sure the pipeline updates `investor_profile_person` (#475) for person/angel investors and `investor_profile_company` (#478) for company/fund investors.
+- **Profile table writes:** verify the person path updates `investor_profile_person` (#475). The company path now writes `investor_profile_company` (#478) in the passing FirstMark sandbox run.
 - **Completion bar:** do not treat the thesis build as done until the relevant investor profile table row has been written or refreshed and the thesis row can be tied back to that profile context.
 
 </div>
 
 <div style={{padding: '20px', border: '3px solid #E0245E', borderRadius: '10px', background: 'rgba(224,36,94,0.08)', color: '#fff', margin: '16px 0'}}>
 
-<div style={{color: '#FF5C8A', fontSize: '1.3em', fontWeight: 'bold', marginBottom: '8px'}}>🚧 UNDER ACTIVE DEV &amp; TESTING — DO NOT RELY ON THIS YET 🚧</div>
+<div style={{color: '#FF5C8A', fontSize: '1.3em', fontWeight: 'bold', marginBottom: '8px'}}>ACTIVE QA STATUS</div>
 
-This function is **being built and iterated on right now.** Behavior, inputs, and the GCP contract are all in flux. This page is the live changelog — it gets updated as the function evolves.
+This function is still being iterated on, but the company/fund path has passed the FirstMark sandbox smoke test.
 
-**Current known state:** a `debug.stop` sits right after the context-gather step, so the function **halts early and returns the gathered context** — it does **not** yet call the GCP backend or write a thesis row on a normal run. Remove the `debug.stop` to exercise the full path.
+**Current known state as of June 22, 2026:** company-side thesis generation works in sandbox and writes both `investment_thesis` (#709) and `investor_profile_company` (#478). Person-side investor QA is still open; do not assume the Scott Belsky/person path is complete until it is tested separately.
 
 </div>
 
@@ -34,6 +34,93 @@ thesis/build-investment-thesis-in-gcp — 12978
 **Public entry point.** Gathers investor context in Xano, POSTs it to the GCP (Go / Cloud Run) backend which does the LLM + embedding work, then upserts the returned thesis metadata into the Xano `investment_theses` table. Workspace 3 (OrbiterV2).
 
 </Card>
+
+## June 22, 2026 QA Handoff
+
+Company-side thesis generation passed in sandbox for FirstMark after the patches below:
+
+| Check | Result |
+|---|---|
+| `master_company` (#142) | FirstMark sandbox row `id=1` ended with `is_vc: true`. |
+| Signal NFX company scrape | `mvp/investor/get-signal-nfx-data-company` (#12991) succeeded and wrote `investor_profile_company` (#478). |
+| `investment_thesis` (#709) | Row populated with `node_uuid`, `firm_name`, `investor_type`, `last_validated_date`, and `derived_thesis_summary`. |
+| `investor_profile_company` (#478) | `derived_thesis_summary` mirrored from the GCP thesis response. |
+| Live data source | Spot check showed no thesis/profile writes for live FirstMark (`master_company_id=421`), so the QA runs stayed in sandbox. |
+
+Known good sandbox thesis summary written by #12978 v1.4:
+
+> FirstMark is a thematic investor focused on AI-native infrastructure and data platforms, backing technical founders with deep domain expertise, typically at Series A stage, favoring companies with strong technical moats and product-led growth.
+
+### Functions patched
+
+| Function | Patch | Why |
+|---|---|---|
+| `mvp/investor/get-signal-nfx-data-company` (#12991) | v1.2 | Successful Signal NFX company scrapes now write `investor_profile_company` (#478), mark `master_company.is_vc = true`, and mirror `signal_page` / `signal_json` to `permalink_company`. |
+| `mvp/enrich/enrich-master-company` (#12992) | v4.9 | If `fundable_org_id` already exists, copy `fundable_organizations.is_investor` into `master_company.is_vc` before Signal/thesis gates. Existing `company_enrich_data.signal_nfx_json` also counts as investor proof. |
+| `mvp/enrich/enrich-master-company` (#12992) | v4.10 | Reassert `is_vc = true` after `update-company-node`, because later phases could overwrite the company row back to `is_vc: false`. |
+| `mvp/enrich/enrich-master-company` (#12992) | v4.11 | Treat an existing `investment_thesis` row with empty `derived_thesis_summary` as incomplete and rebuild it. This prevents one failed/empty pre-patch run from permanently suppressing thesis generation. |
+| `thesis/build-investment-thesis-in-gcp` (#12978) | v1.2 | Avoid local variable name `$response`; Xano serialized `$response|get...` into an invalid `$response[""]|get...`, causing `Unable to locate response:` crashes. |
+| `thesis/build-investment-thesis-in-gcp` (#12978) | v1.3 | Added response-shape diagnostics and fallback parsing for alternate Cloud Run response wrappers. |
+| `thesis/build-investment-thesis-in-gcp` (#12978) | v1.4 | Fixed the observed Cloud Run wrapper shape: `response.result = { data, error, meta }`. Now reads thesis fields from `response.result.data.*` and mirrors `derived_thesis_summary` to #478/#475 when present. |
+
+Other related changes from this workstream:
+
+- `mvp/firecrawl/scrape` (#4515) was updated earlier so Signal NFX scraping uses the current Firecrawl scrape API shape.
+- Clear/reset function #4657 was patched earlier for fresher sandbox QA wipes; use it before repeating full person/company smoke tests.
+
+### Root causes fixed
+
+1. **Company investor classification was being lost.** FirstMark had a `fundable_org_id`, and the matching `fundable_organizations` row had `is_investor: true`, but the final `master_company` row was ending as `is_vc: false`. #12992 v4.9 repairs `is_vc` before Signal/thesis gates, and #12992 v4.10 reasserts it after `update-company-node`.
+2. **Signal NFX wrote the profile, but thesis stayed empty.** #478 existed, but #709 contained an empty row. The company orchestrator skipped future thesis builds because it only checked row existence/staleness. #12992 v4.11 treats an empty `derived_thesis_summary` as incomplete and rebuilds.
+3. **#12978 had response-handling failures.** The `$response` local variable name caused bad XanoScript serialization, and the Cloud Run payload was nested under `response.result.data`. #12978 v1.4 reads from the observed wrapper and writes `derived_thesis_summary` to #709 plus the relevant profile table.
+
+### Sandbox QA evidence
+
+The final passing company test used:
+
+```json
+{
+  "master_company_id": 1,
+  "data_source_id": 0,
+  "cascade_depth": 0
+}
+```
+
+Expected table state after a passing company run:
+
+| Table | Query | Expected |
+|---|---|---|
+| `master_company` (#142) | `id = 1` | `is_vc: true` |
+| `investor_profile_company` (#478) | `master_company_id = 1` | Signal fields plus non-empty `derived_thesis_summary` |
+| `investment_thesis` (#709) | `master_company_id = 1` | Non-empty `node_uuid`, `firm_name`, `investor_type`, `last_validated_date`, `derived_thesis_summary` |
+| `log_crash` (#542) | `master_company_id = 1` | Latest #12992 log should be `qa_passed: true`; no new `WARN: GCP thesis response missing derived_thesis_summary` after v1.4 |
+| `enrich_history_company` (#404) | `master_company_id = 1` | Latest `Base Company Enrich` row succeeds; Signal NFX row exists from the initial scrape |
+
+Live spot check:
+
+- Live FirstMark exists as `master_company_id = 421`.
+- Live #709 and #478 were empty for `421` during this QA session.
+- Live `master_company_id = 1` is Montana State University, not FirstMark.
+
+### Person-side follow-up
+
+The person investor path still needs fresh QA. Verify these before treating Scott Belsky/person-side thesis generation as complete:
+
+1. `thesis/gather-investor-context-v3` (#12911) should enforce a person Signal NFX attempt before returning final context for direct/manual #12978 calls.
+2. Person Signal NFX scraper (#2769) must write/refresh `investor_profile_person` (#475), not only raw scrape fields.
+3. #12978 v1.4 should mirror `derived_thesis_summary` to #475 when called with a non-zero `master_person_id`.
+4. The person enrichment path should not recurse into uncontrolled company creation. Watch `cascade_depth` and `current_company_only` gates.
+5. After a fresh sandbox wipe, run one person-only QA before combining person + company flows again.
+
+Suggested person QA checks:
+
+| Table | What to check |
+|---|---|
+| `master_person` | Scott Belsky row exists and enrichment has completed. |
+| `investor_profile_person` (#475) | Signal NFX fields and `derived_thesis_summary` are populated. |
+| `investment_thesis` (#709) | Row exists for `master_person_id`, not just `master_company_id`. |
+| `log_crash` (#542) | No Signal NFX, gather-context, or thesis-build crash/warn rows for the person id. |
+| `enrich_history_person` | Signal NFX / deep research steps show expected success state. |
 
 ## `gather-investor-context-v3`
 
@@ -70,7 +157,7 @@ thesis/gather-investor-context-v3 — 12911
 - **Person path must enforce Signal before return.** For `master_person_id`, force the person-side Signal NFX attempt before this function's output is treated as thesis-ready.
 - **Company path must prefer the new Signal location.** For `master_company_id`, read `company_enrich_data.signal_nfx_json` first, with legacy fallback to `permalink_company.signal_json`.
 - **Profile tables must stay current.** Person/angel context should refresh `investor_profile_person` (#475); company/fund context should refresh `investor_profile_company` (#478).
-- **Debugging expectation.** While #12978 has the temporary `debug.stop`, the returned `$context` from this function is the primary object to inspect.
+- **Current QA boundary.** Company-side context worked in the FirstMark sandbox run. Person-side context still needs a fresh direct/person QA pass.
 
 ### Context finalization gate
 
@@ -122,6 +209,7 @@ When it runs, `mvp/investor/get-signal-nfx-data-company` (#12991) does:
 3. Write raw scrape output to `company_enrich_data.signal_nfx_scrape`.
 4. Parse the markdown via `mvp/investor/parse-signal-nfx-company` (#12990).
 5. Write parsed JSON to `company_enrich_data.signal_nfx_json`.
+6. Write or refresh `investor_profile_company` (#478), mark `master_company.is_vc = true`, and mirror `signal_page` / `signal_json` to `permalink_company`.
 
 Then #12992 Step 6 decides whether to run `thesis/build-investment-thesis-in-gcp` (#12978). That means the company path is ordered correctly: **Signal NFX first, thesis build second**.
 
@@ -177,17 +265,15 @@ The profile-table write happens in `mvp/investor/person-extract-cb-signal` (#268
 
 ### Company side
 
-`mvp/investor/get-signal-nfx-data-company` (#12991) **does not write `investor_profile_company` (#478) directly.** It writes:
+`mvp/investor/get-signal-nfx-data-company` (#12991) now writes `investor_profile_company` (#478) directly after a successful Signal NFX company scrape. It also writes:
 
-- raw Signal scrape → `company_enrich_data.signal_nfx_scrape`
-- parsed Signal JSON → `company_enrich_data.signal_nfx_json`
-- attempt/dedup history → `enrich_history_company.source == "Signal NFX"`
+- raw Signal scrape -> `company_enrich_data.signal_nfx_scrape`
+- parsed Signal JSON -> `company_enrich_data.signal_nfx_json`
+- attempt/dedup history -> `enrich_history_company.source == "Signal NFX"`
+- compatibility copy -> `permalink_company.signal_page` / `permalink_company.signal_json`
+- investor classification repair -> `master_company.is_vc = true`
 
 `mvp/investor/parse-signal-nfx-company` (#12990) is parser-only: it returns JSON and does not write #478.
-
-<Warning>
-No current company-side equivalent of `person-extract-cb-signal` was found for `investor_profile_company` (#478). If #478 should be the company/fund profile surface, we need to add an explicit post-Signal company profile upsert.
-</Warning>
 
 Current #478 schema:
 
@@ -203,11 +289,11 @@ Current #478 schema:
 
 ## Pre-return profile summary write
 
-#12978 should update the relevant investor profile table **after the GCP response is parsed and before returning success**.
+#12978 v1.4 updates the relevant investor profile table **after the GCP response is parsed and before returning success**.
 
 Required behavior:
 
-1. Read `$response.derived_thesis_summary` from the GCP response.
+1. Read `response.result.data.derived_thesis_summary` from the GCP response.
 2. If `master_person_id` is present, upsert/update `investor_profile_person` (#475) for that person.
 3. If `master_company_id` is present, upsert/update `investor_profile_company` (#478) for that company.
 4. Write `updated_at: now` and store the derived thesis summary.
@@ -216,13 +302,13 @@ Required behavior:
 Schema note:
 
 - #475 records already return `derived_thesis_summary` in table content, alongside the older `llm_investor_summary`.
-- #478 staging records also return `derived_thesis_summary`; live #478 currently has no rows.
-- Before editing #12978, verify the field is visible in the Xano editor/schema for the target datasource. If it is not visible, add/repair the column before writing to it.
+- #478 records return `derived_thesis_summary` in the passing sandbox company test.
+- Before extending this path to a new datasource, verify the field is visible in the Xano editor/schema for that datasource. If it is not visible, add/repair the column before writing to it.
 - Prefer writing directly to `derived_thesis_summary`, not overloading #475's older `llm_investor_summary`.
 
 ## Firecrawl scrape audit
 
-The shared wrapper `mvp/firecrawl/scrape` (#4515) is already using the current Firecrawl v2 scrape endpoint:
+The shared wrapper `mvp/firecrawl/scrape` (#4515) was updated earlier for the current Firecrawl v2 scrape endpoint:
 
 ```text
 POST https://api.firecrawl.dev/v2/scrape
@@ -230,22 +316,22 @@ POST https://api.firecrawl.dev/v2/scrape
 
 Firecrawl's current [Scrape API docs](https://docs.firecrawl.dev/api-reference/endpoint/scrape) document `formats`, `onlyMainContent`, `maxAge`, `timeout`, `proxy`, `removeBase64Images`, and related scrape parameters.
 
-Current wrapper settings:
+Recommended Signal NFX scrape settings:
 
 ```json
 {
   "formats": ["markdown", "links"],
-  "onlyMainContent": false,
+  "onlyMainContent": true,
   "maxAge": 172800000,
-  "proxy": "stealth"
+  "proxy": "auto"
 }
 ```
 
-Recommended changes for Signal NFX scrapes:
+Notes for Signal NFX scrapes:
 
-- **Change `proxy` from `"stealth"` to `"auto"`.** Firecrawl v2 documents `basic`, `enhanced`, and `auto`; `stealth` is not in the current v2 enum. `auto` starts cheaper and retries with enhanced proxy if needed.
+- **Use `proxy: "auto"`.** Firecrawl v2 documents `basic`, `enhanced`, and `auto`; `stealth` is not in the current v2 enum. `auto` starts cheaper and retries with enhanced proxy if needed.
 - **Keep `formats: ["markdown", "links"]`.** The Signal parsers need markdown content, and the person path also preserves links as `linksOnPage`.
-- **Consider `onlyMainContent: true` for Signal pages.** This is the v2 default and should reduce nav/footer noise. If Signal profile fields disappear in testing, keep `false`.
+- **Prefer `onlyMainContent: true` for Signal pages.** This is the v2 default and should reduce nav/footer noise. If Signal profile fields disappear in testing, fall back to `false`.
 - **Keep `maxAge: 172800000` unless we need fresher than two days.** The Xano-level Signal dedup is 30 days; Firecrawl's two-day cache is acceptable for an attempt gate and avoids unnecessary re-scrape cost.
 - **Keep the 60s timeout.** It matches Firecrawl's documented default and is sufficient for a single Signal profile page.
 - **Do not enable `onlyCleanContent` by default.** It is a beta LLM cleanup pass; useful for noisy pages, but unnecessary until Signal markdown quality proves to be a problem.
@@ -256,43 +342,49 @@ Recommended changes for Signal NFX scrapes:
 
 2. **Gather investor context.** Runs `thesis/gather-investor-context-v3` with `max_deals: 100` and `recency_months: 36` → `$context`. This is the Xano-owned layer (it has `master_*` and `fundable_*`); the gathered bundle is everything the thesis builder needs to reason about the investor. For `master_person_id`, this gather step must enforce the person Signal NFX attempt before returning final context.
 
-3. **⛔ `debug.stop` (temporary).** Currently the stack stops here and returns `$context` for inspection. **While this line is present, nothing below runs** — no GCP call, no DB write. Remove it to test the full pipeline.
+3. **Fetch GCP credentials.** Runs `mvp/file/get-gcp-url-key` -> `$keys`, which supplies the Cloud Run `gcp_backend_url` and key material.
 
-4. **Fetch GCP credentials.** Runs `mvp/file/get-gcp-url-key` → `$keys`, which supplies the Cloud Run `gcp_backend_url` (and key material).
+4. **Build the request body.** Assembles `$request_body` with `master_person_id` / `master_company_id` (only if non-empty), the full `$context`, and the current `data_source` from `$env`.
 
-5. **Build the request body.** Assembles `$request_body` with `master_person_id` / `master_company_id` (only if non-empty), the full `$context`, and the current `data_source` from `$env`.
+5. **POST to the Go Cloud Run backend.** Sends `$request_body` to `{gcp_backend_url}/v1/outcomes/investment-thesis/build` as JSON, with a 180s timeout. The backend runs the LLM orchestration + embeddings and returns the built thesis.
 
-6. **POST to the Go Cloud Run backend.** Sends `$request_body` to `{gcp_backend_url}/v1/outcomes/investment-thesis/build` as JSON, with a 180s timeout. The backend runs the LLM orchestration + embeddings and returns the built thesis.
+6. **Guard on success.** A precondition requires `status == 200`; otherwise it raises `badrequest` with the raw GCP response as the payload.
 
-7. **Guard on success.** A precondition requires `status == 200`; otherwise it raises `badrequest` with the raw GCP response as the payload.
+7. **Read the result.** Extracts thesis fields from `response.result.data.*`. This is the observed Cloud Run wrapper shape: `response.result = { data, error, meta }`.
 
-8. **Read the result.** Extracts `response.result` → `$response`.
+8. **Look up any existing thesis.** Queries `investment_theses` for a row matching the same `master_person_id` or `master_company_id`, returning its `id` (or `0` if none).
 
-9. **Look up any existing thesis.** Queries `investment_theses` for a row matching the same `master_person_id` or `master_company_id`, returning its `id` (or `0` if none).
+9. **Upsert the thesis row.** `db.add_or_edit` on `investment_theses` keyed by that `id` writes `updated_at`, `node_uuid` (= the GCP `thesis_id`), `firm_name`, `investor_type`, `last_validated_date`, `derived_thesis_summary`, and the relevant master id.
 
-10. **Upsert the thesis row.** `db.add_or_edit` on `investment_theses` keyed by that `id` — writes `updated_at`, `node_uuid` (= the GCP `thesis_id`), the master IDs, plus `firm_name`, `investor_type`, and `last_validated_date` from the GCP response.
+10. **Update the investor profile summary.** Before returning, write `derived_thesis_summary` to `investor_profile_person` (#475) or `investor_profile_company` (#478), depending on whether this is a person or company thesis build.
 
-11. **Update the investor profile summary.** Before returning, write `$response.derived_thesis_summary` to `investor_profile_person` (#475) or `investor_profile_company` (#478), depending on whether this is a person or company thesis build.
-
-12. **Return** the upserted `investment_theses` row.
+11. **Return** the upserted `investment_theses` row.
 
 ## Related
 
 - `thesis/gather-investor-context-v3` — the context-gather step (Xano-owned `master_*` / `fundable_*` layer).
 - `mvp/file/get-gcp-url-key` — supplies the Cloud Run backend URL + key.
 - [Find investors — AlloyDB build](/guides/open-work/vectors-alloydb/find-investors-engine) — the broader migration plan this function fits into. The earlier Xano-only builder was `thesis/build-investment-thesis-v21` (#12916).
+- [Run Base Company Enrich](/guides/open-work/run-base-company-enrich)
+- [Find Investors - Production Pipeline](/guides/open-work/suggestion-core-concepts/find-investors/production-pipeline)
+- [Investment Thesis Schema](/guides/open-work/suggestion-core-concepts/find-investors/thesis-schema)
 
 ## Iteration log
 
 _Progress notes land here as we iterate. Newest first._
 
-- **Added scraper/profile-table audit** — #2769 writes Signal data to `permalink_person`; #2687 writes #475; #12991 writes Signal data to `company_enrich_data`; no current #478 writer found.
-- **Added pre-return profile summary write** — #12978 should write `$response.derived_thesis_summary` to #475 or #478 before returning. Table content shows `derived_thesis_summary` is already present on #475 and staging #478; verify schema visibility before implementation.
-- **Added Firecrawl audit** — #4515 already uses `/v2/scrape`; change `proxy: "stealth"` to a documented v2 proxy value (`auto` recommended).
+- **June 22 QA handoff added** — company-side FirstMark sandbox test passed after #12991 v1.2, #12992 v4.9-v4.11, and #12978 v1.2-v1.4. Person-side investor QA remains open.
+- **Fixed GCP response parsing** — #12978 v1.4 reads the observed wrapper from `response.result.data.*` and mirrors `derived_thesis_summary` to #478 or #475.
+- **Fixed company thesis rebuild gating** — #12992 v4.11 treats an existing #709 row with empty `derived_thesis_summary` as incomplete, so failed pre-patch thesis rows do not suppress rebuilds.
+- **Fixed company investor classification drift** — #12992 v4.9 and v4.10 repair/reassert `master_company.is_vc` from Fundable investor evidence before and after downstream company updates.
+- **Added company profile-table write** — #12991 v1.2 writes `investor_profile_company` (#478) after successful Signal NFX company scrape.
+- **Added scraper/profile-table audit** — original audit found #2769 writes Signal data to `permalink_person` and #2687 writes #475; the company-side #478 gap was closed later in #12991 v1.2.
+- **Added pre-return profile summary write requirement** — #12978 needed to write `derived_thesis_summary` to #475 or #478 before returning; this landed in #12978 v1.4 using the `response.result.data.*` wrapper.
+- **Added Firecrawl audit** — #4515 uses `/v2/scrape`; Signal NFX scrapes should use a documented v2 proxy value (`auto` recommended), not legacy `stealth`.
 - **Strengthened person enforcement** — for `master_person_id`, #12911 should force `get-signal-nfx-data` (#2769), refresh CB/Signal extraction, refetch `investor_profile_person` (#475), then finalize context.
 - **Added Signal attempt gate** — #12911 must check whether Signal NFX has ever been attempted before finalizing context; if not, run the relevant scraper, refetch context/profile rows, then return the source bundle.
 - **Clarified guarantee boundary** — Signal is completed/attempted before context only on orchestrated paths today; direct #12978 calls still need an explicit pre-context gate.
 - **Added Signal NFX timing section** — company scrape runs in #12992 Step 5 before thesis Step 6; person scrape runs in #12830 Phase 9 when `is_angel` is true; #12978 only reads existing Signal context through #12911.
 - **Added `gather-investor-context-v3` section** — captured #12911 inputs, responsibilities, source-bundle shape, and the current person-first/profile-table requirements.
 - **Added next-pass goals** — person-first Signal NFX scrape + deep research before thesis context is trusted, plus required writes to `investor_profile_person` (#475) and `investor_profile_company` (#478).
-- **Initial doc** — captured the current shape of #12978: gather → (debug.stop) → GCP POST → upsert. `debug.stop` still in place; GCP path not yet exercised end-to-end.
+- **Initial doc** — captured the early shape of #12978 when it still stopped after context gathering and the GCP path had not been exercised end-to-end.

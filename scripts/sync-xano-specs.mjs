@@ -92,6 +92,20 @@ function pathToTitle(path, method, summary) {
   return `${methodLabel[method] || method.toUpperCase()} ${titleCase}`.trim();
 }
 
+// ─── Escape free-text prose for the MDX body ─────────────────────────────────
+
+// Xano descriptions are plain text, but MDX parses `{...}` as a JS expression
+// and `<...>` as a JSX tag. Any such char dropped raw into a ParamField /
+// ResponseField body throws an acorn parse error and breaks the page render.
+// Escape braces (\{ \}) and neutralize angle brackets so prose stays literal.
+function escapeMdx(text) {
+  if (!text) return text;
+  return text
+    .replace(/[{}]/g, (ch) => `\\${ch}`)
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
 // ─── Map OpenAPI type to MDX type ────────────────────────────────────────────
 
 function mapType(schema) {
@@ -153,7 +167,7 @@ description: '${description.replace(/'/g, "''")}'
     for (const param of pathParams) {
       const required = param.required ? " required" : "";
       mdx += `<ParamField path="${param.name}" type="${mapType(param.schema)}"${required}>\n`;
-      mdx += `  ${param.description || `The ${param.name} parameter.`}\n`;
+      mdx += `  ${escapeMdx(param.description) || `The ${param.name} parameter.`}\n`;
       mdx += `</ParamField>\n\n`;
     }
   }
@@ -167,7 +181,7 @@ description: '${description.replace(/'/g, "''")}'
     for (const param of queryParams) {
       const required = param.required ? " required" : "";
       mdx += `<ParamField query="${param.name}" type="${mapType(param.schema)}"${required}>\n`;
-      mdx += `  ${param.description || `The ${param.name} parameter.`}\n`;
+      mdx += `  ${escapeMdx(param.description) || `The ${param.name} parameter.`}\n`;
       mdx += `</ParamField>\n\n`;
     }
   }
@@ -185,7 +199,7 @@ description: '${description.replace(/'/g, "''")}'
         const isRequired = required.includes(name) ? " required" : "";
         const desc = prop.description || "";
         mdx += `<ParamField body="${name}" type="${mapType(prop)}"${isRequired}>\n`;
-        mdx += `  ${desc || `The ${name} field.`}\n`;
+        mdx += `  ${escapeMdx(desc) || `The ${name} field.`}\n`;
         mdx += `</ParamField>\n\n`;
       }
     }
@@ -200,7 +214,7 @@ description: '${description.replace(/'/g, "''")}'
       const desc = prop.description || "";
       const nullable = prop.nullable ? " Can be `null`." : "";
       mdx += `<ResponseField name="${name}" type="${mapType(prop)}">\n`;
-      mdx += `  ${desc || `The ${name} field.`}${nullable}\n`;
+      mdx += `  ${escapeMdx(desc) || `The ${name} field.`}${nullable}\n`;
       mdx += `</ResponseField>\n\n`;
     }
   }

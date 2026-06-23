@@ -188,7 +188,64 @@ Two levels. A **per-tenant KEK** lives in Cloud KMS and is the encryption bounda
   **The blind-index key is decoupled from the KEK — deliberately.** Dedup and shared-number graph linking run on `HMAC(normalize(value))`. If that HMAC used the tenant KEK, revoking the KEK would stall dedup and enrichment. So the blind-index key is **Orbiter-managed in Cloud KMS, separate from the encryption KEK**. Consequence: when a key is revoked the value is unreadable but HMAC matching still works structurally — Orbiter can *confirm two records share a phone* but cannot *recover the phone*. For Tier 2 threat models that's the right trade; it's also the one place the "Orbiter can derive nothing" claim carries an asterisk.
 </Info>
 
-Phone numbers are low-entropy, so a deterministic blind index is dictionary-attackable if that column leaks. Mitigate by truncating the HMAC to force collisions, or by treating the index column itself as Tier-2 sensitive and KMS-gating reads.
+### The blind index is not a secret — and what that costs
+
+The token on the graph node and the `blind_index` column is **deliberately unencrypted** — it has to be, or it couldn't do its job.
+
+<Info>
+  **Why it sits in the clear.** The token is `HMAC-SHA256(normalize(value), index_key)`, and it lives **unencrypted in two places**: as a property on the FalkorDB contact node and in the AlloyDB `blind_index` column. That is the point — dedup, shared-number edges, and suggestions are all equality joins on this value, so it must stay directly comparable. The real number lives elsewhere, as AES-256-GCM ciphertext (per-record DEK wrapped by the per-tenant KEK).
+</Info>
+
+Finding the token is usually **harmless**, and for the three likely breaches (stolen disk, stolen backup, leaked DB creds) it is. The index is **one-way** (HMAC is not reversible), it is **keyed** (the `index_key` lives in Cloud KMS, not the database), and the value it stands for is stored separately as ciphertext. An attacker who dumps the column gets a list of opaque tags and no way to turn them back into numbers.
+
+<Warning>
+  **The low-entropy dictionary attack — the one breach this column does not survive.** Phone numbers are low-entropy: ~10^10 globally, far fewer in a single region. A deterministic keyed index over a domain that small is offline dictionary-attackable **the moment the `index_key` leaks** — and the realistic way it leaks is app-server RCE, because the app *must* hold the key to compute matches. With the key, an attacker computes `HMAC(every plausible number, index_key)` offline and matches against the stolen tokens, recovering numbers **without ever touching the ciphertext or the DEK**. This side-channel bypasses the field encryption entirely.
+
+  The two first-instinct mitigations — truncate the HMAC for k-anonymity, and treat the column as Tier-2 — are real layers but **not the fix**. Truncation buys almost nothing once the key leaks (the domain is trivially enumerable, so the attacker still recovers each token's small k-bucket) and it degrades the dedup precision you need. Column-gating helps against passive DB leaks, but the same RCE that steals the key usually also reads the column.
+</Warning>
+
+The strongest defensible fix changes **where the key lives**, so there is no offline attack at all. Ship the cheap, real layers in P1; reserve the heavier options.
+
+| Layer | What it buys | The tradeoff |
+| --- | --- | --- |
+| **1. KMS-MAC blind index** *(P1 keystone)* | Move the HMAC into a Cloud KMS **MAC key** (`purpose=MAC`, `HMAC_SHA256`, `MacSign`). The raw `index_key` never enters the app process, so RCE can no longer grind offline. | Converts the offline attack to a **rate-limited online oracle**, not zero — pair with tight KMS quota + audit alerts. One round-trip per uncached lookup. |
+| **2. Per-tenant pepper / domain separation** *(P1)* | Distinct index sub-key per tenant+field; kills cross-tenant correlation and global precomputed dictionaries; clean per-tenant crypto-shred. | Necessary, not sufficient on its own; conflicts with *cross-tenant* shared-number edges if you ever want them. |
+| **3. Three separate KMS keys** *(P1, already done)* | Keep `index_key`, per-record DEK, and per-tenant KEK distinct so KEK rotation/crypto-shred never disturbs dedup. | None — preserve the current design. |
+| **4. Truncation + column-gating** *(P1, as layers)* | Blurs frequency/fingerprint leakage and shrinks the token-exfil surface. | Mitigation only; does **not** defeat a leaked key. Frame honestly, never as the fix. |
+| **5. OPRF / POPRF service** *(reserve)* | **Eliminates** the offline attack with input-privacy from the key holder; POPRF adds bulk key-rotation via update tokens (the one thing KMS-MAC lacks). | Self-hosting + hardening a **second trust domain** is real ops overhead, and solves input-hiding you don't need (you own both endpoints). |
+| **6. Vaulted random tokenization** *(nuclear)* | Random keyless token → **no key, no function to invert** → offline attack eliminated unconditionally. | A **vault round-trip on every insert** and a new single crown-jewel datastore to guard as hard as the ciphertext. |
+
+<Info>
+  **Ship this for P1: KMS-MAC as the keystone.** Replace the in-process `HMAC(value, index_key)` with a Cloud KMS `MacSign(keyVersion, normalize(value))`. HMAC stays deterministic, so the returned tag is byte-identical for identical inputs — dedup, shared-number edges, and suggestions work **unchanged**, with no change to the query model. The win: an app-server RCE that steals process memory now gets **no key**, only throttled `MacSign` calls that are IAM-scoped, per-second rate-limited, fully recorded in Cloud Audit Logs, and instantly revocable. The unbounded offline 10^10 grind becomes a throttled, observable, killable online channel. Cost is single-digit cents at this tier (~$0.06/mo per software key version, $0.03/10k ops; ~1,000 QPS default quota). This is the productized version of the OPRF idea, in-stack, with zero extra services to run.
+</Info>
+
+<Warning>
+  **Rotation breaks equality if you're naive about it.** `MacSign` signs with the key's **primary** version, so rotating the key changes the tag for the same input and breaks matching against old rows. Pin the `keyVersion`, store it alongside each `blind_index`, and lazy-migrate on next touch — or treat the index key as long-lived and rotate only on suspected compromise via a one-time full re-index. Unlike the KEK, the **index key should rotate rarely**, precisely because rotation forces a re-index. (This is why decoupling `index_key` from the KEK is correct: the KEK can crypto-shred and rotate freely without disturbing dedup.)
+</Warning>
+
+<AccordionGroup>
+  <Accordion title="Strongest crypto answer (reserve): an OPRF/POPRF service">
+    An RFC 9497 (V)OPRF — pairing-free 3HashSDHI via Cloudflare CIRCL in Go — derives the index as `F(skS, value)` where `skS` lives in a separate trust domain the app never holds. The app blinds the input, the key server applies its secret, the app unblinds a deterministic output. Because the app can never evaluate the PRF offline, RCE yields at most a rate-limited online oracle, and determinism/dedup are fully preserved. POPRF's standout property is **bulk key rotation via update tokens** — re-key every stored value without re-reading plaintext — which KMS-MAC lacks.
+
+    The catch for a solo operator: there is **no managed OPRF on GCP**, so you must run and isolate the key-holding server yourself. If *that* server is compromised the key leaks and you're back to the offline attack. The obliviousness (hiding the input from the evaluator) is defense-in-depth you don't strictly need here — you already trust your own backend with plaintext at ingest. Reserve as the high-assurance upgrade, not the v1.
+
+    **Do not** cite RFC 9497 §7.2.3 as authority that OPRFs "offer no protection against low-entropy inputs" — §7.2.3 is about recovering the *server's* private key via accumulated queries. The correct general principle (a queryable oracle still permits *online* low-entropy guessing, so rate-limit and rotate) holds independently.
+  </Accordion>
+  <Accordion title="Nuclear alternative: vaulted random tokenization">
+    Generate a **random** token per distinct value and store the value↔token mapping in a separate hardened vault. The token has **zero mathematical relationship** to the number — there is no key and no function to invert — so the offline dictionary attack is eliminated even with unlimited compute. Dedup survives because the vault does deterministic insert-or-return-existing.
+
+    The cost is structural: every dedup/edge now needs a **vault round-trip** instead of a local compare, and the vault becomes the single most valuable target — PCI's "most lucrative target." You've relocated the crown jewel, not removed it, and an RCE'd app with vault read access can dump mappings directly unless you gate it. Justified only if you must contractually prove tokens are unconditionally irreversible.
+  </Accordion>
+  <Accordion title="Explicitly rejected">
+    - **Format-Preserving Encryption (FF1/FF3-1):** the key still lives in app memory (same leak path), it's **reversible** (a leaked key decrypts directly — worse than one-way HMAC), and small phone domains sit near or below NIST's safe bounds with known cryptanalysis (Durak–Vaudenay broke FF3). Rejected.
+    - **Searchable Symmetric Encryption (SSE):** research-grade, no GCP fit, leaks search/access patterns, and doesn't match graph node-equality. Rejected.
+    - **Frequency-hiding (FH-OPE):** equal values no longer collide to one token, which **breaks** the deterministic dedup and shared-number edges we depend on. Skip unless frequency analysis on shared celebrity numbers becomes an explicit threat.
+  </Accordion>
+</AccordionGroup>
+
+<Note>
+  **Net.** Truncation alone is not a real fix for the RCE/key-leak threat. The defensible P1 stack is **KMS-MAC blind index + per-tenant domain separation + tight quota/audit alerting**, with truncation and column-gating kept as honest secondary layers. It defeats the *offline* attack while preserving every dedup, rotation, and crypto-shred property — on the stack we already pay for. OPRF/Pythia is the documented north star; vaulted tokenization is the nuclear option that eliminates the attack but recreates a single crown-jewel store.
+</Note>
 
 ### The reveal flow
 
@@ -414,3 +471,8 @@ Rotation is cheap throughout — rotating a KEK rewraps DEKs, it does not re-enc
 - **Bulk reveal / export of VIP fields** — the capability this feature exists to prevent.
 - **At-rest CMEK as the differentiator** — CMEK is the Tier 0/1 baseline; it is instance-scoped and decrypts transparently, so it is not the "Orbiter can't decrypt" control.
 - **Enterprise BYOK/HYOK** — tracked separately as the Atlas upsell; this page is the Tier 2 operator surface.
+- **Blockchain / on-chain storage of VIP data** — confidentiality and deletability are the whole point; a chain offers replication, transparency, and immutability — the opposite on every axis. On-chain ciphertext (or the low-entropy blind index) would be public and brute-forceable *forever*, and immutability breaks crypto-shred, GDPR erasure, and the kill switch. The data never goes on a chain.
+
+<Note>
+  **What's worth borrowing from the blockchain pitch.** The one safe, valuable on-chain-shaped artifact is a **tamper-proof reveal ledger** — hashes of reveal-audit events only, never PII — backing the claim *"even Orbiter can't edit or erase the record of who looked at your number,"* which targets the operator's real fear (Orbiter as the silent leak vector). Under the hood that's a **transparency log** (Merkle tree); a public-chain anchor of the Merkle root is optional and only earns its keep as a crypto-native vanity SKU. Because only event hashes are anchored, it stays erasure-safe — the number itself is still crypto-shreddable. **Sell the property, never the buzzword.** The genuinely "decentralized" upgrade is **threshold / MPC key custody** — no single party (including Orbiter) holds the whole key, the [BYOK boundary](#open-decisions) without the device-loss footgun — tracked as an enterprise/research item, not a chain of contacts.
+</Note>

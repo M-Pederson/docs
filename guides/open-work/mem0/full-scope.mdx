@@ -1,0 +1,1742 @@
+---
+title: "mem0 Full Scope"
+description: "Full Mem0 scope for Orbiter contact memories, master-person facts, source ingestion, APIs, UI, and future product ideas"
+---
+
+<Info>
+  This is the plan for mem0 in Orbiter.io
+</Info>
+
+## Product thesis
+
+Mem0 should be Orbiter's **relationship memory layer**, not the canonical graph, not the raw email/calendar archive, and not a replacement for `contacts` or `master_person`.
+
+The core object is: **what this user knows about this person**.
+
+In Orbiter terms:
+
+- `contacts.id` is the private user-to-person relationship row.
+- `master_person.id` is the shared real-world person row.
+- Mem0 stores retrievable, source-backed memories that can be displayed in a contact UI, injected into chat, and searched when Orbiter needs relationship context.
+
+The contact memory view should merge two memory tiers:
+
+| Tier | Owner | Mem0 scope | Orbiter key | Examples |
+| --- | --- | --- | --- | --- |
+| Contact memory | One Orbiter user | Private user scope | `contacts_id` | "Mark met Ray at State Change"; "Ray prefers short email asks"; "Mark promised to send the investor list" |
+| User memory | One Orbiter user | Private user scope | `self_contacts_id` / `user_id` | "Mark wants to buy a house in Costa Rica"; "Mark is exploring climate fintech angels"; "Mark prefers concise diligence memos" |
+| Company memory | One Orbiter user | Private user scope | `my_company_id` | "Mark thinks Acme is a strategic partner"; "Orbiter is tracking Stripe as a potential customer" |
+| Master-person memory | Orbiter/global facts shown inside a user's contact view | Shared synthetic master-person scope | `master_person_id` | "Ray worked at X"; "Ray attended Y"; "Ray invested in Z" |
+
+The UI goal is simple: given a `contacts_id`, Orbiter can call one API and render every trustworthy memory it has about that contact, including private relationship context, graph-derived master-person facts, and future email/calendar/chat memories.
+
+## Current implementation: function `#13145`
+
+Initial implementation lives in Xano function `mem0/create-memories-from-email-threads-v2` (`#13145`). Despite the name, it is already more than email-thread extraction: it is the first contact-memory bootstrap function.
+
+It accepts `my_contact_id` as the subject contact and defaults to `dry_run = true`. On execution it:
+
+- Resolves the `contacts` row and verifies `contacts.user_id` belongs to the effective user.
+- Resolves `contacts.master_person_id` and the `master_person` display name.
+- Resolves the Mem0 `user_id` from `user.workos_id`.
+- Loads active contact emails from `my_person_email_join` / `master_email`.
+- Loads active Nylas grants for the mailbox owner.
+- Loads the user's other contacts and their emails so email threads can surface related contacts.
+- Runs a one-hop FalkorDB graph-edge stage from `master_person.node_uuid`.
+- Converts graph edge descriptions into Mem0 candidate memories with `source_type = "graph_edge"`.
+- Scans Nylas email threads for the contact and runs a cheap prefilter plus final extractor.
+- Converts durable email facts into Mem0 candidate memories with `source_type = "email_thread"`.
+- Optionally builds a sent-email voice/tone profile and saves it to `email_draft_tone`.
+- Returns candidate memories, Mem0 event summaries, model usage, continuation cursors, and thread results.
+
+Important live behavior:
+
+- Graph-edge and email-thread memories are currently written under the **mailbox owner's Mem0 scope**, not a global Mem0 user. Metadata includes `memory_scope = "mailbox_owner_private"`, `contacts_id`, `master_person_id`, `source_type`, `source_platform`, `memory_hash`, `canonical_memory_hash`, and `run_id = memory_hash`.
+- Writes use `infer: false` after Orbiter has already produced atomic memory text.
+- Before writing, the function searches Mem0 with `user_id = mem0_user_id` and `run_id = memory_hash` to skip duplicates.
+- The email extractor keeps only candidates with confidence `>= 0.75` and drops `sensitive` / `secret` memories.
+- Models are currently `openai/gpt-oss-120b` for cheap prefiltering, `deepseek/deepseek-v4-flash` for final memory extraction, and `anthropic/claude-opus-4.8` for optional sent-email tone.
+
+This makes `#13145` the right initial contact bootstrap for private/contact-specific memories. In the target architecture below, we should stop using it as the long-term writer for graph-edge master-person facts and move those facts to a global master-person writer.
+
+## Frontend implementation audit
+
+`orbiter-frontend` does **not** call Mem0 directly. A search across `src` found no `https://api.mem0.ai`, `/v3/memories`, `MEM0_API_KEY`, `memories/add`, or `memories/search` call sites. The frontend calls Xano endpoints; Xano owns Mem0 reads/writes.
+
+Relevant current frontend surfaces:
+
+| Surface | Frontend location | Backend seam | Notes |
+| --- | --- | --- | --- |
+| Current Outcomes AI chat | `src/features/outcomes/openui/outcomes-canvas-openui.tsx` | `useStartOutcome`, `useSubmitRequestMeta`, `useOpenui05Dispatch` | Creates a `suggestion_request` lazily on turn 1, persists per-turn `outcome_conversations`, flips the row to processing on submit, then dispatches through OpenUI05. |
+| Outcome modify/resubmit rail | `src/routes/_authed/network.index.tsx` | `useStartOutcome`, `useSubmitRequestMeta`, `useOpenui05Dispatch` | A completed suggestion can be edited and resubmitted as a brand-new `suggestion_request` row. |
+| Legacy Outcome canvas | `src/features/outcomes/components/outcomes-canvas.tsx` | `dispatch` from `xano-copilot` | Older Copilot path that still dispatches and writes `outcome_conversations`; useful historical reference but not the target memory seam. |
+| Leverage Loop chat | `src/features/leverage-loops/components/leverage-loops-canvas.tsx` | `useStartOutcome` with `copilot_mode = "loop"`, `useOpenLangInterview`, legacy `dispatch` fallback | Creates a loop `suggestion_request` on turn 1 with `for_master_person_id`, persists `leverage_loop_conversations`, and dispatches when the user activates the loop. |
+| Notes | `src/features/notes/api/use-create-note.ts`, `use-update-note.ts`, `use-delete-note.ts` | Notes API group `/my-notes` | Notes are keyed by `my_person_id` or `my_company_id`; mentions are sent as `my_person_mentions[]` and `my_company_mentions[]`. |
+| Person/company side panel notes | `src/features/master-persons/components/profile-tab/notes.tsx`, `src/features/master-companies/components/profile-tab/notes.tsx` | `useNotes`, `NotesModal` | If a person/company is not yet in the user's private set, the UI first adds it, then opens the note modal. |
+
+Confirmed backend direct Mem0 calls:
+
+- Reusable function `mem0/create-memories-from-email-threads-v2` (`#13145`) calls Mem0 search/add/event APIs.
+- Older reusable function `mem0/create-memories-from-email-threads-v1` (`#13077`) also matches Mem0 API patterns.
+
+The memory architecture should keep this boundary: frontend creates first-party Orbiter rows and sends user intent to Xano; Xano decides what becomes durable memory and writes Mem0 with validated metadata.
+
+## Memory lifecycle
+
+### 1. Bootstrap on contact creation
+
+When a user adds a new contact, Orbiter should enqueue a small memory bootstrap bundle for that `contacts.id`.
+
+Recommended trigger:
+
+1. A `contacts` row is created or attached to a user.
+2. The create flow ensures global master-person memories exist for `contacts.master_person_id`.
+3. The create flow calls/enqueues `mem0/create-memories-from-email-threads-v2` (`#13145`) with:
+
+```json
+{
+  "my_contact_id": 12345,
+  "dry_run": false,
+  "run_email_tone": false,
+  "max_threads_per_batch": 20,
+  "max_graph_edge_memories": 0
+}
+```
+
+Use `max_graph_edge_memories = 500` only during the transition period before the global master-person writer exists.
+
+4. The create flow calls/enqueues `mem0/create-contact-calendar-memories-v1` with:
+
+```json
+{
+  "my_contact_id": 12345,
+  "dry_run": false,
+  "lookback_days": 730,
+  "lookahead_days": 90,
+  "write_related_contact_memories": true
+}
+```
+
+5. The bootstrap bundle creates the first memory set:
+
+- Historical email-thread memories for this contact.
+- Historical calendar memories and useful upcoming touchpoints for this contact.
+- Optional sent-email tone profile for drafting style.
+- Global master-person facts from graph/profile enrichment.
+
+6. The Contact Side Panel Memories tab can show "building memories" until the private email bootstrap, private calendar bootstrap, and global master-person sync have returned or been queued.
+
+### 2. Incremental memory writers
+
+After the initial bootstrap, every source that learns something durable about the user-contact relationship should add or update contact memories:
+
+| Source | Trigger | Memory examples |
+| --- | --- | --- |
+| New email thread / reply | Nylas webhook or sync job | commitments, asks, preferences, intros, relationship context |
+| Calendar event created/updated | Calendar sync | meeting history, upcoming touchpoints, recurring cadence, related attendees |
+| How I Know interview | Interview completed | relationship history and subjective user context |
+| Outcome request submitted | `suggestion_request` moves from draft to processing/submitted | durable user goals, constraints, target geographies, desired purchases, hiring/fundraising intent |
+| Leverage Loop activated | `copilot_mode = "loop"` request is activated | "user wants to help this contact with X", intro strategy, target's requested outcome |
+| Outcome/chat turn | User makes a durable decision involving the contact | next ask, deal context, intro strategy |
+| Graph enrichment | New public fact/edge lands on `master_person` | global master-person memories: job changes, education, investments, affiliations |
+| Manual user note | User adds note in contact/company/general notes | explicit relationship memory, company memory, or private user memory |
+
+The key product rule: **bootstrap creates the first memory set; source events keep it alive.**
+
+## Mem0 research summary
+
+This plan is based on the current Mem0 Platform docs:
+
+- [Entity-scoped memory](https://docs.mem0.ai/platform/features/entity-scoped-memory): Mem0 scopes memories by `user_id`, `agent_id`, `app_id`, and `run_id`.
+- [Memory filters](https://docs.mem0.ai/platform/features/v2-memory-filters): retrieval supports logical filters, time filters, categories, keywords, and top-level metadata matching.
+- [Graph Memory](https://docs.mem0.ai/platform/features/graph-memory): Mem0 automatically links people, places, organizations, and concepts mentioned across memories; it affects ranking but does not expose typed graph edges.
+- [Add Memories API](https://docs.mem0.ai/api-reference/memory/add-memories): v3 add is async, additive, requires at least one entity ID, accepts metadata, and supports `infer`.
+- [Get Memories API](https://docs.mem0.ai/api-reference/memory/get-memories): `get_all` is the right API for paginated list/timeline views.
+- [Search Memories API](https://docs.mem0.ai/api-reference/memory/search-memories): `search` uses hybrid retrieval and supports `top_k`, `threshold`, `rerank`, and `reference_date`.
+- [Direct Import](https://docs.mem0.ai/platform/features/direct-import): `infer=false` stores predefined memories directly, but skips inference and duplicate detection.
+- [Custom Instructions](https://docs.mem0.ai/platform/features/custom-instructions): project or request instructions control what Mem0 extracts or excludes.
+- [Custom Categories](https://docs.mem0.ai/platform/features/custom-categories): project-level categories are auto-assigned to new memories.
+- [Temporal Reasoning](https://docs.mem0.ai/platform/features/temporal-reasoning) and [Memory Timestamps](https://docs.mem0.ai/platform/features/timestamp): `timestamp` anchors historical memories and `reference_date` makes relative searches reproducible.
+- [Advanced Retrieval](https://docs.mem0.ai/platform/features/advanced-retrieval), [Criteria Retrieval](https://docs.mem0.ai/platform/features/criteria-retrieval), and [Memory Decay](https://docs.mem0.ai/platform/features/memory-decay): Mem0 can improve ranking through reranking, custom scoring criteria, and recency/reinforcement.
+- [Feedback](https://docs.mem0.ai/platform/features/feedback-mechanism), [Webhooks](https://docs.mem0.ai/platform/features/webhooks), and [Memory Export](https://docs.mem0.ai/platform/features/memory-export): useful for product QA, reactive sync, and structured dossiers.
+- [Group Chat](https://docs.mem0.ai/platform/features/group-chat) and [Automated Email Intelligence](https://docs.mem0.ai/cookbooks/operations/email-automation): useful patterns for multi-participant meetings and email-derived memories.
+
+## Recommended Mem0 mapping
+
+Use Mem0's entity scope for privacy and retrieval boundaries, and Orbiter metadata for the contact/person model.
+
+### Entity IDs
+
+| Mem0 field | Orbiter use | Notes |
+| --- | --- | --- |
+| `user_id` | The current user's stable Mem0 ID, currently `user.workos_id` in live Mem0 paths | Required privacy boundary for private contact memories |
+| `user_id = "master_person:{master_person_id}"` | Recommended synthetic global master-person scope | Not a real user. This is the simplest way to store userless master-person memories while satisfying Mem0's entity-scope requirement |
+| `run_id` | Current implementation uses deterministic `memory_hash` | Good for duplicate checks, but the Contact tab should retrieve by `contacts_id` metadata |
+| `agent_id` | Optional agent-owned memory, not core contact memory | Avoid mixing this into contact retrieval until needed |
+| `app_id` | Optional app/environment partition | If used, test filters carefully against Mem0's entity-scoping behavior |
+
+The most important decision: **do not try to make `contacts_id` the Mem0 `user_id`**. `user_id` should remain the user/privacy boundary. Store `contacts_id` and `master_person_id` as flat metadata.
+
+For user-general memories, still use `user_id = user.workos_id`. If Orbiter has a self-contact row for the user, store it as `self_contacts_id` and optionally as `contacts_id` only when the memory should appear in the user's own contact/profile memory view.
+
+## Master-person memory linking strategy
+
+Mem0 has two separate concepts that sound like "linking":
+
+1. **Entity scope** is the storage/retrieval boundary. The v3 add API requires at least one entity ID: `user_id`, `agent_id`, `app_id`, or `run_id`. That means a memory cannot be completely unscoped. If Orbiter wants a master-person memory with "no user", it still needs a synthetic Mem0 entity such as a system `user_id`, system `agent_id`, or master-person `app_id`/`run_id` pattern.
+2. **Graph Memory** is Mem0's built-in retrieval graph. It automatically extracts people, places, organizations, and concepts from memory text and uses those connections to improve ranking. It does not expose typed edges or replace Orbiter's `contacts.master_person_id` join.
+
+So the source-of-truth link should remain in Orbiter:
+
+```text
+user -> contacts.id -> master_person.id
+```
+
+Mem0 should make that link retrievable by storing the relevant IDs in flat metadata:
+
+```json
+{
+  "contacts_id": "12345",
+  "master_person_id": "67890",
+  "memory_scope": "mailbox_owner_private"
+}
+```
+
+### Option A: copy master-person memories into each contact scope
+
+This is what function `#13145` does today for graph edges.
+
+When a contact is created, Orbiter reads graph facts for the linked `master_person` and writes those facts into the mailbox owner's private Mem0 scope with the contact's `contacts_id`.
+
+Pros:
+
+- Simple Contact Side Panel retrieval: one `user_id + contacts_id` query.
+- Strong privacy boundary.
+- Works with Mem0's requirement that every memory has an entity scope.
+- Already implemented for graph edges in `#13145`.
+
+Cons:
+
+- Duplicates objective graph facts across users who share the same `master_person`.
+- If a graph fact changes, Orbiter must update/delete every copied contact memory or tolerate stale copies until refresh.
+
+### Option B: create a synthetic global master-person scope
+
+When a `master_person` is created or enriched, Orbiter writes objective memories once under a synthetic system entity, for example:
+
+```json
+{
+  "user_id": "master_person:67890",
+  "messages": [
+    { "role": "user", "content": "Ray Deck attended Stanford." }
+  ],
+  "infer": false,
+  "metadata": {
+    "memory_scope": "global_master_person",
+    "master_person_id": "67890",
+    "source_type": "graph_edge",
+    "memory_hash": "sha256:..."
+  }
+}
+```
+
+Then the Contact Side Panel reads:
+
+- private user-contact memories by `user_id + metadata.contacts_id`
+- global master-person memories by synthetic `user_id = master_person:{master_person_id}`
+
+Pros:
+
+- Objective graph facts are stored once.
+- Master-person enrichment can update memories independently of any user's contacts.
+- Cleaner long-term separation between global truth and private relationship context.
+
+Cons:
+
+- The Contact tab becomes a two-scope fan-out.
+- Global memory visibility must be carefully limited to objective/public graph facts.
+- Needs an explicit decision on synthetic entity naming and update/delete behavior.
+
+### Recommendation
+
+Use **Option B** as the target architecture. It better matches the product model: master-person memories belong to the master person, while contact memories belong to the user-contact relationship.
+
+Keep `#13145` for private contact bootstrap, but refactor or configure it so graph-edge writing moves to a new global master-person sync. During migration, the Contact Side Panel can de-dupe old private graph-edge copies against new global memories by `canonical_memory_hash`.
+
+## Option B implementation spec
+
+### Synthetic entity convention
+
+Use one synthetic Mem0 `user_id` per master person:
+
+```text
+master_person:{master_person_id}
+```
+
+Example:
+
+```text
+master_person:67890
+```
+
+This is not an Orbiter user. It is a namespaced Mem0 entity that lets us store "userless" global memories while satisfying Mem0's requirement that every memory belongs to at least one entity ID.
+
+Keep metadata explicit:
+
+```json
+{
+  "memory_scope": "global_master_person",
+  "master_person_id": "67890",
+  "visibility": "global_objective",
+  "source_type": "graph_edge",
+  "source_platform": "falkordb",
+  "source_id": "edge_uuid_or_hash",
+  "memory_hash": "sha256:...",
+  "canonical_memory_hash": "sha256:...",
+  "schema_version": "2026-06-23"
+}
+```
+
+### New global writer
+
+Create a dedicated Xano function:
+
+```text
+mem0/sync-master-person-memories-v1
+```
+
+Inputs:
+
+```json
+{
+  "master_person_id": 67890,
+  "dry_run": true,
+  "force_refresh": false,
+  "max_graph_edge_memories": 500,
+  "source_types": ["graph_edge", "profile_field"]
+}
+```
+
+Responsibilities:
+
+1. Load `master_person`.
+2. Read `master_person.node_uuid`.
+3. Query one-hop graph edges and stable profile/enrichment fields.
+4. Convert each objective fact into an atomic memory sentence.
+5. Reject facts that are subjective, private, speculative, or user-derived.
+6. Compute `canonical_memory_hash` from `master_person_id`, source type, source ID/edge UUID, and normalized memory text.
+7. Write to Mem0 under `user_id = "master_person:{master_person_id}"`.
+8. Use `infer: false`.
+9. Use `run_id = memory_hash` for duplicate checks and idempotent writes.
+10. Persist every write attempt to a first-party Xano index table.
+
+Recommended Mem0 add payload:
+
+```json
+{
+  "user_id": "master_person:67890",
+  "run_id": "sha256:memory_hash",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Ray Deck was a partner at State Change from 2017 to 2021."
+    }
+  ],
+  "infer": false,
+  "metadata": {
+    "memory_scope": "global_master_person",
+    "master_person_id": "67890",
+    "source_type": "graph_edge",
+    "source_platform": "falkordb",
+    "edge_type": "WORKED_AT",
+    "edge_uuid": "edge_555",
+    "source_id": "sha256:memory_hash",
+    "canonical_memory_hash": "sha256:canonical_hash",
+    "memory_hash": "sha256:memory_hash",
+    "run_id": "sha256:memory_hash",
+    "visibility": "global_objective",
+    "schema_version": "2026-06-23"
+  }
+}
+```
+
+### Xano index table
+
+Add a first-party table so Orbiter can audit and update Mem0 without relying on Mem0 as the source of truth.
+
+Suggested table: `mem0_memory_index`
+
+| Field | Purpose |
+| --- | --- |
+| `mem0_memory_id` | Memory ID when available |
+| `mem0_event_id` | Async event ID returned by Mem0 add |
+| `mem0_entity_id` | `master_person:67890` or `user.workos_id` |
+| `memory_scope` | `global_master_person` or `mailbox_owner_private` |
+| `contacts_id` | Private contact memory key, null for global master-person facts |
+| `master_person_id` | Master person key |
+| `source_type` | `graph_edge`, `email_thread`, `calendar_event`, etc. |
+| `source_id` | Stable source identifier |
+| `canonical_memory_hash` | Source-level dedupe key |
+| `memory_hash` | Mem0 write/run key |
+| `memory_text` | Last written memory text |
+| `status` | `pending`, `succeeded`, `failed`, `skipped_duplicate`, `deleted` |
+| `last_synced_at` | Last sync timestamp |
+| `error` | Last error preview |
+
+### Master-person sync triggers
+
+Run `mem0/sync-master-person-memories-v1` when:
+
+- A `master_person` row is created.
+- A `master_person` receives a `node_uuid`.
+- Graph enrichment adds or updates a public edge.
+- Profile enrichment adds or updates objective fields.
+- A `master_person` merge changes the canonical ID.
+- A backfill/migration job needs to seed global master-person memories.
+
+### Contact creation flow
+
+When a user adds a contact:
+
+1. Create/attach `contacts.id`.
+2. Resolve `contacts.master_person_id`.
+3. Ensure global master-person memories are synced:
+
+```json
+{
+  "master_person_id": 67890,
+  "dry_run": false,
+  "source_types": ["graph_edge", "profile_field"]
+}
+```
+
+4. Run the private contact bootstrap:
+
+```json
+{
+  "my_contact_id": 12345,
+  "dry_run": false,
+  "run_email_tone": false,
+  "max_graph_edge_memories": 0
+}
+```
+
+`max_graph_edge_memories = 0` is the desired target behavior once the global writer exists. If `#13145` cannot cleanly skip the graph stage with that input, refactor it into two functions:
+
+- `mem0/sync-master-person-memories-v1`
+- `mem0/create-contact-email-memories-v1`
+
+### Contact Side Panel read path
+
+`GET /contacts/{contacts_id}/memories`
+
+Server steps:
+
+1. Verify current user owns `contacts_id`.
+2. Load `contacts.master_person_id`.
+3. Load current user's Mem0 ID from `user.workos_id`.
+4. Fetch private contact memories:
+
+```json
+{
+  "AND": [
+    { "user_id": "workos_user_id" },
+    { "metadata": { "contacts_id": "12345" } }
+  ]
+}
+```
+
+5. Fetch global master-person memories:
+
+```json
+{
+  "user_id": "master_person:67890"
+}
+```
+
+6. Merge the two result sets.
+7. De-dupe by `canonical_memory_hash` and `memory_hash`.
+8. Sort by `source_timestamp`, then `created_at`, then source priority.
+9. Return a unified feed with `scope = "global_master_person"` or `scope = "private_contact"`.
+
+The Contact Side Panel should render global facts and private relationship memories in the same scroll, but visually distinguish them.
+
+### Search path
+
+`POST /contacts/{contacts_id}/memories/search`
+
+Run two Mem0 searches and merge results:
+
+1. Private contact search:
+
+```json
+{
+  "query": "What should I remember before meeting Ray?",
+  "filters": {
+    "AND": [
+      { "user_id": "workos_user_id" },
+      { "metadata": { "contacts_id": "12345" } }
+    ]
+  },
+  "top_k": 20,
+  "rerank": true
+}
+```
+
+2. Global master-person search:
+
+```json
+{
+  "query": "What should I remember before meeting Ray?",
+  "filters": {
+    "user_id": "master_person:67890"
+  },
+  "top_k": 20,
+  "rerank": true
+}
+```
+
+3. Merge, de-dupe, and optionally run an Orbiter-side final rerank that prefers:
+
+- private relationship memories for relationship questions
+- global master facts for biography/background questions
+- recent memories for meeting-prep questions
+- high-confidence memories over low-confidence ones
+
+### Update and delete behavior
+
+Global master-person memories:
+
+- Update when the underlying graph edge/profile fact changes but remains valid.
+- Delete when the graph edge is removed, merged away, or marked false.
+- Re-key when a `master_person` merge changes the canonical ID.
+
+Private contact memories:
+
+- Delete or hide when a user deletes the contact.
+- Delete or hide email/calendar-derived memories when the user disconnects the source and policy requires removal.
+- Keep global master-person memories untouched when a user deletes a contact.
+
+### Migration from `#13145` graph copies
+
+During migration, existing private graph-edge memories may duplicate new global master-person memories.
+
+Migration plan:
+
+1. Backfill global master-person memories for a small cohort.
+2. Update the Contact Side Panel to fetch both scopes.
+3. De-dupe old private graph-edge copies against global memories by `canonical_memory_hash`.
+4. Stop future private graph writes from `#13145`.
+5. Decide whether to delete old private graph-edge copies or leave them hidden by the API.
+
+### QA cases
+
+- Two users have contacts linked to the same `master_person`; both see the same global graph facts.
+- User A's email memories never appear for User B.
+- Contact deletion removes/hides private contact memories but leaves global master-person memories.
+- A graph edge update updates the global memory once and appears updated in every linked contact panel.
+- A `master_person` merge moves/rebuilds the synthetic global memory scope.
+
+## Calendar bootstrap implementation spec
+
+Calendar memory should follow the same pattern as the email bootstrap in `#13145`: resolve the contact, scan user-owned source data, extract only durable relationship facts, write accepted atomic memories under the mailbox owner's private Mem0 scope, and preserve enough provenance to show the memory in the Contact Side Panel.
+
+Calendar should not write to the global master-person scope. A user's calendar is private relationship context, even when the attendees are globally known people.
+
+### New private calendar writer
+
+Create a dedicated Xano function:
+
+```text
+mem0/create-contact-calendar-memories-v1
+```
+
+Recommended inputs:
+
+```json
+{
+  "my_contact_id": 12345,
+  "user_id": 987,
+  "dry_run": true,
+  "force_refresh": false,
+  "lookback_days": 730,
+  "lookahead_days": 90,
+  "max_events_per_batch": 100,
+  "max_description_chars": 12000,
+  "include_private_events": false,
+  "include_declined_events": false,
+  "write_related_contact_memories": true,
+  "page_token": null
+}
+```
+
+The function should support two modes:
+
+- **Contact bootstrap mode:** run when a `contacts.id` is first created, using the contact's known emails to find historical and upcoming calendar events.
+- **Incremental event mode:** run from calendar webhooks or sync jobs when an event is created, updated, deleted, or when attendee metadata changes.
+
+### Calendar bootstrap flow
+
+1. Resolve `contacts.id`, verify user ownership, and load `contacts.master_person_id`.
+2. Resolve the user's Mem0 ID from `user.workos_id`.
+3. Load the subject contact's active emails from `my_person_email_join` / `master_email`.
+4. Load active calendar grants for the user.
+5. Load the user's known contact-email map so all attendees can be resolved to `contacts.id` and/or `master_person.id`.
+6. Query calendar events where the subject contact is an attendee, organizer, or directly mentioned by a resolved email.
+7. Normalize each event into a stable event object:
+
+```json
+{
+  "calendar_event_id": "nylas_event_abc",
+  "ical_uid": "uid@example.com",
+  "recurring_event_id": "series_123",
+  "occurrence_start": "2026-07-02T16:00:00Z",
+  "title": "Seed round sync with Ray",
+  "description_preview": "short cleaned description",
+  "location_type": "video",
+  "organizer_email": "mark@example.com",
+  "attendees": [],
+  "status": "confirmed",
+  "visibility": "default"
+}
+```
+
+8. Resolve attendees to known contacts and master persons.
+9. Drop events that are not useful relationship signals:
+
+- canceled events
+- events where the user declined
+- all-day holidays and system calendars
+- private events when `include_private_events = false`
+- events with no subject contact participation
+- generic holds such as "busy", "focus time", "OOO", or "block"
+- internal-only meetings unless the subject contact is the external/person-of-interest
+
+10. Classify event type:
+
+- `one_on_one`
+- `group_meeting`
+- `intro_meeting`
+- `recurring_checkin`
+- `investor_update`
+- `board_or_advisor`
+- `interview`
+- `sales_or_partner`
+- `unknown_meeting`
+
+11. Extract candidate memories from title, description, attendees, recurrence, and timing.
+12. Apply sensitivity and confidence filters.
+13. Write accepted atomic memories to Mem0 with `infer: false`.
+14. Persist write attempts and source hashes to `mem0_memory_index`.
+
+### What calendar should remember
+
+Good calendar memories:
+
+- "Mark met Ray on June 11, 2026 for a seed round sync."
+- "Mark and Ray have a recurring monthly check-in."
+- "Ray attended Orbiter's investor update meeting on May 3, 2026."
+- "Mark was introduced to Sandra through a meeting that Ray also attended."
+- "Mark is scheduled to meet Ray on July 2, 2026 about the investor list."
+
+Be careful with claims inferred only from the title. If the source is just an event title, use language like "was scheduled to meet" instead of "discussed" unless notes, transcript, or follow-up email confirms the discussion happened.
+
+Recommended write payload:
+
+```json
+{
+  "user_id": "workos_user_id",
+  "run_id": "sha256:memory_hash",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Mark met Ray on June 11, 2026 for a seed round sync."
+    }
+  ],
+  "infer": false,
+  "metadata": {
+    "memory_scope": "mailbox_owner_private",
+    "contacts_id": "12345",
+    "master_person_id": "67890",
+    "source_type": "calendar_event",
+    "source_platform": "nylas",
+    "source_id": "nylas_event_abc",
+    "ical_uid": "uid@example.com",
+    "recurring_event_id": "series_123",
+    "calendar_event_status": "confirmed",
+    "calendar_event_type": "one_on_one",
+    "source_timestamp": "2026-06-11T16:00:00Z",
+    "timestamp": "2026-06-11T16:00:00Z",
+    "related_contact_ids_csv": "222,333",
+    "related_master_person_ids_csv": "444,555",
+    "related_people_count": "2",
+    "confidence": "high",
+    "visibility": "private_user",
+    "memory_hash": "sha256:memory_hash",
+    "canonical_memory_hash": "sha256:canonical_hash",
+    "schema_version": "2026-06-23"
+  }
+}
+```
+
+### Upcoming events policy
+
+Upcoming meetings are valuable for Meeting Prep, but they are not all durable memories yet.
+
+Recommended policy:
+
+- Keep raw upcoming events in the calendar tables and use them directly for near-term UI.
+- Write a Mem0 memory for an upcoming event only when it is relationship-useful, such as a high-value meeting, recurring cadence, investor update, board/advisor meeting, or user-initiated ask.
+- Tag upcoming memories with `event_lifecycle = "upcoming"` and `expires_at` or `event_end_at`.
+- When the event passes, update/delete the upcoming memory or convert it into an attended/scheduled historical memory based on event status and available evidence.
+
+### Calendar update/delete behavior
+
+- If an event title, time, or attendee list changes, recompute `memory_hash` and update the previous memory through the Xano index table.
+- If an event is canceled, delete/hide the memory or convert it to "The planned meeting was canceled" only when cancellation itself is relationship-useful.
+- If a recurring series creates many identical occurrences, store cadence memories at the series level and occurrence memories only when a specific occurrence has distinct context.
+- If a user disconnects calendar access, follow the same retention policy as email-derived memories.
+
+## Related people and participant attribution
+
+Email threads and calendar events often involve more than the primary contact. Orbiter should use participant resolution aggressively, but write memories conservatively.
+
+### Resolution model
+
+For every participant email address:
+
+1. Normalize the email address.
+2. Resolve to `master_email`.
+3. Resolve to `master_person.id` when possible.
+4. Resolve to the current user's `contacts.id` when that master person is already in their contacts.
+5. Mark unresolved participants as `unresolved_email` and keep them out of durable Mem0 writes unless the primary contact memory needs a plain-text provenance mention.
+
+Suggested participant object:
+
+```json
+{
+  "email": "sandra@example.com",
+  "display_name": "Sandra Lee",
+  "role": "attendee",
+  "attendance_status": "accepted",
+  "contacts_id": 222,
+  "master_person_id": 444,
+  "is_subject_contact": false,
+  "is_mailbox_owner": false,
+  "resolution_confidence": "high"
+}
+```
+
+### Primary write rule
+
+Every Mem0 memory should still have one primary `contacts_id`.
+
+If an email or event has three relevant people, write one primary memory per contact only when the memory is actually useful for that contact.
+
+Good fan-out:
+
+- Ray and Sandra are both resolved contacts, and the event is an intro meeting where Ray introduced Mark to Sandra.
+- The email contains a commitment from Sandra and a separate commitment from Ray.
+- The meeting establishes a relationship between the user and each attendee.
+
+Bad fan-out:
+
+- Every CC recipient gets the same generic memory.
+- A large investor update writes memories to every attendee.
+- A person mentioned in passing receives a durable contact memory.
+- A private user-calendar event creates global master-person facts.
+
+### Related people metadata
+
+Store related people as metadata for display and provenance, but do not make related IDs the primary retrieval key.
+
+Keep `contacts_id` as the primary contact key and add flat related fields:
+
+```json
+{
+  "contacts_id": "12345",
+  "master_person_id": "67890",
+  "related_contact_ids_csv": "222,333",
+  "related_master_person_ids_csv": "444,555",
+  "related_people_count": "2",
+  "related_people_summary": "Sandra Lee and Priya Nair also attended",
+  "participant_resolution_version": "v1"
+}
+```
+
+If Orbiter needs richer participant rendering, store the full attendee map in Xano and return it through the Contact Memories API. Do not depend on Mem0 metadata as the full participant database.
+
+### Email-specific attribution rules
+
+- Write memories only for direct participants by default: sender, recipient, or clearly addressed person.
+- Treat CC participants as related people unless the content gives them a direct ask, commitment, introduction, or decision.
+- Treat BCC as private delivery metadata and do not write durable person memories from it.
+- Attribute commitments to the person who made or accepted the commitment.
+- Attribute intros to both the introduced contact and the introducer when both are resolved contacts.
+- Use the existing `#13145` known-contact resolution as the baseline for `related_contacts`.
+
+### Calendar-specific attribution rules
+
+- For 1:1 meetings, write to the subject contact when the event title/description is useful.
+- For small group meetings, write to the subject contact and optionally to other resolved contacts if each person's participation is meaningful.
+- For large events, investor updates, webinars, and all-hands meetings, keep attendee data in Xano and write only summary/cadence memories for contacts that matter.
+- If an attendee is resolved to `master_person.id` but the user does not have a `contacts.id`, do not create a Mem0 private memory for that person yet. Store the participant in Xano so a future contact bootstrap can pick up the event.
+- Do not auto-create contacts just because someone appeared on a calendar invite or email thread.
+
+### Relationship graph ideas
+
+Resolved co-participants can power product features beyond the memory card itself:
+
+- "Introduced by" hints when one resolved contact appears to connect the user to another.
+- Warm-path suggestions based on repeated co-attendance or email threads.
+- Meeting-prep warnings such as "Sandra will also be there; your last interaction was through Ray."
+- Relationship maps from private user-owned interactions, kept separate from global graph facts.
+- Contact suggestions: "You have met Sandra in 4 events but she is not in your contacts."
+
+These relationship signals should live first in Orbiter tables. Mem0 should receive only the human-readable memories needed for retrieval and UI.
+
+### Metadata schema
+
+Keep metadata flat. Mem0's metadata filters are useful, but nested and multi-value logic is limited compared with a database query planner.
+
+```json
+{
+  "schema_version": "2026-06-23",
+  "scope": "contact",
+  "memory_scope": "mailbox_owner_private",
+  "contacts_id": "12345",
+  "self_contacts_id": "99999",
+  "master_person_id": "67890",
+  "my_company_id": "555",
+  "master_company_id": "777",
+  "source_type": "email_thread",
+  "source_platform": "nylas",
+  "source_id": "nylas_thread_abc",
+  "source_record_id": "xano_row_123",
+  "suggestion_request_id": "456",
+  "my_note_id": "123",
+  "copilot_mode": "outcome",
+  "outcome_class": "make_purchase",
+  "source_timestamp": "2026-06-23T14:00:00Z",
+  "related_contact_ids_csv": "222,333",
+  "related_master_person_ids_csv": "444,555",
+  "related_company_ids_csv": "888",
+  "related_master_company_ids_csv": "999",
+  "related_people_count": "2",
+  "memory_hash": "sha256:...",
+  "canonical_memory_hash": "sha256:...",
+  "run_id": "sha256:...",
+  "visibility": "private_user",
+  "confidence": "high",
+  "evidence_url": "/internal/source/...",
+  "created_by": "orbiter.mem0.email_extractor.v1"
+}
+```
+
+Suggested `source_type` values:
+
+- `graph_master_fact`
+- `graph_edge`
+- `email_thread`
+- `calendar_event`
+- `how_i_know`
+- `outcome_request`
+- `leverage_loop_request`
+- `chat_outcome`
+- `manual_user_note`
+- `manual_company_note`
+- `imported_contact_note`
+
+Suggested `scope` values:
+
+- `contact`: private, user-specific relationship memory keyed by `contacts_id`.
+- `master_person`: objective global fact keyed by `master_person_id`.
+- `user`: private user memory keyed by `user_id` and optionally `self_contacts_id`.
+- `company`: private company memory keyed by `my_company_id`.
+- `contact_inferred`: private fact inferred from user-owned source data.
+- `contact_claim`: user-authored statement, lower confidence until corroborated.
+
+## Retrieval contract
+
+Orbiter should own the contact-memory API. Xano/app code should call Orbiter, not Mem0 directly, so privacy checks, graph joins, pagination, source links, and redaction stay first-party.
+
+### List all memories for a contact
+
+`GET /contacts/{contacts_id}/memories`
+
+Server steps:
+
+1. Verify the requesting user owns `contacts_id`.
+2. Resolve `contacts.master_person_id`.
+3. Resolve the user's Mem0 ID from `user.workos_id`.
+4. Fetch private contact memories from Mem0. This query covers the live `#13145` email bootstrap and the proposed calendar bootstrap because both write under the mailbox owner's Mem0 `user_id` with `metadata.contacts_id`.
+
+```json
+{
+  "AND": [
+    { "user_id": "workos_user_id" },
+    { "metadata": { "contacts_id": "12345" } }
+  ]
+}
+```
+
+5. Fetch shared global master-person memories from the synthetic master-person scope:
+
+```json
+{
+  "user_id": "master_person:67890"
+}
+```
+
+6. Merge, de-dupe, sort, redact, and return:
+
+```json
+{
+  "contacts_id": 12345,
+  "master_person_id": 67890,
+  "results": [
+    {
+      "id": "mem0_memory_id",
+      "memory": "Ray worked at Acme before founding Example Labs.",
+      "scope": "global_master_person",
+      "memory_scope": "global_master_person",
+      "source_type": "graph_edge",
+      "source_timestamp": "2024-09-12T00:00:00Z",
+      "confidence": "high",
+      "categories": ["professional_history"],
+      "provenance": {
+        "label": "Graph edge",
+        "source_record_id": "employment_edge_555"
+      }
+    },
+    {
+      "id": "mem0_memory_id_2",
+      "memory": "Mark met Ray and Sandra on June 11, 2026 for a seed round sync.",
+      "scope": "private_contact",
+      "memory_scope": "mailbox_owner_private",
+      "source_type": "calendar_event",
+      "source_timestamp": "2026-06-11T16:00:00Z",
+      "related_people": [
+        {
+          "contacts_id": 222,
+          "master_person_id": 444,
+          "name": "Sandra Lee"
+        }
+      ]
+    }
+  ]
+}
+```
+
+Use Mem0 `get_all` for this scrollable list view because it is deterministic and paginated. Use `search` when a user or agent asks a natural-language question such as "what should I remember before meeting Ray?"
+
+### List all memories for the current user
+
+`GET /me/memories`
+
+Server steps:
+
+1. Verify the requesting user.
+2. Resolve the user's Mem0 ID from `user.workos_id`.
+3. Resolve the user's self-contact row if available.
+4. Fetch private user memories:
+
+```json
+{
+  "AND": [
+    { "user_id": "workos_user_id" },
+    { "metadata": { "memory_scope": "user_private" } }
+  ]
+}
+```
+
+5. Optionally filter to self-contact memories when rendering the user's own contact/profile view:
+
+```json
+{
+  "AND": [
+    { "user_id": "workos_user_id" },
+    { "metadata": { "contacts_id": "self_contacts_id" } }
+  ]
+}
+```
+
+Use this for general goals and preferences that do not primarily belong to another person or company.
+
+### List all memories for a company
+
+`GET /companies/{my_company_id}/memories`
+
+Server steps:
+
+1. Verify the requesting user owns or can access `my_company_id`.
+2. Resolve `my_company.master_company_id`.
+3. Resolve the user's Mem0 ID from `user.workos_id`.
+4. Fetch private company memories:
+
+```json
+{
+  "AND": [
+    { "user_id": "workos_user_id" },
+    { "metadata": { "my_company_id": "555" } }
+  ]
+}
+```
+
+5. Optionally fetch global master-company facts later if Orbiter adds a synthetic company scope such as `master_company:{master_company_id}`.
+
+Company memories should stay separate from contact memories. A company note can mention people, but it should not appear in a person's Contact Side Panel unless the note also creates a deliberate person-scoped memory.
+
+### Search memories for a contact
+
+`POST /contacts/{contacts_id}/memories/search`
+
+Request:
+
+```json
+{
+  "query": "What did we discuss most recently?",
+  "top_k": 20,
+  "rerank": true,
+  "reference_date": "2026-06-23T00:00:00Z"
+}
+```
+
+Server behavior:
+
+- Run the same two-scope retrieval as the list endpoint: private contact memories plus global master-person memories.
+- Use Mem0 `search` with `rerank=true` for user-facing answer quality.
+- Pass `reference_date` for testable temporal queries.
+- Return both the ranked memories and the source/provenance payload Orbiter needs to show "why this was retrieved."
+
+## Source ingestion strategy
+
+### 1. Graph to global master-person memories
+
+Function `#13145` already writes one-hop graph edge descriptions as contact-scoped Mem0 memories. That was a useful bootstrap, but the target architecture should move graph-derived objective facts into `mem0/sync-master-person-memories-v1` under `user_id = "master_person:{master_person_id}"`.
+
+Best for:
+
+- Education
+- Employment history
+- Investment history
+- Board/advisor roles
+- Known locations
+- Public social/profile facts
+- Stable graph-derived expertise
+
+Recommended write mode: **`infer=false`** after Orbiter has already converted the graph edge into a clean atomic sentence.
+
+Why: graph facts are already structured. Asking Mem0 to infer from them can blur provenance or create duplicate variants. Direct import is faster and more deterministic, but Orbiter must own idempotency because Mem0's direct import skips duplicate detection.
+
+Target global writer pattern:
+
+```json
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Ray Deck was a partner at State Change from 2017 to 2021."
+    }
+  ],
+  "user_id": "master_person:67890",
+  "run_id": "sha256:memory_hash",
+  "infer": false,
+  "metadata": {
+    "memory_scope": "global_master_person",
+    "master_person_id": "67890",
+    "source_type": "graph_edge",
+    "source_platform": "falkordb",
+    "source_id": "employment_edge_555",
+    "memory_hash": "sha256:..."
+  }
+}
+```
+
+During migration, keep de-duping old `#13145` private graph-edge copies against the new global memories by `canonical_memory_hash`.
+
+### 2. Email to contact memories
+
+Email should create private relationship memories keyed to the user's `contacts_id`, not global person facts by default.
+
+Best for:
+
+- How the user knows the contact
+- Recent threads and open loops
+- Promises, asks, intros, and follow-ups
+- Communication style
+- Preferences learned through correspondence
+- Relationship warmth, only when evidence is strong
+
+Recommended write mode: **extract first, then `infer=false`**.
+
+Pipeline:
+
+1. Resolve thread participants to `contacts.id`.
+2. Split a multi-contact email into one candidate memory set per contact.
+3. Resolve related people from participants and mentioned email addresses.
+4. Run an Orbiter extractor that outputs atomic memories, confidence, evidence spans, participant attribution, and source IDs.
+5. Drop memories below threshold or containing sensitive data.
+6. Write accepted atomic memories to Mem0 with `infer=false`.
+7. Store `memory_hash`, participant resolution, and source IDs in Xano for idempotency.
+
+This avoids letting a raw email thread create accidental memories for the wrong contact, and it keeps provenance strong enough for UI display.
+
+### 3. Calendar to contact memories
+
+Calendar is a high-value temporal source and should be implemented as `mem0/create-contact-calendar-memories-v1`.
+
+Best for:
+
+- "Met with Ray on June 11 about the seed raise"
+- "Next meeting with Ray is July 2"
+- "Ray attends Orbiter investor update calls"
+- "Mark and Ray meet roughly monthly"
+- "Ray introduced Mark to Sandra in a small group meeting"
+
+Use `timestamp` for the actual event time, not the ingestion time. That makes contact timelines and Mem0 temporal search much more useful.
+
+Calendar should write private contact memories only. Resolved attendees become related people metadata, and fan-out to other contacts should happen only when the meeting creates useful relationship context for those other contacts.
+
+### 4. How I Know to contact memories
+
+How I Know is the cleanest subjective source because the user is intentionally describing the relationship.
+
+Two acceptable modes:
+
+- Keep the current pattern of sending the relationship summary with `infer=true` when Mem0 should split one prose summary into multiple facts.
+- Move to Orbiter extractor -> `infer=false` if we want all sources to use one idempotent atomic-memory contract.
+
+Either way, tag every memory with `contacts_id`, `master_person_id`, `source_type = "how_i_know"`, and the interview/source row ID.
+
+### 5. Outcome requests to user memories
+
+Outcome requests should create durable private memories about the **user's goals, constraints, and preferences**, even when no other person is involved.
+
+This is the "buy a house in Costa Rica" case:
+
+```text
+Mark wants to buy a house in Costa Rica and is looking for trusted local advisors, legal guidance, and warm introductions.
+```
+
+Target write trigger:
+
+- Do not write on every chat turn.
+- Write when the user submits the request and the `suggestion_request` moves from draft/interview into processing/submitted.
+- Optionally update the memory when a completed suggestion is modified/resubmitted as a new `suggestion_request`.
+
+Recommended source function:
+
+```text
+mem0/sync-suggestion-request-memory-v1
+```
+
+Inputs:
+
+```json
+{
+  "suggestion_request_id": 123,
+  "dry_run": true,
+  "force_refresh": false
+}
+```
+
+The function should load the `suggestion_request`, request context, class, result count, delivery format, and saved conversation turns. It should then extract only durable facts:
+
+- user goals
+- target outcomes
+- constraints
+- geography
+- timing
+- budget/range only when explicitly stated
+- preferences that should affect future recommendations
+- durable negative preferences such as "not current investors" or "avoid agencies"
+
+Bad memories:
+
+- temporary reasoning fragments
+- intermediate interview questions
+- raw ranking results
+- prompt scaffolding
+- facts already in the graph
+- private details that were only uploaded in a deck unless the user explicitly stated them as a reusable preference
+
+Recommended write payload for a user-general memory:
+
+```json
+{
+  "user_id": "workos_user_id",
+  "run_id": "sha256:memory_hash",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Mark wants to buy a house in Costa Rica and is looking for trusted local advisors, legal guidance, and warm introductions."
+    }
+  ],
+  "infer": false,
+  "metadata": {
+    "memory_scope": "user_private",
+    "scope": "user",
+    "subject_type": "user_self",
+    "self_contacts_id": "99999",
+    "contacts_id": "99999",
+    "source_type": "outcome_request",
+    "source_platform": "orbiter_outcomes",
+    "suggestion_request_id": "123",
+    "copilot_mode": "outcome",
+    "outcome_class": "make_purchase",
+    "source_id": "suggestion_request:123",
+    "source_timestamp": "2026-06-23T14:00:00Z",
+    "visibility": "private_user",
+    "confidence": "high",
+    "memory_hash": "sha256:memory_hash",
+    "canonical_memory_hash": "sha256:canonical_hash",
+    "schema_version": "2026-06-23"
+  }
+}
+```
+
+If the outcome directly involves a person or company, the same sync function may also create entity-specific memories:
+
+- contact memory when the request is about a specific contact
+- company memory when the request is about a specific company
+- user memory when the request is mainly about the user's own goal
+
+The default should be one user memory plus related entity metadata, not aggressive fan-out.
+
+### 6. Leverage Loop requests to contact memories
+
+Leverage Loops are different from Outcomes because they are explicitly "help this person do X." In the frontend, Leverage Loops create or reuse a `suggestion_request` with:
+
+```json
+{
+  "copilot_mode": "loop",
+  "for_master_person_id": 67890
+}
+```
+
+The backend should resolve `for_master_person_id` to the current user's `contacts.id` before writing Mem0. The frontend currently has the target `master_person_id`; the memory writer should not require the browser to send `contacts_id`.
+
+Good Leverage Loop memories:
+
+- "Mark wants to help Ray raise a seed round by finding warm investor introductions."
+- "Mark is helping Sandra find senior engineering candidates."
+- "Mark decided Ray is not a good fit for customer introductions this quarter."
+
+Recommended primary write:
+
+```json
+{
+  "user_id": "workos_user_id",
+  "run_id": "sha256:memory_hash",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Mark wants to help Ray raise a seed round by finding warm investor introductions."
+    }
+  ],
+  "infer": false,
+  "metadata": {
+    "memory_scope": "mailbox_owner_private",
+    "scope": "contact",
+    "contacts_id": "12345",
+    "master_person_id": "67890",
+    "source_type": "leverage_loop_request",
+    "source_platform": "orbiter_leverage_loops",
+    "suggestion_request_id": "456",
+    "copilot_mode": "loop",
+    "outcome_class": "find_investors",
+    "source_id": "suggestion_request:456",
+    "visibility": "private_user",
+    "confidence": "high",
+    "memory_hash": "sha256:memory_hash",
+    "canonical_memory_hash": "sha256:canonical_hash",
+    "schema_version": "2026-06-23"
+  }
+}
+```
+
+Optional secondary write:
+
+- Also write a user-general memory under `memory_scope = "user_private"` when the loop reveals a durable user preference or goal independent of the target contact.
+- Example: "Mark often uses Orbiter to find warm investor paths for founder friends."
+
+Do not write a global master-person memory from a Leverage Loop. The loop is private relationship context.
+
+### 7. Manual notes to memories
+
+Notes should create private memories when the user intentionally writes something worth remembering. Notes are high-signal, but the current frontend stores only title and a short preview in Xano while the full content lives in Tiptap. The memory writer must therefore use full note content when available, not only the 80-character preview.
+
+Current frontend note API:
+
+- Create: `POST /my-notes`
+- Update: `PUT /my-notes/{id}`
+- Delete: `DELETE /my-notes/{id}`
+- Person key: `my_person_id`
+- Company key: `my_company_id`
+- Mentions: `my_person_mentions[]`, `my_company_mentions[]`
+
+Recommended source function:
+
+```text
+mem0/sync-note-memory-v1
+```
+
+Inputs:
+
+```json
+{
+  "my_note_id": 123,
+  "dry_run": true,
+  "force_refresh": false
+}
+```
+
+Person note policy:
+
+- If `my_person_id` is present, resolve it to `contacts.id` and `master_person.id`.
+- Write a private contact memory with `source_type = "manual_user_note"`.
+- Use `contacts_id` as the primary retrieval key.
+- Mentions become related people/company metadata unless the note directly says something durable about the mentioned entity.
+
+Company note policy:
+
+- If `my_company_id` is present, resolve it to `my_company.id` and `master_company.id`.
+- Write a private company memory with `source_type = "manual_company_note"`.
+- Retrieve it through a company memory endpoint, not the contact memory endpoint.
+
+General note policy:
+
+- If neither `my_person_id` nor `my_company_id` is present, write a private user memory with `memory_scope = "user_private"`.
+- If the note contains mentions, store related entity metadata and fan out only when the note contains durable facts about those entities.
+
+Recommended person-note payload:
+
+```json
+{
+  "user_id": "workos_user_id",
+  "run_id": "sha256:memory_hash",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Mark noted that Ray is the best person to ask for climate fintech investor feedback."
+    }
+  ],
+  "infer": false,
+  "metadata": {
+    "memory_scope": "mailbox_owner_private",
+    "scope": "contact",
+    "contacts_id": "12345",
+    "master_person_id": "67890",
+    "source_type": "manual_user_note",
+    "source_platform": "orbiter_notes",
+    "my_note_id": "123",
+    "source_id": "my_note:123",
+    "related_contact_ids_csv": "222,333",
+    "related_master_company_ids_csv": "777",
+    "visibility": "private_user",
+    "confidence": "user_asserted",
+    "memory_hash": "sha256:memory_hash",
+    "canonical_memory_hash": "sha256:canonical_hash",
+    "schema_version": "2026-06-23"
+  }
+}
+```
+
+Recommended company-note payload:
+
+```json
+{
+  "user_id": "workos_user_id",
+  "run_id": "sha256:memory_hash",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Mark noted that Acme is a strong strategic partner candidate for Orbiter."
+    }
+  ],
+  "infer": false,
+  "metadata": {
+    "memory_scope": "company_private",
+    "scope": "company",
+    "my_company_id": "555",
+    "master_company_id": "777",
+    "source_type": "manual_company_note",
+    "source_platform": "orbiter_notes",
+    "my_note_id": "124",
+    "source_id": "my_note:124",
+    "visibility": "private_user",
+    "confidence": "user_asserted",
+    "memory_hash": "sha256:memory_hash",
+    "canonical_memory_hash": "sha256:canonical_hash",
+    "schema_version": "2026-06-23"
+  }
+}
+```
+
+Update/delete behavior:
+
+- On note autosave/update, recompute the memory and update or replace the indexed Mem0 memory.
+- On note delete, delete or hide the linked Mem0 memories.
+- If a note's primary entity changes, delete/hide the old memory and write a new one under the new scope.
+- If a note is shared/collaborative, preserve the original owner's `user_id` scope unless Orbiter explicitly supports team/shared memory later.
+
+### 8. Product-event memory writer
+
+Rather than sprinkling Mem0 calls across Outcome, Leverage Loop, Notes, and future features, create one event-normalizing writer:
+
+```text
+mem0/sync-product-event-memory-v1
+```
+
+It can route internally by `source_type`:
+
+- `outcome_request`
+- `leverage_loop_request`
+- `manual_user_note`
+- `manual_company_note`
+- `chat_outcome`
+
+Required responsibilities:
+
+1. Load the source row from Xano.
+2. Verify the authenticated user owns the source.
+3. Resolve primary entity: user self, contact, company, or none.
+4. Resolve related contacts/companies from mentions, selected target, participants, and generated result context.
+5. Extract durable atomic memory statements.
+6. Reject transient or sensitive statements.
+7. Compute deterministic hashes.
+8. Write to Mem0 with `infer=false`.
+9. Persist the write to `mem0_memory_index`.
+10. Return a dry-run preview for QA.
+
+## Categories and filters
+
+Mem0 custom categories are project-level and auto-assigned to future memories. Keep the category list concise and put fine-grained source/provenance detail in metadata.
+
+Candidate category catalog:
+
+```json
+[
+  { "relationship_context": "How the user knows the contact and what the relationship means" },
+  { "interaction_history": "Emails, meetings, calls, and prior conversations" },
+  { "professional_history": "Roles, education, investments, affiliations, and public work history" },
+  { "preferences_and_style": "Communication preferences, working style, interests, and personal preferences" },
+  { "commitments_and_followups": "Promises, tasks, asks, next steps, and open loops" },
+  { "deal_or_opportunity_context": "Fundraising, investing, sales, hiring, partnerships, and strategic opportunities" }
+]
+```
+
+Use metadata for:
+
+- `source_type`
+- `contacts_id`
+- `self_contacts_id`
+- `master_person_id`
+- `my_company_id`
+- `master_company_id`
+- `suggestion_request_id`
+- `my_note_id`
+- `source_id`
+- `confidence`
+- `visibility`
+- `memory_hash`
+
+Use categories for broad UI filters and analytics, not for primary identity joins.
+
+## UI ideas
+
+### Contact Side Panel: Memories tab
+
+The first product surface should be a scrollable Memories tab in the Contact Side Panel.
+
+- Infinite/paginated scroll over all memories for the current `contacts_id`.
+- Uses `GET /contacts/{contacts_id}/memories`, backed first by `#13145` output.
+- Shows graph-edge and email-thread bootstrap memories immediately after contact creation.
+- Later shows calendar, How I Know, chat/outcome, and manual-note memories as they are added.
+- Filters for source, category, scope, confidence, and date.
+- Source chips: Graph, Email, Calendar, How I Know, Chat, Manual.
+- Private/global toggle so users can distinguish public master-person facts from private relationship memories.
+- Related people chips for email and calendar memories, backed by resolved `contacts.id` / `master_person.id`.
+- Outcome and Leverage Loop chips when a saved request created the memory.
+- Provenance drawer for each memory.
+- "Used in AI answer" badges when a memory influenced a generated response.
+- User feedback buttons: useful, wrong, outdated, private, delete.
+- Empty state: "No memories yet" plus a "Build memories" action if bootstrap has not run.
+- Loading state: "Building memories from graph, email, and calendar" while bootstrap jobs are running.
+- Error state: show the bootstrap stage that failed (`master_person_sync`, email thread scan, calendar scan, Mem0 write, or email tone).
+
+### Contact timeline
+
+Use `timestamp` and `source_timestamp` to render memories chronologically:
+
+- First known public facts from the graph.
+- First user-owned touchpoint.
+- Email threads.
+- Meetings.
+- How I Know interviews.
+- Outcome requests and follow-ups.
+
+This becomes the human-readable relationship history.
+
+### Meeting prep memory pack
+
+Before a meeting, run a contact memory search:
+
+- "What changed since the last meeting?"
+- "What open loops do we have?"
+- "What should I avoid forgetting?"
+- "What does this person care about?"
+
+Use Mem0 temporal reasoning with a stable `reference_date`, and include the top memories in Meeting Prep.
+
+### Relationship memory QA
+
+Add a review queue for newly created memories:
+
+- Low confidence
+- Contradictory with existing memory
+- Sensitive / possibly private
+- Missing source link
+- Duplicate hash collision
+
+Human approval is not needed for every memory, but the system should surface questionable ones.
+
+### Ask this contact
+
+Add a contact-scoped assistant:
+
+- "How do I know Ray?"
+- "What has Ray invested in?"
+- "When did I last email Ray?"
+- "What does Ray usually respond to?"
+- "What intro angle should I use?"
+
+The answer should cite memory cards, not raw Mem0 text only.
+
+### User memory view
+
+Add a private user memory view for memories that are not primarily about another person:
+
+- personal goals
+- active outcomes
+- preferences
+- durable constraints
+- recurring interests
+- high-level working style
+
+This can live in account/profile settings first, and later appear in the user's own self-contact side panel if Orbiter consistently creates a self `contacts.id`.
+
+### Company memory tab
+
+Add a Company Side Panel Memories tab once company notes and company-scoped outcomes begin writing memories.
+
+- Uses `GET /companies/{my_company_id}/memories`.
+- Shows private company notes, company-scoped outcomes, and future company calendar/email context.
+- Keeps global master-company facts separate unless we later add `master_company:{id}` synthetic memory scope.
+
+## Feature ideas beyond the first tab
+
+### 1. Warm intro builder
+
+Use memories to draft intro requests with real context:
+
+- relationship evidence
+- recent touchpoints
+- why the ask is relevant
+- what not to mention
+
+### 2. Relationship freshness score
+
+Combine calendar/email recency, Mem0 memory decay, and user interactions to show whether a relationship is fresh, cooling, dormant, or recently reactivated.
+
+Mem0 decay is only a ranking bias, not a data retention policy, so Orbiter should still compute explicit freshness metrics in Xano.
+
+### 3. "What changed?" digests
+
+For important contacts, compare new memories since last viewed:
+
+- new public graph facts
+- new email commitments
+- new meetings
+- updated preferences
+- changed role/company
+
+### 4. Source-backed memory correction
+
+Let the user mark a memory wrong or outdated. Route that to:
+
+- Mem0 feedback API
+- Xano memory event log
+- optional Mem0 update/delete
+- source-specific blocklist or correction rule
+
+### 5. Contact-specific memory export
+
+Use Mem0 export to create structured person dossiers:
+
+- relationship summary
+- professional profile
+- interaction history
+- open loops
+- known preferences
+- source coverage
+
+This can power PDF/share views, admin audits, or migration backups.
+
+### 6. Multi-person meeting memory attribution
+
+Mem0 group chat support can attribute memories to named speakers. For calendar meetings with multiple participants, Orbiter can convert transcripts/notes into participant-attributed memories, then write one memory per resolved `contacts_id`.
+
+Use this carefully: names alone are not enough. Orbiter should resolve participants to contacts before writing durable memories.
+
+### 7. Contact memory as retrieval context everywhere
+
+Use the same contact-memory retrieval in:
+
+- Meeting Prep
+- Outcomes
+- Leverage Loops
+- How I Know
+- Deal Flow
+- Introduction drafting
+- Collection questions
+- Serendipity
+
+The retrieval contract stays the same; each surface just asks a different question.
+
+### 8. Memory quality analytics
+
+Track:
+
+- memories created per source
+- memories used in answers
+- feedback ratio
+- deleted/updated memories
+- source coverage by contact
+- stale memories never retrieved
+- high-confidence vs low-confidence distribution
+
+Use webhooks to keep a first-party Xano shadow/audit table in sync with Mem0 changes.
+
+## Guardrails
+
+### Mem0 is not the source of truth
+
+Canonical facts live in Orbiter:
+
+- identities and merges in Xano/FalkorDB
+- raw emails in the email/Nylas layer
+- calendar events in calendar tables
+- graph edges in the graph
+- user/contact ownership in `contacts`
+
+Mem0 stores the retrieval-optimized memory layer.
+
+### Never leak private contact memories into global scope
+
+Anything from a user's email, calendar, How I Know interview, Outcome, Leverage Loop, note, or chat belongs under that user's `user_id`.
+
+Only objective, graph-backed facts may be written to the synthetic global master-person scope. Email, calendar, How I Know, contact chat, and person-note memories stay private to the user's Mem0 scope with a primary `contacts_id`.
+
+During migration, `#13145` may still copy graph-backed facts into the user's private contact scope. The Contact Memories API should de-dupe those old copies against global master-person memories and hide or remove them once the global writer is trusted.
+
+For general user memories, use `memory_scope = "user_private"`. For company memories, use `memory_scope = "company_private"`. Do not force these through `contacts_id` unless the user self-contact or a deliberate contact-specific fact is the primary subject.
+
+### Prefer one atomic memory per contact
+
+If an email mentions three people, write separate contact-specific memories after participant resolution. Do not store `contacts_id` as an array unless Mem0 metadata filtering can support the exact query pattern.
+
+### Keep source provenance
+
+Every memory should be traceable to:
+
+- source system
+- source record ID
+- source timestamp
+- memory creation function/version
+- confidence
+- visibility
+
+If a memory cannot explain where it came from, it should not be shown in the UI as a trusted fact.
+
+### Be careful with `infer=false`
+
+Direct import is ideal for curated graph facts and Orbiter-extracted atomic memories, but it skips Mem0 duplicate detection. For every direct import source, Orbiter needs:
+
+- deterministic `memory_hash`
+- idempotency table
+- source row IDs
+- re-run policy
+- delete/update strategy
+
+## Suggested build phases
+
+### Phase 1: Contact memory foundation
+
+- Finalize metadata schema.
+- Build `mem0/sync-master-person-memories-v1` and synthetic `master_person:{id}` scope.
+- Trigger the bootstrap bundle when a `contacts.id` is first created.
+- Persist/track bootstrap status so the UI can show building, complete, dry-run, or failed states.
+- Build `GET /contacts/{contacts_id}/memories`.
+- Build the scrollable Contact Side Panel Memories tab.
+
+### Phase 2: Email-derived relationship memory
+
+- Move from one-time historical email bootstrap to incremental Nylas email writers.
+- Resolve email participants to contacts.
+- Extract atomic relationship memories.
+- Add confidence/sensitivity filters.
+- Write to Mem0 with `infer=false`.
+- Add provenance drawer and user feedback.
+
+### Phase 3: Outcome, Leverage Loop, and notes memory
+
+- Build `mem0/sync-suggestion-request-memory-v1`.
+- Trigger memory sync when an Outcome is submitted or resubmitted.
+- Trigger memory sync when a Leverage Loop is activated.
+- Resolve `for_master_person_id` to `contacts.id` server-side for loop contact memories.
+- Ensure the user's self-contact row exists before writing self-scoped user memories.
+- Build `mem0/sync-note-memory-v1`.
+- Trigger note memory sync on note create/update/delete for person notes, company notes, and general notes.
+- Build `GET /me/memories` and `GET /companies/{my_company_id}/memories`.
+
+### Phase 4: Calendar and meeting prep
+
+- Build `mem0/create-contact-calendar-memories-v1`.
+- Bootstrap historical and upcoming calendar memories when a contact is created.
+- Ingest incremental calendar updates with accurate `timestamp`.
+- Resolve event attendees to contacts/master persons and store related people metadata.
+- Add How I Know completed-interview writes if not already covered by live endpoints.
+- Generate meeting-prep memory packs.
+- Add temporal searches like "since last meeting" and "upcoming".
+
+### Phase 5: Quality and operations
+
+- Add Xano shadow table / event log.
+- Add Mem0 webhook processing.
+- Add correction/update/delete flows.
+- Add memory QA dashboard.
+
+### Phase 6: Advanced retrieval and product loops
+
+- Enable reranking for user-facing search.
+- Test criteria retrieval for importance/recency/trust.
+- Evaluate memory decay on a duplicate project before production.
+- Add structured exports for contact dossiers.
+
+## Open decisions
+
+- Should the synthetic global entity be exactly `master_person:{id}`, or should it include an environment prefix such as `orbiter:prod:master_person:{id}`?
+- Do we keep current How I Know `infer=true`, or standardize all source writes through Orbiter extractor -> `infer=false`?
+- Where should bootstrap run state live: a dedicated contact-memory job table, `log_crash`, or a new lightweight status field/table?
+- Should the Side Panel tab call Mem0 live each time, read from a Xano shadow table, or use a hybrid cache plus live refresh?
+- Should Mem0 categories be global across all Orbiter memories, or should contact memory live in a separate Mem0 project with its own category catalog?
+- Which memories should be editable by users, and which should only be removable/hidden?
+- What is the retention/deletion policy when a user deletes a contact, disconnects email, or revokes calendar access?
+- Do we expose low-confidence memories in the UI, or keep them in QA only?
+- How aggressive should related-contact fan-out be for group emails and calendar events?
+- Should upcoming calendar memories be stored in Mem0, kept only in calendar tables, or stored temporarily with expiration?
+- Is the self-contact row guaranteed for every user, and should self memories also set `contacts_id = self_contacts_id`?
+- Should company memories get a future global `master_company:{id}` scope, or remain private user/company memories for now?
+- Should note memory sync use full Tiptap content from Tiptap Cloud, a server-rendered plaintext export, or only Xano's stored note preview?

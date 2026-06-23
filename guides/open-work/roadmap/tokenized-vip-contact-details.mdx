@@ -61,6 +61,46 @@ stateDiagram-v2
   The rule that matches the physical padlock: **closing is free; peeking needs the key but stays locked; removing the lock is gated and confirmed.** Unlock lives behind a menu action with step-up + a "you sure?" confirm.
 </Warning>
 
+## Operator control model
+
+The operator's real question is *"what do I create, and what do I hold?"* — and the disciplined answer is **the operator controls the reveal, never the key.** There is no user-held token or key on this tier: the token is a system artifact, and every key lives in Cloud KMS under Orbiter's control. What the operator owns is the *decision surface* — when a field is protected, when it's looked at, and when it's destroyed.
+
+<Info>
+  **The operator never authors or holds a token.** The "token" is the blind index — `HMAC(normalize(value), index_key)` — that the backend derives on lock. It is a system-managed stand-in, not a credential the operator types, stores, copies, or can lose. "Only you hold the key" is the [enterprise/Atlas claim](#open-decisions), deliberately *not* this tier.
+</Info>
+
+### Create — locking is the only path
+
+A token comes into existence exactly one way in P1: the operator **locks** a field that already exists as plaintext. The click is free — no key, no challenge — and the backend does the rest (normalize → blind-index → encrypt → null the plaintext → write the token to the graph node). The operator's act is a single intent — *"protect this"* — not a key ceremony. P2 adds a second, automatic path — [born-locked ingestion](#phasing) that tokenizes known VIPs at the source — but that is system-authored too, never operator-authored.
+
+### Control — four verbs, escalating gates
+
+The operator's entire control vocabulary is four verbs, and the gate rises with the consequence:
+
+| Verb | Gate | Effect on the value | The token |
+| --- | --- | --- | --- |
+| **Lock** | none — free | plaintext → ciphertext | **created** |
+| **Reveal** | step-up (passkey), logged | decrypted for that moment | unchanged — peeked through the window |
+| **Unlock** | step-up **+ confirm** | plaintext re-materializes | removed |
+| **Shred** | step-up **+ confirm** | permanently unreadable | DEK destroyed; blind index may remain |
+
+Protecting is frictionless, **looking** costs a passkey, and **removing or destroying** costs a passkey *plus* an explicit "you sure?". That gradient — cheap to protect, costed to expose — *is* the control model.
+
+### What the operator holds vs. what Orbiter holds
+
+<CardGroup cols={2}>
+  <Card title="Operator — the decisions" icon="hand-pointer">
+    Which fields are locked, every reveal (passkey-confirmed), the unlock / shred lifecycle, and *read* access to the audit trail. Gated, logged, reversible-by-them, never bulk.
+  </Card>
+  <Card title="Orbiter — the crypto root" icon="key">
+    The per-tenant KEK and per-record DEKs (Cloud KMS), the Orbiter-managed blind-index key, step-up enforcement, and append-only audit writes. The operator holds none of this key material.
+  </Card>
+</CardGroup>
+
+<Note>
+  This split is what keeps the operator claim honest: the operator's control is real but **scoped to the reveal**, while the cryptographic root of trust stays with Orbiter. An operator who wants to hold the key *itself* is asking for the [enterprise BYOK tier](#open-decisions) — same crypto spine, different narrative: enterprise buys control of the *key*, the operator buys control of the *reveal*.
+</Note>
+
 ## Tiering
 
 Gating is reserved for the crown jewels. If friction bleeds onto ordinary contacts, the product feels broken.
@@ -76,6 +116,50 @@ Gating is reserved for the crown jewels. If friction bleeds onto ordinary contac
     Same crypto spine, but the **tenant** holds the KEK (EKM-backed). Atlas upsell, separate claim. Out of scope here; tracked separately.
   </Card>
 </CardGroup>
+
+## Key custody — why Orbiter holds the key
+
+The crown-jewel question for this tier is *who holds the key*. The answer is **Orbiter holds it** — the operator holds **reveal authority** (their passkey), not the key material. This is the deliberate, defensible choice, and it rests on one distinction security reviewers will test: **custody is not authority.**
+
+<Info>
+  **The decision in one line.** The operator's passkey *gates* every reveal; Orbiter's KMS-held KEK *performs* the decrypt. So "operator-controlled" is true and "Orbiter cannot decrypt" is **false** — and conflating the two is the exact claim-drift the [BYOK boundary](#open-decisions) exists to prevent. We hold the key on purpose, because moving it off-server would delete the platform value the $100 tier is sold on.
+</Info>
+
+### Why not the operator, and not a hybrid (yet)
+
+| Option | Who holds the key | Honest claim | Intelligence on locked fields | Key-loss posture |
+| --- | --- | --- | --- | --- |
+| **A — Orbiter-custody** *(current)* | Orbiter (per-tenant KEK in Cloud KMS) | "Gated, logged, per-record, no bulk — nobody browses your book, not even Orbiter." **Never** "cannot decrypt." | **Full** — enrichment, dedup, shared-number edges, suggestions, search all survive (the blind index stays server-side) | Recoverable — re-enroll a passkey; the key never lived on the device |
+| **B — Operator-custody (device E2EE)** | The operator's device / passkey-derived key | "Orbiter literally cannot decrypt" — and that is genuinely true | **None** — no server enrich, no value-dedup, no shared-number edge, drops from suggestions/search | **Irreversible** — lost device = permanently lost data, unless a recovery party is added (which dilutes the claim back toward A) |
+| **C — Hybrid vault mode** | Per-field: default Orbiter, opt-in operator | Per-field — each field carries the claim it can actually back | Full by default; **none** on opted-in vault fields | Operator chooses per field |
+
+Option B earns the strongest *literal* claim but pays for it by making the most valuable contacts the least intelligent — a direct inversion of the product. It is also the wrong key-loss posture for a solo operator with no HSM or escrow, where a lost or replaced phone is routine. So B is the right **primitive** for a narrow use, not the right **default**.
+
+<Note>
+  **"Like enterprise" does not mean device-held keys.** Enterprise [BYOK](#open-decisions) is **EKM-backed and server-reachable**: the tenant controls and can revoke the key, but Orbiter's servers still decrypt to run intelligence. The enterprise property a buyer covets is *only-you-can-revoke + every access is gated and logged* — **not** vendor-blindness. Option A is the honest solo-tier analogue of that property. A human-device-held key (Option B) is a different, strictly more brittle thing, and we never market the two as equivalent.
+</Note>
+
+### The vault-mode exception
+
+True "we cannot decrypt" has exactly one honest home: a **per-field vault mode** (Option C) that promotes a specific crown jewel to operator-held E2EE. It applies when **both** conditions hold:
+
+1. The operator's stated threat is an **Orbiter-side compromise or rogue insider** — the one scenario default custody does *not* cover (see below) — and
+2. They **explicitly accept irreversible key-loss** for that field: they would rather destroy the number than have Orbiter able to surrender it.
+
+That is the only case where "cannot decrypt" is both true and worth its cost. Vault mode is a **demand-gated fast-follow, not a launch posture** — it ships only once pilot data proves the paranoid micro-segment exists, and only with airtight routing-integrity tests.
+
+<Warning>
+  **What default custody does NOT cover — say it plainly.** Option A protects excellently against the three likely breaches (stolen disk, stolen backup, leaked DB creds). It does **not** protect against app-server RCE, full compromise (KMS + DB + app), or a privileged insider with KMS+DB IAM — all of which can decrypt these fields. The step-up gate is an application-layer control enforced by the same backend an attacker would control; there is no cryptographic floor beneath it. The operator's worst fear — *leaked with me named as the source* — lands in this uncovered zone. That gap is precisely what the [vault-mode exception](#the-vault-mode-exception) exists to close, per field, for the buyer who needs it.
+</Warning>
+
+<AccordionGroup>
+  <Accordion title="The hard rule for copy">
+    A is defended by discipline, not by cryptography. Market the **capability** ("gated, logged, per-record, no bulk; nobody browses your book, not even Orbiter"), **never** the impossibility ("Orbiter cannot decrypt" / "not even we can read it"). One drift in a deck or press quote converts the strength into a deceptive-claim liability a reviewer will catch.
+  </Accordion>
+  <Accordion title="If vault mode ships">
+    Its unique failure mode is a routing bug that silently mis-classifies a vault field into the default path — quietly downgrading a "cannot decrypt" field to server-decryptable with no visible error. That manufactures a false claim harder to detect than A's drift. Treat routing-integrity tests and per-field messaging as first-class, must-pass gates.
+  </Accordion>
+</AccordionGroup>
 
 ## Architecture
 

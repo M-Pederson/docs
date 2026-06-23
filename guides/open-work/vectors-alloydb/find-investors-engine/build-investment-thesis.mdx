@@ -5,11 +5,11 @@ description: "Xano orchestrator that gathers investor context and hands off to t
 
 <div style={{padding: '20px', border: '3px solid #6B9FE8', borderRadius: '10px', background: 'rgba(107,159,232,0.08)', color: '#fff', margin: '16px 0'}}>
 
-<div style={{color: '#9BBDE8', fontSize: '1.3em', fontWeight: 'bold', marginBottom: '8px'}}>REMAINING PERSON-SIDE GOALS</div>
+<div style={{color: '#9BBDE8', fontSize: '1.3em', fontWeight: 'bold', marginBottom: '8px'}}>PERSON-SIDE STATUS</div>
 
-- **Person first:** enforce a person-side Signal NFX attempt before the investment thesis build relies on `master_person_id` context.
-- **Profile table writes:** verify the person path updates `investor_profile_person` (#475). The company path now writes `investor_profile_company` (#478) in the passing FirstMark sandbox run.
-- **Completion bar:** do not treat the thesis build as done until the relevant investor profile table row has been written or refreshed and the thesis row can be tied back to that profile context.
+- **Person first:** #12911 v3.3 now forces a person-side Signal NFX/profile refresh before direct/manual `master_person_id` thesis context is trusted.
+- **Profile table writes:** Scott Belsky sandbox QA confirmed `investor_profile_person` (#475) receives `derived_thesis_summary`.
+- **Completion bar:** Scott Belsky sandbox QA confirmed `investment_thesis` (#709), #475, `master_person.full_enrich`, and closeout logs all land green.
 
 </div>
 
@@ -17,9 +17,9 @@ description: "Xano orchestrator that gathers investor context and hands off to t
 
 <div style={{color: '#FF5C8A', fontSize: '1.3em', fontWeight: 'bold', marginBottom: '8px'}}>ACTIVE QA STATUS</div>
 
-This function is still being iterated on, but the company/fund path has passed the FirstMark sandbox smoke test.
+This function is still being iterated on. Person/angel thesis generation has passed sandbox QA. Company/fund enrichment is now bounded, but company thesis content is **not trusted** until the Cloud Run thesis builder stops returning mismatched firms.
 
-**Current known state as of June 22, 2026:** company-side thesis generation works in sandbox and writes both `investment_thesis` (#709) and `investor_profile_company` (#478). Person-side investor QA is still open; do not assume the Scott Belsky/person path is complete until it is tested separately.
+**Current known state as of June 23, 2026:** person-side Scott Belsky QA works in sandbox: final Phase 9 builds the thesis, #709 receives a non-empty `derived_thesis_summary`, #475 mirrors it, `master_person.full_enrich` closes true, and downstream company work stays bounded. Company-side smoke runs now create/enrich seed orgs and write #709/#478, but Cloud Run frequently returns a different investor than the requested `master_company_id` (for example `Heroic Ventures` receiving `Long Journey Ventures`). #12978 v1.6 contains the damage by forcing canonical local `firm_name`, rejecting mismatched GCP output, and logging the mismatch to #542.
 
 </div>
 
@@ -34,6 +34,33 @@ thesis/build-investment-thesis-in-gcp — 12978
 **Public entry point.** Gathers investor context in Xano, POSTs it to the GCP (Go / Cloud Run) backend which does the LLM + embedding work, then upserts the returned thesis metadata into the Xano `investment_theses` table. Workspace 3 (OrbiterV2).
 
 </Card>
+
+## June 23, 2026 Smoke-Run Findings
+
+The 100-subject smoke task exposed two separate company-side issues:
+
+| Area | Finding | Current state |
+|---|---|---|
+| Queue containment | `queue_enrich_person` (#582) and `queue_enrich_company` (#583) stayed at zero during the run. | Recursive queue fan-out is contained. |
+| Sandbox cap | With kill switches at roughly `300/300`, person and company leaf expansion hit the company cap around `master_company` id `303`. | The active run is not a clean QA pass; rerun with a higher cap after wiping sandbox. |
+| Task order | #185 v1.2 seeded people first, so person leaf-company creation raced ahead of the 50 seed orgs. | #185 v1.3 now seeds organizations first. |
+| Org dispatch | Fresh seed orgs relied on nested async dispatch from `master-company-new`; request history made this hard to verify. | #185 v1.3 runs org get/add sync with `hold_downstream=true`, then explicitly dispatches `mvp/enrich/enrich-master-company` for the returned `master_company_id`. |
+| Company thesis content | Cloud Run often returns a thesis for a lead/co-investor or unrelated firm instead of the requested company. | #12978 v1.6 rejects mismatched firm names and writes a safe diagnostic summary instead of corrupt content. |
+
+Patch summary from this pass:
+
+| Object | Patch | Why |
+|---|---|---|
+| `seed-invetment-thesis-smoke-test` task (#185) | v1.3 | Org-first deterministic smoke seed. Creates/resolves orgs with `hold_downstream=true`, explicitly dispatches company enrichment, then dispatches people. |
+| `thesis/build-investment-thesis-in-gcp` (#12978) | v1.6 | Replaces optional OR upsert with explicit person/company branches, forces canonical local firm names, and rejects GCP company outputs whose `firm_name` does not match the requested company. |
+
+Recommended next clean run:
+
+1. Clear sandbox with #4657.
+2. Set kill switches to at least `600/600`.
+3. Run #185 v1.3.
+4. Confirm #542 has `mode: "org-first-v1.3"` and `organization_enrich_dispatched: 50`.
+5. Confirm company thesis rows use canonical `firm_name`; any `REJECTED: GCP thesis firm_name mismatch` logs are backend thesis-builder defects, not Xano identity/enrichment defects.
 
 ## June 22, 2026 QA Handoff
 
@@ -62,6 +89,13 @@ Known good sandbox thesis summary written by #12978 v1.4:
 | `thesis/build-investment-thesis-in-gcp` (#12978) | v1.2 | Avoid local variable name `$response`; Xano serialized `$response|get...` into an invalid `$response[""]|get...`, causing `Unable to locate response:` crashes. |
 | `thesis/build-investment-thesis-in-gcp` (#12978) | v1.3 | Added response-shape diagnostics and fallback parsing for alternate Cloud Run response wrappers. |
 | `thesis/build-investment-thesis-in-gcp` (#12978) | v1.4 | Fixed the observed Cloud Run wrapper shape: `response.result = { data, error, meta }`. Now reads thesis fields from `response.result.data.*` and mirrors `derived_thesis_summary` to #478/#475 when present. |
+| `thesis/build-investment-thesis-in-gcp` (#12978) | v1.6 | Company safety rails: explicit person/company upsert branches, canonical local `firm_name`, and GCP firm-name mismatch rejection to prevent corrupt company thesis rows. |
+| `mvp/enrich/process-person-phase-9` (#12830) | v3.3 | Added a gated final-pass thesis build for angel/person investors after `investor_profile_person` has been refreshed. |
+| `mvp/enrich/enrich-master-person` (#13040) | v3.18 | Calls early Phase 9 without thesis, then final Phase 9 with `build_investment_thesis: true` so the thesis sees complete person context. |
+| `thesis/gather-investor-context-v3` (#12911) | v3.3 | Person branch forces Signal NFX and `person-extract-cb-signal` before reading `permalink_person` context, making direct #12978 person calls safer. |
+| `thesis/build-investment-thesis-in-gcp` (#12978) | v1.5 | Defaults `last_validated_date` to today's `YYYY-MM-DD` when Cloud Run returns a successful thesis without that field. |
+| `mvp/resolve/resolve-edges-certifications` (#12578) | v2.5 | Scoped every certification query to the input `master_person_id` so one person run cannot process unrelated certification backlog. |
+| `mvp/resolve/resolve-edges-honor` (#4574) | v4 | Scoped honor issuer-resolution queries to the input `master_person_id` so Phase 7 stays bounded. |
 
 Other related changes from this workstream:
 
@@ -73,6 +107,9 @@ Other related changes from this workstream:
 1. **Company investor classification was being lost.** FirstMark had a `fundable_org_id`, and the matching `fundable_organizations` row had `is_investor: true`, but the final `master_company` row was ending as `is_vc: false`. #12992 v4.9 repairs `is_vc` before Signal/thesis gates, and #12992 v4.10 reasserts it after `update-company-node`.
 2. **Signal NFX wrote the profile, but thesis stayed empty.** #478 existed, but #709 contained an empty row. The company orchestrator skipped future thesis builds because it only checked row existence/staleness. #12992 v4.11 treats an empty `derived_thesis_summary` as incomplete and rebuilds.
 3. **#12978 had response-handling failures.** The `$response` local variable name caused bad XanoScript serialization, and the Cloud Run payload was nested under `response.result.data`. #12978 v1.4 reads from the observed wrapper and writes `derived_thesis_summary` to #709 plus the relevant profile table.
+4. **Person-side thesis was never called at the right point.** The early Phase 9 investor-profile pass ran before later person context finished, and no final thesis pass existed. #12830 v3.3 and #13040 v3.18 add a final thesis build after person context and current-role sync are complete.
+5. **Phase 7 could process unrelated rows.** Certification and honor resolvers had unscoped table queries, which could make a Scott run chew through unrelated backlog before reaching final Phase 9. #12578 v2.5 and #4574 v4 scope those resolvers to the input person.
+6. **Company Cloud Run thesis output can bind to the wrong investor.** June 23 smoke rows showed valid company contexts coming back with unrelated `firm_name` values such as `Long Journey Ventures`, `StepStone Group`, and `Greylock Partners`. #12978 v1.6 prevents corrupt writes, but the Cloud Run builder still needs a backend fix so summaries are generated for the target entity.
 
 ### Sandbox QA evidence
 
@@ -102,25 +139,134 @@ Live spot check:
 - Live #709 and #478 were empty for `421` during this QA session.
 - Live `master_company_id = 1` is Montana State University, not FirstMark.
 
-### Person-side follow-up
+### Person-side sandbox QA
 
-The person investor path still needs fresh QA. Verify these before treating Scott Belsky/person-side thesis generation as complete:
-
-1. `thesis/gather-investor-context-v3` (#12911) should enforce a person Signal NFX attempt before returning final context for direct/manual #12978 calls.
-2. Person Signal NFX scraper (#2769) must write/refresh `investor_profile_person` (#475), not only raw scrape fields.
-3. #12978 v1.4 should mirror `derived_thesis_summary` to #475 when called with a non-zero `master_person_id`.
-4. The person enrichment path should not recurse into uncontrolled company creation. Watch `cascade_depth` and `current_company_only` gates.
-5. After a fresh sandbox wipe, run one person-only QA before combining person + company flows again.
-
-Suggested person QA checks:
+Fresh Scott Belsky sandbox run on June 23, 2026 used `master_person_id = 1` and returned `node_uuid = 847fc772-da52-4050-a9ae-95dfb4577ca6`. The run completed after the Phase 7 resolver scoping patches and final person-thesis gate.
 
 | Table | What to check |
 |---|---|
-| `master_person` | Scott Belsky row exists and enrichment has completed. |
-| `investor_profile_person` (#475) | Signal NFX fields and `derived_thesis_summary` are populated. |
-| `investment_thesis` (#709) | Row exists for `master_person_id`, not just `master_company_id`. |
-| `log_crash` (#542) | No Signal NFX, gather-context, or thesis-build crash/warn rows for the person id. |
-| `enrich_history_person` | Signal NFX / deep research steps show expected success state. |
+| `master_person` | Scott Belsky row exists, `visibility = true`, `master_company_id = 2`, `current_title = Partner`, `full_enrich = true`. |
+| `investor_profile_person` (#475) | Signal/Fundable investor fields are populated and `derived_thesis_summary` mirrors the #709 thesis summary. |
+| `investment_thesis` (#709) | Row exists for `master_person_id = 1` with non-empty `node_uuid`, `firm_name`, `investor_type`, and `derived_thesis_summary`. The observed row was created before #12978 v1.5, so `last_validated_date` was null on that run; future successful builds default the date in Xano. |
+| `log_crash` (#542) | Latest person logs show `investment thesis build passed`, final `phase-9`, `phase-10`, `phase-11`, `phase-12`, and `all phases passed`. |
+| `enrich_history_person` | `Master Person Enrich` closed `processing = false`, `enrich_success = true`; Signal NFX and xAI succeeded; Crunchbase remains false/idle when no Crunchbase permalink exists. |
+| Queues | Person queue (#582) empty. Company queue (#583) bounded to Scott-sourced leaf companies, all `processing = false`, `cascade_depth = 1`. |
+
+## Smoke Test Subjects
+
+Use these live Fundable-derived seed/enrich smoke-test fixtures for AI-related investment-thesis paths. People come from `fundable_people` (#667) through recent `fundable_angel_investments` (#679) attached to AI/agent/LLM-related deal rows and are listed by LinkedIn URL because `mvp/get-add/master-person-new` seeds from profile links. Organizations come from `fundable_organizations` (#666) through `fundable_institutional_investments` (#678) attached to Seed or pre-Seed AI-related deal rows and are listed by bare website domain because `mvp/get-add/master-company-new` seeds from domains.
+
+The inactive live-data task `seed-invetment-thesis-smoke-test` (#185) mirrors these rows as object-array variables, then dispatches full top-level get-add calls with `queue=false` and `cascade_depth=0` for manual smoke runs.
+
+### People
+
+| Name | LinkedIn URL |
+|---|---|
+| David Bartman | https://www.linkedin.com/in/david-bartman-04062518/ |
+| Fei-Fei Li | https://www.linkedin.com/in/fei-fei-li-4541247/ |
+| Lukasz Kaiser | https://www.linkedin.com/in/lukaszkaiser/ |
+| Vijay B. | https://www.linkedin.com/in/vbolina/ |
+| Joe Sullivan | https://www.linkedin.com/in/joesu11ivan/ |
+| Vincent Bouvier | https://www.linkedin.com/in/vincentbouvier/ |
+| Felix Blossier | https://www.linkedin.com/in/felix-blossier/ |
+| Quentin de Metz | https://www.linkedin.com/in/quentindemetz/ |
+| Arthur Mensch | https://www.linkedin.com/in/arthur-mensch/ |
+| Olivier Brourhant | https://www.linkedin.com/in/brourhant/ |
+| Régis Samuel | https://www.linkedin.com/in/regis-samuel/ |
+| Raphaël Nahum | https://www.linkedin.com/in/rnahum/ |
+| David Ioannidis | https://www.linkedin.com/in/david-ioannidis-4491b0182/ |
+| Mei-Shan Tan | https://www.linkedin.com/in/mei-shan-tan-ba7166a/ |
+| Wai Ling Chan | https://www.linkedin.com/in/wai-ling-chan-75581714/ |
+| Todd Persen | https://www.linkedin.com/in/toddpersen/ |
+| Ben Sigelman | https://www.linkedin.com/in/bensigelman/ |
+| Arman Suleimenov | https://www.linkedin.com/in/armansu/ |
+| Ant Wilson | https://www.linkedin.com/in/ant-wilson-46179937/ |
+| Nurdaulet Bazylbekov | https://www.linkedin.com/in/nurbaz/ |
+| Paul Forster | https://www.linkedin.com/in/paul-forster/ |
+| Jorn van Dijk | https://www.linkedin.com/in/jorn-vandijk/ |
+| Koen Bok | https://www.linkedin.com/in/koen-bok-029592137/ |
+| Brendan Foody | https://www.linkedin.com/in/brendan-foody-2995ab10b/ |
+| Noam Brown | https://www.linkedin.com/in/noam-brown-8b785b62/ |
+| Yash Patil | https://www.linkedin.com/in/yash-s-patil/ |
+| Mark Strande | https://www.linkedin.com/in/markstrande/ |
+| Mattias Miksche | https://www.linkedin.com/in/mattiasmiksche/ |
+| Kyle Tibbitts | https://www.linkedin.com/in/kyletibbitts/ |
+| Shuo Wang | https://www.linkedin.com/in/shuooo/ |
+| Leo Polovets | https://www.linkedin.com/in/lpolovets/ |
+| Julian Weisser | https://www.linkedin.com/in/julianweisser/ |
+| Sean Williams | https://www.linkedin.com/in/sean-weareunknown/ |
+| Sam Winward | https://www.linkedin.com/in/sam-winward/ |
+| Hugo Rodger-Brown | https://www.linkedin.com/in/hugorodgerbrown/ |
+| Nikesh Arora | https://www.linkedin.com/in/nikesh-arora-02894670/ |
+| Amit Agarwal | https://www.linkedin.com/in/amitto/ |
+| Jeff Dean | https://www.linkedin.com/in/jeff-dean-8b212555/ |
+| Elad Gil | https://www.linkedin.com/in/eladgil/ |
+| Mark Shmulevich | https://www.linkedin.com/in/mark-shmulevich/ |
+| Alexey Dosovitskiy | https://www.linkedin.com/in/alexey-dosovitskiy-3694a1a9/ |
+| Vadim Barshtak | https://www.linkedin.com/in/barshtak/ |
+| Konstantin Vinogradov | https://www.linkedin.com/in/kvinogradov/ |
+| David Peterson | https://www.linkedin.com/in/davidlpeterson3/ |
+| Brad Peltz | https://www.linkedin.com/in/brad-peltz-149771129/ |
+| JB Rudelle | https://www.linkedin.com/in/jbrudelle/ |
+| Gary Anssens | https://www.linkedin.com/in/gary-anssens/ |
+| Michael Benabou | https://www.linkedin.com/in/michael-benabou-a572936/ |
+| Mike Knoop | https://www.linkedin.com/in/mikeknoop/ |
+| Elias Torres | https://www.linkedin.com/in/eliast/ |
+
+### Organizations
+
+| Name | Domain |
+|---|---|
+| TTV Capital | ttvcapital.com |
+| Correlation Ventures | correlationvc.com |
+| Weekend Fund | weekend.fund |
+| FJ Labs | fjlabs.com |
+| HF0 | hf0.com |
+| Mintaka Ventures | mintakaventures.com |
+| Cambrian Ventures | cambrianhq.com |
+| Bling Capital | blingcap.com |
+| Sapphire Sport | sapphireventures.com |
+| CEAS Investments | ceasinvestments.com |
+| Betty and Will Ventures | bettyandwill.com |
+| Will Ventures | willventures.com |
+| A16Z Speedrun | a16z.com |
+| LMNT Ventures | lmnt.vc |
+| Penny Jar Capital | pennyjar.com |
+| Telegraph Hill Capital | thcap.com |
+| Hyundai Motor Company | hyundai.com |
+| Collaborative Fund | collabfund.com |
+| South Park Commons | southparkcommons.com |
+| Naver | navercorp.com |
+| Susa Ventures | susaventures.com |
+| Repeat | repeat.vc |
+| Tekton Ventures | tektonventures.com |
+| People Ventures | people.ventures |
+| Golden Sparrow Ventures | goldensparrow.vc |
+| Creandum | creandum.com |
+| Z21 Ventures | z21.ventures |
+| Hersir Ventures | hersir.ventures |
+| Leap435 | leap435.vc |
+| Asterion Ventures | asterionventures.com |
+| Zero Infinity Partners | zeroinfinitypartners.com |
+| Heroic Ventures | heroicvc.com |
+| EIT Urban Mobility | eiturbanmobility.eu |
+| PeakBridge | peakbridge.vc |
+| āltitude | altitude-vc.com |
+| Gekko Capital Partners | gekkocapital.partners |
+| seed + speed Ventures | seedandspeed.com |
+| Flybridge Capital Partners | flybridge.com |
+| NFX | nfx.com |
+| Carao Ventures | caraov.com |
+| Textbook VC | textbook.vc |
+| Pear VC | pear.vc |
+| Underscore VC | underscore.vc |
+| Kleiner Perkins | kleinerperkins.com |
+| NovaWave Capital | novawavecapital.com |
+| Kima Ventures | kimaventures.com |
+| Better Angle | better-angle.com |
+| Super Capital | supercapital.club |
+| another.vc | another.vc |
+| Aonia Ventures | aonia.vc |
 
 ## `gather-investor-context-v3`
 
@@ -373,6 +519,8 @@ Notes for Signal NFX scrapes:
 
 _Progress notes land here as we iterate. Newest first._
 
+- **June 23 smoke-task hardening + company thesis guard** — #185 v1.3 now seeds organizations first and explicitly dispatches company enrichment from the task. #12978 v1.6 prevents corrupt company thesis writes by forcing canonical local firm names, replacing optional OR upsert matching with explicit person/company branches, and rejecting mismatched Cloud Run firm output. The remaining company-side blocker is the Cloud Run thesis builder returning the wrong investor from otherwise valid company contexts.
+- **June 23 person-side QA passed** — Scott Belsky sandbox run now closes `master_person.full_enrich = true`, writes `investment_thesis` (#709), mirrors `derived_thesis_summary` to #475, and keeps queues bounded. Published #12830 v3.3, #13040 v3.18, #12911 v3.3, #12978 v1.5, #12578 v2.5, and #4574 v4 during the pass.
 - **June 22 QA handoff added** — company-side FirstMark sandbox test passed after #12991 v1.2, #12992 v4.9-v4.11, and #12978 v1.2-v1.4. Person-side investor QA remains open.
 - **Fixed GCP response parsing** — #12978 v1.4 reads the observed wrapper from `response.result.data.*` and mirrors `derived_thesis_summary` to #478 or #475.
 - **Fixed company thesis rebuild gating** — #12992 v4.11 treats an existing #709 row with empty `derived_thesis_summary` as incomplete, so failed pre-patch thesis rows do not suppress rebuilds.

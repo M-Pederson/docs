@@ -1,0 +1,175 @@
+---
+title: "loop_generic Harness Suggestions"
+sidebarTitle: "loop_generic Harness Suggestions"
+description: "Build spec for the evaluation harness that reviews leverage-loop suggestions — cache raw, derive live, and put a labeled corpus behind every lever."
+icon: "flask-vial"
+---
+
+<Note>
+Companion to [**Loop: Generic**](/guides/open-work/suggestion-recipes/loop-generic). That page defines the scoring method; this one specifies the harness that measures it. The harness reuses the `loop_generic` scoring function with every constant promoted to a parameter — so build that function first, then build this around it. No synthetic demo here: this is the spec to implement against your own cached scores.
+</Note>
+
+## The keystone
+
+This one decision determines whether the harness is an instrument or a toy.
+
+<Warning>
+**Cache the raw cosines and graph signals. Never cache z-scores or composites.** Z-scores are pool-relative and version-bound — caching them freezes your normalization choice and locks you out of the single most important lever. Cache the layer that's expensive and stable (the cosines, the graph reads), and make every transform above it a **pure function of `(raw record, config)`**.
+</Warning>
+
+With that boundary in place the harness becomes a CPU-only replay: every lever change re-scores the entire labeled corpus in milliseconds. That is the difference between a per-target tuner (intuition) and a harness (statistics over the whole corpus). Get this boundary right and everything else — every metric, chart, and ablation — is a trivial consumer of one function.
+
+---
+
+## What to cache
+
+One record per target→candidate pair:
+
+```jsonc
+{
+  "target_id": "...", "candidate_id": "...",
+  "diag":  { "identity":0.62, "domain":0.72, "soft":0.55, "track":0.68,
+             "public":0.76, "passion":0.74, "comm":0.58 },        // 7 raw cosines
+  "cross": { "domain_passion":0.50, "passion_domain":0.41, ... }, // off-diagonal cells
+  "graph": { "dist":3, "jaccard":0.14, "node_brokerage":0.45 },   // snapshotted from FalkorDB
+  "pool_id": "ego:target_id@2026-06-24",   // WHICH candidate set defined the z-population
+  "verdict": { "peer":"good", "complement":"bad" },               // per-mode ground truth
+  "reason":  "already_connected",                                 // failure / success code
+  "prov":    { "prompt_version":"v7", "embedding_model":"gemini-embedding-2",
+               "scored_at":"2026-06-24T..." }
+}
+```
+
+Four fields people forget and then chase ghosts over:
+
+| Field | Why it's non-negotiable |
+|-------|-------------------------|
+| `cross` | Without the off-diagonal cells you cannot tune serendipity offline — you're back to re-embedding on every experiment. |
+| `pool_id` | Z-scoring shifts when the ego network changes; you must know which population a score was normalized against. |
+| `verdict` *(per mode)* | Peer and complement have different ground truth — a candidate good for war-stories can be wrong as a complement. |
+| `prov` | Raw scores are only comparable within one prompt+model version. Mixing versions silently corrupts every metric — tag it, and filter on it. |
+
+---
+
+## The replay function
+
+It is the `loop_generic` scoring function with every constant promoted to a parameter. Two pure functions:
+
+- `score(record, config) → { diag, serZ, lift, dropped }`
+- `rank(scored[], config) → { diagonal, serendipity, overall }`
+
+The config surface **is** your lever inventory:
+
+```jsonc
+{
+  "mode": "peer|complement",
+  "norm": "pool|global|none",                                  // z-population
+  "operator": "softmax|mean|max|topk", "temp": 2.0,            // driver pooling
+  "gate": 1, "maxhop": 4, "prox": {"2":1.0,"3":0.6,"4":0.25},  // graph
+  "family": ["domain","public","passion"],                     // serendipity cross-block
+  "soft_as_driver": false,                                     // role assignment
+  "w": { "dom":1,"pub":1,"pas":1, "drivers":0.55,"valence":0.20,
+         "bridge":0.15,"mod":0.05, "node_nudge":0.30 },
+  "tau": 0.50, "ser_bonus": 0.6                                // serendipity promotion
+}
+```
+
+<Warning>
+Three implementation details that bite:
+
+1. **Normalize per dimension.** `norm` fits a z over the `pool_id` population (`pool`), or uses corpus-global μ/σ (`global`), or passes raw through (`none`). Standardizing across all dimensions at once is wrong — each dimension baselines differently.
+2. **Standardize each cross-cell *type* separately before the argmax.** `passion→domain` baselines differently than `domain→public`; without per-type standardization the argmax just always picks the highest-baseline cell type.
+3. **Don't min-max the two lanes and take the max for `overall`** — that over-weights serendipity, because the top of each min-maxed lane always hits 1.0. Use the diagonal as the backbone with a serendipity *promotion*:
+
+   `overall = diag + ser_bonus · max(0, lift − tau)`
+
+   Strong-diagonal candidates stay ranked correctly; a high-lift serendipity hit climbs in. This also makes the "drop serendipity" ablation produce a *real* metric delta instead of zero.
+</Warning>
+
+---
+
+## Levers, in three tiers
+
+<Steps>
+<Step title="Structural — build these first, they move the metric most">
+Normalization population; driver aggregation operator; connectivity gate (≤1 / ≤2 / off); role-and-sign assignment (which dims are drivers / valence / modifier, and `mode` flipping the sign); the distance→proximity curve and max-hop; serendipity family membership (3 vs +`track`).
+</Step>
+<Step title="Continuous — the easy sliders">
+Per-dimension driver weights (expose these **individually** — the point is to *discover* that `public` should outweigh `domain`, not assume it), soft-max temperature, the four bucket weights, the node-broker nudge, the lift floor `tau`.
+</Step>
+<Step title="Ablation presets — each reports Δ headline metric vs the current config">
+No gate · mean-pool · no z-score · drop serendipity · family-+track. The delta is the quantified cost of removing that component.
+</Step>
+</Steps>
+
+<Info>
+**The ablation deltas double as patent evidence.** "Removing the gate drops precision@3 by N points on the labeled corpus" is a defensible non-obviousness argument for the gated-brokerage element — generated for free by the harness, and collected in [IP Notes](/guides/open-work/suggestion-recipes/ip-notes). *(Not legal advice; flag for counsel.)*
+</Info>
+
+---
+
+## Ground truth capture
+
+Three traps that quietly invalidate evaluation harnesses.
+
+<AccordionGroup>
+<Accordion title="Blind the reviewer to the score" icon="eye-slash">
+If they see "0.87" before judging, they confirm the ranking and you've measured nothing. Capture the verdict **first**; reveal the score breakdown **after**. The reviewer judges the introduction, not the number.
+</Accordion>
+<Accordion title="Reason codes, not yes/no" icon="tags">
+A thumbs-down is noise; a reason attributes the failure to a lever. This map is the most valuable artifact the harness produces — surface a live "your false positives are 3× `already_connected`" panel and it points straight at the fix.
+
+| Reason | Maps to |
+|--------|---------|
+| `already_connected` | tighten gate to dist ≤ 1 |
+| `no_thread` (diffuse) | raise soft-max temp / lower drivers bucket — reward spikes |
+| `no_bridge` (connector trap) | lower node-broker nudge; weight pairwise bridge |
+| `matched_skills` | keep `soft_skills` a modifier (invert in complement), not a driver |
+| `wrong_direction` | **no lever** — the 8 dims miss asymmetric value (seniority / direction) |
+| `stale` | **no lever** — add a freshness / bitemporal decay signal |
+
+The two no-lever reasons are the important ones: they mark where the eight dimensions are blind and motivate the next signal to add.
+</Accordion>
+<Accordion title="Selection bias — you can't measure recall on what you never surfaced" icon="filter">
+You only get labels for candidates the current params ranked highly; ones they buried never enter the review queue. So you cannot measure recall, and you'll happily overfit to "the rankings I already produce." Periodically **inject random and low-ranked candidates** into the review set to sample the buried space.
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Metrics — ranking, not classification
+
+Positives are sparse, so use precision@k (top 3–5 is all you surface), MRR, and NDCG — not accuracy.
+
+**Measure the two lanes separately.** Serendipity runs lower precision but higher value-when-right; averaging the lanes hides both. Report the serendipity lane's **marginal contribution** — goods that reached overall top-k *only* via the serendipity promotion. That number is the lane's justification.
+
+Three panels beyond the headline:
+
+<CardGroup cols={3}>
+<Card title="Calibration" icon="chart-column">
+Acceptance rate bucketed by composite score. Rising left-to-right means the score discriminates; flat means no weighting will save it.
+</Card>
+<Card title="Sensitivity" icon="sliders">
+Perturb each lever across its range, measure Δ precision@k, sort descending. A triage list: tune the long bars, freeze the flat ones — fiddling with an insensitive lever only overfits it to noise.
+</Card>
+<Card title="Diagnostics" icon="wave-square">
+Per-dimension variance (a dim that's always ~0.6 carries no signal — down-weight it) and the driver correlation matrix (if domain/public/passion correlate, the soft-max double-counts; diversify the prompts).
+</Card>
+</CardGroup>
+
+---
+
+## Methodology guardrails
+
+With ~50 labels and 10+ tunable weights you will overfit instantly.
+
+- **Train/test split or k-fold, and report the held-out metric as the headline** — never the fit-set number. If you ever hand-tune to maximize the visible number, watch the held-out one.
+- **Frozen golden set** — fixed targets, pools, and known-good rankings, re-run on every change with a rank-churn alert.
+- **Version-drift diffing** — on any prompt or embedding bump, re-score the golden set and diff. Rankings *will* move because raw scores are version-bound; you want that surfaced, not silent.
+- **Versioned, diffable configs** — store param-sets as files so "A vs B on the same labeled data" is one comparison.
+
+---
+
+## What to build first
+
+The **replay function** and the **blind verdict-capture flow**. Everything else — every metric, chart, and ablation toggle — is a thin consumer of `evaluate(corpus, config)` once that pure function exists. Get the replay boundary right and the rest is reporting.

@@ -1,0 +1,2733 @@
+---
+title: "Fundable <> Orbiter Sync"
+description: "Scope for syncing Fundable source tables into Orbiter on a cron, then re-syncing the graph so Funding_Round nodes and investor, partner, portfolio-company edges stay current."
+---
+
+**Status: open work / scope.** This page defines the recurring `Fundable <> Orbiter Sync` lane: keep the raw Fundable tables current via cron, then replay the downstream node and edge materialization so the graph stays aligned with the relational source.
+
+<Warning>
+This will not be built or run in Xano. The Fundable table-update cron, changelog, update queue, and graph-sync workers should only be built in the new AlloyDB backend.
+</Warning>
+
+This is separate from [Fundable investor enrich](/guides/open-work/fundable-investor-enrich), which resolves sparse `fundable_organizations` rows on demand. This scope is about ongoing table freshness and graph consistency.
+
+## Goal
+
+Make Fundable an automatically refreshed source instead of a manual or one-off backfill surface.
+
+The cron should:
+
+1. Pull new and changed Fundable data on a fixed cadence.
+2. Upsert the core `fundable_*` tables using stable source identifiers.
+3. Record which organizations, people, deals, investments, and article rows changed.
+4. Re-process affected graph materialization paths after the relational writes succeed.
+5. Leave enough audit state to prove which rows were touched, skipped, retried, or failed.
+
+## Tables in scope
+
+| Table | Refresh responsibility | Downstream graph impact |
+|-------|------------------------|-------------------------|
+| `fundable_organizations` | Upsert organization identity, profile URLs, descriptions, funding/investment counts, `is_investor`, and public-company fields. | May update linked `master_company` fields, company node display properties, VC classification, and portfolio-company linkage. |
+| `fundable_people` | Upsert investor/person identity and links to canonical `master_person` rows where known. | May update person nodes and partner edges when the person participates in a deal. |
+| `fundable_deals` | Upsert rounds, dates, amounts, financing type, descriptions, and source freshness markers. | Drives `Funding_Round` node properties and the portfolio-company `RAISED` edge. |
+| `fundable_institutional_investments` | Upsert firm participation, lead/follow-on role, fund labels, and updated timestamps. | Drives company-to-round `LEAD_INVESTED_IN`, `INVESTED_IN`, and `FOLLOW_ON_INVESTED_IN` edges. |
+| `fundable_institutional_investments_person` | Upsert partner attribution for institutional investments. | Drives `INVESTMENT_PARTNER_IN` and `INVESTMENT_PARTNER_AT` person/company/round edges. |
+| `fundable_angel_investments` | Upsert angel investor participation on deals. | Drives angel person nodes and investor-to-round edges. |
+| `fundable_articles` | Upsert supporting article URLs and metadata for deal context. | No direct graph write in v1; feeds future enrichment context and audit. |
+
+## Changelog and update queue
+
+The sync should leave a durable changelog before any graph worker runs. This keeps table freshness and graph replay decoupled: the cron can finish with a complete record of what changed even if a downstream graph update fails and needs retry.
+
+<Card icon="database">
+
+```
+fundable_sync_runs - proposed
+```
+
+One row per cron run. Stores `started_at`, `finished_at`, `status`, `queue_stage`, `dry_run`, source window, watermark before/after, total fetched rows, changed row counts by table, skipped counts, failed counts, and a compact error summary.
+
+</Card>
+
+<Card icon="database">
+
+```
+fundable_change_log - proposed
+```
+
+One row per changed source entity. Stores `sync_run_id`, `source_table`, `source_id`, `change_type`, `before_json`, `after_json`, `diff_json`, `changed_fields`, `graph_impact_json`, and processing status. This is the canonical audit trail for what Fundable changed.
+
+</Card>
+
+<Card icon="clock-rotate-left">
+
+```
+fundable_graph_update_queue - proposed
+```
+
+Worker-ready graph update tasks derived from the changelog. Stores `change_log_id`, `queue_stage`, `update_type`, `fundable_deal_id`, `master_company_id`, `master_person_id`, `priority`, `status`, `attempt_count`, `last_error`, and timestamps. This is the retry surface for node and edge sync.
+
+</Card>
+
+<Warning>
+When executing the update queue, there are two development stages. Stage 1 is `pre-unlimited PDL`: only add queue rows for Fundable changes connected to already-linked `master_person`, `master_company`, and `company_funding_rounds` / `funding_rounds` records where the canonical table ref and node UUID are not null. Stage 2 is `with unlimited PDL`: after unlimited PDL is available in the AlloyDB backend, queue every Fundable deal and create or enrich the connected companies and people even when they do not exist yet, so every Fundable deal can land in the graph. Stage 1 is linked-record graph sync; Stage 2 is full Fundable graph expansion.
+</Warning>
+
+## Target AlloyDB architecture
+
+AlloyDB should own the sync state, changelog, and update queue. The raw Fundable mirror tables can live in the existing Fundable schema or a new `fundable` schema, but the control tables below must live next to the data they diff so the cron can do the comparison, upsert, changelog write, and queue derivation in one transaction per batch.
+
+Target runtime:
+
+| Concern | Target |
+|---|---|
+| Scheduler | Cloud Scheduler triggers a Cloud Run job. Start hourly; move to 15-30 minutes after the first stable week. |
+| Runtime | Go Cloud Run job/service using `pgx/v5` + `pgxpool` for AlloyDB. |
+| Source fetch | A Fundable source adapter that pages by `updated_at` or source cursor. If the source cannot filter by update time, use table-specific full scans with row hashes. |
+| Durable state | AlloyDB `fundable_sync_runs`, `fundable_change_log`, and `fundable_graph_update_queue`. |
+| Queue stage | Start with `pre_unlimited_pdl`. Move to `with_unlimited_pdl` only after the AlloyDB backend can create/enrich missing companies and people with unlimited PDL. |
+| Graph writes | Cloud Run worker writes to FalkorDB directly from AlloyDB source rows. Existing Xano functions are reference material only and should not be called by this backend. |
+| Backpressure | Update queue rows claimed with `FOR UPDATE SKIP LOCKED`, bounded batch size, attempt count, and retry backoff. |
+
+## Go implementation blueprint
+
+Build this as two Go binaries that share one internal package tree. The cron binary owns source fetch, diff, table upsert, changelog, and queue derivation. The worker binary owns queue claim, graph payload hydration, FalkorDB writes, and queue completion.
+
+Do not put Xano calls in the final path. Xano helpers are only reference implementations for graph shape.
+
+```text
+services/fundable-sync/
+  cmd/fundable-sync-cron/main.go
+  cmd/fundable-graph-worker/main.go
+  internal/config/config.go
+  internal/alloydb/pool.go
+  internal/source/adapter.go
+  internal/source/fundable_deals.go
+  internal/source/fundable_organizations.go
+  internal/source/fundable_people.go
+  internal/source/fundable_institutional_investments.go
+  internal/source/fundable_institutional_investments_person.go
+  internal/source/fundable_angel_investments.go
+  internal/source/fundable_articles.go
+  internal/sync/run.go
+  internal/sync/normalize.go
+  internal/sync/hash.go
+  internal/sync/diff.go
+  internal/sync/changelog.go
+  internal/sync/graph_impact.go
+  internal/queue/derive.go
+  internal/queue/claim.go
+  internal/graph/falkor.go
+  internal/graph/deal_replay.go
+  internal/graph/node_refresh.go
+  internal/graph/cypher.go
+```
+
+Recommended package contracts:
+
+```go
+package sync
+
+import (
+	"context"
+	"encoding/json"
+	"time"
+)
+
+type TableName string
+
+const (
+	TableOrganizations TableName = "fundable_organizations"
+	TablePeople        TableName = "fundable_people"
+	TableDeals         TableName = "fundable_deals"
+	TableInvestments   TableName = "fundable_institutional_investments"
+	TablePartners      TableName = "fundable_institutional_investments_person"
+	TableAngels        TableName = "fundable_angel_investments"
+	TableArticles      TableName = "fundable_articles"
+)
+
+type QueueStage string
+
+const (
+	QueueStagePreUnlimitedPDL  QueueStage = "pre_unlimited_pdl"
+	QueueStageWithUnlimitedPDL QueueStage = "with_unlimited_pdl"
+)
+
+type UpdateType string
+
+const (
+	UpdateDealReplay         UpdateType = "deal_replay"
+	UpdateCompanyNodeRefresh UpdateType = "company_node_refresh"
+	UpdatePersonNodeRefresh  UpdateType = "person_node_refresh"
+	UpdateEdgeRetire         UpdateType = "edge_retire"
+	UpdateOrphanEdgeAudit    UpdateType = "orphan_edge_audit"
+)
+
+type SyncWindow struct {
+	Start time.Time
+	End   time.Time
+	Limit int
+}
+
+type SourceRow struct {
+	Table           TableName
+	SourceID        string
+	SourceUpdatedAt *time.Time
+	Payload         json.RawMessage
+}
+
+type SourceAdapter interface {
+	Table() TableName
+	Fetch(ctx context.Context, window SyncWindow, cursor string) (rows []SourceRow, nextCursor string, err error)
+}
+
+type ExistingRow struct {
+	SourceID          string
+	SourceHash        string
+	SourcePayloadJSON json.RawMessage
+	RemovedAt         *time.Time
+}
+
+type ChangeLogInput struct {
+	SyncRunID       string
+	Table           TableName
+	SourceID        string
+	ChangeType      string
+	RowHashBefore   *string
+	RowHashAfter    string
+	BeforeJSON      json.RawMessage
+	AfterJSON       json.RawMessage
+	DiffJSON        json.RawMessage
+	ChangedFields   []string
+	GraphImpactJSON json.RawMessage
+}
+
+type GraphImpact struct {
+	EligibleForGraphSync bool     `json:"eligible_for_graph_sync"`
+	UpdateType           string   `json:"update_type,omitempty"`
+	QueueStage           string   `json:"queue_stage,omitempty"`
+	DedupeKey            string   `json:"dedupe_key,omitempty"`
+	FundableDealID       string   `json:"fundable_deal_id,omitempty"`
+	MasterCompanyID      *int64   `json:"master_company_id,omitempty"`
+	MasterPersonID       *int64   `json:"master_person_id,omitempty"`
+	IdentityBootstrapRequired bool     `json:"identity_bootstrap_required,omitempty"`
+	MissingIdentityRefs       []string `json:"missing_identity_refs,omitempty"`
+	SkipReason           string   `json:"skip_reason,omitempty"`
+	MissingFields        []string `json:"missing_fields,omitempty"`
+}
+```
+
+Use a fixed enum for table names and update types. Do not accept table names from request flags and splice them into SQL. CLI flags should map to one of the constants above.
+
+### Go developer quick start
+
+If you are building this for the first time, ignore the graph details until PR 5. The safest path is to ship the system in small PRs where each PR can be tested without guessing about the whole pipeline.
+
+| PR | Build this | Do not build yet | How you know it works |
+|---|---|---|---|
+| 1 | Config loader, AlloyDB pool, advisory lock, insert/update `fundable_sync_runs`. | Fundable fetch, changelog, queue, FalkorDB. | Running the job creates one `fundable_sync_runs` row with `status = complete`. |
+| 2 | `fundable_deals` source adapter in dry-run mode only. | Mirror-table writes. | Dry-run logs fetched deal IDs and row counts, but database tables do not change. |
+| 3 | Normalize, hash, diff, and upsert `fundable_deals`; write `fundable_change_log`. | Graph queue and FalkorDB writes. | First run writes changelog rows; second run over same window writes zero new changelog rows. |
+| 4 | Stage 1 queue derivation for `deal_replay` only. | Company/person fanout, removals, Stage 2. | Eligible linked deals create one active queue row per deal; unlinked deals are logged as ignored. |
+| 5 | Graph worker dry-run for one forced `deal_replay`. | Real FalkorDB writes. | Worker claims a row, rehydrates the deal, prints the Cypher operations it would run, and marks nothing complete unless `--dry-run=false`. |
+| 6 | Real graph write for one forced linked deal. | Broad scheduler rollout. | One `Funding_Round` node and one `RAISED` edge exist after two runs, with no duplicates. |
+| 7 | Add the remaining adapters one at a time. | Stage 2 unlimited-PDL behavior. | Each adapter has one dry-run fixture and one real linked-row smoke test. |
+| 8 | Add Stage 2 identity bootstrap in dry-run mode. | Enabling `with_unlimited_pdl` in production. | Dry-run reports exactly which missing companies/people would be created or enriched. |
+
+Use this mental model:
+
+```text
+source row -> normalized JSON -> row hash -> changelog -> queue row -> worker -> graph write
+```
+
+Do not make these decisions inside random call sites:
+
+| Decision | Where it belongs |
+|---|---|
+| Which Fundable table is allowed by a CLI flag | `config` package maps strings to `TableName` constants. |
+| Whether Stage 1 or Stage 2 behavior is active | `cfg.QueueStage`, copied into `fundable_sync_runs.queue_stage` and every queue row. |
+| Whether a changed row can touch the graph | `sync/graph_impact.go`. |
+| How duplicate queue rows collapse | `queue/derive.go`. |
+| How queue rows are claimed/retried | `queue/claim.go`. |
+| Which Cypher template runs | `graph/deal_replay.go` chooses from fixed helper functions. |
+
+Plain-English rules for the first implementation:
+
+- Start with `FUNDABLE_QUEUE_STAGE=pre_unlimited_pdl`.
+- Treat null `master_*_id` or null `*_node_uuid` as "not graph-ready" in Stage 1.
+- Never create missing companies or people in Stage 1.
+- Never call Xano from the AlloyDB backend.
+- Make every graph write idempotent so retrying the same queue row is safe.
+- Keep dry-run paths honest: dry run may read everything, but it must not write mirror tables, changelog rows, queue rows, or FalkorDB.
+
+### Local test harness
+
+Build these small fakes before connecting real Fundable or FalkorDB clients. They make the cron and worker testable by an ordinary Go unit test.
+
+```go
+type StaticAdapter struct {
+	table TableName
+	rows  []SourceRow
+}
+
+func (a StaticAdapter) Table() TableName {
+	return a.table
+}
+
+func (a StaticAdapter) Fetch(ctx context.Context, window SyncWindow, cursor string) ([]SourceRow, string, error) {
+	if cursor != "" {
+		return nil, "", nil
+	}
+	return a.rows, "", nil
+}
+```
+
+Use it in tests like this:
+
+```go
+func TestFundableDealsSecondRunIsNoop(t *testing.T) {
+	adapter := StaticAdapter{
+		table: TableDeals,
+		rows: []SourceRow{{
+			Table:    TableDeals,
+			SourceID: "deal_123",
+			Payload: json.RawMessage(`{"id":"deal_123","amount_usd":5000000}`),
+		}},
+	}
+
+	runFundableSyncForTest(t, adapter)
+	runFundableSyncForTest(t, adapter)
+
+	assertChangeLogCount(t, TableDeals, "deal_123", 1)
+}
+```
+
+Fake graph writer:
+
+```go
+type RecordedGraphQuery struct {
+	Name   string
+	Cypher string
+	Params map[string]any
+}
+
+type GraphResult struct {
+	RowsAffected int
+}
+
+type FakeGraphWriter struct {
+	Queries []RecordedGraphQuery
+}
+
+func (g *FakeGraphWriter) Query(ctx context.Context, name string, cypher string, params map[string]any) (GraphResult, error) {
+	g.Queries = append(g.Queries, RecordedGraphQuery{Name: name, Cypher: cypher, Params: params})
+	return GraphResult{RowsAffected: 1}, nil
+}
+
+func (g *FakeGraphWriter) ReadOnly(ctx context.Context, name string, cypher string, params map[string]any) (GraphResult, error) {
+	g.Queries = append(g.Queries, RecordedGraphQuery{Name: name, Cypher: cypher, Params: params})
+	return GraphResult{RowsAffected: 1}, nil
+}
+```
+
+Minimum tests before real graph writes:
+
+| Test | Expected result |
+|---|---|
+| Same source row twice | One changelog row after the first run, zero new changelog rows after the second run. |
+| Changed source row | One `update` changelog row with `changed_fields` populated. |
+| Stage 1 unlinked company/person | Changelog row is `ignored`; no queue row is created. |
+| Stage 1 linked deal | One active `deal_replay` queue row. |
+| Duplicate child changes for one deal | One active `deal_replay` queue row with multiple `change_log_ids`. |
+| Worker dry run | Claims queue rows and records planned graph queries, but does not mark rows `complete`. |
+| Worker retry | Failing graph query sets `status = retry`, increments `attempt_count`, and sets `not_before`. |
+
+### Cron control flow
+
+Implement the cron in this exact order so failures are easy to replay:
+
+```go
+func RunFundableSync(ctx context.Context, cfg Config, adapters []SourceAdapter) error {
+	pool := alloydb.MustOpenPool(ctx, cfg.AlloyDBDSN)
+	defer pool.Close()
+
+	lock, err := alloydb.TryAdvisoryLock(ctx, pool, "fundable_sync_cron")
+	if err != nil {
+		return err
+	}
+	if !lock.Acquired {
+		return nil
+	}
+	defer lock.Release(ctx)
+
+	window := ReadWindow(ctx, pool, cfg)
+	runID := InsertSyncRun(ctx, pool, window, cfg)
+
+	for _, adapter := range adapters {
+		if !cfg.ShouldRunTable(adapter.Table()) {
+			continue
+		}
+		if err := SyncTable(ctx, pool, runID, window, adapter, cfg); err != nil {
+			MarkRunFailed(ctx, pool, runID, err)
+			return err
+		}
+	}
+
+	return MarkRunComplete(ctx, pool, runID, window.End)
+}
+```
+
+`SyncTable` should page through source rows and process each page inside one AlloyDB transaction:
+
+```go
+func SyncTable(ctx context.Context, pool *pgxpool.Pool, runID string, window SyncWindow, adapter SourceAdapter, cfg Config) error {
+	cursor := ""
+	for {
+		rows, next, err := adapter.Fetch(ctx, window, cursor)
+		if err != nil {
+			return err
+		}
+		if len(rows) == 0 && next == "" {
+			return nil
+		}
+
+		if err := WithTx(ctx, pool, func(tx pgx.Tx) error {
+			normalized := NormalizeRows(rows)
+			existing := LoadExistingRows(ctx, tx, adapter.Table(), normalized.SourceIDs())
+			changes := DiffRows(existing, normalized)
+
+			if cfg.DryRun {
+				AccumulateDryRunStats(changes)
+				return nil
+			}
+
+			if err := UpsertMirrorRows(ctx, tx, adapter.Table(), normalized, runID); err != nil {
+				return err
+			}
+			changeIDs, err := InsertChangeLogRows(ctx, tx, runID, changes)
+			if err != nil {
+				return err
+			}
+			return DeriveGraphQueueRows(ctx, tx, runID, adapter.Table(), changeIDs)
+		}); err != nil {
+			return err
+		}
+
+		if next == "" {
+			return nil
+		}
+		cursor = next
+	}
+}
+```
+
+### Canonical hash rule
+
+Compute hashes in Go after normalization, then store the normalized JSON exactly as hashed. This avoids mismatches between app JSON ordering and Postgres JSONB text rendering.
+
+```go
+func CanonicalPayloadHash(payload any) (json.RawMessage, string, error) {
+	normalized := NormalizeFundablePayload(payload)
+	b, err := json.Marshal(normalized)
+	if err != nil {
+		return nil, "", err
+	}
+	sum := sha256.Sum256(b)
+	return b, hex.EncodeToString(sum[:]), nil
+}
+```
+
+Normalization requirements:
+
+| Field shape | Rule |
+|---|---|
+| Empty strings | Convert to `null` before hashing. |
+| URLs | Trim whitespace, lowercase scheme/host, remove tracking query params. |
+| Domains | Lowercase and strip `www.`. |
+| Arrays | Sort when order does not carry meaning. |
+| Timestamps | Convert to UTC RFC3339. |
+| Source fetch metadata | Remove before hashing unless it is a business field. |
+
+### SQL building blocks for Go
+
+Insert the run before source fetch starts:
+
+```sql
+INSERT INTO fundable_sync_runs (
+  trigger_type,
+  status,
+  queue_stage,
+  dry_run,
+  source_window_start,
+  source_window_end,
+  watermark_before,
+  lookback_minutes,
+  batch_size,
+  created_by
+) VALUES (
+  $1,
+  'running',
+  $2,
+  $3,
+  $4,
+  $5,
+  $6,
+  $7,
+  $8,
+  $9
+) RETURNING id;
+```
+
+Complete the run only after all table batches commit:
+
+```sql
+UPDATE fundable_sync_runs
+SET status = 'complete',
+    finished_at = now(),
+    watermark_after = $2,
+    fetched_counts_json = $3,
+    changed_counts_json = $4,
+    queued_counts_json = $5,
+    skipped_counts_json = $6
+WHERE id = $1;
+```
+
+Fail the run with compact error context:
+
+```sql
+UPDATE fundable_sync_runs
+SET status = 'failed',
+    finished_at = now(),
+    error_summary_json = jsonb_build_object(
+      'message', $2,
+      'source_table', $3,
+      'cursor', $4
+    )
+WHERE id = $1;
+```
+
+Load existing rows with table-specific SQL. The table name must come from the Go enum, never from user input:
+
+```sql
+SELECT id::text AS source_id,
+       source_hash,
+       source_payload_json,
+       removed_at
+FROM fundable_deals
+WHERE id = ANY($1::text[]);
+```
+
+Insert the changelog row after mirror-table diffing and before queue derivation:
+
+```sql
+INSERT INTO fundable_change_log (
+  sync_run_id,
+  source_table,
+  source_id,
+  change_type,
+  row_hash_before,
+  row_hash_after,
+  before_json,
+  after_json,
+  diff_json,
+  changed_fields,
+  graph_impact_json,
+  processing_status
+) VALUES (
+  $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+) RETURNING id;
+```
+
+Upsert an active queue item. This is the write that collapses many changed child rows into one `deal_replay` task:
+
+```sql
+INSERT INTO fundable_graph_update_queue AS q (
+  sync_run_id,
+  change_log_id,
+  queue_stage,
+  dedupe_key,
+  update_type,
+  priority,
+  fundable_deal_id,
+  funding_round_id,
+  funding_round_node_uuid,
+  fundable_org_id,
+  fundable_person_id,
+  master_company_id,
+  master_company_node_uuid,
+  master_person_id,
+  master_person_node_uuid,
+  payload_json
+) VALUES (
+  $1, $2, $3, $4, $5, $6,
+  $7, $8, $9, $10, $11,
+  $12, $13, $14, $15, $16
+)
+ON CONFLICT (dedupe_key) WHERE status IN ('queued', 'processing', 'retry')
+DO UPDATE SET
+  priority = LEAST(q.priority, EXCLUDED.priority),
+  payload_json = jsonb_set(
+    q.payload_json,
+    '{change_log_ids}',
+    coalesce(q.payload_json -> 'change_log_ids', '[]'::jsonb) || to_jsonb(EXCLUDED.change_log_id::text),
+    true
+  ),
+  updated_at = now()
+RETURNING id;
+```
+
+When a changelog row is not graph-eligible, mark it ignored inside the same transaction:
+
+```sql
+UPDATE fundable_change_log
+SET processing_status = 'ignored',
+    graph_impact_json = $2,
+    updated_at = now()
+WHERE id = $1;
+```
+
+## AlloyDB DDL
+
+Use these control tables before implementing the cron logic. If the team later moves them into a schema, keep the logical names and indexes the same.
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+CREATE TABLE fundable_sync_runs (
+  id                    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  trigger_type          text NOT NULL DEFAULT 'scheduled'
+    CHECK (trigger_type IN ('scheduled', 'manual', 'backfill', 'replay')),
+  status                text NOT NULL DEFAULT 'running'
+    CHECK (status IN ('running', 'complete', 'partial', 'failed', 'cancelled')),
+  queue_stage           text NOT NULL DEFAULT 'pre_unlimited_pdl'
+    CHECK (queue_stage IN ('pre_unlimited_pdl', 'with_unlimited_pdl')),
+  dry_run               boolean NOT NULL DEFAULT false,
+  source_window_start   timestamptz,
+  source_window_end     timestamptz NOT NULL DEFAULT now(),
+  watermark_before      timestamptz,
+  watermark_after       timestamptz,
+  lookback_minutes      integer NOT NULL DEFAULT 10,
+  batch_size            integer NOT NULL DEFAULT 500,
+  fetched_counts_json   jsonb NOT NULL DEFAULT '{}'::jsonb,
+  changed_counts_json   jsonb NOT NULL DEFAULT '{}'::jsonb,
+  queued_counts_json    jsonb NOT NULL DEFAULT '{}'::jsonb,
+  skipped_counts_json   jsonb NOT NULL DEFAULT '{}'::jsonb,
+  error_summary_json    jsonb NOT NULL DEFAULT '{}'::jsonb,
+  started_at            timestamptz NOT NULL DEFAULT now(),
+  finished_at           timestamptz,
+  created_by            text NOT NULL DEFAULT 'fundable-sync-cron'
+);
+
+CREATE INDEX fundable_sync_runs_status_started_idx
+  ON fundable_sync_runs (status, started_at DESC);
+
+CREATE INDEX fundable_sync_runs_watermark_idx
+  ON fundable_sync_runs (watermark_after DESC)
+  WHERE status = 'complete' AND dry_run = false;
+
+CREATE TABLE fundable_change_log (
+  id                    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  sync_run_id           uuid NOT NULL REFERENCES fundable_sync_runs(id),
+  source_table          text NOT NULL,
+  source_id             text NOT NULL,
+  change_type           text NOT NULL
+    CHECK (change_type IN ('insert', 'update', 'remove', 'restore')),
+  row_hash_before       text,
+  row_hash_after        text,
+  before_json           jsonb,
+  after_json            jsonb,
+  diff_json             jsonb NOT NULL DEFAULT '{}'::jsonb,
+  changed_fields        text[] NOT NULL DEFAULT '{}',
+  graph_impact_json     jsonb NOT NULL DEFAULT '{}'::jsonb,
+  processing_status     text NOT NULL DEFAULT 'logged'
+    CHECK (processing_status IN ('logged', 'queued', 'complete', 'ignored', 'failed')),
+  created_at            timestamptz NOT NULL DEFAULT now(),
+  updated_at            timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (sync_run_id, source_table, source_id, change_type)
+);
+
+CREATE INDEX fundable_change_log_run_idx
+  ON fundable_change_log (sync_run_id, source_table, change_type);
+
+CREATE INDEX fundable_change_log_source_idx
+  ON fundable_change_log (source_table, source_id, created_at DESC);
+
+CREATE INDEX fundable_change_log_status_idx
+  ON fundable_change_log (processing_status, created_at);
+
+CREATE TABLE fundable_graph_update_queue (
+  id                        uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  sync_run_id               uuid NOT NULL REFERENCES fundable_sync_runs(id),
+  change_log_id             uuid REFERENCES fundable_change_log(id),
+  queue_stage               text NOT NULL DEFAULT 'pre_unlimited_pdl'
+    CHECK (queue_stage IN ('pre_unlimited_pdl', 'with_unlimited_pdl')),
+  dedupe_key                text NOT NULL,
+  update_type               text NOT NULL
+    CHECK (update_type IN (
+      'deal_replay',
+      'company_node_refresh',
+      'person_node_refresh',
+      'edge_retire',
+      'orphan_edge_audit'
+    )),
+  status                    text NOT NULL DEFAULT 'queued'
+    CHECK (status IN ('queued', 'processing', 'complete', 'retry', 'failed', 'skipped')),
+  priority                  integer NOT NULL DEFAULT 100,
+  not_before                timestamptz NOT NULL DEFAULT now(),
+  locked_at                 timestamptz,
+  locked_by                 text,
+  attempt_count             integer NOT NULL DEFAULT 0,
+  max_attempts              integer NOT NULL DEFAULT 5,
+  fundable_deal_id          text,
+  funding_round_id          bigint,
+  funding_round_node_uuid   text,
+  fundable_org_id           text,
+  fundable_person_id        text,
+  master_company_id         bigint,
+  master_company_node_uuid  text,
+  master_person_id          bigint,
+  master_person_node_uuid   text,
+  payload_json              jsonb NOT NULL DEFAULT '{}'::jsonb,
+  result_json               jsonb NOT NULL DEFAULT '{}'::jsonb,
+  last_error                text,
+  created_at                timestamptz NOT NULL DEFAULT now(),
+  updated_at                timestamptz NOT NULL DEFAULT now(),
+  completed_at              timestamptz
+);
+
+CREATE INDEX fundable_graph_update_queue_claim_idx
+  ON fundable_graph_update_queue (status, priority, not_before, created_at);
+
+CREATE INDEX fundable_graph_update_queue_deal_idx
+  ON fundable_graph_update_queue (fundable_deal_id)
+  WHERE fundable_deal_id IS NOT NULL;
+
+CREATE INDEX fundable_graph_update_queue_funding_round_idx
+  ON fundable_graph_update_queue (funding_round_id)
+  WHERE funding_round_id IS NOT NULL;
+
+CREATE INDEX fundable_graph_update_queue_company_idx
+  ON fundable_graph_update_queue (master_company_id)
+  WHERE master_company_id IS NOT NULL;
+
+CREATE INDEX fundable_graph_update_queue_person_idx
+  ON fundable_graph_update_queue (master_person_id)
+  WHERE master_person_id IS NOT NULL;
+
+CREATE UNIQUE INDEX fundable_graph_update_queue_active_dedupe_idx
+  ON fundable_graph_update_queue (dedupe_key)
+  WHERE status IN ('queued', 'processing', 'retry');
+```
+
+### Raw Fundable mirror requirements
+
+Every mirrored Fundable source table needs these operational columns in AlloyDB, even if the business columns mirror the current Xano table names exactly:
+
+| Column | Purpose |
+|---|---|
+| `source_updated_at` | The source system's update timestamp, when available. |
+| `source_hash` | Stable SHA-256 hash of the normalized row payload. Used when timestamps are missing or unreliable. |
+| `source_payload_json` | Exact normalized source payload used to compute the hash. |
+| `first_seen_at` | First time this row was observed by the cron. |
+| `last_seen_at` | Last successful sync where this row appeared. |
+| `removed_at` | Soft-delete marker when a full snapshot proves the row disappeared. |
+| `last_sync_run_id` | `fundable_sync_runs.id` that last touched the row. |
+| `graph_synced_at` | Last time graph workers completed all updates derived from this row. |
+
+For stable diffing, the source adapter must normalize empty strings to `null`, trim URLs, lowercase domains, sort array fields, and remove volatile fetch metadata before hashing.
+
+### Graph eligibility gate
+
+Do not queue graph updates just because a Fundable row changed. The Fundable organization, person, and deal tables carry explicit back-reference fields that prove the row is already joined to the canonical table and graph node. If those fields are null, the cron should still write the table change and changelog row, but it should mark the changelog as `ignored` for graph sync and skip `fundable_graph_update_queue`.
+
+Queue derivation must branch by `queue_stage`:
+
+| Stage | Queue behavior | What this means in the graph |
+|---|---|---|
+| Stage 1: `pre_unlimited_pdl` | Only queue changes where the source row is already linked to canonical tables and graph nodes: `master_person`, `master_company`, and `company_funding_rounds` / `funding_rounds` refs are present and node UUIDs are not null. | Fundable updates improve the graph around companies, people, and rounds that already exist. New deals only enter when the company is already in the graph. |
+| Stage 2: `with_unlimited_pdl` | Queue every Fundable deal, then create/enrich missing companies and people through the AlloyDB unlimited-PDL identity path before graph writes. | Every Fundable deal should be represented in the graph, including deals where the company, investors, partners, or angels do not exist yet. |
+
+Stage 1 must not create missing canonical company/person records. Stage 2 is the first stage where missing Fundable-connected companies and people can be created and enriched before graph sync.
+
+Stage 1 required refs:
+
+| Fundable row | Required before graph update | If missing |
+|---|---|---|
+| `fundable_organizations` | `master_company_id` and `master_company_node_uuid` | Log the org change only; do not queue `company_node_refresh` or org-derived deal replays. |
+| `fundable_people` | `master_person_id` and `master_person_node_uuid` | Log the person change only; do not queue `person_node_refresh` or person-derived deal replays. |
+| `fundable_deals` | Funding-round table ref ID, `funding_round_node_uuid`, and the linked portfolio `fundable_organizations.master_company_id` / `master_company_node_uuid` | Log the deal change only; do not queue `deal_replay`. |
+
+Use the exact local column names in AlloyDB. Current Xano docs already reference `fundable_deals.funding_round_node_uuid`, `fundable_organizations.master_company_id`, `fundable_organizations.master_company_node_uuid`, `fundable_people.master_person_id`, and `fundable_people.master_person_node_uuid`. If the Funding Round table ref ID is not yet mirrored beside `funding_round_node_uuid`, add it during the AlloyDB mirror migration so the worker can join to the canonical `funding_rounds` row without guessing.
+
+## Cron shape
+
+Use a scheduled task as the outer loop and keep the actual work in callable functions so the same code path can be used for sandbox, one-off repair runs, and production cron.
+
+Recommended phases:
+
+1. **Fetch window** - pull Fundable records changed since the last successful watermark, with a manual override for a specific organization, person, or deal.
+2. **Stage and diff** - normalize incoming rows, compare source hashes / `updated_at` values, and classify each row as `new`, `changed`, `unchanged`, or `removed`.
+3. **Relational upsert** - write changed rows into the relevant `fundable_*` table inside small batches. Do not start graph writes until the batch's table writes have completed.
+4. **Write changelog rows** - create one `fundable_change_log` row per changed entity, including JSON before/after snapshots and a structured `diff_json`.
+5. **Queue graph updates** - derive `fundable_graph_update_queue` rows according to `queue_stage`. In Stage 1, queue only rows that pass the linked-ref graph eligibility gate. In Stage 2, queue every deal and route missing companies/people through the unlimited-PDL identity path before graph writes.
+6. **Graph replay** - workers claim update-queue rows and run the AlloyDB sync helpers that reproduce the enrichment graph shape, relying on `MERGE` semantics so re-processing updates existing nodes and edges rather than duplicating them.
+7. **Audit and retry** - store batch id, row counts, changed ids, graph replay results, errors, and next retry time.
+
+## Developer build plan
+
+<Steps>
+  <Step title="1. Create the AlloyDB control tables">
+    Apply the DDL above in AlloyDB and confirm:
+
+    ```sql
+    SELECT to_regclass('fundable_sync_runs') IS NOT NULL AS has_sync_runs,
+           to_regclass('fundable_change_log') IS NOT NULL AS has_change_log,
+           to_regclass('fundable_graph_update_queue') IS NOT NULL AS has_update_queue;
+    ```
+
+    Do this before wiring Cloud Scheduler. The first deployed job should be able to create a `fundable_sync_runs` row and mark it `complete` without touching Fundable or FalkorDB.
+  </Step>
+
+  <Step title="2. Build the Cloud Run job skeleton">
+    Create a Go Cloud Run job named `fundable-sync-cron`. It should accept:
+
+    ```text
+    --dry-run=true|false
+    --source-table=all|fundable_organizations|fundable_people|fundable_deals|...
+    --since=optional ISO timestamp
+    --until=optional ISO timestamp
+    --limit=optional integer
+    --force-source-id=optional source id for smoke tests
+    ```
+
+    Required env:
+
+    ```text
+    ALLOYDB_DSN
+    FUNDABLE_SYNC_BATCH_SIZE=500
+    FUNDABLE_LOOKBACK_MINUTES=10
+    FUNDABLE_GRAPH_QUEUE_BATCH_SIZE=100
+    FUNDABLE_SOURCE_MODE=incremental
+    FUNDABLE_QUEUE_STAGE=pre_unlimited_pdl
+    ```
+
+    `FUNDABLE_QUEUE_STAGE` must start as `pre_unlimited_pdl`. Do not switch it to `with_unlimited_pdl` until the AlloyDB backend has the unlimited-PDL identity creation/enrichment path for companies and people.
+
+    The skeleton should only open an AlloyDB connection, acquire the singleton lock, insert `fundable_sync_runs`, and update it to `complete`.
+  </Step>
+
+  <Step title="3. Add the singleton lock and watermark reader">
+    Prevent overlapping scheduled runs with a Postgres advisory lock:
+
+    ```sql
+    SELECT pg_try_advisory_lock(hashtext('fundable_sync_cron')) AS acquired;
+    ```
+
+    If `acquired = false`, exit cleanly and do not create a failed run. The watermark for the next real run is:
+
+    ```sql
+    SELECT watermark_after
+    FROM fundable_sync_runs
+    WHERE status = 'complete'
+      AND dry_run = false
+      AND watermark_after IS NOT NULL
+    ORDER BY watermark_after DESC
+    LIMIT 1;
+    ```
+
+    Fetch from `watermark_after - lookback_minutes` through `now()`. The lookback protects against late-arriving source updates and clock drift.
+  </Step>
+
+  <Step title="4. Implement source adapters table by table">
+    Implement one adapter per Fundable table. Each adapter returns normalized rows with:
+
+    ```json
+    {
+      "source_table": "fundable_deals",
+      "source_id": "source stable id",
+      "source_updated_at": "2026-06-27T09:00:00Z",
+      "payload": {}
+    }
+    ```
+
+    Start in this order:
+
+    | Order | Adapter | Why first |
+    |---|---|---|
+    | 1 | `fundable_deals` | Validates `Funding_Round` node refresh and `processed_at` semantics. |
+    | 2 | `fundable_institutional_investments` | Validates investor company edge replay. |
+    | 3 | `fundable_institutional_investments_person` | Validates partner edge replay. |
+    | 4 | `fundable_organizations` | Validates company node refresh and deal fanout. |
+    | 5 | `fundable_people` | Validates person node refresh and angel/partner fanout. |
+    | 6 | `fundable_angel_investments` | Validates angel edge replay. |
+    | 7 | `fundable_articles` | Changelog only in v1; no graph worker required. |
+
+    Do not build all adapters before testing the first one. Ship table-by-table.
+  </Step>
+
+  <Step title="5. Stage, diff, and upsert in one transaction per batch">
+    For each fetched batch:
+
+    1. Normalize payload JSON.
+    2. Compute `source_hash = sha256(normalized_json)`.
+    3. Read the existing AlloyDB row by source id.
+    4. If hashes match, update `last_seen_at` only.
+    5. If hashes differ, insert a `fundable_change_log` row with `before_json`, `after_json`, `diff_json`, and `changed_fields`.
+    6. Upsert the raw Fundable mirror table.
+    7. Derive queue rows from eligible changelog rows.
+    8. If the row changed but required graph refs are null, set `processing_status = 'ignored'` and write `graph_impact_json.skip_reason`.
+
+    Use the Go `CanonicalPayloadHash` helper from this page as the source of truth. Do not compute production hashes from `jsonb::text`, because JSON key ordering and null handling can drift from the normalized payload the adapter produced.
+
+    Optional SQL-only debugging check:
+
+    ```sql
+    SELECT source_id, source_hash
+    FROM fundable_deals
+    WHERE source_id = $1;
+    ```
+
+    The diff JSON should be shallow and developer-readable:
+
+    ```json
+    {
+      "amount_usd": {"before": 5000000, "after": 7500000},
+      "financing_type": {"before": "Seed", "after": "Series A"}
+    }
+    ```
+  </Step>
+
+  <Step title="6. Derive graph updates from changelog rows">
+    Use deterministic mapping after applying the graph eligibility gate. Multiple changed rows may collapse into one active queue item through `dedupe_key`.
+
+    | Changed source table | Queue update |
+    |---|---|
+    | `fundable_deals` | For inserts, run `fundable/bootstrap-funding-round-ref` first when the portfolio company already has canonical refs. Then queue `deal_replay` only when the deal has funding-round table ref ID, `funding_round_node_uuid`, and portfolio-company refs. |
+    | `fundable_institutional_investments` | `deal_replay` for `deal_id` only when the parent deal has funding-round table ref ID and `funding_round_node_uuid`. |
+    | `fundable_institutional_investments_person` | `deal_replay` for the parent investment's `deal_id` only when the parent deal has funding-round table ref ID and `funding_round_node_uuid`. |
+    | `fundable_angel_investments` | `deal_replay` for `deal_id` only when the parent deal has funding-round table ref ID and `funding_round_node_uuid`. |
+    | `fundable_organizations` where the org is a portfolio company | `company_node_refresh` only when `master_company_id` and `master_company_node_uuid` are present; also `deal_replay` only for linked deals that have funding-round refs. |
+    | `fundable_organizations` where the org is an institutional investor | `company_node_refresh` only when `master_company_id` and `master_company_node_uuid` are present; also `deal_replay` only for joined deals that have funding-round refs. |
+    | `fundable_people` | `person_node_refresh` only when `master_person_id` and `master_person_node_uuid` are present; also `deal_replay` only for linked deals that have funding-round refs. |
+    | `fundable_articles` | No graph update in v1. Keep changelog only. |
+
+    Example active dedupe keys:
+
+    ```text
+    deal_replay:fundable_deal_id:{id}
+    company_node_refresh:master_company_id:{id}
+    person_node_refresh:master_person_id:{id}
+    ```
+
+    When a duplicate active queue item exists, append the new `change_log_id` to `payload_json.change_log_ids`, keep the lower priority number, and leave the row queued/retry unless it is already processing.
+
+    Skipped graph impact should be explicit:
+
+    ```json
+    {
+      "eligible_for_graph_sync": false,
+      "skip_reason": "missing_funding_round_ref",
+      "missing_fields": ["funding_round_id", "funding_round_node_uuid"]
+    }
+    ```
+  </Step>
+
+  <Step title="7. Build the graph update worker">
+    The worker can be the same Cloud Run service with a different entrypoint (`fundable-graph-update-worker`) or a second Cloud Run job. It claims queue rows with `FOR UPDATE SKIP LOCKED`:
+
+    ```sql
+    WITH claim AS (
+      SELECT id
+      FROM fundable_graph_update_queue
+      WHERE status IN ('queued', 'retry')
+        AND not_before <= now()
+        AND attempt_count < max_attempts
+      ORDER BY priority ASC, created_at ASC
+      LIMIT $1
+      FOR UPDATE SKIP LOCKED
+    )
+    UPDATE fundable_graph_update_queue q
+    SET status = 'processing',
+        locked_at = now(),
+        locked_by = $2,
+        attempt_count = attempt_count + 1,
+        updated_at = now()
+    FROM claim
+    WHERE q.id = claim.id
+    RETURNING q.*;
+    ```
+
+    For `deal_replay`, read the full deal, portfolio company, institutional investors, partner rows, angel rows, and linked canonical IDs from AlloyDB before writing the graph. If the queued deal no longer has funding-round table ref ID and `funding_round_node_uuid`, mark the queue row `skipped` instead of writing the graph. Otherwise, the worker must produce the same logical graph writes as `mvp/investor/cascade-deal-participants` (#12856): `Funding_Round`, `RAISED`, investor edges, partner edges, and partner-at-firm edges.
+
+    For `company_node_refresh`, update the linked `Company` / `VC_Firm` node from the canonical `master_company` plus Fundable fields. If either `master_company_id` or `master_company_node_uuid` is null, mark the row `skipped`.
+
+    For `person_node_refresh`, update the linked `Person` node from the canonical `master_person` plus Fundable fields. If either `master_person_id` or `master_person_node_uuid` is null, mark the row `skipped`.
+  </Step>
+
+  <Step title="8. Mark success, retry, or failure">
+    On success:
+
+    ```sql
+    UPDATE fundable_graph_update_queue
+    SET status = 'complete',
+        result_json = $2,
+        completed_at = now(),
+        updated_at = now()
+    WHERE id = $1;
+    ```
+
+    For successful `deal_replay`, also update the mirrored deal row:
+
+    ```sql
+    UPDATE fundable_deals
+    SET processed_at = now(),
+        graph_synced_at = now(),
+        last_graph_update_queue_id = $2
+    WHERE id = $1;
+    ```
+
+    On failure, set `status = 'retry'`, store `last_error`, and use exponential backoff:
+
+    ```sql
+    UPDATE fundable_graph_update_queue
+    SET status = CASE WHEN attempt_count + 1 >= max_attempts THEN 'failed' ELSE 'retry' END,
+        not_before = now() + make_interval(mins => LEAST(60, power(2, attempt_count)::int)),
+        last_error = $2,
+        updated_at = now()
+    WHERE id = $1;
+    ```
+  </Step>
+</Steps>
+
+## Graph worker implementation details
+
+The queue payload is only a routing hint. The worker must always rehydrate the current AlloyDB rows immediately before writing FalkorDB. This is what makes queued work safe across company/person merges, manual ref repairs, and source row updates that happen after the queue item was created.
+
+<Warning>
+Queue execution must honor `queue_stage`. In `pre_unlimited_pdl`, skip queue rows that no longer have linked canonical refs and node UUIDs; do not create missing companies, people, or funding-round refs except for a new funding round whose portfolio company is already linked. In `with_unlimited_pdl`, run the missing-identity PDL helper first, then proceed so every Fundable deal and every connected company/person can land in the graph.
+</Warning>
+
+Worker shape:
+
+```go
+func RunGraphWorker(ctx context.Context, cfg Config) error {
+	pool := alloydb.MustOpenPool(ctx, cfg.AlloyDBDSN)
+	defer pool.Close()
+
+	graph := graph.MustOpenFalkor(ctx, cfg.FalkorURL, cfg.FalkorGraphName)
+	workerID := cfg.WorkerID()
+
+	for {
+		tasks, err := queue.Claim(ctx, pool, workerID, cfg.GraphQueueBatchSize)
+		if err != nil {
+			return err
+		}
+		if len(tasks) == 0 {
+			return nil
+		}
+
+		for _, task := range tasks {
+			err := ProcessGraphTask(ctx, pool, graph, task, cfg)
+			if err != nil {
+				queue.MarkRetryOrFailed(ctx, pool, task.ID, err)
+			}
+		}
+	}
+}
+```
+
+Task dispatch:
+
+```go
+func ProcessGraphTask(ctx context.Context, db *pgxpool.Pool, graph GraphWriter, task QueueTask, cfg Config) error {
+	switch task.UpdateType {
+	case "deal_replay":
+		return ReplayDealGraph(ctx, db, graph, task, cfg)
+	case "company_node_refresh":
+		return RefreshCompanyNode(ctx, db, graph, task, cfg)
+	case "person_node_refresh":
+		return RefreshPersonNode(ctx, db, graph, task, cfg)
+	case "edge_retire":
+		return RetireRemovedEdges(ctx, db, graph, task, cfg)
+	case "orphan_edge_audit":
+		return AuditOrphanEdges(ctx, db, graph, task, cfg)
+	default:
+		return fmt.Errorf("unknown fundable graph update_type %q", task.UpdateType)
+	}
+}
+```
+
+`ReplayDealGraph` order:
+
+1. Load the current deal and portfolio-company refs from AlloyDB.
+2. If `queue_stage = 'with_unlimited_pdl'`, run `fundable/resolve-missing-deal-identities-with-pdl` for missing portfolio company, investor company, partner person, and angel person refs.
+3. If `funding_round_id` or `funding_round_node_uuid` is null, run `fundable/bootstrap-funding-round-ref` only when the portfolio company refs are now present.
+4. In Stage 1, if `funding_round_id`, `funding_round_node_uuid`, `master_company_id`, or `master_company_node_uuid` is still null, mark the queue row `skipped`.
+5. In Stage 1, load only active institutional investor rows that already have `master_company_id` and `master_company_node_uuid`.
+6. In Stage 1, load only active angel rows that already have `master_person_id` and `master_person_node_uuid`.
+7. In Stage 1, load only active partner rows where both the partner person and investor firm already have canonical refs and node UUIDs.
+8. In Stage 2, after the PDL identity helper runs, load all active participants again and require refs to be populated before graph writes.
+9. Run graph writes in this order: `Funding_Round` node, `RAISED` edge, institutional investor edges, angel edges, partner edges.
+10. If stale-edge retirement is enabled, run retirement queries after current edges are upserted.
+11. Mark the queue row `complete`, update the source deal's `processed_at` and `graph_synced_at`, and mark related changelog rows `complete`.
+
+Deal loader. Adjust only column names to match the AlloyDB mirror; keep the required null checks:
+
+```sql
+SELECT d.id::text AS fundable_deal_id,
+       d.funding_round_id,
+       d.funding_round_node_uuid,
+       d.organization_id::text AS portfolio_fundable_org_id,
+       d.financing_type,
+       d.announced_date,
+       d.size_usd,
+       d.size,
+       d.currency,
+       d.short_description,
+       d.long_description,
+       d.source_payload_json,
+       po.master_company_id AS portfolio_master_company_id,
+       po.master_company_node_uuid AS portfolio_company_node_uuid,
+       po.name AS portfolio_company_name
+FROM fundable_deals d
+JOIN fundable_organizations po
+  ON po.id::text = d.organization_id::text
+WHERE d.id::text = $1
+  AND d.removed_at IS NULL;
+```
+
+Institutional investor loader:
+
+```sql
+SELECT ii.id::text AS fundable_investment_id,
+       ii.deal_id::text AS fundable_deal_id,
+       ii.organization_id::text AS investor_fundable_org_id,
+       ii.is_lead_investor,
+       ii.is_follow_on,
+       ii.fund_name,
+       ii.source_payload_json,
+       inv.master_company_id AS investor_master_company_id,
+       inv.master_company_node_uuid AS investor_company_node_uuid,
+       inv.name AS investor_company_name
+FROM fundable_institutional_investments ii
+JOIN fundable_organizations inv
+  ON inv.id::text = ii.organization_id::text
+WHERE ii.deal_id::text = $1
+  AND ii.removed_at IS NULL
+  AND inv.master_company_id IS NOT NULL
+  AND inv.master_company_node_uuid IS NOT NULL;
+```
+
+Angel investor loader:
+
+```sql
+SELECT ai.id::text AS fundable_angel_investment_id,
+       ai.deal_id::text AS fundable_deal_id,
+       ai.person_id::text AS fundable_person_id,
+       ai.is_lead_investor,
+       ai.source_payload_json,
+       p.master_person_id,
+       p.master_person_node_uuid,
+       p.name AS angel_name
+FROM fundable_angel_investments ai
+JOIN fundable_people p
+  ON p.id::text = ai.person_id::text
+WHERE ai.deal_id::text = $1
+  AND ai.removed_at IS NULL
+  AND p.master_person_id IS NOT NULL
+  AND p.master_person_node_uuid IS NOT NULL;
+```
+
+Investment partner loader:
+
+```sql
+SELECT ip.id::text AS fundable_partner_row_id,
+       ip.institutional_investment_id::text AS fundable_investment_id,
+       ii.deal_id::text AS fundable_deal_id,
+       ii.organization_id::text AS investor_fundable_org_id,
+       ip.person_id::text AS fundable_person_id,
+       partner.master_person_id,
+       partner.master_person_node_uuid,
+       partner.name AS partner_name,
+       inv.master_company_id AS investor_master_company_id,
+       inv.master_company_node_uuid AS investor_company_node_uuid,
+       inv.name AS investor_company_name
+FROM fundable_institutional_investments_person ip
+JOIN fundable_institutional_investments ii
+  ON ii.id::text = ip.institutional_investment_id::text
+JOIN fundable_people partner
+  ON partner.id::text = ip.person_id::text
+JOIN fundable_organizations inv
+  ON inv.id::text = ii.organization_id::text
+WHERE ii.deal_id::text = $1
+  AND ip.removed_at IS NULL
+  AND ii.removed_at IS NULL
+  AND partner.master_person_id IS NOT NULL
+  AND partner.master_person_node_uuid IS NOT NULL
+  AND inv.master_company_id IS NOT NULL
+  AND inv.master_company_node_uuid IS NOT NULL;
+```
+
+Mark a skipped worker row without retrying:
+
+```sql
+UPDATE fundable_graph_update_queue
+SET status = 'skipped',
+    result_json = jsonb_build_object(
+      'skip_reason', $2,
+      'missing_fields', $3::text[]
+    ),
+    completed_at = now(),
+    updated_at = now()
+WHERE id = $1;
+```
+
+Mark all changelog rows represented by a completed queue item:
+
+```sql
+UPDATE fundable_change_log
+SET processing_status = 'complete',
+    updated_at = now()
+WHERE id = $1
+   OR id = ANY($2::uuid[]);
+```
+
+### Deterministic graph IDs
+
+Use deterministic edge UUIDs so retries update the same relationship:
+
+| Edge | Deterministic UUID |
+|---|---|
+| Portfolio company `RAISED` round | `{portfolio_company_node_uuid}-{funding_round_node_uuid}` |
+| Institutional investor to round | `{investor_company_node_uuid}-{funding_round_node_uuid}` |
+| Angel investor to round | `{master_person_node_uuid}-{funding_round_node_uuid}` |
+| Partner to round | `{partner_person_node_uuid}-{funding_round_node_uuid}` |
+| Partner to investor firm | `{partner_person_node_uuid}-{investor_company_node_uuid}-deal_partner` |
+
+The old Xano edge UUIDs use this same pattern. Preserve it so the AlloyDB worker updates existing graph relationships instead of creating a parallel identity scheme.
+
+### FalkorDB client contract
+
+The graph writer should expose one method that accepts a query name, Cypher string, and parameter map. Keep all Cypher parameterized.
+
+```go
+type GraphWriter interface {
+	Query(ctx context.Context, name string, cypher string, params map[string]any) (GraphResult, error)
+	ReadOnly(ctx context.Context, name string, cypher string, params map[string]any) (GraphResult, error)
+}
+```
+
+Before enabling a new query in production, run `GRAPH.EXPLAIN` against staging with representative parameters and save the query name, plan check date, and smoke-test source ID in the PR.
+
+## Graph helper audit
+
+Pass result: we have the enrichment helpers needed to materialize Fundable deals, but they are not sufficient as the final sync-worker contract because several of them are allowed to create/link missing canonical records. The cron sync must be stricter: table changes are logged for every changed Fundable row, but graph writes happen only when the row already has its canonical table ref and node UUID.
+
+| Helper / path | Exists today | Reuse decision for sync |
+|---|---|---|
+| `mvp/funding/add-fundable-deal-node` (#12701) | Yes. MERGEs `Funding_Round` and `RAISED`; stamps `fundable_deals.funding_round_node_uuid`. | Use as reference behavior only. The AlloyDB worker should use sync-only Cypher that updates the existing round node by `funding_round_node_uuid` and MERGEs `RAISED`; it should not be the thing that creates the first funding-round ref. |
+| `mvp/fundable/resolve-investors-edges` (#12702) | Yes. MERGEs investor/angel/partner edges and can call get-add / queue enrich for missing investors. | Not safe as the final sync helper. It is enrichment behavior, not sync behavior. The sync worker needs a new existing-links-only helper that skips unlinked investors/people instead of creating them. |
+| `mvp/investor/cascade-deal-participants` (#12856) | Yes. Orchestrates portfolio company, Funding Round node, investors, partners, `processed_at`; staleness gate exists. | Do not call this from the AlloyDB backend. It may ensure/create portfolio company refs and it gates investor resolution by `cascade_depth`. Use it as the reference behavior for graph shape, not as the sync contract. |
+| `mvp/node/update-company-node` (#4659) | Yes. Updates canonical Company node from `master_company` / addon state. | Reuse when the Fundable org change has already been projected into `master_company` or addons. If the change is Fundable-only and should appear on the node, add a small Fundable-specific node-property helper instead of overloading #4659. |
+| `mvp/node/update-person-node` (#2758) | Yes. Updates canonical Person node from `master_person` state. | Reuse when the Fundable person change has already been projected into `master_person`. If the change is Fundable-only and should appear on the node, add a small Fundable-specific node-property helper. |
+| `merge/person-v2` (#12945) | Yes. Repoints `fundable_people.master_person_id` and re-syncs `fundable_people.master_person_node_uuid` to survivor node UUID. | Merge-safe for source rows. Worker must still re-read the current Fundable row before graph write, because a queued payload may contain stale pre-merge ids/UUIDs. |
+| `merge/company-v2` (#12956) + `resync-company-node-uuid` (#12963) | Yes. Docs confirm `fundable_organizations.master_company_node_uuid` is covered. | Merge-safe for source rows. Worker must re-read current org refs before graph write for the same reason. |
+| Funding-round merge / resync | Not documented as a live helper. Existing graph UUID is the Fundable deal id. | No new merge helper needed for v1 if `funding_round_node_uuid` remains stable and points at the Fundable deal id. If the AlloyDB `funding_rounds` table introduces mergeable canonical round ids, add a funding-round ref resync helper before enabling edge retirement. |
+
+### New sync helpers to build
+
+These helpers should live in the AlloyDB / Cloud Run sync worker layer. They should use parameterized Cypher when calling FalkorDB from Go.
+
+| New helper | Purpose | Required behavior |
+|---|---|---|
+| `fundable/sync-existing-deal-graph` | One queue row -> one existing linked deal graph refresh. | Re-read the current Fundable deal, portfolio org, institutional investor rows, partner rows, angel rows, and canonical refs from AlloyDB. Skip any participant whose canonical table ref or node UUID is null. Never call get-add. Never enqueue enrichment. |
+| `fundable/resolve-missing-deal-identities-with-pdl` | Stage 2 helper that makes every Fundable deal graph-eligible. | Only enabled when `queue_stage = 'with_unlimited_pdl'`. For the portfolio company, institutional investor companies, partner people, and angel people connected to a deal, create or reuse `master_company` / `master_person` rows through the AlloyDB unlimited-PDL identity path, then populate the Fundable back-reference IDs and node UUIDs before graph writes. |
+| `fundable/bootstrap-funding-round-ref` | Prepare a newly inserted Fundable deal for graph sync. | Runs in AlloyDB before graph queue derivation. In Stage 1, requires the portfolio company to already have `master_company_id` and `master_company_node_uuid`. In Stage 2, runs after `fundable/resolve-missing-deal-identities-with-pdl`. Creates or reuses the canonical `funding_rounds` row, then sets `fundable_deals.funding_round_id` and deterministic `funding_round_node_uuid`. |
+| `fundable/sync-new-funding-round-node` | Create the `Funding_Round` graph node for a new graph-eligible deal. | Uses `MERGE` by `funding_round_node_uuid`, but only after the AlloyDB funding-round table ref and node UUID are present. Never creates canonical company/person records. |
+| `fundable/sync-company-node-refresh` | Refresh an existing company graph node from a linked Fundable organization. | Require `master_company_id` and `master_company_node_uuid`. Update only the existing `Company` node. Preserve `VC_Firm` label behavior for investor organizations. Never create a company node. |
+| `fundable/sync-person-node-refresh` | Refresh an existing person graph node from a linked Fundable person. | Require `master_person_id` and `master_person_node_uuid`. Update only the existing `Person` node. Preserve `Angel` label behavior for angel investors. Never create a person node. |
+| `fundable/sync-funding-round-node` | Update an existing `Funding_Round` node and `RAISED` edge. | `MATCH` the existing `Funding_Round` by `funding_round_node_uuid`; do not create it when missing. MERGE the `RAISED` edge only when the portfolio company node UUID is present. |
+| `fundable/sync-investor-edges` | Upsert current institutional and angel edges for already-linked actors. | For each linked investor/angel, delete stale sibling edge types for the same actor/round when lead/follow-on status changed, then MERGE the current edge type. |
+| `fundable/sync-partner-edges` | Upsert partner-to-round and partner-to-firm edges for already-linked people. | MERGE `INVESTMENT_PARTNER_IN`. MERGE `INVESTMENT_PARTNER_AT` only as a firm-level relationship; do not delete it unless no remaining Fundable rows connect that partner to that firm. |
+| `fundable/retire-stale-funding-edges` | Handle `remove` changelog rows and full-snapshot absences. | Delete stale deal participant edges only after the removal policy says the source row is truly gone. Protect `INVESTMENT_PARTNER_AT` with a remaining-row existence check. |
+| `fundable/backfill-funding-round-refs` | One-shot repair for rows where `funding_round_node_uuid` exists but the new funding-round table ref ID is missing. | Populate the table ref ID from the canonical `funding_rounds` row. If no canonical row exists, leave refs null so the graph eligibility gate skips the row. |
+
+### New Cypher templates needed
+
+The current funding Cypher is close, but the sync path needs stricter existing-links-only templates. These are meant for the AlloyDB Go worker calling FalkorDB directly with a parameter map.
+
+Do not parameterize relationship type names. Pick the query template in Go from a fixed enum, then pass only values as parameters.
+
+### Company and person node refresh templates
+
+Use these only when the source row already has canonical refs and node UUIDs. These queries update existing graph nodes; they do not create nodes.
+
+**Refresh existing Company node from a linked Fundable organization**
+
+```cypher
+MATCH (c:Company {uuid: $company_node_uuid})
+SET c.updated_at = timestamp(),
+    c.name = $name,
+    c.company_name = $company_name,
+    c.domain = $domain,
+    c.website = $website,
+    c.linkedin_url = $linkedin_url,
+    c.twitter_url = $twitter_url,
+    c.facebook_url = $facebook_url,
+    c.crunchbase_url = $crunchbase_url,
+    c.fundable_url = $fundable_url,
+    c.short_description = $short_description,
+    c.long_description = $long_description,
+    c.is_investor = $is_investor,
+    c.is_public = $is_public,
+    c.fundable_organization_id = $fundable_organization_id,
+    c.fundable_last_seen_at = $fundable_last_seen_at
+RETURN c.uuid AS node_uuid
+```
+
+If the organization is an investor, the worker may also preserve the existing `VC_Firm` label behavior:
+
+```cypher
+MATCH (c:Company {uuid: $company_node_uuid})
+SET c:VC_Firm,
+    c.updated_at = timestamp(),
+    c.is_investor = true,
+    c.fundable_organization_id = $fundable_organization_id
+RETURN c.uuid AS node_uuid
+```
+
+**Refresh existing Person node from a linked Fundable person**
+
+```cypher
+MATCH (p:Person {uuid: $person_node_uuid})
+SET p.updated_at = timestamp(),
+    p.name = $name,
+    p.first_name = $first_name,
+    p.last_name = $last_name,
+    p.linkedin_url = $linkedin_url,
+    p.twitter_url = $twitter_url,
+    p.personal_website_url = $personal_website_url,
+    p.angellist_url = $angellist_url,
+    p.fundable_url = $fundable_url,
+    p.short_description = $short_description,
+    p.long_description = $long_description,
+    p.is_angel = $is_angel,
+    p.fundable_person_id = $fundable_person_id,
+    p.fundable_last_seen_at = $fundable_last_seen_at
+RETURN p.uuid AS node_uuid
+```
+
+If the person is an angel investor, preserve the existing `Angel` label behavior:
+
+```cypher
+MATCH (p:Person {uuid: $person_node_uuid})
+SET p:Angel,
+    p.updated_at = timestamp(),
+    p.is_angel = true,
+    p.fundable_person_id = $fundable_person_id
+RETURN p.uuid AS node_uuid
+```
+
+For optional properties, pass the current AlloyDB value when the field exists. Pass `NULL` only when the sync is intentionally clearing the property.
+
+**Create new Funding Round node after AlloyDB refs are bootstrapped**
+
+Use this only after `fundable_deals.funding_round_id`, `fundable_deals.funding_round_node_uuid`, and the portfolio company's `master_company_node_uuid` are present. This query may create a graph node, but it must never create the canonical `funding_rounds` row or any company/person identity.
+
+```cypher
+MERGE (fr:Funding_Round {uuid: $funding_round_node_uuid})
+ON CREATE SET
+    fr.visibility = true,
+    fr.created_at = timestamp(),
+    fr.updated_at = timestamp(),
+    fr.display_label = 'Funding_Round',
+    fr.name = $node_name,
+    fr.company_name = $company_name,
+    fr.funding_type = $funding_type,
+    fr.announced_date = $announced_date,
+    fr.size_usd = $size_usd,
+    fr.size = $size,
+    fr.currency = $currency,
+    fr.short_description = $short_description,
+    fr.long_description = $long_description,
+    fr.number_of_angel_investors = $angel_count,
+    fr.number_of_institutional_investors = $institutional_count,
+    fr.total_number_of_investors = $total_investor_count
+ON MATCH SET
+    fr.visibility = true,
+    fr.updated_at = timestamp(),
+    fr.display_label = 'Funding_Round',
+    fr.name = $node_name,
+    fr.company_name = $company_name,
+    fr.funding_type = $funding_type,
+    fr.announced_date = $announced_date,
+    fr.size_usd = $size_usd,
+    fr.size = $size,
+    fr.currency = $currency,
+    fr.short_description = $short_description,
+    fr.long_description = $long_description,
+    fr.number_of_angel_investors = $angel_count,
+    fr.number_of_institutional_investors = $institutional_count,
+    fr.total_number_of_investors = $total_investor_count
+RETURN fr.uuid AS node_uuid
+```
+
+**Update existing Funding Round node only**
+
+```cypher
+MATCH (fr:Funding_Round {uuid: $funding_round_node_uuid})
+SET fr.visibility = true,
+    fr.updated_at = timestamp(),
+    fr.display_label = 'Funding_Round',
+    fr.name = $node_name,
+    fr.company_name = $company_name,
+    fr.funding_type = $funding_type,
+    fr.announced_date = $announced_date,
+    fr.size_usd = $size_usd,
+    fr.size = $size,
+    fr.currency = $currency,
+    fr.short_description = $short_description,
+    fr.long_description = $long_description,
+    fr.number_of_angel_investors = $angel_count,
+    fr.number_of_institutional_investors = $institutional_count,
+    fr.total_number_of_investors = $total_investor_count
+RETURN fr.uuid AS node_uuid
+```
+
+The query must return exactly one row. If it returns zero rows, mark the queue item `skipped` with `skip_reason = funding_round_node_missing`; do not `MERGE` the round in the sync path.
+
+**Refresh RAISED edge when both endpoints exist**
+
+```cypher
+MATCH (c:Company {uuid: $company_node_uuid})
+MATCH (fr:Funding_Round {uuid: $funding_round_node_uuid})
+MERGE (c)-[raised:RAISED]->(fr)
+SET raised.created_at = coalesce(raised.created_at, $announced_millis, timestamp()),
+    raised.updated_at = timestamp(),
+    raised.uuid = coalesce(raised.uuid, $raised_edge_uuid),
+    raised.weight = 10,
+    raised.announced_date = $announced_date,
+    raised.company_name = $company_name,
+    raised.description = $short_description
+RETURN raised.uuid AS edge_uuid
+```
+
+### Institutional investor edge templates
+
+Before writing the current institutional investor edge, remove sibling relationship types for the same actor and round. This prevents a lead investor from also keeping an old `INVESTED_IN` edge after the source role changes.
+
+```cypher
+MATCH (actor:Company {uuid: $actor_node_uuid})-[old]->(fr:Funding_Round {uuid: $funding_round_node_uuid})
+WHERE type(old) IN ['LEAD_INVESTED_IN', 'INVESTED_IN', 'FOLLOW_ON_INVESTED_IN']
+  AND old.uuid = $investment_edge_uuid
+  AND type(old) <> $target_edge_type
+DELETE old
+RETURN count(old) AS deleted_stale_edges
+```
+
+Go chooses the target relationship type:
+
+```go
+func InstitutionalEdgeType(row InstitutionalInvestment, hasEarlierInvestment bool) string {
+	if row.IsLeadInvestor {
+		return "LEAD_INVESTED_IN"
+	}
+	if row.IsFollowOn || hasEarlierInvestment {
+		return "FOLLOW_ON_INVESTED_IN"
+	}
+	return "INVESTED_IN"
+}
+```
+
+Use this read-only query when the source does not explicitly say follow-on:
+
+```cypher
+MATCH (vc:Company {uuid: $investor_node_uuid})
+MATCH (funded:Company {uuid: $portfolio_company_node_uuid})-[:RAISED]->(earlier:Funding_Round)<-[r]-(vc)
+WHERE earlier.uuid <> $funding_round_node_uuid
+  AND earlier.announced_date < $announced_date
+  AND type(r) IN ['LEAD_INVESTED_IN', 'INVESTED_IN', 'FOLLOW_ON_INVESTED_IN']
+RETURN count(earlier) > 0 AS has_earlier_investment
+```
+
+If `announced_date` is null, skip the read-only follow-on check and default to `INVESTED_IN` unless the row is explicitly lead or explicitly follow-on.
+
+**Institutional LEAD_INVESTED_IN**
+
+```cypher
+MATCH (vc:Company {uuid: $investor_node_uuid})
+SET vc:VC_Firm,
+    vc.updated_at = timestamp()
+WITH vc
+MATCH (fr:Funding_Round {uuid: $funding_round_node_uuid})
+MERGE (vc)-[r:LEAD_INVESTED_IN]->(fr)
+SET r.created_at = coalesce(r.created_at, timestamp()),
+    r.updated_at = timestamp(),
+    r.uuid = $investment_edge_uuid,
+    r.name = NULL,
+    r.description = $description,
+    r.is_lead_investor = true,
+    r.fundable_investment_id = $fundable_investment_id,
+    r.fundable_deal_id = $fundable_deal_id,
+    r.weight = 15
+RETURN vc.uuid AS investor_node_uuid,
+       fr.uuid AS funding_round_node_uuid,
+       r.uuid AS edge_uuid,
+       'LEAD_INVESTED_IN' AS rel_type
+```
+
+**Institutional INVESTED_IN**
+
+```cypher
+MATCH (vc:Company {uuid: $investor_node_uuid})
+SET vc:VC_Firm,
+    vc.updated_at = timestamp()
+WITH vc
+MATCH (fr:Funding_Round {uuid: $funding_round_node_uuid})
+MERGE (vc)-[r:INVESTED_IN]->(fr)
+SET r.created_at = coalesce(r.created_at, timestamp()),
+    r.updated_at = timestamp(),
+    r.uuid = $investment_edge_uuid,
+    r.name = NULL,
+    r.description = $description,
+    r.is_lead_investor = false,
+    r.fundable_investment_id = $fundable_investment_id,
+    r.fundable_deal_id = $fundable_deal_id,
+    r.weight = 20
+RETURN vc.uuid AS investor_node_uuid,
+       fr.uuid AS funding_round_node_uuid,
+       r.uuid AS edge_uuid,
+       'INVESTED_IN' AS rel_type
+```
+
+**Institutional FOLLOW_ON_INVESTED_IN**
+
+```cypher
+MATCH (vc:Company {uuid: $investor_node_uuid})
+SET vc:VC_Firm,
+    vc.updated_at = timestamp()
+WITH vc
+MATCH (fr:Funding_Round {uuid: $funding_round_node_uuid})
+MERGE (vc)-[r:FOLLOW_ON_INVESTED_IN]->(fr)
+SET r.created_at = coalesce(r.created_at, timestamp()),
+    r.updated_at = timestamp(),
+    r.uuid = $investment_edge_uuid,
+    r.name = NULL,
+    r.description = $description,
+    r.is_lead_investor = false,
+    r.fundable_investment_id = $fundable_investment_id,
+    r.fundable_deal_id = $fundable_deal_id,
+    r.weight = 20
+RETURN vc.uuid AS investor_node_uuid,
+       fr.uuid AS funding_round_node_uuid,
+       r.uuid AS edge_uuid,
+       'FOLLOW_ON_INVESTED_IN' AS rel_type
+```
+
+### Angel investor edge templates
+
+Use the same sibling-delete pattern with `actor:Person` for angel investors:
+
+```cypher
+MATCH (actor:Person {uuid: $actor_node_uuid})-[old]->(fr:Funding_Round {uuid: $funding_round_node_uuid})
+WHERE type(old) IN ['LEAD_INVESTED_IN', 'INVESTED_IN', 'FOLLOW_ON_INVESTED_IN']
+  AND old.uuid = $investment_edge_uuid
+  AND type(old) <> $target_edge_type
+DELETE old
+RETURN count(old) AS deleted_stale_edges
+```
+
+Angels normally use `LEAD_INVESTED_IN` when `is_lead_investor = true`; otherwise use `INVESTED_IN`. Only use `FOLLOW_ON_INVESTED_IN` for angels if the Fundable source explicitly carries that role.
+
+**Angel LEAD_INVESTED_IN**
+
+```cypher
+MATCH (p:Person {uuid: $angel_node_uuid})
+SET p:Angel,
+    p.updated_at = timestamp(),
+    p.is_angel = true
+WITH p
+MATCH (fr:Funding_Round {uuid: $funding_round_node_uuid})
+MERGE (p)-[r:LEAD_INVESTED_IN]->(fr)
+SET r.created_at = coalesce(r.created_at, timestamp()),
+    r.updated_at = timestamp(),
+    r.uuid = $investment_edge_uuid,
+    r.name = NULL,
+    r.description = $description,
+    r.is_lead_investor = true,
+    r.fundable_angel_investment_id = $fundable_angel_investment_id,
+    r.fundable_deal_id = $fundable_deal_id,
+    r.weight = 15
+RETURN p.uuid AS angel_node_uuid,
+       fr.uuid AS funding_round_node_uuid,
+       r.uuid AS edge_uuid,
+       'LEAD_INVESTED_IN' AS rel_type
+```
+
+**Angel INVESTED_IN**
+
+```cypher
+MATCH (p:Person {uuid: $angel_node_uuid})
+SET p:Angel,
+    p.updated_at = timestamp(),
+    p.is_angel = true
+WITH p
+MATCH (fr:Funding_Round {uuid: $funding_round_node_uuid})
+MERGE (p)-[r:INVESTED_IN]->(fr)
+SET r.created_at = coalesce(r.created_at, timestamp()),
+    r.updated_at = timestamp(),
+    r.uuid = $investment_edge_uuid,
+    r.name = NULL,
+    r.description = $description,
+    r.is_lead_investor = false,
+    r.fundable_angel_investment_id = $fundable_angel_investment_id,
+    r.fundable_deal_id = $fundable_deal_id,
+    r.weight = 25
+RETURN p.uuid AS angel_node_uuid,
+       fr.uuid AS funding_round_node_uuid,
+       r.uuid AS edge_uuid,
+       'INVESTED_IN' AS rel_type
+```
+
+### Partner edge templates
+
+Partner sync writes two relationships:
+
+1. `INVESTMENT_PARTNER_IN` from person to funding round.
+2. `INVESTMENT_PARTNER_AT` from person to investor firm.
+
+```cypher
+MATCH (p:Person {uuid: $partner_node_uuid})
+MATCH (fr:Funding_Round {uuid: $funding_round_node_uuid})
+MATCH (vc:Company {uuid: $investor_node_uuid})
+SET vc:VC_Firm,
+    vc.updated_at = timestamp()
+
+MERGE (p)-[round_edge:INVESTMENT_PARTNER_IN]->(fr)
+SET round_edge.created_at = coalesce(round_edge.created_at, timestamp()),
+    round_edge.updated_at = timestamp(),
+    round_edge.uuid = $partner_round_edge_uuid,
+    round_edge.description = $partner_round_description,
+    round_edge.fundable_partner_row_id = $fundable_partner_row_id,
+    round_edge.fundable_investment_id = $fundable_investment_id,
+    round_edge.fundable_deal_id = $fundable_deal_id,
+    round_edge.weight = 15
+
+MERGE (p)-[firm_edge:INVESTMENT_PARTNER_AT]->(vc)
+SET firm_edge.created_at = coalesce(firm_edge.created_at, timestamp()),
+    firm_edge.updated_at = timestamp(),
+    firm_edge.uuid = $partner_firm_edge_uuid,
+    firm_edge.description = $partner_firm_description,
+    firm_edge.fundable_partner_row_id = $fundable_partner_row_id,
+    firm_edge.fundable_investment_id = $fundable_investment_id,
+    firm_edge.weight = 20
+
+RETURN p.uuid AS partner_node_uuid,
+       fr.uuid AS funding_round_node_uuid,
+       vc.uuid AS investor_node_uuid,
+       round_edge.uuid AS partner_round_edge_uuid,
+       firm_edge.uuid AS partner_firm_edge_uuid
+```
+
+Do not delete `INVESTMENT_PARTNER_AT` as part of ordinary deal replay. It is a durable partner-firm relationship. Delete it only from the stale-edge retirement path after AlloyDB confirms there are no remaining active partner rows for that person and firm.
+
+### Retirement templates
+
+**Retire removed participant edge**
+
+```cypher
+MATCH (actor:Company {uuid: $actor_node_uuid})-[r]->(fr:Funding_Round {uuid: $funding_round_node_uuid})
+WHERE type(r) IN ['LEAD_INVESTED_IN', 'INVESTED_IN', 'FOLLOW_ON_INVESTED_IN']
+  AND r.uuid = $investment_edge_uuid
+WITH collect(r) AS rels
+FOREACH (rel IN rels | DELETE rel)
+RETURN size(rels) AS deleted_edges
+```
+
+Use the same template with `actor:Person` for angel investor edges.
+
+```cypher
+MATCH (p:Person {uuid: $partner_node_uuid})-[r:INVESTMENT_PARTNER_IN]->(fr:Funding_Round {uuid: $funding_round_node_uuid})
+WHERE r.uuid = $partner_round_edge_uuid
+WITH collect(r) AS rels
+FOREACH (rel IN rels | DELETE rel)
+RETURN size(rels) AS deleted_edges
+```
+
+For `INVESTMENT_PARTNER_AT`, delete only when AlloyDB confirms no remaining active `fundable_institutional_investments_person` row links that partner to that investor firm across any deal.
+
+```cypher
+MATCH (p:Person {uuid: $partner_node_uuid})-[r:INVESTMENT_PARTNER_AT]->(vc:Company {uuid: $investor_node_uuid})
+WHERE r.uuid = $partner_firm_edge_uuid
+WITH collect(r) AS rels
+FOREACH (rel IN rels | DELETE rel)
+RETURN size(rels) AS deleted_edges
+```
+
+### Graph verification queries
+
+Run these with `GRAPH.RO_QUERY` after smoke tests.
+
+Confirm one funding round node exists:
+
+```cypher
+MATCH (fr:Funding_Round {uuid: $funding_round_node_uuid})
+RETURN count(fr) AS round_count,
+       collect(fr.name) AS names
+```
+
+Confirm there is one portfolio-company `RAISED` edge:
+
+```cypher
+MATCH (c:Company {uuid: $company_node_uuid})-[r:RAISED]->(fr:Funding_Round {uuid: $funding_round_node_uuid})
+RETURN count(r) AS raised_edge_count,
+       collect(r.uuid) AS raised_edge_uuids
+```
+
+Find duplicate sibling investor edge types for one company actor and round:
+
+```cypher
+MATCH (actor:Company {uuid: $actor_node_uuid})-[r]->(fr:Funding_Round {uuid: $funding_round_node_uuid})
+WHERE type(r) IN ['LEAD_INVESTED_IN', 'INVESTED_IN', 'FOLLOW_ON_INVESTED_IN']
+RETURN actor.uuid AS actor_uuid,
+       fr.uuid AS funding_round_node_uuid,
+       collect(type(r)) AS edge_types,
+       collect(r.uuid) AS edge_uuids,
+       count(r) AS edge_count
+```
+
+Use the same check for angel/person actors:
+
+```cypher
+MATCH (actor:Person {uuid: $actor_node_uuid})-[r]->(fr:Funding_Round {uuid: $funding_round_node_uuid})
+WHERE type(r) IN ['LEAD_INVESTED_IN', 'INVESTED_IN', 'FOLLOW_ON_INVESTED_IN']
+RETURN actor.uuid AS actor_uuid,
+       fr.uuid AS funding_round_node_uuid,
+       collect(type(r)) AS edge_types,
+       collect(r.uuid) AS edge_uuids,
+       count(r) AS edge_count
+```
+
+## Sync aspect build plan
+
+This is the graph-sync portion of the work, separate from the source-fetch / changelog cron.
+
+<Steps>
+  <Step title="1. Add the graph eligibility function">
+    Build a pure AlloyDB helper that takes a `fundable_change_log.id` and returns:
+
+    ```json
+    {
+      "eligible_for_graph_sync": true,
+      "update_type": "deal_replay",
+      "required_refs_present": true,
+      "missing_fields": [],
+      "dedupe_key": "deal_replay:fundable_deal_id:..."
+    }
+    ```
+
+    It must enforce the null-ref rule for organizations, people, and deals before any queue row is created.
+  </Step>
+
+  <Step title="2. Rehydrate refs at worker execution time">
+    Do not trust `master_company_id`, `master_person_id`, or node UUIDs stored in the queue payload. The worker must re-read the current Fundable row by source id immediately before graph writes. This makes person/company merges safe because the merge orchestrators already repoint and resync the Fundable back-reference columns.
+  </Step>
+
+  <Step title="3. Build funding-round bootstrap and `sync-funding-round-node`">
+    Build `fundable/bootstrap-funding-round-ref` before enabling graph work for newly inserted Fundable deals. For a new deal whose portfolio company already has `master_company_id` and `master_company_node_uuid`, create or reuse the canonical `funding_rounds` row, then stamp `fundable_deals.funding_round_id` and deterministic `funding_round_node_uuid`.
+
+    After refs are present, implement the new-round `MERGE` Cypher and the existing-round-only update Cypher above. Start with one forced `fundable_deal_id` whose portfolio company refs are present. Confirm the first run creates exactly one `Funding_Round` node and one `RAISED` edge, and the second run updates the same node and edge without duplication.
+  </Step>
+
+  <Step title="4. Build `sync-investor-edges`">
+    Port the existing #12702 edge logic into existing-links-only code. For institutional investors, require `fundable_organizations.master_company_id` and `master_company_node_uuid`. For angels, require `fundable_people.master_person_id` and `master_person_node_uuid`. Add the stale sibling-edge deletion step before MERGE so lead/follow-on changes do not leave old edge types behind.
+  </Step>
+
+  <Step title="5. Build `sync-partner-edges`">
+    Require partner `master_person_id` / `master_person_node_uuid`, investor org `master_company_id` / `master_company_node_uuid`, and deal funding-round refs. MERGE `INVESTMENT_PARTNER_IN` for the round. MERGE `INVESTMENT_PARTNER_AT` for the firm, but treat it as a durable partner-firm edge across deals.
+  </Step>
+
+  <Step title="6. Build stale-edge retirement behind a flag">
+    Start with detection-only mode. Report the edges that would be deleted for removed investments or removed partners, but do not delete until at least two successful source snapshots prove the row is gone. Enable actual delete after sample review.
+  </Step>
+
+  <Step title="7. Add merge-safety tests">
+    Test queue rows created before a merge:
+
+    1. Create a queue row for a linked `fundable_people` or `fundable_organizations` record.
+    2. Merge the canonical person/company into a survivor.
+    3. Run the worker.
+    4. Confirm the worker uses the survivor `master_*_id` and survivor node UUID by re-reading the Fundable row.
+  </Step>
+
+  <Step title="8. Add graph drift audit queries">
+    Add read-only checks for:
+
+    - Fundable rows with changed hashes but no graph queue because refs are null.
+    - Queue rows where refs became null between queue and worker execution.
+    - Funding_Round nodes whose properties differ from the current `fundable_deals` row.
+    - Actor-to-round edges that no longer have a backing Fundable investment row.
+    - Duplicate sibling edge types for the same actor + round.
+  </Step>
+</Steps>
+
+## Fundable Update Examples
+
+Use these as build-time stress tests. Each example should be runnable in dry-run mode first, then against one forced source id in staging. The expected path is always:
+
+1. Source adapter detects a changed Fundable row.
+2. Cron writes `fundable_change_log`.
+3. Queue derivation applies the graph eligibility gate.
+4. Worker rehydrates current AlloyDB rows.
+5. Worker runs only the sync helper needed for that change.
+6. Worker records `complete`, `skipped`, `retry`, or `failed`.
+
+Run every example twice in design review: once under Stage 1 `pre_unlimited_pdl`, and once under Stage 2 `with_unlimited_pdl`. Stage 1 should prove the queue does not create missing identities. Stage 2 should prove the unlimited-PDL helper can create/enrich missing connected companies and people before graph writes.
+
+### Helper coverage summary
+
+| Example | Source event | Queue row or rows | Helpers used | Helper gap |
+|---|---|---|---|---|
+| New funding round is added to an existing company | `fundable_deals insert` | Run relational bootstrap, then `deal_replay:{deal_id}` | `fundable/bootstrap-funding-round-ref`, `fundable/sync-new-funding-round-node`, `fundable/sync-funding-round-node`, `fundable/sync-existing-deal-graph` | Bootstrap helper is required if new deals arrive with null `funding_round_id` / `funding_round_node_uuid`. |
+| New angel investor is added to an existing deal | `fundable_angel_investments insert` or `restore` | `deal_replay:{deal_id}` | `fundable/sync-existing-deal-graph`, `fundable/sync-funding-round-node`, `fundable/sync-investor-edges` angel branch | Covered if angel person already has `master_person_id` and `master_person_node_uuid`. |
+| Fundable removes an incorrectly linked investor from a deal | `fundable_institutional_investments remove` or `fundable_angel_investments remove` | `deal_replay:{deal_id}` plus `edge_retire:{edge_uuid}` | `fundable/sync-existing-deal-graph`, `fundable/retire-stale-funding-edges` | `retire-stale-funding-edges` is required for this scenario; without it the stale graph edge remains. |
+| Missing last name is added to a person connected to a deal | `fundable_people update` with `last_name` / `name` fields | `person_node_refresh:{master_person_id}` plus `deal_replay:{deal_id}` for active connected deals | `fundable/sync-person-node-refresh`, `fundable/sync-existing-deal-graph`, `fundable/sync-investor-edges` or `fundable/sync-partner-edges` | Covered after explicit person node-refresh helper is built. |
+| New profile URLs are added to a company | `fundable_organizations update` with URL fields only | `company_node_refresh:{master_company_id}` | `fundable/sync-company-node-refresh` | Covered after explicit company node-refresh helper is built. |
+| New profile URLs are added to a person | `fundable_people update` with URL fields only | `person_node_refresh:{master_person_id}` | `fundable/sync-person-node-refresh` | Covered after explicit person node-refresh helper is built. |
+
+### Field-routing rules
+
+Use `changed_fields` to avoid unnecessary graph work.
+
+| Changed fields | Queue behavior |
+|---|---|
+| New `fundable_deals` row | Stage 1: if the portfolio company already has `master_company_id` and `master_company_node_uuid`, run `fundable/bootstrap-funding-round-ref`, then queue `deal_replay`; otherwise log only and skip graph sync. Stage 2: queue the deal, run `fundable/resolve-missing-deal-identities-with-pdl`, bootstrap the funding round refs, then replay the deal graph. |
+| Deal amount/date/type/description/count fields | Queue `deal_replay` when the deal and portfolio company refs are present. |
+| Institutional or angel investment insert/update | Stage 1: queue `deal_replay` when parent deal refs are present and the actor has canonical refs. Stage 2: queue `deal_replay`, create/enrich missing actors through unlimited PDL, then write the edge. |
+| Institutional or angel investment remove | Queue `edge_retire` using `before_json` refs. Also queue `deal_replay` to refresh round counts and remaining participants. |
+| Person name fields: `first_name`, `last_name`, `name` | Queue `person_node_refresh`. Also queue `deal_replay` for active connected deals because angel and partner edge descriptions include person names. |
+| Person profile URL fields only | Queue `person_node_refresh` only. Do not replay deals. |
+| Company name/display fields: `name`, `company_name`, `domain` | Queue `company_node_refresh`. Also queue `deal_replay` for active connected deals because edge descriptions include company names. |
+| Company profile URL fields only | Queue `company_node_refresh` only. Do not replay deals. |
+
+Person-to-deal fanout query for name changes:
+
+```sql
+SELECT DISTINCT ai.deal_id::text AS fundable_deal_id
+FROM fundable_angel_investments ai
+WHERE ai.person_id::text = $1
+  AND ai.removed_at IS NULL
+
+UNION
+
+SELECT DISTINCT ii.deal_id::text AS fundable_deal_id
+FROM fundable_institutional_investments_person ip
+JOIN fundable_institutional_investments ii
+  ON ii.id::text = ip.institutional_investment_id::text
+WHERE ip.person_id::text = $1
+  AND ip.removed_at IS NULL
+  AND ii.removed_at IS NULL;
+```
+
+Company-to-deal fanout query for display-name changes:
+
+```sql
+SELECT DISTINCT d.id::text AS fundable_deal_id
+FROM fundable_deals d
+WHERE d.organization_id::text = $1
+  AND d.removed_at IS NULL
+
+UNION
+
+SELECT DISTINCT ii.deal_id::text AS fundable_deal_id
+FROM fundable_institutional_investments ii
+WHERE ii.organization_id::text = $1
+  AND ii.removed_at IS NULL;
+```
+
+Before enqueueing any fanout deal, apply the deal eligibility gate:
+
+```sql
+SELECT d.id::text AS fundable_deal_id,
+       d.funding_round_id,
+       d.funding_round_node_uuid,
+       po.master_company_id AS portfolio_master_company_id,
+       po.master_company_node_uuid AS portfolio_company_node_uuid
+FROM fundable_deals d
+JOIN fundable_organizations po
+  ON po.id::text = d.organization_id::text
+WHERE d.id::text = ANY($1::text[])
+  AND d.removed_at IS NULL
+  AND d.funding_round_id IS NOT NULL
+  AND d.funding_round_node_uuid IS NOT NULL
+  AND po.master_company_id IS NOT NULL
+  AND po.master_company_node_uuid IS NOT NULL;
+```
+
+### Example: new funding round added to an existing company
+
+Scenario: Fundable adds a new `fundable_deals` row for a company that already has canonical company refs in `fundable_organizations`.
+
+Stage behavior:
+
+| Stage | Expected behavior |
+|---|---|
+| Stage 1: `pre_unlimited_pdl` | Add the new funding round only if the portfolio company is already linked to `master_company` and has `master_company_node_uuid`. This means Stage 1 adds deals based on companies already existing in the graph. |
+| Stage 2: `with_unlimited_pdl` | Add the new funding round even when the portfolio company is not linked yet. First create/enrich the company through the AlloyDB unlimited-PDL identity path, populate the Fundable back-reference fields, then bootstrap the round and replay the graph. This is the path that eventually gets every Fundable deal into the graph. |
+
+This is the scenario that requires a bootstrap step. The graph worker can only run after the cron has enough refs to satisfy the graph eligibility gate:
+
+| Required ref | Source |
+|---|---|
+| `portfolio master_company_id` | Existing linked `fundable_organizations` row. |
+| `portfolio master_company_node_uuid` | Existing linked `fundable_organizations` row. |
+| `funding_round_id` | Created or reused by `fundable/bootstrap-funding-round-ref`. |
+| `funding_round_node_uuid` | Set by `fundable/bootstrap-funding-round-ref`, preferably deterministic from the Fundable deal id. |
+
+Relational bootstrap helper. Adjust `funding_rounds` column names to the AlloyDB schema, but keep the behavior:
+
+```sql
+WITH portfolio AS (
+  SELECT o.master_company_id,
+         o.master_company_node_uuid
+  FROM fundable_deals d
+  JOIN fundable_organizations o
+    ON o.id::text = d.organization_id::text
+  WHERE d.id::text = $1
+    AND d.removed_at IS NULL
+    AND o.master_company_id IS NOT NULL
+    AND o.master_company_node_uuid IS NOT NULL
+),
+round_upsert AS (
+  INSERT INTO funding_rounds (
+    source,
+    source_id,
+    master_company_id,
+    announced_date,
+    financing_type,
+    amount_usd,
+    source_payload_json,
+    created_at,
+    updated_at
+  )
+  SELECT 'fundable',
+         $1,
+         portfolio.master_company_id,
+         $2,
+         $3,
+         $4,
+         $5,
+         now(),
+         now()
+  FROM portfolio
+  ON CONFLICT (source, source_id)
+  DO UPDATE SET
+    master_company_id = EXCLUDED.master_company_id,
+    announced_date = EXCLUDED.announced_date,
+    financing_type = EXCLUDED.financing_type,
+    amount_usd = EXCLUDED.amount_usd,
+    source_payload_json = EXCLUDED.source_payload_json,
+    updated_at = now()
+  RETURNING id
+)
+UPDATE fundable_deals d
+SET funding_round_id = round_upsert.id,
+    funding_round_node_uuid = coalesce(d.funding_round_node_uuid, d.id::text),
+    updated_at = now()
+FROM round_upsert
+WHERE d.id::text = $1
+RETURNING d.id::text AS fundable_deal_id,
+          d.funding_round_id,
+          d.funding_round_node_uuid;
+```
+
+Expected changelog after bootstrap:
+
+```json
+{
+  "source_table": "fundable_deals",
+  "source_id": "deal_456",
+  "change_type": "insert",
+  "changed_fields": ["organization_id", "announced_date", "financing_type", "amount_usd"],
+  "graph_impact_json": {
+    "eligible_for_graph_sync": true,
+    "update_type": "deal_replay",
+    "fundable_deal_id": "deal_456",
+    "funding_round_id": 12345,
+    "funding_round_node_uuid": "deal_456",
+    "dedupe_key": "deal_replay:fundable_deal_id:deal_456"
+  }
+}
+```
+
+Worker helper sequence:
+
+1. `fundable/sync-existing-deal-graph` rehydrates the current deal and portfolio company.
+2. Because the graph node may not exist yet, call `fundable/sync-new-funding-round-node` once the refs are present.
+3. Call `fundable/sync-funding-round-node` on later updates to the same deal.
+4. Refresh the `RAISED` edge from the existing portfolio company node to the funding round.
+5. Run investor and partner edge helpers for any participants already present and linked.
+
+In Stage 1, if the portfolio company lacks `master_company_id` or `master_company_node_uuid`, do not bootstrap the funding-round refs yet. Log the deal insert and mark graph sync ignored:
+
+```json
+{
+  "eligible_for_graph_sync": false,
+  "skip_reason": "missing_portfolio_company_ref",
+  "missing_fields": ["master_company_id", "master_company_node_uuid"]
+}
+```
+
+In Stage 2, the same missing-company case should queue the deal and run `fundable/resolve-missing-deal-identities-with-pdl` first:
+
+```json
+{
+  "eligible_for_graph_sync": true,
+  "queue_stage": "with_unlimited_pdl",
+  "update_type": "deal_replay",
+  "identity_bootstrap_required": true,
+  "missing_identity_refs": ["portfolio_company"],
+  "dedupe_key": "deal_replay:fundable_deal_id:deal_456"
+}
+```
+
+Smoke-test assertions:
+
+```cypher
+MATCH (fr:Funding_Round {uuid: $funding_round_node_uuid})
+RETURN count(fr) AS round_count,
+       collect(fr.name) AS round_names
+```
+
+```cypher
+MATCH (c:Company {uuid: $company_node_uuid})-[r:RAISED]->(fr:Funding_Round {uuid: $funding_round_node_uuid})
+RETURN count(r) AS raised_edges,
+       collect(r.uuid) AS raised_edge_uuids
+```
+
+Expected result: `round_count = 1` and `raised_edges = 1`.
+
+### Example: new angel investor added to an existing deal
+
+Scenario: Fundable adds an active `fundable_angel_investments` row for a deal that already has a `Funding_Round` node.
+
+Expected changelog:
+
+```json
+{
+  "source_table": "fundable_angel_investments",
+  "source_id": "angel_investment_123",
+  "change_type": "insert",
+  "changed_fields": ["deal_id", "person_id", "is_lead_investor"],
+  "graph_impact_json": {
+    "eligible_for_graph_sync": true,
+    "update_type": "deal_replay",
+    "fundable_deal_id": "deal_456",
+    "dedupe_key": "deal_replay:fundable_deal_id:deal_456"
+  }
+}
+```
+
+Required refs before queueing:
+
+| Ref | Source |
+|---|---|
+| `funding_round_id` | Parent `fundable_deals` row. |
+| `funding_round_node_uuid` | Parent `fundable_deals` row. |
+| `portfolio master_company_id` / `master_company_node_uuid` | Parent deal's `fundable_organizations` row. |
+| `master_person_id` / `master_person_node_uuid` | Angel's `fundable_people` row. |
+
+Worker helper sequence:
+
+1. `fundable/sync-existing-deal-graph` rehydrates the full deal.
+2. `fundable/sync-funding-round-node` updates investor counts on the existing `Funding_Round`.
+3. `fundable/sync-investor-edges` runs the angel branch:
+   - delete stale sibling edge types for that person and round,
+   - MERGE `LEAD_INVESTED_IN` when `is_lead_investor = true`,
+   - otherwise MERGE `INVESTED_IN`.
+4. Mark the queue row `complete`.
+
+In Stage 1, if the new angel person does not have `master_person_id` and `master_person_node_uuid`, do not queue graph work. The changelog should be `ignored` with:
+
+```json
+{
+  "eligible_for_graph_sync": false,
+  "skip_reason": "missing_master_person_ref",
+  "missing_fields": ["master_person_id", "master_person_node_uuid"]
+}
+```
+
+In Stage 2, queue the parent deal anyway and run the missing-identity PDL helper before edge writes:
+
+```json
+{
+  "eligible_for_graph_sync": true,
+  "queue_stage": "with_unlimited_pdl",
+  "update_type": "deal_replay",
+  "identity_bootstrap_required": true,
+  "missing_identity_refs": ["angel_person"],
+  "dedupe_key": "deal_replay:fundable_deal_id:deal_456"
+}
+```
+
+Smoke-test assertion:
+
+```cypher
+MATCH (p:Person {uuid: $angel_node_uuid})-[r]->(fr:Funding_Round {uuid: $funding_round_node_uuid})
+WHERE type(r) IN ['LEAD_INVESTED_IN', 'INVESTED_IN']
+  AND r.uuid = $investment_edge_uuid
+RETURN count(r) AS angel_edges,
+       collect(type(r)) AS edge_types
+```
+
+Expected result: `angel_edges = 1`.
+
+### Example: Fundable removes an incorrectly linked investor from a deal
+
+Scenario: Fundable removes a participant row because the investor was incorrectly attached to the deal. This can happen for either an institutional investor or an angel investor.
+
+Expected changelog:
+
+```json
+{
+  "source_table": "fundable_institutional_investments",
+  "source_id": "investment_789",
+  "change_type": "remove",
+  "changed_fields": ["removed_at"],
+  "graph_impact_json": {
+    "eligible_for_graph_sync": true,
+    "update_type": "edge_retire",
+    "fundable_deal_id": "deal_456",
+    "actor_node_uuid": "company_node_uuid",
+    "funding_round_node_uuid": "round_node_uuid",
+    "edge_uuid": "company_node_uuid-round_node_uuid",
+    "dedupe_key": "edge_retire:company_node_uuid-round_node_uuid"
+  }
+}
+```
+
+Use `before_json` for removal refs. The current row may be soft-deleted or gone, so the edge retirement task must read these from the changelog snapshot:
+
+| Required retirement value | Source |
+|---|---|
+| Actor type | `source_table`: company for institutional investments, person for angel investments. |
+| Actor node UUID | `before_json.master_company_node_uuid` or `before_json.master_person_node_uuid`. |
+| Funding round node UUID | Parent deal snapshot or current parent deal row. |
+| Edge UUID | Deterministic `{actor_node_uuid}-{funding_round_node_uuid}`. |
+
+Queue behavior:
+
+1. Queue `deal_replay:{deal_id}` to refresh the round node counts and remaining current participants.
+2. Queue `edge_retire:{edge_uuid}` to delete the stale participant edge.
+3. If the source supports only snapshots, keep `edge_retire` in detection-only mode until the row is absent from two consecutive successful snapshots.
+4. If `before_json` does not contain enough refs to identify the stale edge, queue `orphan_edge_audit` instead of deleting.
+
+Worker helpers:
+
+| Helper | Use |
+|---|---|
+| `fundable/sync-existing-deal-graph` | Rewrites current round properties and current participant edges. |
+| `fundable/retire-stale-funding-edges` | Deletes the exact stale `LEAD_INVESTED_IN`, `INVESTED_IN`, or `FOLLOW_ON_INVESTED_IN` edge by actor node UUID, round UUID, and deterministic edge UUID. |
+
+Smoke-test assertion after retirement:
+
+```cypher
+MATCH (actor:Company {uuid: $actor_node_uuid})-[r]->(fr:Funding_Round {uuid: $funding_round_node_uuid})
+WHERE type(r) IN ['LEAD_INVESTED_IN', 'INVESTED_IN', 'FOLLOW_ON_INVESTED_IN']
+  AND r.uuid = $investment_edge_uuid
+RETURN count(r) AS stale_edges
+```
+
+Use the same assertion with `actor:Person` for angel removals. Expected result: `stale_edges = 0`.
+
+### Example: missing last name added to a person connected to a deal
+
+Scenario: Fundable updates `fundable_people.last_name`, and that person is already linked to `master_person` and participates in one or more deals as an angel or investment partner.
+
+Expected changelog:
+
+```json
+{
+  "source_table": "fundable_people",
+  "source_id": "person_123",
+  "change_type": "update",
+  "changed_fields": ["last_name", "name"],
+  "graph_impact_json": {
+    "eligible_for_graph_sync": true,
+    "update_type": "person_node_refresh",
+    "master_person_id": 987,
+    "dedupe_key": "person_node_refresh:master_person_id:987",
+    "fanout_deal_replay": true
+  }
+}
+```
+
+Queue behavior:
+
+1. Queue `person_node_refresh:{master_person_id}` when `master_person_id` and `master_person_node_uuid` are present.
+2. Use the person-to-deal fanout query above.
+3. For every eligible connected deal, queue `deal_replay:{deal_id}`.
+4. If a connected deal is missing funding-round or portfolio-company refs, keep the person node refresh but skip that deal replay with `skip_reason = missing_deal_graph_refs`.
+
+Worker helpers:
+
+| Helper | Use |
+|---|---|
+| `fundable/sync-person-node-refresh` | Updates `Person.name`, `first_name`, `last_name`, profile fields, and `updated_at`. |
+| `fundable/sync-investor-edges` angel branch | Rewrites angel edge descriptions that contain the person's display name. |
+| `fundable/sync-partner-edges` | Rewrites partner edge descriptions that contain the person's display name. |
+
+No edge should be created just because the name changed. Any edge MERGE should target an already eligible active deal relationship.
+
+Smoke-test assertions:
+
+```cypher
+MATCH (p:Person {uuid: $person_node_uuid})
+RETURN p.first_name AS first_name,
+       p.last_name AS last_name,
+       p.name AS name
+```
+
+Expected result: `last_name` is populated and `name` reflects the updated display name.
+
+### Example: new profile URLs added to a company
+
+Scenario: Fundable updates a linked `fundable_organizations` row with new URLs such as `website`, `linkedin_url`, `twitter_url`, `crunchbase_url`, or `fundable_url`.
+
+Expected changelog:
+
+```json
+{
+  "source_table": "fundable_organizations",
+  "source_id": "org_123",
+  "change_type": "update",
+  "changed_fields": ["linkedin_url", "crunchbase_url"],
+  "graph_impact_json": {
+    "eligible_for_graph_sync": true,
+    "update_type": "company_node_refresh",
+    "master_company_id": 456,
+    "dedupe_key": "company_node_refresh:master_company_id:456"
+  }
+}
+```
+
+Queue behavior:
+
+1. Queue `company_node_refresh:{master_company_id}` when `master_company_id` and `master_company_node_uuid` are present.
+2. Do not queue deal replay for URL-only changes.
+3. If the same change also includes `name`, `company_name`, or `domain`, use the company-to-deal fanout query and queue eligible `deal_replay` rows because edge descriptions may need the updated display name.
+
+Worker helper:
+
+| Helper | Use |
+|---|---|
+| `fundable/sync-company-node-refresh` | Updates URL fields on the existing `Company` node and preserves `VC_Firm` label behavior for investors. |
+
+Smoke-test assertion:
+
+```cypher
+MATCH (c:Company {uuid: $company_node_uuid})
+RETURN c.website AS website,
+       c.linkedin_url AS linkedin_url,
+       c.twitter_url AS twitter_url,
+       c.crunchbase_url AS crunchbase_url,
+       c.fundable_url AS fundable_url
+```
+
+Expected result: the new URL values are present on the existing node UUID.
+
+### Example: new profile URLs added to a person
+
+Scenario: Fundable updates a linked `fundable_people` row with new URLs such as `linkedin_url`, `twitter_url`, `personal_website_url`, `angellist_url`, or `fundable_url`.
+
+Expected changelog:
+
+```json
+{
+  "source_table": "fundable_people",
+  "source_id": "person_123",
+  "change_type": "update",
+  "changed_fields": ["linkedin_url", "twitter_url"],
+  "graph_impact_json": {
+    "eligible_for_graph_sync": true,
+    "update_type": "person_node_refresh",
+    "master_person_id": 987,
+    "dedupe_key": "person_node_refresh:master_person_id:987"
+  }
+}
+```
+
+Queue behavior:
+
+1. Queue `person_node_refresh:{master_person_id}` when `master_person_id` and `master_person_node_uuid` are present.
+2. Do not queue deal replay for URL-only changes.
+3. If the same change also includes `first_name`, `last_name`, or `name`, also queue eligible connected `deal_replay` rows because edge descriptions may need the updated display name.
+
+Worker helper:
+
+| Helper | Use |
+|---|---|
+| `fundable/sync-person-node-refresh` | Updates profile URL fields on the existing `Person` node and preserves `Angel` label behavior for angel investors. |
+
+Smoke-test assertion:
+
+```cypher
+MATCH (p:Person {uuid: $person_node_uuid})
+RETURN p.linkedin_url AS linkedin_url,
+       p.twitter_url AS twitter_url,
+       p.personal_website_url AS personal_website_url,
+       p.angellist_url AS angellist_url,
+       p.fundable_url AS fundable_url
+```
+
+Expected result: the new URL values are present on the existing node UUID.
+
+### Scenario coverage conclusion
+
+These examples do not require Xano runtime calls. They do require the AlloyDB backend to implement the new sync-only helpers listed above. The only helper that is truly blocking for corrections/removals is `fundable/retire-stale-funding-edges`; without it, the cron can refresh current rows but cannot remove graph edges that Fundable later says were wrong.
+
+## Smoke Tests
+
+Every scenario above should pass in smoke before the scheduler is allowed to run broadly in production. We have a useful advantage here: the smoke environment can wipe the graph and graph-related tables between runs. Use that advantage aggressively. A clean graph makes duplicate nodes, duplicate edges, missing skips, and bad queue behavior much easier to see.
+
+<Warning>
+Smoke resets are allowed only in the dedicated smoke environment. Never run graph wipe, queue truncation, or graph-related table reset commands against production or shared staging data.
+</Warning>
+
+### Smoke test goals
+
+Smoke tests should prove five things:
+
+1. The cron detects the intended Fundable change.
+2. The changelog records the exact before/after diff.
+3. Queue derivation chooses the right `update_type` for the active `queue_stage`.
+4. The worker writes the expected graph nodes and edges, or correctly skips when refs are missing.
+5. Re-running the same smoke case is idempotent: no duplicate queue rows, nodes, or edges.
+
+### Smoke environment reset
+
+Prefer a dedicated smoke AlloyDB database and dedicated FalkorDB graph name, such as `orbiter_fundable_smoke`. If that is available, each scenario can start from zero state.
+
+FalkorDB graph reset:
+
+```bash
+redis-cli GRAPH.DELETE orbiter_fundable_smoke
+```
+
+After deleting the graph, recreate any required graph indexes before running worker writes. Keep this in the smoke reset script, not in individual tests.
+
+Graph-state reset for a dedicated smoke database:
+
+```sql
+TRUNCATE fundable_graph_update_queue,
+         fundable_change_log,
+         fundable_sync_runs
+CASCADE;
+
+DELETE FROM funding_rounds
+WHERE source = 'fundable';
+
+UPDATE fundable_deals
+SET funding_round_id = NULL,
+    funding_round_node_uuid = NULL,
+    processed_at = NULL,
+    graph_synced_at = NULL,
+    last_graph_update_queue_id = NULL;
+```
+
+If smoke shares an AlloyDB database with other staging data, do not truncate. Use only smoke-prefixed source IDs:
+
+```sql
+DELETE FROM fundable_graph_update_queue
+WHERE fundable_deal_id LIKE 'smoke_%'
+   OR fundable_org_id LIKE 'smoke_%'
+   OR fundable_person_id LIKE 'smoke_%';
+
+DELETE FROM fundable_change_log
+WHERE source_id LIKE 'smoke_%'
+   OR graph_impact_json ->> 'fundable_deal_id' LIKE 'smoke_%';
+
+DELETE FROM fundable_sync_runs
+WHERE created_by = 'fundable-smoke-test';
+
+DELETE FROM funding_rounds
+WHERE source = 'fundable'
+  AND source_id LIKE 'smoke_%';
+```
+
+### Required smoke runner flags
+
+Add these flags before smoke testing. They keep smoke runs focused and repeatable:
+
+```text
+--smoke=true
+--smoke-test-id=required stable id, for example new_round_linked_company
+--force-source-id=required smoke source id
+--source-table=required table name
+--queue-stage=pre_unlimited_pdl|with_unlimited_pdl
+--disable-scheduler-safety=false by default
+```
+
+Smoke mode should set:
+
+```text
+created_by=fundable-smoke-test
+batch_size=1
+limit=1
+```
+
+The worker should also support:
+
+```text
+--smoke=true
+--queue-id=optional exact queue row id
+--limit=1
+--dry-run=true|false
+```
+
+### Standard smoke flow
+
+Run every scenario with this sequence:
+
+1. Reset the smoke graph and graph-state tables.
+2. Seed only the minimum AlloyDB rows needed for the scenario.
+3. Run the cron in dry-run mode.
+4. Confirm dry-run reports the expected `changed_counts`, `would_queue_counts`, and `graph_skipped_counts`.
+5. Run the cron with `--dry-run=false`.
+6. Inspect `fundable_change_log` and `fundable_graph_update_queue`.
+7. Run the worker in dry-run mode for the exact queue row.
+8. Confirm the worker reports the intended Cypher templates and parameter keys.
+9. Run the worker with `--dry-run=false`.
+10. Run read-only graph assertions with `GRAPH.RO_QUERY`.
+11. Run the same worker again and confirm node/edge counts do not increase.
+12. Save the smoke report JSON before moving to the next scenario.
+
+### Smoke fixture matrix
+
+Use deterministic IDs. The exact values do not matter, but the prefix does: every smoke fixture should start with `smoke_`.
+
+| Smoke id | Stage | Fixture setup | Expected queue | Required graph assertion |
+|---|---|---|---|---|
+| `new_round_linked_company` | Stage 1 | `smoke_org_portfolio_1` has `master_company_id` and `master_company_node_uuid`; `smoke_deal_1` is new. | One `deal_replay` after `fundable/bootstrap-funding-round-ref`. | One `Funding_Round`; one `RAISED` edge from the linked company. |
+| `new_round_unlinked_company_stage1` | Stage 1 | `smoke_org_unlinked_1` has null company refs; `smoke_deal_2` is new. | No queue row; changelog is `ignored`. | Zero `Funding_Round` nodes for `smoke_deal_2`. |
+| `new_round_unlinked_company_stage2` | Stage 2 | Same as above, but `queue_stage = with_unlimited_pdl`. | One `deal_replay` with `identity_bootstrap_required = true`. | Company node, `Funding_Round`, and `RAISED` edge exist after identity bootstrap. |
+| `new_angel_linked_person` | Stage 1 | Existing deal + linked angel person. | One `deal_replay`. | One angel `LEAD_INVESTED_IN` or `INVESTED_IN` edge. |
+| `new_angel_unlinked_person_stage1` | Stage 1 | Existing deal + angel person with null `master_person_id` / node UUID. | No queue row; changelog is `ignored`. | Zero angel investment edges for that person. |
+| `new_angel_unlinked_person_stage2` | Stage 2 | Same as above, but `queue_stage = with_unlimited_pdl`. | One `deal_replay` with missing `angel_person` identity bootstrap. | Person node exists and one angel investment edge exists. |
+| `remove_bad_investor` | Stage 1 | Existing deal has a stale investor edge; Fundable row is removed. | One `edge_retire` and one `deal_replay`. | Stale investor edge count is zero; remaining current participant edges still exist. |
+| `person_last_name_added` | Stage 1 | Linked person has missing last name and participates in a deal. | One `person_node_refresh`; one `deal_replay` for each eligible connected deal. | Person node has `last_name`; connected edge descriptions are refreshed. |
+| `company_profile_urls_added` | Stage 1 | Linked organization gets URL-only changes. | One `company_node_refresh`; no `deal_replay`. | Company node URL properties are updated; funding edge counts are unchanged. |
+| `person_profile_urls_added` | Stage 1 | Linked person gets URL-only changes. | One `person_node_refresh`; no `deal_replay`. | Person node URL properties are updated; funding edge counts are unchanged. |
+| `idempotent_deal_replay` | Stage 1 | Any linked deal replay fixture. | Same active queue row dedupes; second worker run does not create duplicates. | Node and edge counts are unchanged after second run. |
+| `worker_retry` | Stage 1 | Force graph writer to fail once. | Queue row moves to `retry`, `attempt_count` increments, `not_before` is set. | No partial duplicate graph writes after retry succeeds. |
+
+### Smoke SQL checks
+
+Latest smoke run:
+
+```sql
+SELECT id, status, queue_stage, dry_run, changed_counts_json,
+       queued_counts_json, skipped_counts_json, error_summary_json
+FROM fundable_sync_runs
+WHERE created_by = 'fundable-smoke-test'
+ORDER BY started_at DESC
+LIMIT 5;
+```
+
+Changelog for one smoke source:
+
+```sql
+SELECT source_table, source_id, change_type, changed_fields,
+       processing_status, graph_impact_json
+FROM fundable_change_log
+WHERE source_id = $1
+   OR graph_impact_json ->> 'fundable_deal_id' = $1
+ORDER BY created_at DESC;
+```
+
+Queue row for one smoke deal:
+
+```sql
+SELECT id, queue_stage, update_type, status, attempt_count,
+       fundable_deal_id, master_company_id, master_person_id,
+       payload_json, result_json, last_error
+FROM fundable_graph_update_queue
+WHERE fundable_deal_id = $1
+ORDER BY created_at DESC;
+```
+
+Duplicate active queue rows should always be zero:
+
+```sql
+SELECT dedupe_key, count(*) AS active_rows
+FROM fundable_graph_update_queue
+WHERE status IN ('queued', 'processing', 'retry')
+GROUP BY dedupe_key
+HAVING count(*) > 1;
+```
+
+### Smoke graph checks
+
+Run graph assertions with `GRAPH.RO_QUERY`. Do not use write queries for verification.
+
+Funding round and `RAISED` edge:
+
+```cypher
+MATCH (fr:Funding_Round {uuid: $funding_round_node_uuid})
+OPTIONAL MATCH (c:Company {uuid: $company_node_uuid})-[raised:RAISED]->(fr)
+RETURN count(fr) AS round_count,
+       count(raised) AS raised_edge_count,
+       collect(raised.uuid) AS raised_edge_uuids
+```
+
+Investor edge count for one company investor:
+
+```cypher
+MATCH (actor:Company {uuid: $actor_node_uuid})-[r]->(fr:Funding_Round {uuid: $funding_round_node_uuid})
+WHERE type(r) IN ['LEAD_INVESTED_IN', 'INVESTED_IN', 'FOLLOW_ON_INVESTED_IN']
+RETURN count(r) AS investor_edge_count,
+       collect(type(r)) AS edge_types,
+       collect(r.uuid) AS edge_uuids
+```
+
+Angel edge count for one person investor:
+
+```cypher
+MATCH (actor:Person {uuid: $actor_node_uuid})-[r]->(fr:Funding_Round {uuid: $funding_round_node_uuid})
+WHERE type(r) IN ['LEAD_INVESTED_IN', 'INVESTED_IN', 'FOLLOW_ON_INVESTED_IN']
+RETURN count(r) AS angel_edge_count,
+       collect(type(r)) AS edge_types,
+       collect(r.uuid) AS edge_uuids
+```
+
+Partner edges:
+
+```cypher
+MATCH (p:Person {uuid: $partner_node_uuid})
+OPTIONAL MATCH (p)-[round_edge:INVESTMENT_PARTNER_IN]->(fr:Funding_Round {uuid: $funding_round_node_uuid})
+OPTIONAL MATCH (p)-[firm_edge:INVESTMENT_PARTNER_AT]->(vc:Company {uuid: $investor_node_uuid})
+RETURN count(round_edge) AS partner_round_edges,
+       count(firm_edge) AS partner_firm_edges
+```
+
+URL-only node refresh:
+
+```cypher
+MATCH (c:Company {uuid: $company_node_uuid})
+RETURN c.website AS website,
+       c.linkedin_url AS linkedin_url,
+       c.twitter_url AS twitter_url,
+       c.crunchbase_url AS crunchbase_url,
+       c.fundable_url AS fundable_url
+```
+
+### Smoke report contract
+
+Each smoke run should emit a small JSON report. Save it with the deployment artifacts for the PR.
+
+```json
+{
+  "smoke_test_id": "new_round_linked_company",
+  "queue_stage": "pre_unlimited_pdl",
+  "sync_run_id": "uuid",
+  "queue_ids": ["uuid"],
+  "expected": {
+    "change_log_rows": 1,
+    "queued_rows": 1,
+    "skipped_rows": 0,
+    "funding_round_nodes": 1,
+    "raised_edges": 1
+  },
+  "actual": {
+    "change_log_rows": 1,
+    "queued_rows": 1,
+    "skipped_rows": 0,
+    "funding_round_nodes": 1,
+    "raised_edges": 1
+  },
+  "passed": true,
+  "errors": []
+}
+```
+
+### Production gate
+
+Do not enable the full production scheduler until all of these are true:
+
+- Every Stage 1 smoke fixture passes from a clean graph.
+- Every Stage 1 smoke fixture is idempotent when run twice.
+- Stage 1 unlinked fixtures are logged and skipped without graph writes.
+- Stage 2 fixtures are dry-run clean before `with_unlimited_pdl` is enabled.
+- `remove_bad_investor` proves stale edges can be retired without deleting current participant edges.
+- Duplicate active queue row check returns zero rows.
+- FalkorDB read-only assertions return the expected node and edge counts.
+- No smoke run calls Xano or any Xano-backed runtime path.
+- The reset script is documented and clearly scoped to smoke-only databases and graph names.
+
+## Dry-run response contract
+
+The cron and worker should both support dry-run mode. Dry run writes one `fundable_sync_runs` row with `dry_run = true`, but it must not mutate raw Fundable tables, create changelog rows, create update-queue rows, or write FalkorDB.
+
+Return this shape from the Cloud Run job:
+
+```json
+{
+  "sync_run_id": "uuid",
+  "dry_run": true,
+  "queue_stage": "pre_unlimited_pdl",
+  "source_window_start": "2026-06-27T08:50:00Z",
+  "source_window_end": "2026-06-27T09:00:00Z",
+  "fetched_counts": {
+    "fundable_deals": 42,
+    "fundable_institutional_investments": 113
+  },
+  "changed_counts": {
+    "fundable_deals": {"insert": 3, "update": 7, "remove": 0},
+    "fundable_institutional_investments": {"insert": 19, "update": 4, "remove": 0}
+  },
+  "would_queue_counts": {
+    "deal_replay": 12,
+    "company_node_refresh": 3,
+    "person_node_refresh": 0,
+    "identity_bootstrap_required": 0
+  },
+  "graph_skipped_counts": {
+    "missing_master_company_ref": 4,
+    "missing_master_person_ref": 2,
+    "missing_funding_round_ref": 6
+  },
+  "sample_changes": [
+    {
+      "source_table": "fundable_deals",
+      "source_id": "deal_123",
+      "change_type": "update",
+      "changed_fields": ["amount_usd", "financing_type"],
+      "diff_json": {
+        "amount_usd": {"before": 5000000, "after": 7500000}
+      }
+    }
+  ],
+  "sample_graph_skips": [
+    {
+      "source_table": "fundable_deals",
+      "source_id": "deal_456",
+      "skip_reason": "missing_funding_round_ref",
+      "missing_fields": ["funding_round_id", "funding_round_node_uuid"]
+    }
+  ],
+  "warnings": []
+}
+```
+
+Keep `sample_changes` and `sample_graph_skips` capped at 20 rows each so the response stays readable in Cloud Run logs and Xano / admin tooling.
+
+## Rollout sequence
+
+| Phase | What ships | Exit criteria |
+|---|---|---|
+| 0 | DDL only. Create control tables and required operational columns on mirrored Fundable tables. | DDL applies cleanly in AlloyDB; indexes exist; no runtime code enabled. |
+| 1 | No-op Cloud Run job + Cloud Scheduler wiring. | Scheduled run creates and completes a `fundable_sync_runs` row without source fetch. |
+| 2 | `fundable_deals` adapter in dry-run mode. | Dry-run output matches a manual source pull for 10 sampled deals; no table writes. |
+| 3 | `fundable_deals` real upsert + changelog, graph queue disabled. | Re-running the same window creates zero new changelog rows after first pass. |
+| 4 | `deal_replay` queue derivation enabled, worker dry-run only. | Queue rows are deduped by deal id; worker logs the exact graph writes it would make. |
+| 5 | Worker writes graph for one forced deal id. | Existing `Funding_Round` node updates in place; no duplicate nodes or investment edges. |
+| 6 | Add institutional investment and partner adapters. | New/changed investor rows collapse to one `deal_replay` queue item per deal. |
+| 7 | Add organization and person node refresh adapters. | Linked company/person node refreshes succeed and preserve canonical node UUIDs. |
+| 8 | Enable hourly scheduled production run. | One stable week with no failed queue rows older than 24 hours; then consider 15-30 minute cadence. |
+| 9 | Add Stage 2 unlimited-PDL identity helper in dry-run mode. | Dry run reports how many missing portfolio companies, investor companies, partners, and angels would be created or enriched before graph writes. |
+| 10 | Switch `FUNDABLE_QUEUE_STAGE=with_unlimited_pdl`. | Every Fundable deal becomes queue-eligible; missing companies and people are created/enriched in AlloyDB before graph sync; no Xano runtime calls are introduced. |
+
+## Operational queries
+
+Use these while building and during the first production week.
+
+Latest runs:
+
+```sql
+SELECT id, status, dry_run, source_window_start, source_window_end,
+       queue_stage, changed_counts_json, queued_counts_json, started_at, finished_at
+FROM fundable_sync_runs
+ORDER BY started_at DESC
+LIMIT 20;
+```
+
+Pending graph updates:
+
+```sql
+SELECT queue_stage, update_type, status, count(*) AS rows, min(created_at) AS oldest
+FROM fundable_graph_update_queue
+GROUP BY queue_stage, update_type, status
+ORDER BY queue_stage, update_type, status;
+```
+
+Failed updates to inspect first:
+
+```sql
+SELECT id, update_type, fundable_deal_id, master_company_id, master_person_id,
+       attempt_count, last_error, payload_json
+FROM fundable_graph_update_queue
+WHERE status = 'failed'
+ORDER BY updated_at DESC
+LIMIT 50;
+```
+
+Changelog for one deal:
+
+```sql
+SELECT c.created_at, c.source_table, c.source_id, c.change_type,
+       c.changed_fields, c.diff_json, q.status AS queue_status
+FROM fundable_change_log c
+LEFT JOIN fundable_graph_update_queue q
+  ON q.change_log_id = c.id
+WHERE c.graph_impact_json ->> 'fundable_deal_id' = $1
+   OR c.source_id = $1
+ORDER BY c.created_at DESC;
+```
+
+## Node and edge sync contract
+
+Relational freshness is not done until the graph has been reconciled.
+
+In Stage 1, graph reconciliation only applies to Fundable rows that are already linked to canonical records. Null back-reference fields mean there is no graph target yet, so the cron should preserve the changelog but skip graph updates. In Stage 2, null back-reference fields should trigger the AlloyDB unlimited-PDL identity helper, which creates or reuses the missing company/person records, fills the Fundable refs, and then allows graph sync to continue.
+
+For every graph-eligible changed deal or participant row, enqueue one `deal_replay` task. In the AlloyDB backend, do not call `mvp/investor/cascade-deal-participants` (#12856). Use that function only as the reference for the graph shape the Go worker must reproduce:
+
+- Existing `Funding_Round` node update by `funding_round_node_uuid`.
+- Portfolio-company `RAISED` edge.
+- Institutional investor `LEAD_INVESTED_IN`, `INVESTED_IN`, and `FOLLOW_ON_INVESTED_IN` edges.
+- Angel investor `LEAD_INVESTED_IN` and `INVESTED_IN` edges.
+- Partner `INVESTMENT_PARTNER_IN` and `INVESTMENT_PARTNER_AT` edges.
+- On success, update `fundable_deals.processed_at` so future cron runs can skip unchanged deals.
+
+For organization or person changes that do not touch a deal, enqueue the linked canonical record for the AlloyDB worker's node-refresh path:
+
+- `fundable_organizations.master_company_id` / `master_company_node_uuid` -> update the company node after table fields change.
+- `fundable_people.master_person_id` / `master_person_node_uuid` -> update the person node after table fields change.
+
+Every graph update worker should mark the related `fundable_graph_update_queue` row as `complete`, `retry`, or `failed`. The source `fundable_change_log` row should remain immutable except for derived processing status, so the JSON diff is always preserved exactly as the sync saw it.
+
+## Removal handling
+
+Updates are easy to make idempotent with `MERGE`; removals need an explicit policy.
+
+If the Fundable source gives full snapshots, the cron should mark missing rows as removed with `removed_at` / `last_seen_at` before graph cleanup. For removed investments or partner rows, retire or delete the corresponding graph edge only after the row has been absent from two consecutive successful snapshots. If the source only exposes incremental changes, keep removals out of v1 and add a separate orphan-edge audit that compares live `fundable_*` rows against FalkorDB edges.
+
+## Acceptance criteria
+
+- Cron can run in dry-run mode and report candidate row counts, changed row counts, graph replay counts, failures, and estimated remaining work.
+- Running the same changed deal twice does not create duplicate `Funding_Round` nodes or investment edges.
+- Stage 1 new deals create or update the round node and `RAISED` edge only when the portfolio company is already linked to `master_company` and has a node UUID.
+- Stage 2 new deals create or update the portfolio company, round node, `RAISED` edge, investor company/person nodes, and all participant edges, even when connected companies or people did not exist before the sync.
+- Updated deal amount/date/type/description fields are reflected on the existing `Funding_Round` node.
+- Updated investor participation changes refresh the relevant investor edges.
+- Linked `master_company_node_uuid` and `master_person_node_uuid` values remain in sync after canonical merges or Fundable row updates.
+- In Stage 1, changes to Fundable rows with null canonical table refs or null node UUIDs are logged but do not create graph update queue rows.
+- In Stage 2, changes to Fundable rows with null canonical refs route through the unlimited-PDL identity helper before graph writes.
+- Failures are resumable by `fundable_sync_runs.id` and `fundable_graph_update_queue.id`, and do not block unrelated deals in the same cron window.
+
+## Related pages
+
+- [Fundable investor enrich](/guides/open-work/fundable-investor-enrich) - on-demand identity resolution for sparse investor organizations.
+- [Waterfall core concepts - Deal Cascade Pattern](/guides/enrichment/waterfall/core-concepts#deal-cascade-pattern) - current helper that materializes Fundable deal participants.
+- [Run-base company enrich](/guides/open-work/run-base-company-enrich) - existing staleness gate and `processed_at` strategy for re-processing Fundable deals.
+- [Funding cyphers](/guides/cyphers/funding) - current `Funding_Round` node and investor edge MERGE queries.

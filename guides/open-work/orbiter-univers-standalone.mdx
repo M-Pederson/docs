@@ -1,0 +1,261 @@
+---
+title: "Orbiter Universe Standalone"
+description: "Standalone open-work notes for splitting the Orbiter Universe graph and enrichment engine into dedicated AlloyDB and FalkorDB infrastructure."
+---
+
+Status: draft.
+
+<Note>
+  This page explores and scopes moving the Orbiter Universe FalkorDB graph and
+  Enrichment Engine into a separate AlloyDB-backed instance/deployment boundary
+  with dedicated hardware. The goal is to understand isolation, throughput,
+  scaling, migration, and operational cost before committing to a standalone
+  production architecture.
+</Note>
+
+<Tip>
+  **Terminology for this page:** **Universe backend** means the standalone
+  enrichment service and its AlloyDB storage. **Universe graph** means the
+  dedicated FalkorDB graph owned by that backend. **App backend** means the
+  Orbiter product backend and its AlloyDB storage. **Product projections** are
+  App backend read-model/card tables populated from Universe packages, not
+  source-of-truth enrichment tables.
+</Tip>
+
+Use this page to collect scope, architecture, decisions, and implementation notes for the standalone Orbiter Universe workstream.
+
+## Overview:
+
+The current enrichment waterfalls already behave like a separate product inside Orbiter: they crawl public sources, run bounded cascades, write global graph nodes and edges, maintain source-specific queues, and materialize canonical people, companies, music entities, film/TV entities, funding rounds, investors, partners, and expertise. The strongest target architecture is to make that separation explicit.
+
+At a high level:
+
+- **App backend** owns the Orbiter product surface: users, organizations, teams, app workflows, auth, contacts, notes, and product-facing `master_*` records.
+- **Universe backend** owns public-source enrichment state, Fundable mirrors, queue state, raw provider payloads, source freshness, and the control tables needed to run enrichment safely.
+- **Orbiter Universe FalkorDB** is a standalone global public graph. It owns the canonical Universe graph: public people, companies, funding rounds, MusicBrainz entities, IMDB / film-TV entities, expertise nodes, source-derived edges, and global priors.
+- **User Graphs and Organization Graphs** communicate with the Universe graph through explicit APIs, references, or graph-gateway reads. They should not directly mutate the Universe graph.
+
+The App backend can still create and read `master_person`, `master_company`, `master_link`, `master_email`, `master_phone`, `master_avatar`, and related product records. The difference is that enrichment-derived values come from a call to the Universe backend instead of being created by the same runtime that stores product state.
+
+### Why split this out
+
+The enrichment waterfalls have different hardware, data, and failure characteristics than the app backend:
+
+- **Dedicated hardware for graph-heavy work.** Universe enrichment writes and queries a dense global graph. Funding-round fanout, IMDB credit edges, MusicBrainz graph expansion, expertise resolution, and future priors/centrality jobs should not compete with product API traffic.
+- **Different queue profile.** Person/company enrichment, IMDB, and MusicBrainz all have queue processors, retry surfaces, rate limits, depth caps, and seed-only expansion rules. These are background workloads, not interactive product workloads.
+- **Cleaner data ownership.** Fundable tables serve the enrichment engine and should live only in the Universe backend. Product records should receive distilled results, not carry the raw source mirror.
+- **Better blast-radius control.** A bad enrichment cascade, provider outage, scrape failure, or graph backfill should degrade enrichment, not the core Orbiter app.
+- **Privacy boundary.** The Universe graph should hold public or source-verified data. User-private and organization-private context stays in the App backend and tenant graphs.
+- **Future global intelligence.** Universe-level priors, centrality, similarity, and scoring baselines need a stable global graph that can be recomputed independently and then consumed by product, organization, and user layers.
+
+### What the waterfall docs imply
+
+The existing waterfall pages point toward the same boundary:
+
+- **People** begin at `get-add/master-person-new`, dedup locally, call PDL / Enrich Layer / Exa, optionally match Fundable people, create `master_person` and related records, write a FalkorDB Person node, then dispatch `enrich-master-person`. That is currently both product record creation and global Universe expansion in one flow.
+- **Companies** begin at `get-add/master-company-new`, run LLM / Serper enrichment, match Fundable organizations, create `master_company`, write company facts and links, create a FalkorDB Company node, then dispatch `enrich-master-company`. The downstream company orchestrator already gates seed-only expansion for Exa C-suite, YC, Fundable deal fanout, and funding-network participants.
+- **MusicBrainz** is structurally a Universe workload. It has source tables, queue tables, a global 1 request/second rate limiter, seed entities, depth caps, MusicBrainz natural keys, and reconciliation bridges back to `master_person` / `master_company`.
+- **IMDB** is also structurally a Universe workload. It has its own `imdb_person`, `film_tv`, `film_tv_award`, queue tables, scrape freshness, poster storage, credit-edge writers, award edges, and expertise extraction. The product only needs the useful person/title facts and graph connections.
+- **Fundable** is the cleanest first ownership line. `fundable_organizations`, `fundable_people`, `fundable_deals`, `fundable_institutional_investments`, `fundable_institutional_investments_person`, `fundable_angel_investments`, `fundable_articles`, and future sync/changelog/graph-update tables should live only in the Universe backend.
+
+### Ownership boundary
+
+| Lives in App backend | Lives in Universe backend |
+|---|---|
+| `master_person`, `master_company`, `master_link`, `master_email`, `master_phone`, `master_avatar` | Fundable mirror tables and Fundable sync/changelog/update queues |
+| User, organization, team, contact, note, app workflow, auth, permissions | Raw enrichment payloads and source-specific freshness state |
+| Product-facing canonical rows and denormalized display/card fields | Person/company/music/IMDB enrichment queues and retry state |
+| Product read models for film/TV, music, awards, and similar cards | Universe source-of-truth tables such as `mb_*`, `imdb_person`, `film_tv`, `film_tv_award` |
+| User Graph and Organization Graph state | Universe graph source tables, source provenance, graph-write state, and graph replay metadata |
+| References to Universe entities, such as `universe_person_uuid` / `universe_company_uuid` | Canonical Universe entity ids, graph node UUIDs, source provenance, and graph-write audit |
+
+The App backend should not store Fundable source mirrors. It may store a reference to the Universe entity, a distilled funding summary, a confidence score, or product-specific display fields copied from a Universe response.
+
+### Source tables vs card tables
+
+The important refinement: some "source" tables also carry the data needed to render product cards. `imdb_person`, `film_tv`, `film_tv_award`, and the `mb_*` tables are not like raw Fundable mirrors. They describe user-visible entities: actors, creators, films, TV titles, awards, artists, labels, recordings, releases, events, and places.
+
+So yes, these tables may need to exist in **both** AlloyDB environments, but they should not have the same responsibility.
+
+| Table family | Universe backend role | App backend role |
+|---|---|---|
+| `imdb_person` | Source-of-truth IMDB enrichment row: raw scrape/LLM payload, freshness gates, cascade depth, graph node UUID, credit/award replay state, enrichment success. | Product read model for IMDB person cards and cross-links to `master_person`; stores display-safe fields, image, role summaries, `universe_person_uuid`, `universe_node_uuid`, `source_updated_at`, and projection sync metadata. |
+| `film_tv` | Source-of-truth title row: raw IMDB title payload, poster processing, graph node UUID, credit-edge replay, award cascade state. | Product read model for Film/TV cards; stores title, year/date, type, poster, tagline/summary, key credits, `universe_film_tv_uuid`, `universe_node_uuid`, and projection freshness. |
+| `film_tv_award` | Source-of-truth award row: raw award extraction, nominee/winner resolution state, graph edge/node write state. | Product read model for award badges, award sections, and title/person card modules; stores display-safe award text, year, category, status, linked product rows, and Universe references. |
+| `mb_*` | Source-of-truth MusicBrainz rows: raw lookup/browse JSON, MBID natural keys, MusicBrainz rate-limit/freshness state, graph node UUIDs, cascade metadata, image/description generation state. | Product read models for music entity cards; stores display fields, canonical image URLs, short descriptions, MBIDs, Universe references, and links to `master_person` / `master_company` when reconciled. |
+
+This is a projection pattern, not a dual-write source-of-truth pattern.
+
+The Universe backend owns:
+
+- raw provider payloads and source-specific payload history
+- provider freshness gates, retry state, queue state, and cascade metadata
+- graph node/edge mutation, graph replay, and graph-write audit
+- provider natural keys such as MBID and IMDB URL as canonical source keys
+- enrichment-only state that product screens should not depend on directly
+
+The App backend owns:
+
+- card-ready rows that are cheap to query in product flows
+- denormalized display fields and product-specific labels
+- references to product records such as `master_person_id` and `master_company_id`
+- references back to Universe entities and graph nodes
+- projection freshness fields, such as `source_updated_at` and `projection_synced_at`
+
+Because the AlloyDB backend has not been built yet, use explicit projection names now instead of carrying the Xano-era ambiguity forward. The legacy Xano table names remain reference material for migration, but the AlloyDB design should make the boundary obvious in the schema:
+
+| Universe source table | App backend product projection |
+|---|---|
+| `universe.imdb_person` | `app.imdb_person_card` |
+| `universe.film_tv` | `app.film_tv_card` |
+| `universe.film_tv_award` | `app.film_tv_award_card` |
+| `universe.mb_artist`, `universe.mb_recording`, `universe.mb_label`, `universe.mb_event`, `universe.mb_release_group`, `universe.mb_release`, `universe.mb_work`, `universe.mb_place` | `app.music_entity_card` plus type-specific detail tables only when the UI needs them |
+
+This gives product code clear read-model names while keeping Universe source tables close to the existing waterfall terminology.
+
+<Warning>
+Avoid bidirectional table sync for these rows. Universe should publish projection events or answer projection pulls; App backend should upsert its read models from those packages. Product edits should not mutate the Universe source row directly. If a user or org has a correction, send it through a proposed-correction flow and promote it to Universe only after public/source verification.
+</Warning>
+
+Likewise, Universe tables should avoid hard dependencies on product row IDs wherever possible. Instead of raw Fundable rows depending on `master_company_id` or `master_person_id`, the long-term shape should be:
+
+```text
+Fundable source row -> Universe entity UUID -> product master_* record reference
+```
+
+That keeps Fundable aligned with the global graph while letting the App backend decide how and when to create product records.
+
+### Communication strategy
+
+Use explicit service contracts rather than shared-table writes:
+
+1. **Resolve APIs** answer "do we know this entity?" from public identifiers: LinkedIn URL, domain, email, phone, IMDB URL, MusicBrainz MBID, Fundable id, Crunchbase URL, and similar keys.
+2. **Enrich APIs** run or queue Universe enrichment and return a canonical package: Universe UUID, graph node UUID, normalized identity, public links, safe contact facts, avatar/logo, source provenance, confidence, and freshness.
+3. **Graph gateway APIs** let User Graphs and Organization Graphs read Universe paths, priors, and public context without writing to the Universe graph.
+4. **Async update events** notify the App backend when a Universe entity improves. The App backend then decides whether to update `master_*` rows.
+5. **Privacy-safe promotion** prevents private user/org facts from flowing into Universe unless they are independently verified by public/source data.
+
+### Example: `get-add/master-person-new` today
+
+At a high level, the current flow works like this:
+
+1. A caller invokes `mvp/get-add/master-person-new` with links, emails, phones, name fields, `cascade_depth`, and priority metadata.
+2. The function checks the person kill switch and runs product-local dedup against existing `master_link`, `master_email`, `master_phone`, and `master_person` data.
+3. `cascade-person-data` gathers raw public enrichment from PDL, Enrich Layer, and Exa.
+4. `match-master-person` tries to resolve an existing person from the enriched identifiers.
+5. Fundable lookup runs from the enriched link set and may link `fundable_people` to the person.
+6. If no existing person is found, the function creates or updates `master_person`, `master_link`, `master_email`, `master_phone`, avatar, and related product rows.
+7. The same flow stores raw enrichment payloads and history rows.
+8. The same flow calls `add-person-node` to create or update the Person node in FalkorDB.
+9. The function dispatches `enrich-master-person` immediately for a depth-0 non-queued seed, or upserts `queue_enrich_person` for queued/deeper work.
+10. The downstream person orchestrator writes more product rows, graph properties, edges, biographies, expertise, and related company queues.
+
+The important observation: one entry point currently owns product dedup, source enrichment, Fundable matching, raw payload storage, graph mutation, queue routing, and product record creation.
+
+### Example: `get-add/master-person-new` after separation
+
+After the split, the same user-facing operation should keep the product contract but divide responsibility:
+
+1. A caller asks the **App backend** to get or add a person.
+2. The App backend first runs a cheap local dedup against `master_link`, `master_email`, `master_phone`, and `master_person`.
+3. If the person already exists and is fresh enough, the App backend returns the local `master_person`.
+4. If the person is missing or thin, the App backend calls the **Universe backend** with public identifiers and minimal context.
+5. The Universe backend resolves or creates the canonical Universe Person, runs or queues the PDL / Enrich Layer / Exa / Fundable enrichment path, stores raw payloads in Universe AlloyDB, and writes the standalone Universe FalkorDB node/edges.
+6. Fundable matching happens only inside the Universe backend. Fundable rows link to Universe entity UUIDs, not directly to product master rows.
+7. The Universe backend returns a canonical person package: `universe_person_uuid`, `universe_node_uuid`, normalized name fields, public profile links, safe emails/phones if allowed, avatar, current role, source provenance, confidence, and freshness.
+8. The App backend upserts `master_person`, `master_link`, `master_email`, `master_phone`, avatar, and product display fields from that package.
+9. The App backend stores the Universe reference on the master record so future reads can ask the Universe graph for public context and paths.
+10. The User Graph or Organization Graph links local private context to the product master record and/or Universe UUID by reference. Private notes, relationship strength, org-specific context, and user-specific edges stay outside the Universe graph.
+11. If deeper enrichment finishes later, the Universe backend emits an update event. The App backend selectively refreshes local `master_*` fields from the new canonical package.
+
+This keeps the product API stable while moving the expensive global work behind a dedicated enrichment boundary.
+
+### Example: new person miss after separation
+
+Suppose a user adds a person who does not exist in the App backend or the Universe backend yet:
+
+```json
+{
+  "links": ["https://www.linkedin.com/in/example-person"],
+  "full_name": "Example Person",
+  "source": "user_add_contact"
+}
+```
+
+Recommended default behavior:
+
+<Steps>
+  <Step title="App backend checks local identity first">
+    It looks for existing `master_person`, `master_link`, `master_email`, and `master_phone` matches. Nothing is found.
+  </Step>
+
+  <Step title="App backend creates a usable local record quickly">
+    It creates a thin `master_person` with the user's supplied name/link, writes the LinkedIn URL to `master_link`, marks the row as `enrichment_status = "pending"` or equivalent, and returns that product record to the caller.
+  </Step>
+
+  <Step title="App backend asks Universe backend to resolve/enrich">
+    It sends public identifiers only: name, LinkedIn URL, email/phone if supplied, source context, and requested freshness/depth mode.
+  </Step>
+
+  <Step title="Universe backend creates the canonical Universe entity">
+    It creates a Universe Person row and Universe graph node, then starts the enrichment waterfall: PDL / Enrich Layer / Exa, Fundable person matching, social/profile discovery, and downstream queue work as allowed by depth rules.
+  </Step>
+
+  <Step title="Universe backend returns an initial package if available">
+    <Check>
+      This is the fast enrichment handoff. If identity resolution completes inside the request budget, the App backend can immediately update the local `master_person` with `universe_entity_uuid`, `universe_node_uuid`, normalized name fields, avatar, headline, and public links.
+    </Check>
+  </Step>
+
+  <Step title="App backend keeps the product experience responsive">
+    The user sees the contact immediately. The UI can show "enriching" state instead of waiting for the full Universe waterfall.
+  </Step>
+
+  <Step title="Universe backend continues asynchronously">
+    Deeper work such as work history, companies, funding/investor edges, IMDB/MusicBrainz bridges, expertise, and graph priors runs in Universe queues.
+  </Step>
+
+  <Step title="Universe publishes an update event">
+    When the canonical package improves, the App backend consumes the event and updates the local `master_person`, related links/contact fields, product projections, and any cached graph snippets.
+  </Step>
+
+  <Step title="User/private context stays local">
+    Notes, relationship labels, organization-specific context, and private corrections stay in the App backend/User Graph/Organization Graph unless explicitly promoted through a verified correction flow.
+  </Step>
+</Steps>
+
+Synchronous enrichment should be an opt-in mode, not the default. It is useful for admin QA, backfills, controlled seed jobs, and tests where the caller needs to block until Universe has completed a richer identity package. Normal product creates should prefer "thin record now, richer record shortly" because the Universe waterfall may hit provider latency, rate limits, queue backpressure, or graph-heavy fanout.
+
+### Initial success shape
+
+The first successful version should be deliberately boring:
+
+- Keep `master_*` records product-owned.
+- Move Fundable source tables and Fundable graph replay into Universe-owned storage.
+- Keep product card/read-model tables for IMDB, Film/TV, MusicBrainz, and awards in the App backend, but make them projections from Universe packages.
+- Make Universe entity UUIDs the bridge between raw source rows, the Universe graph, and product master records.
+- Start with App backend calls to Universe resolve/enrich APIs; avoid direct cross-database reads from app code.
+- Keep User Graph and Organization Graph writes local, but allow read-time calls to Universe graph context.
+- Return useful partial results quickly, then update asynchronously when enrichment finishes.
+- Treat the existing Xano waterfall functions as reference behavior while rebuilding the boundary in the new AlloyDB services.
+
+### Working decisions
+
+These are the current default decisions for the standalone design. Treat them as the baseline until a specific implementation pass proves one should change.
+
+| # | Decision | Rationale |
+|---:|---|---|
+| 1 | **App backend owns final product writes.** The Universe backend should not directly write App backend `master_*` rows. It returns canonical packages and emits update events; App backend decides when to upsert `master_person`, `master_company`, `master_link`, `master_email`, `master_phone`, card rows, and other product tables. | Keeps the product database as the authority for product state, permissions, user/org context, and backwards-compatible API behavior. It also prevents enrichment backfills from mutating product records unexpectedly. |
+| 2 | **IMDB, Film/TV, award, and MusicBrainz tables exist in both backends when product screens need them.** In the Universe backend, they are enrichment source-of-truth tables. In the App backend, they are product read models / card tables projected from Universe packages. | These entities are not raw mirrors like Fundable; they are user-visible cards. The product needs cheap local reads, but enrichment needs raw payloads, queues, graph replay, and source freshness state. |
+| 3 | **Use explicit product projection names in AlloyDB.** Since the AlloyDB backend is greenfield, product-side IMDB / Film-TV / MusicBrainz tables should be named as read models: `imdb_person_card`, `film_tv_card`, `film_tv_award_card`, and `music_entity_card` unless a later UI requirement needs a type-specific detail table. Universe keeps source-table names such as `imdb_person`, `film_tv`, `film_tv_award`, and `mb_*`. | Avoids importing Xano-era ambiguity into the new database. Product code reads card/projection tables; Universe services own source-of-truth enrichment tables. |
+| 4 | **Use common Universe reference columns everywhere.** Product master rows and card rows should carry `universe_entity_uuid`, `universe_node_uuid`, `universe_entity_type` where needed, `source_key`, `source_updated_at`, `projection_synced_at`, and `projection_version`. Type-specific aliases such as `universe_person_uuid` or `universe_film_tv_uuid` are allowed only when a hot query truly needs them. | A common reference contract works across people, companies, Film/TV, music, awards, funding rounds, and future entity types. Type-specific aliases are query conveniences only; they must not become a second identity system. |
+| 5 | **User Graphs and Organization Graphs use a hybrid read model.** They read stable/product-needed fields from App backend projections, ask a Universe graph gateway for live paths, priors, and broad public context, and materialize hot snippets into local caches only when needed. They do not write directly to Universe. | This gives product speed without copying the whole public graph into every tenant graph. The graph gateway preserves the privacy boundary and keeps Universe graph compute on dedicated hardware. |
+| 6 | **Product creates should return fast, useful records and continue enrichment asynchronously.** The App backend should do local dedup, create or return a usable thin product record, call Universe for identity resolution / an initial canonical package, and let deeper waterfalls complete async. Specific admin/backfill/QA flows can request synchronous enrichment explicitly. | Keeps interactive product flows responsive while preserving a path for workflows that truly need a richer result before continuing. The default user experience is "thin record now, richer record shortly," which matches the bounded-cascade direction: seed identity first, deeper expansion later. |
+| 7 | **Only copy display-safe public contact facts into product contact tables.** `master_email` / `master_phone` should receive public or provider-licensed facts with source, confidence, and freshness. Raw provider payloads, low-confidence inferred values, and enrichment-only contact evidence stay in Universe. | Product contact rows are used in user-facing workflows. They need provenance and conservative promotion rules; raw enrichment evidence should remain behind the Universe boundary. |
+| 8 | **Private corrections flow through a proposed-correction path.** User/org edits should update product/private state immediately when appropriate, but they should not directly mutate Universe. Promote a correction to Universe only after public-source verification or explicit operator review. | Prevents private tenant data from leaking into the global graph and keeps the Universe graph aligned with public/source-verified truth. |
+| 9 | **Fundable lives only in Universe.** Fundable mirror tables, sync runs, changelogs, and graph replay queues should not exist in App backend except as distilled fields or references on product projections. | Fundable serves the enrichment engine and funding graph. Product needs results, not the raw source mirror or graph replay machinery. |
+| 10 | **Projection sync is one-way by default: Universe backend → App backend.** Universe publishes packages/events; App backend consumes them and updates read models. Product-origin changes become proposed corrections or private overlays, not direct source-table writes. | Avoids bidirectional sync ambiguity, circular updates, and hard-to-debug source-of-truth conflicts. |
+
+### Current resolved posture
+
+There are no unresolved architecture questions on this page at the scoping level. The next pass should turn these working decisions into an implementation plan: schemas, service contracts, sync events, migration order, and cutover strategy.

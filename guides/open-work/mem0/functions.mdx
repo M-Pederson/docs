@@ -1,0 +1,1245 @@
+---
+title: "mem0 Functions"
+description: "Live Xano function reference for Orbiter Mem0 memory functions."
+---
+
+This page tracks the current Mem0-related Xano functions. It is a live implementation reference, not a future-state scope doc.
+
+<Info>
+  **Current split documented:** `mem0/create-master-person-memories` (`#13148`), `mem0/create-memories-from-contact-id-v2` (`#13149`), `mem0/get-contacts-memories` (`#13147`), QA helper `mem0/delete-master-person-memories` (`#13150`), QA helper `mem0/delete-contact-memories` (`#13151`), and QA helper `mem0/delete-all-memories` (`#13152`), created in Xano workspace `3`.
+</Info>
+
+## Current Scope Split
+
+Orbiter now separates Mem0 memory work into three core functions plus QA cleanup helpers:
+
+| Role | Function | Xano ID | Primary input | Mem0 scope |
+| --- | --- | --- | --- | --- |
+| Shared master-person writer | `mem0/create-master-person-memories` | `13148` | `master_person_id` | `user_id = "master_person:{master_person_id}"` |
+| Private contact writer | `mem0/create-memories-from-contact-id-v2` | `13149` | `contacts_id` | mailbox owner's private `user.workos_id` |
+| Combined contact read path | `mem0/get-contacts-memories` | `13147` | `contacts_id` | private contact memories plus shared master-person memories |
+| QA master-person cleanup | `mem0/delete-master-person-memories` | `13150` | `master_person_id` | deletes only `user_id = "master_person:{master_person_id}"` |
+| QA private-contact cleanup | `mem0/delete-contact-memories` | `13151` | `contacts_id` | deletes mailbox-owner private memories under `user.workos_id` |
+| QA global Mem0 cleanup | `mem0/delete-all-memories` | `13152` | none | deletes every Mem0 memory visible to the API key |
+
+The intended shape is:
+
+1. One function creates shared memories for `master_person`.
+2. One function creates private email and calendar memories for `contacts_id`; those memories stay in the mailbox owner's Mem0 scope but include `master_person_id` metadata.
+3. One function takes `contacts_id`, resolves the mailbox owner and linked `master_person`, and returns all memories for the person as one ordered array.
+4. One QA helper clears shared `master_person` memories so tests can be rerun from a clean Mem0 scope.
+5. One QA helper clears private contact memories, optionally filtered to stale source types such as `graph_edge` / `falkordb`.
+6. One QA-only global helper can clear every Mem0 memory visible to the project API key.
+
+<Note>
+  `mem0/create-memories-from-contact-id` (`#13146`) remains the source function used for the split. It still contains the old inline FalkorDB graph-edge stage. `#13149` is the new contact-scoped version with that master-person Cypher stage removed.
+</Note>
+
+## `mem0/create-master-person-memories` (`#13148`)
+
+| Field | Value |
+| --- | --- |
+| Xano function name | `mem0/create-master-person-memories` |
+| Xano ID | `13148` |
+| Workspace | `3` |
+| Primary input | `master_person_id` |
+| Default mode | `dry_run=true` |
+| Mem0 write mode | `dry_run=false`, requires `$env.MEM0_API_KEY` |
+| Memory target | Shared synthetic Mem0 user: `master_person:{master_person_id}` |
+| Memory scope | `global_master_person` |
+| Source | One-hop FalkorDB graph edges from `master_person.node_uuid` |
+
+### What It Does
+
+This function creates shared objective memories for one `master_person`. It extracts the FalkorDB graph-edge portion from `#13146` and writes those graph facts once to the synthetic master-person Mem0 scope.
+
+It does not use `contacts_id`, `user.workos_id`, Nylas email, calendar, or email tone. The resulting memories are intended to be visible to any user viewing a contact linked to the same `master_person`.
+
+### Inputs
+
+| Input | Default | Purpose |
+| --- | --- | --- |
+| `master_person_id` | required | The shared `master_person` row to sync. |
+| `dry_run` | `true` | Returns candidate memories without writing to Mem0. |
+| `max_graph_edge_memories` | `500` | Max one-hop FalkorDB edge descriptions to read. |
+
+### Step-by-step
+
+1. Load `master_person` by `master_person_id`.
+2. Read `master_person.node_uuid`; if missing, return a skipped `graph_edge_stage`.
+3. Run the same one-hop Cypher pattern used in `#13146` through `mvp/falkor/send-cypher`.
+4. Keep only relationships with `rel.description` or `rel.fact`.
+5. Convert each edge description into one memory candidate.
+6. Scrub large arrays, embeddings, and vectors from edge metadata.
+7. Build deterministic hashes:
+   - `canonical_memory_hash` from graph root, edge identity, from/to node identity, edge type, and description.
+   - `memory_hash` from the canonical hash plus `master_person_id`.
+8. If the edge has `valid_from`, normalize it and write it as `valid_from`, `occurred_at`, `memory_date`, and `memory_date_source: "edge.valid_from"`.
+9. Tag metadata with `memory_scope: "global_master_person"`, `visibility: "global_objective"`, `master_person_id`, graph node/edge provenance, `source_type: "graph_edge"`, and `source_platform: "falkordb"`.
+10. When `dry_run=false`, duplicate-check Mem0 by `user_id = "master_person:{master_person_id}"` plus `run_id = memory_hash`.
+11. Write non-duplicates to `POST https://api.mem0.ai/v3/memories/add/` with `infer=false`.
+12. Return `graph_edge_stage`, `candidate_memory_count`, and full `candidate_memories`.
+
+### Example Output
+
+Richard Kerris dry-run input:
+
+```json
+{
+  "master_person_id": 4464,
+  "dry_run": true,
+  "max_graph_edge_memories": 500
+}
+```
+
+Abridged live output. The full dry run returned `21` one-hop graph-edge memory candidates; the example below keeps the top-level shape and the first three candidates from the attached run.
+
+```json
+{
+  "function_name": "mem0/create-master-person-memories",
+  "status": "complete",
+  "dry_run": true,
+  "master_person_id": 4464,
+  "subject_person_name": "Richard Kerris",
+  "node_uuid": "55a84e0d-03a8-434a-83d5-a312664cb051",
+  "mem0_user_id": "master_person:4464",
+  "graph_edge_stage": {
+    "called": true,
+    "skipped": false,
+    "skip_reason": "",
+    "edge_count": 21,
+    "candidate_count": 21,
+    "written_count": 0,
+    "duplicate_count": 0,
+    "error": "",
+    "candidate_memories": [
+      {
+        "memory": "Richard Kerris served as a Partner and Executive Advisor to kineticmindsnc_org from March 2014 to May 2017.",
+        "category": "graph_edge",
+        "confidence": 1,
+        "scope": "global_master_person",
+        "mem0_user_id": "master_person:4464",
+        "master_person_id": 4464,
+        "canonical_memory_hash": "sha256:2f920dd61b8e088c94f9b1f136689a83db50ad8925fbbef1d600e45baf0c1086",
+        "memory_hash": "sha256:5178d30fcd3dafda048fc7baefacf296fe094c8680b59df7222ebec4c56c8261",
+        "metadata": {
+          "flow_type": "master_person_memory_sync",
+          "source_type": "graph_edge",
+          "source_platform": "falkordb",
+          "memory_scope": "global_master_person",
+          "visibility": "global_objective",
+          "user_id": "master_person:4464",
+          "master_person_id": 4464,
+          "subject_person_name": "Richard Kerris",
+          "edge_type": "ADVISOR_TO",
+          "edge_uuid": "342c5574-d865-4721-8090-a70578e34ab6",
+          "from_node_name": "Richard Kerris",
+          "to_node_name": "kineticmindsnc_org",
+          "graph_hop_count": 1,
+          "schema_version": "2026-06-27"
+        },
+        "mem0": {
+          "dry_run": true,
+          "attempted": false,
+          "status": null,
+          "event_id": null,
+          "memory_id": null,
+          "duplicate_check_attempted": false,
+          "duplicate_check_status": null,
+          "duplicate_found": false,
+          "existing_memory_id": null,
+          "duplicate_check_error": null,
+          "error": null,
+          "response_preview": null
+        }
+      },
+      {
+        "memory": "Richard Kerris served as a member of the board of advisors for OTOY from June 2018 to February 2019.",
+        "category": "graph_edge",
+        "confidence": 1,
+        "scope": "global_master_person",
+        "mem0_user_id": "master_person:4464",
+        "master_person_id": 4464,
+        "canonical_memory_hash": "sha256:3d0a1f1a3dd28de95445210a80591155164dc50012da3d7f89995a27fe76d191",
+        "memory_hash": "sha256:f42542f67bc0e14a256cdf81b7ed721c6440dc1f28e652b4a6b383b3a5c22b0c",
+        "metadata": {
+          "flow_type": "master_person_memory_sync",
+          "source_type": "graph_edge",
+          "source_platform": "falkordb",
+          "memory_scope": "global_master_person",
+          "visibility": "global_objective",
+          "user_id": "master_person:4464",
+          "master_person_id": 4464,
+          "subject_person_name": "Richard Kerris",
+          "edge_type": "ADVISOR_TO",
+          "edge_uuid": "270c24c5-a09e-455c-acb3-1fbd843997a0",
+          "from_node_name": "Richard Kerris",
+          "to_node_name": "OTOY",
+          "graph_hop_count": 1,
+          "schema_version": "2026-06-27"
+        },
+        "mem0": {
+          "dry_run": true,
+          "attempted": false,
+          "status": null,
+          "event_id": null,
+          "memory_id": null,
+          "duplicate_check_attempted": false,
+          "duplicate_check_status": null,
+          "duplicate_found": false,
+          "existing_memory_id": null,
+          "duplicate_check_error": null,
+          "error": null,
+          "response_preview": null
+        }
+      },
+      {
+        "memory": "Richard Kerris served as a Member of the Board of Advisors for OTOY from June 2018 to February 2019.",
+        "category": "graph_edge",
+        "confidence": 1,
+        "scope": "global_master_person",
+        "mem0_user_id": "master_person:4464",
+        "master_person_id": 4464,
+        "canonical_memory_hash": "sha256:f36623c7bb0a2765e661cd76a9549e4696389f47962f693d3d9e7bb30453df19",
+        "memory_hash": "sha256:b531f2d1a541142fdf982446c18f0f8cd1be216ea4a555da893fea151742ee34",
+        "metadata": {
+          "flow_type": "master_person_memory_sync",
+          "source_type": "graph_edge",
+          "source_platform": "falkordb",
+          "memory_scope": "global_master_person",
+          "visibility": "global_objective",
+          "user_id": "master_person:4464",
+          "master_person_id": 4464,
+          "subject_person_name": "Richard Kerris",
+          "edge_type": "BOARD_MEMBER_OF",
+          "edge_uuid": "56b0e964-ebed-4064-acd7-0a90d6e0ddf2",
+          "from_node_name": "Richard Kerris",
+          "to_node_name": "OTOY",
+          "graph_hop_count": 1,
+          "schema_version": "2026-06-27"
+        },
+        "mem0": {
+          "dry_run": true,
+          "attempted": false,
+          "status": null,
+          "event_id": null,
+          "memory_id": null,
+          "duplicate_check_attempted": false,
+          "duplicate_check_status": null,
+          "duplicate_found": false,
+          "existing_memory_id": null,
+          "duplicate_check_error": null,
+          "error": null,
+          "response_preview": null
+        }
+      }
+    ],
+    "note": "Abridged: live dry run returned 21 candidate_memories; only the first three are shown here."
+  },
+  "candidate_memory_count": 21,
+  "candidate_memories": "[same 21 candidate memories as graph_edge_stage.candidate_memories]"
+}
+```
+
+## `mem0/delete-master-person-memories` (`#13150`)
+
+| Field | Value |
+| --- | --- |
+| Xano function name | `mem0/delete-master-person-memories` |
+| Xano ID | `13150` |
+| Workspace | `3` |
+| Primary input | `master_person_id` |
+| Default mode | `dry_run=true` |
+| Mem0 delete mode | `dry_run=false`, requires `$env.MEM0_API_KEY` |
+| Memory target | Shared synthetic Mem0 user: `master_person:{master_person_id}` |
+| QA purpose | Clear master-person memories before rerunning master-person memory tests |
+
+### What It Does
+
+This function is a QA helper for clearing the shared Mem0 scope used by `mem0/create-master-person-memories`.
+
+It lists or deletes memories whose Mem0 `user_id` is exactly `master_person:{master_person_id}`. It does not delete mailbox-owner private contact memories stored under `user.workos_id`, including private email or calendar memories created by `#13149`.
+
+<Note>
+  The input must be the `master_person.id`, not a `contacts.id` and not the Xano function ID. For the Richard Kerris QA path documented here, the `master_person_id` is `4464`.
+</Note>
+
+<Warning>
+  Use `dry_run=true` first. Setting `dry_run=false` deletes every memory found in the synthetic master-person Mem0 scope for the given `master_person_id`.
+</Warning>
+
+### Inputs
+
+| Input | Default | Purpose |
+| --- | --- | --- |
+| `master_person_id` | required | The shared `master_person` whose synthetic Mem0 scope should be inspected or cleared. |
+| `dry_run` | `true` | When true, returns matching memories without deleting them. |
+| `max_pages` | `20` | Maximum Mem0 list pages to inspect. |
+| `page_size` | `1000` | Page size used when listing Mem0 memories. |
+
+### Step-by-step
+
+1. Load `master_person` by `master_person_id`.
+2. Build the synthetic Mem0 user id: `master_person:{master_person_id}`.
+3. List Mem0 memories from `POST https://api.mem0.ai/v3/memories/` filtered to that exact `user_id`.
+4. If the list call fails, fall back to `POST https://api.mem0.ai/v3/memories/search/` with the same `user_id` filter.
+5. De-duplicate returned memories by Mem0 memory id.
+6. If `dry_run=true`, return the matching memories and `would_delete_count` without making delete calls.
+7. If `dry_run=false`, delete each memory id, trying the v1 delete endpoint first and the v3 delete endpoint second.
+8. Treat HTTP `404` as already deleted so the function is idempotent for QA reruns.
+9. Return counts, memory previews, and per-memory delete attempt details.
+
+### Response Shape
+
+| Field | Purpose |
+| --- | --- |
+| `status` | `dry_run_complete`, `delete_complete`, or `delete_partial_failure`. |
+| `mem0_user_id` | The synthetic Mem0 user scope that was inspected or cleared. |
+| `read_method` | `list` or `search_fallback`. |
+| `found_count` | Number of unique memories found with a Mem0 memory id. |
+| `missing_id_count` | Number of returned memory objects that did not include a deleteable id. |
+| `would_delete_count` | Number of memories that would be deleted in dry-run mode. |
+| `deleted_count` | Number of memories deleted, or treated as already deleted. |
+| `failed_count` | Number of delete attempts that failed. |
+| `memories` | A preview array of matching memories. |
+| `delete_results` | Per-memory delete details when `dry_run=false`. |
+
+### Example Dry Run
+
+```json
+{
+  "master_person_id": 4464,
+  "dry_run": true
+}
+```
+
+Expected output shape:
+
+```json
+{
+  "function_name": "mem0/delete-master-person-memories",
+  "status": "dry_run_complete",
+  "dry_run": true,
+  "master_person_id": 4464,
+  "subject_person_name": "Richard Kerris",
+  "mem0_user_id": "master_person:4464",
+  "read_method": "list",
+  "found_count": 21,
+  "missing_id_count": 0,
+  "would_delete_count": 21,
+  "deleted_count": 0,
+  "failed_count": 0,
+  "skipped_count": 0,
+  "memories": [
+    {
+      "id": "mem0_memory_id",
+      "memory": "Richard Kerris served as a member of the board of advisors for OTOY from June 2018 to February 2019.",
+      "user_id": "master_person:4464",
+      "memory_scope": "global_master_person",
+      "master_person_id": 4464,
+      "source_type": "graph_edge",
+      "source_platform": "falkordb",
+      "created_at": "2026-06-27T00:00:00.000Z"
+    }
+  ],
+  "delete_results": []
+}
+```
+
+## `mem0/delete-contact-memories` (`#13151`)
+
+| Field | Value |
+| --- | --- |
+| Xano function name | `mem0/delete-contact-memories` |
+| Xano ID | `13151` |
+| Workspace | `3` |
+| Primary input | `contacts_id` |
+| Default mode | `dry_run=true` |
+| Mem0 delete mode | `dry_run=false`, requires `$env.MEM0_API_KEY` |
+| Memory target | Mailbox owner's private Mem0 user, keyed by `user.workos_id` |
+| QA purpose | Clear private contact memories before rerunning contact memory tests |
+
+### What It Does
+
+This function is a QA helper for clearing private Mem0 memories tied to one `contacts` row.
+
+It resolves `contacts_id` to `contacts.user_id`, then resolves that mailbox owner to `user.workos_id`, which is the private Mem0 `user_id`. It reads private memories matching `metadata.contacts_id`; by default it also reads private memories matching the linked `metadata.master_person_id`, because `mem0/get-contacts-memories` uses both match paths.
+
+It does not call FalkorDB or run Cypher. It only lists matching Mem0 memories and optionally deletes them by Mem0 memory id.
+
+<Warning>
+  Use `dry_run=true` first. Setting `dry_run=false` deletes matching private Mem0 memories under the mailbox owner's `user.workos_id`.
+</Warning>
+
+<Note>
+  For safety, `dry_run=false` refuses broad deletion unless `source_type` or `source_platform` is provided, or `delete_all_sources=true` is explicitly set.
+</Note>
+
+### Inputs
+
+| Input | Default | Purpose |
+| --- | --- | --- |
+| `contacts_id` | required | The `contacts` row whose private memories should be inspected or cleared. |
+| `user_id` | `contacts.user_id` | Optional mailbox owner override for manual testing; must own the contact. |
+| `dry_run` | `true` | When true, returns matching memories without deleting them. |
+| `source_type` | optional | Optional metadata filter, for example `graph_edge` or `email_thread`. |
+| `source_platform` | optional | Optional metadata filter, for example `falkordb` or `nylas`. |
+| `memory_scope` | optional | Optional metadata filter, normally `mailbox_owner_private`. |
+| `include_master_person_matches` | `true` | Also inspect private memories matched by `metadata.master_person_id`. |
+| `delete_all_sources` | `false` | Required for `dry_run=false` when no source filter is provided. |
+| `max_pages` | `20` | Maximum Mem0 list pages to inspect per filter. |
+| `page_size` | `1000` | Page size used when listing Mem0 memories. |
+
+### Step-by-step
+
+1. Load `contacts` by `contacts_id`.
+2. Resolve the mailbox owner from `contacts.user_id`, or validate the optional `user_id` override owns the contact.
+3. Load `user.workos_id`; this is the private Mem0 `user_id`.
+4. Resolve the linked `master_person_id` and display name for response context.
+5. Read Mem0 memories from `POST https://api.mem0.ai/v3/memories/` where `user_id = user.workos_id` and `metadata.contacts_id = contacts_id`.
+6. When `include_master_person_matches=true`, also read private memories where `user_id = user.workos_id` and `metadata.master_person_id = contacts.master_person_id`.
+7. De-duplicate returned memories by Mem0 id, memory hash, canonical hash, or run id.
+8. Client-side confirm each returned memory still has `metadata.contacts_id = contacts_id` or, when enabled, `metadata.master_person_id = contacts.master_person_id`; then apply optional source filters such as `source_type = "graph_edge"` and `source_platform = "falkordb"`.
+9. If `dry_run=true`, return the matching memories and `would_delete_count` without making delete calls.
+10. If `dry_run=false`, refuse broad deletion unless a source filter is present or `delete_all_sources=true`.
+11. Delete each matching memory id, trying the v1 delete endpoint first and the v3 delete endpoint second.
+12. Treat HTTP `404` as already deleted so the function is idempotent for QA reruns.
+
+### Response Shape
+
+| Field | Purpose |
+| --- | --- |
+| `status` | `dry_run_complete`, `delete_complete`, `delete_partial_failure`, or `refused_missing_source_filter`. |
+| `contacts_id` | The contact row being inspected or cleared. |
+| `mem0_user_id` | The mailbox owner's private Mem0 user scope. |
+| `master_person_id` | The linked shared person id used for optional private master-person matching. |
+| `filters_applied` | Source and scope filters used after the Mem0 read. |
+| `read_scopes` | Per-filter read summary for `metadata.contacts_id` and optionally `metadata.master_person_id`. |
+| `read_count` | Unique private memories read before source filtering. |
+| `found_count` | Unique private memories matching the source filters. |
+| `filtered_out_count` | Unique private memories read but not targeted for deletion. |
+| `would_delete_count` | Number of memories that would be deleted in dry-run mode. |
+| `deleted_count` | Number of memories deleted, or treated as already deleted. |
+| `failed_count` | Number of delete attempts that failed. |
+| `memories` | A preview array of targeted memories. |
+| `delete_results` | Per-memory delete details when `dry_run=false`. |
+
+### Example: Stale Graph Cleanup
+
+Richard Kerris contact-scoped graph memories were stale private rows written by the old pre-split contact function. To inspect only those rows:
+
+```json
+{
+  "contacts_id": 208,
+  "user_id": 12,
+  "dry_run": true,
+  "source_type": "graph_edge",
+  "source_platform": "falkordb"
+}
+```
+
+When the dry run looks correct, delete the targeted stale graph rows:
+
+```json
+{
+  "contacts_id": 208,
+  "user_id": 12,
+  "dry_run": false,
+  "source_type": "graph_edge",
+  "source_platform": "falkordb"
+}
+```
+
+This keeps real private `email_thread` / `nylas` memories for the contact while removing the old contact-scoped graph-edge memories.
+
+Recent Richard Kerris QA dry run:
+
+```json
+{
+  "function_name": "mem0/delete-contact-memories",
+  "status": "dry_run_complete",
+  "dry_run": true,
+  "contacts_id": 208,
+  "mailbox_owner_user_id": 12,
+  "mem0_user_id": "user_01KP3XJHQ6XMVNRZ1SMHCBVDN0",
+  "master_person_id": 4464,
+  "subject_person_name": "Richard Kerris",
+  "include_master_person_matches": true,
+  "filters_applied": {
+    "source_type": "graph_edge",
+    "source_platform": "falkordb",
+    "memory_scope": "",
+    "delete_all_sources": false
+  },
+  "read_scopes": [
+    {
+      "match_scope": "metadata.contacts_id",
+      "read_method": "list",
+      "truncated": false,
+      "raw_count": 100
+    },
+    {
+      "match_scope": "metadata.master_person_id",
+      "read_method": "list",
+      "truncated": false,
+      "raw_count": 100
+    }
+  ],
+  "read_count": 100,
+  "found_count": 98,
+  "filtered_out_count": 2,
+  "missing_id_count": 0,
+  "would_delete_count": 98,
+  "deleted_count": 0,
+  "failed_count": 0,
+  "skipped_count": 0,
+  "memories": [
+    {
+      "id": "8537bc2b-cd58-4193-984a-d125f2706a91",
+      "memory": "Richard Kerris worked at HPE SimpliVity as Vice President, Worldwide Developer Relations - Webos from February 2011 to October 2011.",
+      "contacts_id": 208,
+      "master_person_id": 4464,
+      "memory_scope": "mailbox_owner_private",
+      "source_type": "graph_edge",
+      "source_platform": "falkordb",
+      "match_scopes": ["metadata.contacts_id", "metadata.master_person_id"]
+    }
+  ],
+  "filtered_out_memories_sample": [
+    {
+      "id": "a75652bd-c9a2-42a7-a97c-c19ee1fa6760",
+      "memory": "Mark Pederson invited Richard Kerris to a demo of Orbiter.io...",
+      "contacts_id": 208,
+      "master_person_id": 4464,
+      "source_type": "email_thread",
+      "source_platform": "nylas",
+      "match_scopes": ["metadata.contacts_id", "metadata.master_person_id"]
+    }
+  ],
+  "delete_results": []
+}
+```
+
+The dry run targeted only stale `graph_edge` / `falkordb` rows and filtered out the real `email_thread` / `nylas` memories, so the actual delete can use the same source filters with `dry_run=false`.
+
+## `mem0/delete-all-memories` (`#13152`)
+
+| Field | Value |
+| --- | --- |
+| Xano function name | `mem0/delete-all-memories` |
+| Xano ID | `13152` |
+| Workspace | `3` |
+| Primary input | none |
+| Default mode | `dry_run=true` |
+| Mem0 delete mode | `dry_run=false` plus `confirm_phrase = "DELETE ALL MEM0 MEMORIES"` |
+| Memory target | Every Mem0 memory visible to `$env.MEM0_API_KEY` |
+| QA purpose | Full Mem0 reset before high-risk QA reruns |
+
+### What It Does
+
+This function is the global QA reset helper for Mem0. It lists every memory visible to the configured Mem0 API key, de-dupes by Mem0 id, memory hash, canonical hash, or run id, and optionally deletes each memory by id.
+
+<Warning>
+  This is intentionally broad. Use `dry_run=true` first. Actual deletion requires `dry_run=false` and the exact `confirm_phrase`: `DELETE ALL MEM0 MEMORIES`.
+</Warning>
+
+<Note>
+  If the list read reaches `max_pages`, the function marks the run as `truncated`. It refuses deletion on a truncated read unless `allow_truncated_delete=true`, so a default delete cannot silently clear only a partial subset.
+</Note>
+
+### Inputs
+
+| Input | Default | Purpose |
+| --- | --- | --- |
+| `dry_run` | `true` | When true, list/count memories without deleting them. |
+| `confirm_phrase` | optional | Required exactly as `DELETE ALL MEM0 MEMORIES` when `dry_run=false`. |
+| `max_pages` | `100` | Maximum Mem0 list pages to inspect. |
+| `page_size` | `100` | Page size used when listing Mem0 memories. The function caps wildcard reads at an effective size of `100` because Mem0 currently caps these reads. |
+| `sample_limit` | `50` | Maximum sample memories/delete results returned in the response. |
+| `allow_truncated_delete` | `false` | Allows deleting the fetched subset even if the read hit `max_pages`. |
+| `include_delete_results` | `false` | Includes per-memory delete attempt details in sampled delete results. |
+
+### Step-by-step
+
+1. Require `$env.MEM0_API_KEY`.
+2. Read Mem0 from `POST https://api.mem0.ai/v3/memories/?page={page}&page_size={page_size}` with a body containing `filters: { user_id: "*" }` and `show_expired: true`; Mem0 requires a non-empty filter object.
+3. If `page_size` query pagination fails, try `page` plus `limit` in the query string. The effective page size is capped at `100`; pagination now lives in the URL, not the JSON body.
+4. If list fails, fall back to `POST https://api.mem0.ai/v3/memories/search/`; search fallback is treated as potentially partial.
+5. De-dupe returned memories by id, memory hash, canonical hash, run id, or metadata equivalents.
+6. Return effective `page_size`, `requested_page_size`, counts by `user_id`, `memory_scope`, `source_type`, and `source_platform`, plus samples.
+7. If `dry_run=true`, stop before delete calls.
+8. If `dry_run=false`, require `confirm_phrase = "DELETE ALL MEM0 MEMORIES"`.
+9. Refuse deletion when the read is truncated or non-list unless `allow_truncated_delete=true`.
+10. Delete each memory id, trying the v1 delete endpoint first and the v3 delete endpoint second.
+11. Treat HTTP `404` as already deleted so the function is idempotent for QA reruns.
+
+### Example Dry Run
+
+```json
+{
+  "dry_run": true,
+  "max_pages": 100,
+  "page_size": 100,
+  "sample_limit": 25
+}
+```
+
+### Example Dry Run Output
+
+This abridged output came from a live dry run after the query-parameter pagination hardening. The function read all available pages without truncation, using an effective `page_size` of `100` even though the request asked for `1000`.
+
+```json
+{
+  "function_name": "mem0/delete-all-memories",
+  "status": "dry_run_complete",
+  "dry_run": true,
+  "confirmation_required": "DELETE ALL MEM0 MEMORIES",
+  "read_method": "list",
+  "list_errors": [],
+  "truncated": false,
+  "max_pages": 100,
+  "page_size": 100,
+  "requested_page_size": 1000,
+  "raw_read_count": 287,
+  "found_count": 287,
+  "deletable_count": 287,
+  "missing_id_count": 0,
+  "missing_dedupe_key_count": 0,
+  "would_delete_count": 287,
+  "deleted_count": 0,
+  "failed_count": 0,
+  "skipped_count": 0,
+  "counts_by_user_id": [
+    {
+      "key": "user_01KP3XJHQ6XMVNRZ1SMHCBVDN0",
+      "count": 239
+    },
+    {
+      "key": "user_01KNXVK52YJ24MS6G3GSGV90EF",
+      "count": 43
+    },
+    {
+      "key": "user_01KQSCNSA7J7KWYSXRSYKC3V60",
+      "count": 4
+    },
+    {
+      "key": "probe-robert-15",
+      "count": 1
+    }
+  ],
+  "counts_by_memory_scope": [
+    {
+      "key": "mailbox_owner_private",
+      "count": 239
+    },
+    {
+      "key": "missing",
+      "count": 48
+    }
+  ],
+  "counts_by_source_type": [
+    {
+      "key": "graph_edge",
+      "count": 225
+    },
+    {
+      "key": "chat",
+      "count": 48
+    },
+    {
+      "key": "email_thread",
+      "count": 14
+    }
+  ],
+  "counts_by_source_platform": [
+    {
+      "key": "falkordb",
+      "count": 225
+    },
+    {
+      "key": "missing",
+      "count": 48
+    },
+    {
+      "key": "nylas",
+      "count": 14
+    }
+  ],
+  "memories_sample": [
+    {
+      "id": "48f600a5-6b25-408d-870b-d16d72c6e93d",
+      "memory": "Orbiter.io is raising a $4M seed round in Q1 2026.",
+      "user_id": "user_01KNXVK52YJ24MS6G3GSGV90EF",
+      "source_type": "chat"
+    },
+    {
+      "id": "a75652bd-c9a2-42a7-a97c-c19ee1fa6760",
+      "memory": "Mark Pederson invited Richard Kerris to a demo of Orbiter.io...",
+      "user_id": "user_01KP3XJHQ6XMVNRZ1SMHCBVDN0",
+      "contacts_id": 208,
+      "master_person_id": 4464,
+      "memory_scope": "mailbox_owner_private",
+      "source_type": "email_thread",
+      "source_platform": "nylas"
+    }
+  ]
+}
+```
+
+### Example Delete
+
+```json
+{
+  "dry_run": false,
+  "confirm_phrase": "DELETE ALL MEM0 MEMORIES",
+  "max_pages": 100,
+  "page_size": 100,
+  "sample_limit": 25
+}
+```
+
+If `dry_run=false` is sent without the exact `confirm_phrase`, the function returns `status: "refused_missing_confirmation"` and deletes nothing. If a read is still marked `truncated`, the function refuses deletion unless `allow_truncated_delete=true`.
+
+## `mem0/create-memories-from-contact-id-v2` (`#13149`)
+
+| Field | Value |
+| --- | --- |
+| Xano function name | `mem0/create-memories-from-contact-id-v2` |
+| Xano ID | `13149` |
+| Workspace | `3` |
+| Primary input | `contacts_id` |
+| Default mode | `dry_run=true` |
+| Mem0 write mode | `dry_run=false`, requires `$env.MEM0_API_KEY` |
+| OpenRouter env | `$env.openRouter` is required for model extraction and email tone |
+| Current prefilter model | `deepseek/deepseek-v4-flash` |
+| Current extraction model | `deepseek/deepseek-v4-flash` |
+| Memory target | The mailbox owner's private Mem0 user, keyed by `user.workos_id` |
+| Linked person key | `contacts.master_person_id` is required and written into memory metadata |
+| Removed stage | No FalkorDB Cypher call; no shared master-person graph-edge writes |
+
+### What It Does
+
+This function creates private relationship memories for a single `contacts` row. It keeps the email, calendar, and optional sent-email voice profile behavior from `#13146`, but removes the master-person graph/Cypher stage.
+
+The memories are contact-scoped for privacy and retrieval, but every email and calendar memory is also linked to the shared person through `metadata.master_person_id`.
+
+### Current Model Configuration
+
+| Stage | Model | Purpose |
+| --- | --- | --- |
+| `cheap_prefilter` | `deepseek/deepseek-v4-flash` | Cheap high-recall noise check before memory extraction. |
+| `final_memory_extraction` | `deepseek/deepseek-v4-flash` | Writes the final candidate memory text as strict English-only JSON. |
+| `sent_email_voice_profile` | `anthropic/claude-opus-4.8` | Optional email tone profile when `run_email_tone=true`. |
+
+The prefilter and extraction prompts require English-only string values. Email extraction runs before the calendar stage: the function processes Nylas email threads through a high-recall noise check and then extraction, then creates direct `calendar_event` memories. The prefilter is intentionally non-authoritative: if the model rejects a thread but the transcript is not obvious bulk, receipt, automation, or calendar-forwarding noise, the function overrides the rejection and lets extraction make the final storeability decision. The extraction stage asks for minified JSON, caps summaries/memories/reasons, limits each thread to at most five candidate memories, asks for an `event_date`, and suppresses CJK-script candidate memories before Mem0 writes, so a model slip cannot store Chinese memory text.
+
+For email memories, `memory_date` and `occurred_at` are set from the model-supplied `event_date` when the transcript supports an actual event/action date. If `event_date` is blank, the function falls back to the latest normalized `evidence_dates` value from the source email messages. Calendar memories use the calendar event start as `event_date`, `occurred_at`, and `memory_date`.
+
+Calendar memories use resolved participant names when available. If the Nylas event title is generic, such as `+ 2 others`, the memory text avoids copying that title and instead names the resolved participants in the description.
+
+<Note>
+  `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free` was tested and removed because OpenRouter returned no endpoints matching the function's `data_collection: "deny"` privacy policy. The function should not relax that privacy setting for private email content without explicit approval.
+</Note>
+
+### Inputs
+
+| Input | Default | Purpose |
+| --- | --- | --- |
+| `contacts_id` | required | The `contacts` row whose private memories should be processed. |
+| `user_id` | `auth.id` | Optional mailbox owner override for manual testing. |
+| `dry_run` | `true` | Returns candidate memories without writing to Mem0. |
+| `run_email_tone` | falsey | Runs the sent-email voice profile stage. |
+| `force_email_tone_refresh` | falsey | Rebuilds the voice profile even when the corpus hash has not changed. |
+| `max_sent_email_samples` | `250` | Max sent emails included in the voice profile stage. |
+| `max_sent_email_pages` | `25` | Max Nylas sent-message pages inspected per grant/contact email. |
+| `max_sent_email_chars` | `60000` | Max cleaned sent-email characters sent to the voice profile model. |
+| `max_threads_per_batch` | `20` | Max unique historical threads processed in one run. |
+| `max_messages_per_thread` | `50` | Max messages fetched per historical thread. |
+| `max_cleaned_transcript_chars` | `30000` | Max cleaned thread transcript characters sent to the extraction model. |
+| `max_calendar_events_per_batch` | `100` | Max matched calendar events converted to memory candidates. |
+| `max_calendar_pages_per_calendar` | `10` | Max Nylas calendar-event pages inspected per active calendar. |
+| `calendar_lookback_days` | `3650` | Calendar lookback window. |
+| `calendar_forward_days` | `365` | Calendar lookahead window. |
+| `page_token` | optional | Nylas thread pagination cursor for continuation runs. |
+
+### Step-by-step
+
+1. Resolve `effective_user_id` from `input.user_id`, falling back to `auth.id`.
+2. Load `contacts` by `contacts_id` and verify `contacts.user_id == effective_user_id`.
+3. Require `contacts.master_person_id` so every private memory can be linked back to the shared person.
+4. Load the linked `master_person` and choose `subject_person_name` from `master_person.name`, falling back to `contacts.full_name`.
+5. Load the mailbox owner and require `user.workos_id`; that WorkOS ID is the private Mem0 `user_id`.
+6. Load active contact emails, active Nylas grants, active calendars, mailbox-owner email accounts, and the user's known contact directory.
+7. Scan Nylas email threads with the contact, prefilter threads with DeepSeek V4 Flash, extract durable English-only `email_thread` memories with DeepSeek V4 Flash, and tag them with `contacts_id`, `master_person_id`, surfaced contacts, retrieval contact IDs, source provenance, `event_date`, `memory_date`, and `memory_date_source`.
+8. Scan Nylas calendar events that include the contact, build `calendar_event` memories after email processing, name resolved participants when available, and tag them with `contacts_id`, `master_person_id`, `source_platform: "nylas"`, `memory_scope: "mailbox_owner_private"`, and the event start as `memory_date`.
+9. When `dry_run=false`, duplicate-check and write accepted calendar/email memories to the mailbox owner's private Mem0 user with `infer=false`.
+10. If `run_email_tone=true`, build or refresh the `email_draft_tone` profile for the contact. This stage does not write to Mem0.
+11. Return run status, contact/master-person context, calendar stage, email tone stage, model usage, continuation cursors, thread diagnostics, and `candidate_memories`.
+
+### Example Output
+
+Richard Kerris dry-run input:
+
+```json
+{
+  "contacts_id": 208,
+  "user_id": 12,
+  "dry_run": true,
+  "run_email_tone": false
+}
+```
+
+Abridged live dry-run output after the current all-DeepSeek high-recall prefilter, evidence-date normalization, calendar-forwarding hard-noise filter, and resolved-participant calendar description changes. The run returned `4` email-thread memories and `1` calendar-event memory; the pure meeting-forwarding thread was skipped.
+
+```json
+{
+  "function_name": "mem0/create-memories-from-contact-id-v2",
+  "status": "dry_run_complete",
+  "dry_run": true,
+  "option": "contacts_id-private-email-calendar",
+  "contacts_id": 208,
+  "master_person_id": 4464,
+  "subject_person_name": "Richard Kerris",
+  "mailbox_owner_user_id": 12,
+  "mem0_user_id": "user_01KP3XJHQ6XMVNRZ1SMHCBVDN0",
+  "threads_seen": 4,
+  "threads_processed": 2,
+  "threads_skipped": 2,
+  "calendar_stage": {
+    "called": true,
+    "skipped": false,
+    "candidate_count": 1,
+    "first_memory": {
+      "memory": "Richard Kerris was a participant in a calendar meeting with Mark Pederson, Josh Diamond, and Jason Diamond on 2026-05-20.",
+      "category": "meeting_history",
+      "confidence": 1,
+      "occurred_at": "2026-05-20T20:00:00.000Z",
+      "participant_names": [
+        "Mark Pederson",
+        "Josh Diamond",
+        "Richard Kerris",
+        "Jason Diamond"
+      ],
+      "resolved_participant_count": 4,
+      "event_title": "Richard Kerris and Mark L. Pederson + 2 others"
+    }
+  },
+  "candidate_memory_count": 5,
+  "candidate_memories": [
+    {
+      "memory": "Richard Kerris agreed to a larger team demo with Orbiter.io during a recent meeting.",
+      "category": "meeting_commitment",
+      "confidence": 0.95,
+      "source_type": "email_thread",
+      "occurred_at": "2026-05-26"
+    },
+    {
+      "memory": "Richard Kerris was asked to provide detailed user stories to help prepare a targeted Orbiter.io demo.",
+      "category": "explicit_request",
+      "confidence": 0.95,
+      "source_type": "email_thread",
+      "occurred_at": "2026-05-26"
+    },
+    {
+      "memory": "Mark Pederson requested warm introductions to high-net-worth investors from Richard Kerris.",
+      "category": "introduction_request",
+      "confidence": 0.9,
+      "source_type": "email_thread",
+      "occurred_at": "2026-05-26"
+    },
+    {
+      "memory": "Mark Pederson invited Richard Kerris to a demo of Orbiter.io, mentioning high-profile pilot partners including UTA, SXSW, HBO, and Rochester Institute of Technology.",
+      "category": "demo_invitation",
+      "confidence": 0.95,
+      "source_type": "email_thread",
+      "occurred_at": "2026-05-30"
+    },
+    {
+      "memory": "Richard Kerris was a participant in a calendar meeting with Mark Pederson, Josh Diamond, and Jason Diamond on 2026-05-20.",
+      "category": "meeting_history",
+      "confidence": 1,
+      "source_type": "calendar_event",
+      "occurred_at": "2026-05-20T20:00:00.000Z",
+      "participant_names": [
+        "Mark Pederson",
+        "Josh Diamond",
+        "Richard Kerris",
+        "Jason Diamond"
+      ]
+    }
+  ],
+  "model_usage": [
+    {
+      "model": "deepseek/deepseek-v4-flash",
+      "purpose": "cheap_prefilter",
+      "calls": 3,
+      "total_tokens": 3694,
+      "cost_usd": 0.0002975904
+    },
+    {
+      "model": "deepseek/deepseek-v4-flash",
+      "purpose": "final_memory_extraction",
+      "calls": 2,
+      "total_tokens": 7952,
+      "cost_usd": 0.0010308084
+    },
+    {
+      "model": "anthropic/claude-opus-4.8",
+      "purpose": "sent_email_voice_profile",
+      "calls": 0,
+      "total_tokens": 0,
+      "cost_usd": 0
+    }
+  ],
+  "thread_results": [
+    {
+      "thread_id": "19e4c1a919f3b12c",
+      "should_skip": false,
+      "thread_summary": "Mark Pederson follows up with Richard Kerris after a meeting, requesting user stories for a targeted demo and asking for warm introductions to investors.",
+      "prefilter": {
+        "should_extract": true,
+        "reason": "Direct follow-up to Richard Kerris after prior meeting: requests user stories for targeted demo, shares materials, lists pilots, and mentions fundraising."
+      },
+      "extraction": {
+        "called": true,
+        "error": ""
+      }
+    },
+    {
+      "thread_id": "19e46dddef65e425",
+      "should_skip": true,
+      "skip_reason": "prefilter_rejected",
+      "prefilter": {
+        "should_extract": false,
+        "hard_noise_rejection": true,
+        "reason": "Only automated meeting forward notifications with no substantive conversation, requests, or relationship context."
+      },
+      "extraction": {
+        "called": false,
+        "error": ""
+      }
+    },
+    {
+      "thread_id": "19e21c7774dd433f",
+      "should_skip": true,
+      "skip_reason": "cleaned_transcript_too_short",
+      "extraction": {
+        "called": false,
+        "error": ""
+      }
+    },
+    {
+      "thread_id": "19de3caed3de99d5",
+      "should_skip": false,
+      "thread_summary": "Mark Pederson invited Richard Kerris to an Orbiter.io demo, highlighting pilot partners including UTA, SXSW, HBO, and Rochester Institute of Technology.",
+      "prefilter": {
+        "should_extract": true,
+        "reason": "Direct outbound demo invitation with Calendly links and business context, useful for future relationship tracking."
+      },
+      "extraction": {
+        "called": true,
+        "error": ""
+      }
+    }
+  ]
+}
+```
+
+## `mem0/get-contacts-memories` (`#13147`)
+
+| Field | Value |
+| --- | --- |
+| Xano function name | `mem0/get-contacts-memories` |
+| Xano ID | `13147` |
+| Workspace | `3` |
+| Primary input | `contacts_id` |
+| Mem0 read key | `contacts.user_id -> user.workos_id` |
+| Master-person read key | `contacts.master_person_id -> user_id = "master_person:{master_person_id}"` |
+| Response | Array of merged, de-duped memories, sorted by newest `memory_date` first |
+
+### What It Does
+
+This function is the combined Contact Side Panel read path. It takes a `contacts_id`, resolves the mailbox owner's Mem0 user and the linked `master_person`, fetches both private and shared memories, then returns one array ordered by newest memory date first.
+
+### Step-by-step
+
+1. Load `contacts` by `contacts_id`.
+2. Resolve `contacts.user_id` to the mailbox owner row.
+3. Require `user.workos_id`; this is the private Mem0 `user_id`.
+4. Resolve `contacts.master_person_id` and the best display name from `master_person.name` or `contacts.full_name`.
+5. Read the mailbox owner's private Mem0 scope using `user_id = user.workos_id`.
+6. Client-side keep only private memories whose metadata explicitly has `contacts_id = contacts_id` or `master_person_id = contacts.master_person_id`; missing metadata is not defaulted into a match.
+7. Read shared master-person memories from Mem0 using `user_id = "master_person:{master_person_id}"`.
+8. Normalize each memory into a common response object with `scope`, `memory`, `memory_date`, `memory_date_source`, `created_at`, `updated_at`, `contacts_id`, `master_person_id`, `source_type`, hashes, and raw `metadata`.
+9. De-dupe by `memory_hash`, `canonical_memory_hash`, Mem0 id, or normalized memory text.
+10. Sort by `memory_date` descending, so the most recent memory date appears first. Memories with no parseable date are last.
+
+### Memory Date Ordering
+
+`memory_date` means the date of the event described by the memory when that date exists. The reader checks metadata in this order:
+
+1. `memory_date`
+2. `occurred_at`
+3. `source_timestamp`
+4. `source_date`
+5. `event_at`
+6. `event_date`
+7. `event_start`
+8. `start_date`
+9. `valid_from`
+10. `edge_properties.valid_from`
+11. `date`
+12. `evidence_dates`
+
+If no event date is defined, the reader falls back to the Mem0 memory creation/update date: `created_at`, `createdAt`, `created`, `metadata.created_at`, `updated_at`, or `updatedAt`.
+
+## Legacy Reference: `mem0/create-memories-from-email-threads-v2` (`#13145`)
+
+| Field | Value |
+| --- | --- |
+| Xano function name | `mem0/create-memories-from-email-threads-v2` |
+| Xano ID | `13145` |
+| Workspace | `3` |
+| Primary input | `my_contact_id` |
+| Default mode | `dry_run=true` |
+| Mem0 write mode | `dry_run=false`, requires `$env.MEM0_API_KEY` |
+| OpenRouter env | `$env.openRouter` is required for all runs |
+| Memory target | The mailbox owner's private Mem0 user, keyed by `user.workos_id` |
+| Contact key | `contacts_id` / `contact_id` from the input contact row |
+
+### What It Does
+
+This function builds contact-scoped memory for one `contacts` record. It combines three related jobs:
+
+1. It imports one-hop FalkorDB graph edge descriptions for the contact into Mem0 as `graph_edge` memories.
+2. It searches the mailbox owner's historical Nylas email threads with that contact, extracts durable CRM-style memories, and optionally writes them to Mem0.
+3. If `run_email_tone=true`, it builds or refreshes a per-recipient sent-email voice profile in `email_draft_tone`.
+
+`dry_run=true` is the default. In dry-run mode the function still resolves context, runs the graph/email extraction logic, and returns candidate memories, but it does not write to Mem0 or save the email tone profile.
+
+### Inputs
+
+| Input | Default | Purpose |
+| --- | --- | --- |
+| `my_contact_id` | required | The `contacts` row to process. |
+| `user_id` | `auth.id` | Optional mailbox owner override for manual testing. |
+| `dry_run` | `true` | Returns candidate memories without writing to Mem0. |
+| `run_email_tone` | falsey | Runs the sent-email voice profile stage. |
+| `force_email_tone_refresh` | falsey | Rebuilds the voice profile even when the corpus hash has not changed. |
+| `max_sent_email_samples` | `250` | Max sent emails included in the voice profile stage. |
+| `max_sent_email_pages` | `25` | Max Nylas sent-message pages inspected per grant/contact email. |
+| `max_sent_email_chars` | `60000` | Max cleaned sent-email characters sent to the voice profile model. |
+| `max_threads_per_batch` | `20` | Max unique historical threads processed in one run. |
+| `max_messages_per_thread` | `50` | Max messages fetched per historical thread. |
+| `max_cleaned_transcript_chars` | `30000` | Max cleaned thread transcript characters sent to the extraction model. |
+| `max_graph_edge_memories` | `500` | Max one-hop graph edge memories considered. |
+| `page_token` | optional | Nylas thread pagination cursor for continuation runs. |
+
+### Step-by-step
+
+### 1. Resolve The Effective User
+
+The function sets `effective_user_id` from `input.user_id`, falling back to `auth.id`. It stops immediately if neither is present.
+
+It also loads the runtime keys:
+
+- `$env.openRouter` is required because the email-thread prefilter and extraction stages call OpenRouter.
+- `$env.MEM0_API_KEY` is required only when `dry_run=false`.
+
+The function writes temporary checkpoints to `log_crash` throughout the run.
+
+### 2. Load And Validate The Contact
+
+The function loads `contacts` by `my_contact_id`, verifies that the contact belongs to `effective_user_id`, and then loads the linked `master_person`.
+
+It chooses `subject_person_name` from `master_person.name`, falling back to `contacts.full_name`. It also loads the mailbox owner from `user` and requires `user.workos_id`; that WorkOS ID becomes the Mem0 `user_id`.
+
+### 3. Build The Contact And Mailbox Context
+
+The function prepares the lookup context used by every later stage:
+
+- Reads `my_person_email_join` plus `master_email` to collect the contact's active email addresses.
+- Reads active `nylas_grant` rows for the mailbox owner.
+- Collects mailbox owner email accounts from those grants.
+- Loads up to 1,000 of the user's `contacts` rows, each with active emails, so extracted related contacts can be resolved back to known `contacts_id` values.
+
+### 4. Import One-hop Graph Edge Memories
+
+If the linked `master_person` has a `node_uuid`, the function queries FalkorDB through `mvp/falkor/send-cypher`.
+
+The Cypher query finds one-hop edges around the master-person node where the relationship has a `description` or `fact`, returning edge type, edge properties, from/to node metadata, and labels. The result is capped by `max_graph_edge_memories`.
+
+For each graph edge, a lambda:
+
+- Uses the edge description as the memory text.
+- Scrubs large arrays, embeddings, and vectors from metadata.
+- Builds deterministic `canonical_memory_hash`, `memory_hash`, `source_id`, and `run_id` values.
+- Tags metadata with `source_type: "graph_edge"`, `source_platform: "falkordb"`, `contacts_id`, `master_person_id`, edge identifiers, node labels, and `schema_version: "2026-06-22"`.
+- Adds the candidate to `graph_edge_stage.candidate_memories` and the global `candidate_memories` array.
+
+When `dry_run=false`, each graph memory is duplicate-checked in Mem0 with `user_id + run_id`. If no duplicate is found, it is written to `POST https://api.mem0.ai/v3/memories/add/` with `infer=false`.
+
+<Note>
+  This current implementation writes graph-derived facts as contact-scoped memories. The target architecture in [mem0 Full Scope](/guides/open-work/mem0/full-scope#1-graph-to-global-master-person-memories) moves objective graph facts into a shared master-person scope.
+</Note>
+
+### 5. Decide Whether Email Thread Processing Can Run
+
+Email processing is skipped when:
+
+- The contact has no active email addresses.
+- The mailbox owner has no active Nylas grants.
+
+Otherwise the function loops through each active Nylas grant and each active contact email.
+
+### 6. Find Candidate Nylas Threads
+
+For each grant/contact-email pair, the function calls `mvp/nylas/fetch-threads` with:
+
+- `any_email` set to the contact email.
+- `limit` set to `max_threads_per_batch`.
+- `page_token` passed through from input when present.
+
+It records any `next_cursor` values in `continuation_cursors` so later runs can resume. It also de-dupes threads by a key made from the Xano grant id, the Nylas grant id, and the Nylas thread id.
+
+### 7. Fetch Messages And Clean The Transcript
+
+For each unprocessed thread, the function calls `mvp/nylas/fetch-messages` with the thread id and `max_messages_per_thread`.
+
+The thread-processing lambda then:
+
+- Sorts messages by date.
+- Strips HTML, scripts, styles, quoted reply chains, unsubscribe/tracking links, common email footers, and repeated whitespace.
+- Rejects threads where the contact is not a direct `from` or `to` participant.
+- Rejects too-short transcripts and fully automated or transactional threads.
+- Builds a cleaned transcript capped by `max_cleaned_transcript_chars`.
+- Collects sent-email samples where the mailbox owner wrote to the contact, for the optional email tone stage.
+
+### 8. Prefilter Threads With OpenRouter
+
+The first model call is a cheap JSON prefilter:
+
+| Purpose | Model |
+| --- | --- |
+| `cheap_prefilter` | `deepseek/deepseek-v4-flash` |
+
+It returns `should_extract` and a reason, but the result is not authoritative. The function overrides soft `should_extract=false` decisions unless the transcript or model rejection reason has hard noise signals such as newsletters, receipts, invoices, unsubscribe language, automated notifications, no-reply senders, calendar-forwarding noise, meeting-forwarding noise, or purely transactional content. This keeps recall high and lets the extraction model make the final memory-quality decision.
+
+### 9. Extract Durable Memories
+
+Threads that pass the prefilter go to the extraction model:
+
+| Purpose | Model |
+| --- | --- |
+| `final_memory_extraction` | `deepseek/deepseek-v4-flash` |
+
+The model must return strict JSON with a thread summary and candidate memories. The extraction instructions prefer short, neutral, standalone facts about preferences, priorities, goals, objections, decisions, commitments, relationship history, and business context.
+
+The function stores only candidates that:
+
+- Have `should_store=true`.
+- Have confidence at or above `0.75`.
+- Are not marked `sensitive` or `secret`.
+- Have non-empty memory text.
+- Do not contain CJK-script text.
+
+The function normalizes email event and evidence dates before storing them. Numeric Unix timestamps from Nylas or the model are converted to ISO timestamps, date-only values remain valid, and `occurred_at` / `memory_date` use the supported `event_date` first, then fall back to the latest normalized evidence date.
+
+### 10. Resolve Related Contacts Without Fan-out
+
+Each accepted email memory remains attached to the input contact. Related people are annotations, not extra Mem0 writes.
+
+The function resolves related contacts against the mailbox owner's known contacts by email or by visible participant name plus email. It excludes the mailbox owner and excludes the primary subject contact from the surfaced-contact list.
+
+Metadata includes:
+
+- `surfaced_contacts`
+- `surfaced_contact_ids`
+- `retrieval_contact_ids`
+- `retrieval_person_names`
+- `related_contacts`
+- `unresolved_related_contacts`
+- `fanout_target_count: 1`
+
+This lets a memory remain primary-subject-scoped while still being discoverable when another resolved contact was involved.
+
+### 11. Write Email Memories To Mem0
+
+For each accepted email memory, the function builds deterministic hashes from the thread id, source hash, memory text, and primary contact id.
+
+The Mem0 metadata includes:
+
+- `source_type: "email_thread"`
+- `source_platform: "nylas"`
+- `source_table: "my_person"`
+- `contacts_id`
+- `master_person_id`
+- `memory_scope: "mailbox_owner_private"`
+- `mailbox_owner_user_id`
+- `xano_nylas_grant_id`
+- `nylas_grant_id`
+- `source_email_account`
+- `nylas_thread_id`
+- `nylas_message_ids`
+- `source_hash`
+- `canonical_memory_hash`
+- `memory_hash`
+- `run_id`
+- `extraction_model`
+- `schema_version: "2026-06-23"`
+
+When `dry_run=false`, the function duplicate-checks Mem0 with `user_id + run_id`. If no duplicate is found, it calls `POST https://api.mem0.ai/v3/memories/add/` with `infer=false`.
+
+When Mem0 returns an `event_id`, the function polls `GET https://api.mem0.ai/v1/event/{event_id}/` up to three times and records event status, event errors, and response previews in each candidate's `mem0` object.
+
+### 12. Process Calendar Events After Email
+
+After email-thread processing, the function scans Nylas calendar events for active contact emails.
+
+For each matched event, it:
+
+- Builds a `calendar_event` memory under the mailbox owner's private Mem0 user.
+- Resolves participant names from known contacts and Nylas participant data.
+- Avoids copying generic titles such as `+ 2 others` into the memory text when resolved participant names are available.
+- Stores participant metadata, including `participant_emails`, `participant_names`, `resolved_participants`, and `resolved_participant_count`.
+- Tags the memory with `contacts_id`, `master_person_id`, `occurred_at`, `event_title`, `calendar_id`, and Nylas event provenance.
+
+When `dry_run=false`, the calendar stage duplicate-checks Mem0 with `user_id + run_id` and writes non-duplicates with `infer=false`.
+
+### 13. Optionally Build The Sent-email Voice Profile
+
+When `run_email_tone=true`, the function also builds a per-contact writing-style profile from messages the mailbox owner sent to the contact.
+
+That stage:
+
+1. Calls `mvp/nylas/get-nylas-keys`.
+2. Uses the Nylas folders API to find the real Sent folder, falling back to `SENT`.
+3. Searches Nylas messages for each active contact email using `any_email` and the sent folder.
+4. Falls back to a folder-less message search if the folder-scoped search fails.
+5. Keeps only messages from the mailbox owner to the contact.
+6. Tracks pages queried, messages seen, qualifying sent emails, next cursors, folder resolution, and errors in `sent_email_collection`.
+7. De-dupes samples and caps them by `max_sent_email_samples` and `max_sent_email_chars`.
+8. Computes a corpus hash from the selected sample set.
+9. Skips the model call when the existing `email_draft_tone.email_tone_json.corpus_hash` and prompt version already match, unless `force_email_tone_refresh=true`.
+10. Calls OpenRouter with `anthropic/claude-opus-4.8` and a v3 forensic writing-style prompt.
+11. If `dry_run=false` and the model returns a profile, upserts `email_draft_tone` by `contacts_id`.
+
+This stage does not write to Mem0. It creates the reusable voice profile used by email drafting.
+
+### 14. Return The Run Summary
+
+The response includes:
+
+- Function identity and status.
+- Contact, mailbox owner, and Mem0 user ids.
+- Active emails, known-contact count, and Nylas grant count.
+- `threads_seen`, `threads_processed`, and `threads_skipped`.
+- `sent_email_collection` and `sent_email_sample_count`.
+- `calendar_stage`.
+- `email_tone_stage`.
+- `candidate_memory_count` and full `candidate_memories`.
+- `model_usage` for prefilter, extraction, and email tone stages.
+- `continuation_cursors`.
+- Per-thread diagnostics in `thread_results`.
+
+Status is `dry_run_complete` for dry runs and `write_complete` when `dry_run=false`, unless the run is skipped or blocked before thread processing.

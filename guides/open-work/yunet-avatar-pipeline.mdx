@@ -1,11 +1,11 @@
 ---
-title: "Build Scope — YuNet Avatar Pipeline (Full GCP)"
+title: "YuNet Avatar Pipeline (Full GCP) - Scope"
 description: "Square headshot avatar generation from enrichment-sourced images — deterministic geometry, commercially-clean licensing, GCP-native."
 icon: "image"
 ---
 
 <Info>
-  **Status:** Planned Work spec, ready to build. See [Developer Notes](#developer-notes) at the end for build approach, effort estimates, and known gotchas before pointing an agent at it.
+  **Status:** Scope spec for the eventual Full GCP target. The first implementation plan is Xano-first: [Build Plan](/guides/open-work/yunet-avatar-pipeline/build-plan).
 </Info>
 
 ## Goal
@@ -16,23 +16,28 @@ Turn an arbitrary enrichment-sourced image into a square (1:1) headshot avatar, 
   **Non-goals (v1):** face-alignment rotation, background replacement/segmentation, on-the-fly generation. All deferrable to v2.
 </Note>
 
+<Note>
+  **Rekognition option:** the default plan below stays YuNet/OpenCV-first. The [AWS Rekognition path](#optional-aws-rekognition-path) is selective only: fallback when YuNet is weak, plus a film/music route where `RecognizeCelebrities` may identify the target directly.
+</Note>
+
 ## 1. Inputs / Outputs
 
 **Input**
 
 - Source image: URL or bytes (from the Serper fallback resolver, or the primary PDL/Enrich Layer avatar).
 - Contact identity: `name`, optional descriptors, optional known-good reference face.
+- Routing hints: optional `industry`, `occupation`, `known_for`, and profile/source URLs (IMDb, MusicBrainz, Spotify, Wikipedia/Wikidata, etc.).
 - `verification_required: bool` — `false` for trusted single-source avatars (e.g. LinkedIn), `true` for scraped candidates.
 
 **Output**
 
 - Avatar set: `800x800` master + `400x400` + `128x128`, WebP with JPEG fallback, metadata stripped.
-- Record written to **AlloyDB** (avatar table): `source_url`, `face_box`, `det_confidence`, `gemini_verified`, `gemini_confidence`, `crop_params`, `sizes[]`, `quality_flag`.
+- Record written to **AlloyDB** (avatar table): `source_url`, `det_provider`, `det_route`, `fallback_reason`, `face_box`, `det_confidence`, `gemini_verified`, `gemini_confidence`, `compare_similarity`, `celebrity_match`, `celebrity_match_confidence`, `crop_params`, `sizes[]`, `quality_flag`, `safety_flags`.
 
 ## 2. Pipeline Flow
 
 1. **Fetch & normalize** — URL to bytes, decode, fix EXIF orientation, flatten transparency/animation.
-2. **Detect** — YuNet (`FaceDetectorYN`) returns boxes + 5 landmarks + scores.
+2. **Route + detect** — default to YuNet (`FaceDetectorYN`) for local boxes + 5 landmarks + scores. Use Rekognition only as a fallback when YuNet is weak, or first-pass for likely film/music people where `RecognizeCelebrities` may identify the target directly.
 3. **Select** the target face:
    - 0 faces: reject, fall through to next candidate source, then monogram fallback.
    - 1 face: use it (Gemini-verify only if `verification_required`).
@@ -105,6 +110,8 @@ One structured call does select + verify + locate, routed through OpenRouter and
 
 - **Reconciliation:** convert Gemini's box to pixels, then **IoU-match it against YuNet's boxes** and crop the *YuNet* box. Gemini decides *which* person and *whether* it's them; YuNet supplies the precise geometry. Best of both, no encumbered recognition weights.
 - **Skip the call** entirely on single-face trusted sources and on re-crops.
+- **Known-good reference face:** if the contact already has a trusted face, AWS Rekognition `CompareFaces` can pre-gate identity by similarity. It does **not** replace Gemini's name/descriptors path when no reference face exists.
+- **Likely film/music person:** if enrichment says the person is in film or music, route the candidate through AWS Rekognition `RecognizeCelebrities` first. If the returned celebrity name/URLs match the target aliases, use that face and store the match metadata. If it does not match, continue through YuNet/Gemini as usual.
 
 ## 5. Architecture — Full GCP, No Xano
 
@@ -133,6 +140,130 @@ YuNet is trivial in Python (`cv2.FaceDetectorYN`), but the platform is consolida
 
 GoCV is cleanest if you want it native; a Python sidecar is cleanest if you want it fast.
 
+### Optional AWS Rekognition path
+
+Use Rekognition as a managed fallback, or as the first detector for likely film/music people. This changes the posture from "Full GCP" to "GCP-orchestrated, AWS-managed vision," so keep it behind explicit routing metadata: `det_provider = "yunet" | "rekognition"` and `det_route = "default" | "fallback" | "film_music"`.
+
+| Rekognition API | Where it fits | Notes |
+|-----------------|---------------|-------|
+| [`RecognizeCelebrities`](https://docs.aws.amazon.com/rekognition/latest/APIReference/API_RecognizeCelebrities.html) | Rekognition-first route for film/music people | Returns recognized celebrity faces plus unrecognized faces. Use only as a routing/identity assist; not every film/music person will be in the celebrity set. |
+| [`DetectFaces`](https://docs.aws.amazon.com/rekognition/latest/APIReference/API_DetectFaces.html) | Fallback face geometry when YuNet is weak | Returns up to the 100 largest faces, including `BoundingBox`, `Confidence`, `Quality`, `Pose`, and `Landmarks` in the default attributes. |
+| [`CompareFaces`](https://docs.aws.amazon.com/rekognition/latest/APIReference/API_CompareFaces.html) | Optional identity pre-gate when a trusted reference face exists | Compares one source face to faces in the target image and returns matches above `SimilarityThreshold`; keep human/manual review for rights/privacy-impacting decisions. |
+| [`DetectModerationLabels`](https://docs.aws.amazon.com/rekognition/latest/APIReference/API_DetectModerationLabels.html) | Optional safety gate before storage | Replaces or complements the current "optional Gemini safety flag" for rejecting inappropriate source images. |
+
+**Detector router**
+
+1. **Film/music route:** if `industry`, `occupation`, `known_for`, or source URLs indicate film or music context, call `RecognizeCelebrities` first.
+2. If `RecognizeCelebrities` returns a celebrity whose `Name` or returned URLs match the target aliases, use the Rekognition celebrity face geometry and skip generic face selection unless Gemini verification is still required by policy.
+3. If the celebrity API returns no target match, fall back to the normal YuNet-first path.
+4. **Default route:** run YuNet locally. If YuNet returns a usable single target face, stay local.
+5. **Fallback route:** call Rekognition `DetectFaces` when YuNet returns 0 faces, low confidence, bad/missing eye landmarks, an edge-clipped box, or ambiguous multi-face geometry.
+6. If a trusted reference face exists, `CompareFaces` can run after either route as an additional identity pre-gate.
+
+<Note>
+  Treat film/music industry as a **routing hint**, not proof that Rekognition will know the person. Many working artists, producers, operators, and executives will not be in the celebrity index.
+</Note>
+
+**Flow**
+
+1. Cloud Run fetches the candidate URL, normalizes EXIF/animation/transparency, and re-encodes a JPEG/PNG byte buffer.
+2. Choose the detector route:
+   - `film_music`: call `RecognizeCelebrities` first for likely film/music targets.
+   - `default`: call YuNet locally.
+   - `fallback`: call Rekognition `DetectFaces` only when YuNet cannot produce a trustworthy crop.
+3. Convert Rekognition's normalized `BoundingBox` ratios into the same pixel crop contract used by YuNet. Clamp the box: Rekognition can return negative or >1 coordinates for partial edge faces.
+4. Run the existing select/compose/quality path. Use Rekognition `Quality.Sharpness`, `Quality.Brightness`, `Pose`, and `FaceOccluded` as additional quality flags, but keep the `face_h < 90px` crispness gate.
+5. If `known_good_reference_face` exists, call `CompareFaces` before Gemini. Store `compare_similarity`; accept only above the tuned threshold. If no reference exists and celebrity recognition did not identify the target, keep the Gemini select/verify contract.
+6. Optionally call `DetectModerationLabels` with a tuned `MinConfidence` before writing to GCS.
+7. Persist provider-specific metadata in AlloyDB: `det_provider`, `det_route`, `fallback_reason`, `det_confidence`, `rekognition_quality`, `rekognition_pose`, `face_occluded`, `compare_similarity`, `celebrity_match`, `celebrity_match_confidence`, `moderation_labels`.
+
+```python
+import boto3
+
+rekognition = boto3.client("rekognition", region_name="us-east-1")
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+def landmark_px(face, kind, image_w, image_h):
+    for point in face.get("Landmarks", []):
+        if point.get("Type") == kind:
+            return [point["X"] * image_w, point["Y"] * image_h]
+    return None
+
+def to_crop_contract(face, image_w, image_h):
+    box = face["BoundingBox"]
+    x1 = clamp(box["Left"] * image_w, 0, image_w)
+    y1 = clamp(box["Top"] * image_h, 0, image_h)
+    x2 = clamp((box["Left"] + box["Width"]) * image_w, 0, image_w)
+    y2 = clamp((box["Top"] + box["Height"]) * image_h, 0, image_h)
+
+    return {
+        "provider": "rekognition",
+        "box": [round(x1), round(y1), round(x2 - x1), round(y2 - y1)],
+        "left_eye": landmark_px(face, "eyeLeft", image_w, image_h),
+        "right_eye": landmark_px(face, "eyeRight", image_w, image_h),
+        "confidence": face["Confidence"],
+        "quality": face.get("Quality", {}),
+        "pose": face.get("Pose", {}),
+        "face_occluded": face.get("FaceOccluded", {}),
+    }
+
+def detect_faces_rekognition(jpeg_bytes, image_w, image_h):
+    response = rekognition.detect_faces(
+        Image={"Bytes": jpeg_bytes},
+        Attributes=["DEFAULT", "FACE_OCCLUDED"],
+    )
+    return [
+        to_crop_contract(face, image_w, image_h)
+        for face in response.get("FaceDetails", [])
+    ]
+
+def normalize_name(value):
+    return "".join(ch.lower() for ch in value if ch.isalnum())
+
+def recognize_target_celebrity(jpeg_bytes, image_w, image_h, target_aliases):
+    aliases = {normalize_name(alias) for alias in target_aliases}
+    response = rekognition.recognize_celebrities(Image={"Bytes": jpeg_bytes})
+
+    for celebrity in response.get("CelebrityFaces", []):
+        if normalize_name(celebrity.get("Name", "")) not in aliases:
+            continue
+
+        contract = to_crop_contract(celebrity["Face"], image_w, image_h)
+        contract.update({
+            "route": "film_music",
+            "celebrity_match": celebrity.get("Name"),
+            "celebrity_match_confidence": celebrity.get("MatchConfidence"),
+            "celebrity_id": celebrity.get("Id"),
+            "celebrity_urls": celebrity.get("Urls", []),
+        })
+        return contract
+
+    return None
+
+def compare_to_reference(reference_jpeg_bytes, candidate_jpeg_bytes):
+    response = rekognition.compare_faces(
+        SourceImage={"Bytes": reference_jpeg_bytes},
+        TargetImage={"Bytes": candidate_jpeg_bytes},
+        SimilarityThreshold=85,
+        QualityFilter="AUTO",
+    )
+    matches = response.get("FaceMatches", [])
+    return matches[0] if matches else None
+```
+
+**Auth / infra**
+
+- Prefer GCP Cloud Run service account → AWS IAM role via Workload Identity Federation / STS. For a spike, a short-lived AWS key in Secret Manager is acceptable, but do not ship static long-lived credentials.
+- IAM actions can stay narrow: `rekognition:RecognizeCelebrities`, `rekognition:DetectFaces`, `rekognition:CompareFaces`, `rekognition:DetectModerationLabels`.
+- Keep GCS + AlloyDB as source of truth. Only add S3 if we later want AWS-side image caching; passing bytes avoids cross-cloud object replication.
+- Add retries/backoff for Rekognition throttling and throughput errors; isolate AWS latency from the Pub/Sub ack deadline with bounded per-image timeouts.
+
+<Warning>
+  Rekognition is attractive for speed-to-build, but it is not "free" architecturally: cross-cloud egress, AWS IAM, data-processing review, service quotas, and per-image API cost become part of the production surface. Choose it deliberately, not accidentally.
+</Warning>
+
 ## 6. Telemetry & Observability
 
 Telemetry is the data the pipeline emits about its own behavior so you can see it run in production. Three pillars — logs, metrics, traces — instrumented once via **OpenTelemetry**, exported to GCP, with Phoenix as the lens on the LLM layer.
@@ -140,12 +271,14 @@ Telemetry is the data the pipeline emits about its own behavior so you can see i
 **What to track**
 
 - **Detection hit-rate** — share of sources yielding a usable face. A continuous read on the Phase 0 risk; a drop signals a source-mix shift or model regression.
+- **Detection route split** — `default`, `fallback`, and `film_music`, with hit-rate/latency/quality broken out by provider and route.
 - **Escalation rate** — share of images sent to Gemini. The LLM cost driver.
 - **Verification** — Gemini match rate, confidence histogram, manual-override rate (proxy for false accept/reject).
 - **Quality** — share flagged `low_res`, share falling back to monogram.
+- **Rekognition signals** *(if enabled)* — face count, `Quality.Sharpness`, `Quality.Brightness`, `FaceOccluded`, `compare_similarity`, `moderation_blocked`.
 - **Latency** — per-stage p50/p95 (fetch / detect / gemini / crop / store).
 - **Throughput / queue** — Pub/Sub backlog, DLQ count, processing rate.
-- **Cost** — Gemini calls per day times price.
+- **Cost** — Gemini calls + Rekognition image operations per day times price.
 - **Errors** — fetch / decode / timeout counts by type.
 
 **Stack (full GCP)**
@@ -173,9 +306,10 @@ Phoenix's OpenInference spans are OTel-compatible, so it sits **alongside** Clou
 | onnxruntime-go *(alt Go path)* | MIT (bindings) | Run YuNet ONNX directly |
 | YuNet `face_detection_yunet_2023mar.onnx` | MIT *(confirm)* | OpenCV Zoo |
 | Gemini Flash (via OpenRouter) | API | Selection/verification only |
+| AWS SDK + Rekognition *(optional managed CV path)* | API | Managed face detection, reference-face comparison, moderation; no local model weights |
 
 <Warning>
-  Pick **one** CV path. All options are commercial-safe and CPU-only — no encumbered recognition weights enter the codebase. Confirm the exact YuNet model-weight terms with counsel before it's load-bearing.
+  YuNet/OpenCV stays the primary detector. Rekognition is selective: fallback for weak local detection, plus film/music celebrity recognition. Confirm the exact YuNet model-weight terms with counsel before it's load-bearing, and review Rekognition's AWS API/IAM/privacy surface before shipping the selective route.
 </Warning>
 
 ## 8. Edge Cases
@@ -185,7 +319,8 @@ Phoenix's OpenInference spans are OTel-compatible, so it sits **alongside** Clou
 - **Tiny/low-res face** — reject for crispness (quality gate), prefer alternate source.
 - **Profile / sunglasses / occlusion** — YuNet may still box it; if landmarks look unreliable, fall back to box-center vertical placement; Gemini guards identity.
 - **EXIF rotation / animated / transparent** — normalize before detection.
-- **Inappropriate source image** — optional Gemini safety flag before use as an avatar.
+- **Inappropriate source image** — optional Gemini safety flag or Rekognition `DetectModerationLabels` before use as an avatar.
+- **Rekognition partial edge boxes** — clamp normalized boxes before composing; do not assume `Left`/`Top` always sit between 0 and 1.
 - **At-least-once redelivery** — idempotent worker (key `hash(source) + contact_id`); cache crops so re-runs are free.
 
 ## 9. Phased Delivery
@@ -193,6 +328,7 @@ Phoenix's OpenInference spans are OTel-compatible, so it sits **alongside** Clou
 | Phase | Scope | Est. |
 |-------|-------|------|
 | **0 — Spike** | YuNet detect + naive crop on a sample of **real** enrichment images (Python is fine here regardless of final language). Validate hit-rate on the actual distribution; tune `k` / `eye_top_frac`. De-risks the whole build. | ~0.5d |
+| **0R — Rekognition routing spike** *(optional)* | On the same sample set, run Rekognition only for YuNet failures/weak detections and film/music targets. Measure fallback recovery rate, celebrity match precision, false accepts/rejects, latency, cost, and privacy/IAM burden. | ~0.5–1d |
 | **1 — Crop module** | Production compose (eye-based), multi-size output, EXIF/format handling, quality gate. Single-face path end-to-end. Pick the CV language. | ~1–2d |
 | **2 — Gemini integration** | Selection + verification + IoU reconciliation; multi-face handling; confidence/flagging. | ~1–2d |
 | **3 — Service + GCP wiring** | Cloud Run worker, Pub/Sub trigger + DLQ (or Cloud Tasks), GCS storage, AlloyDB metadata write-back, idempotency. | ~1–1.5d |
@@ -202,7 +338,8 @@ Phoenix's OpenInference spans are OTel-compatible, so it sits **alongside** Clou
 
 ## 10. Open Decisions
 
-- **CV language** — Python microservice vs GoCV vs onnxruntime-go. Decide before Phase 3; Python is fine for the Phase 0 spike either way.
+- **Rekognition routing thresholds** — exact YuNet confidence/landmark/edge-clip triggers for fallback, plus the film/music classification rules that call `RecognizeCelebrities`.
+- **CV language** — Python microservice vs GoCV vs onnxruntime-go for the primary YuNet path. Decide before Phase 3; Python is fine for the Phase 0 spike either way.
 - **Delivery model** — Pub/Sub push subscription (low latency) vs Cloud Run job pulling batches (cheaper at volume).
 - **Embedding persistence** — store the face embedding in AlloyDB/pgvector for future dedup/matching, or skip for v1.
 - `k` and `eye_top_frac` defaults — settle empirically in Phase 0.

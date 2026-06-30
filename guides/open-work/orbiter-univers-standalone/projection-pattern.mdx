@@ -1,0 +1,367 @@
+---
+title: "Projection Pattern"
+description: "How Orbiter Universe publishes one enrichment package that Orbiter Backend applies into card snapshots and side-panel tables."
+icon: "copy"
+---
+
+## Goal
+
+When Orbiter Universe finishes enriching a person or company, Orbiter Backend needs enough data to render:
+
+- fast cards
+- contact side panels
+- company side panels
+- search, filters, and drill-down sections
+
+The expensive part is not the network call. The expensive part is coordinating many downstream tables without turning Universe into a second owner of the App backend schema.
+
+The clean pattern is:
+
+```text
+Backend seed created
+  -> fast UI response with App person/company id
+  -> Universe enrichment runs asynchronously
+  -> Universe enrichment complete
+  -> one versioned projection payload
+  -> Backend projection applier
+  -> card snapshot rows + normalized side-panel facts
+```
+
+Universe sends one package. Backend owns the process that applies it.
+
+## Seeded Fast Response
+
+When the product needs a new person or company, Orbiter Backend should not wait for full enrichment before responding to the UI.
+
+Instead, Backend creates a minimal App-owned seed record immediately:
+
+- `master_person` or `master_company`
+- `person_card_snapshot` or `company_card_snapshot`
+- a projection/enrichment status row, if needed for tracking
+
+That seed row only needs enough information to make the product usable right away. For a person, that can be name, LinkedIn URL, email, company hint, or avatar if already known. For a company, that can be name, domain, website, logo, or LinkedIn URL.
+
+The first response back to the UI should include the Backend identity and a pending snapshot:
+
+```json
+{
+  "entity_type": "person",
+  "master_person_id": 12345,
+  "snapshot": {
+    "display_name": "Ava Chen",
+    "headline": "Enrichment in progress",
+    "avatar_url": null,
+    "primary_company_name": "Northstar AI",
+    "enrichment_status": "enriching"
+  }
+}
+```
+
+For a company, the same fast response uses the company identity and the best known domain or website:
+
+```json
+{
+  "entity_type": "company",
+  "master_company_id": 67890,
+  "snapshot": {
+    "display_name": "Northstar AI",
+    "domain": "northstar.ai",
+    "logo_url": null,
+    "headline": "Enrichment in progress",
+    "enrichment_status": "enriching"
+  }
+}
+```
+
+The card can render immediately from that seeded snapshot. The side panel can open against the same `master_person_id` or `master_company_id`, with sections showing seeded values, loading states, or empty states while Universe works.
+
+After the response, Backend starts the Universe enrichment job asynchronously and passes the Backend identity with the seed input:
+
+```text
+start_universe_person_enrichment({
+  master_person_id,
+  seed_name,
+  seed_linkedin_url,
+  seed_company_hint
+})
+```
+
+For companies, the same pattern uses `master_company_id`, domain, website, LinkedIn URL, and any known company label.
+
+When Universe finishes, it sends one projection package back to Backend. The projection package includes the same Backend identity, Universe identity, run id, card snapshot data, and side-panel facts. Backend applies it idempotently to the existing rows:
+
+```text
+seeded card
+  -> enriching card
+  -> completed card + populated side panel
+```
+
+The UI keeps reading from Backend-owned IDs the whole time. It does not need to switch records after enrichment completes.
+
+## Two Read Models
+
+Cards and side panels should not be forced into the same storage shape.
+
+Cards need compact, display-ready data. They should read one row whenever possible.
+
+Side panels need structured facts. They need normalized rows where the UI supports sections, filtering, history, drill-down, and source-specific display.
+
+So the projection applier writes both:
+
+| Target | Purpose | Shape |
+| --- | --- | --- |
+| Card snapshot | Fast card rendering | One compact row per person/company |
+| Side-panel facts | Rich structured UI sections | Multiple normalized rows, upserted or replaced by section |
+| Projection log/status | Replay and debugging | One row per projection run |
+
+## Person Flow
+
+For a person, Universe publishes one package after the enrichment run is complete:
+
+```json
+{
+  "schema_version": "person_projection.v1",
+  "run_id": "enrich_run_01H...",
+  "universe_person_uuid": "up_01H...",
+  "source_updated_at": "2026-06-30T19:00:00Z",
+  "card_snapshot": {
+    "display_name": "Ava Chen",
+    "headline": "Founder and CTO at Northstar AI",
+    "avatar_url": "https://...",
+    "primary_company_name": "Northstar AI",
+    "primary_company_domain": "northstar.ai",
+    "location_label": "San Francisco, CA",
+    "summary": "Founder building AI workflow infrastructure for enterprise teams.",
+    "top_skills": ["AI strategy", "workflow automation", "enterprise SaaS"],
+    "top_links": [
+      {"type": "linkedin", "url": "https://www.linkedin.com/in/..."},
+      {"type": "website", "url": "https://..."}
+    ],
+    "enrichment_status": "complete"
+  },
+  "side_panel_facts": {
+    "roles": [
+      {
+        "company_name": "Northstar AI",
+        "company_domain": "northstar.ai",
+        "title": "Founder and CTO",
+        "is_current": true,
+        "start_date": "2022-01-01"
+      }
+    ],
+    "skills": [
+      {"name": "AI strategy", "confidence": 0.94, "source": "Universe"},
+      {"name": "enterprise SaaS", "confidence": 0.88, "source": "Universe"}
+    ],
+    "work_experience": [],
+    "links": [],
+    "emails": [],
+    "phones": [],
+    "primary_location": {
+      "city": "San Francisco",
+      "region": "California",
+      "country": "United States",
+      "formatted_location": "San Francisco, CA"
+    }
+  }
+}
+```
+
+Orbiter Backend receives that package and runs one internal applier:
+
+```text
+apply_person_projection(payload)
+  1. validate schema_version
+  2. resolve or create App person identity
+  3. upsert person_card_snapshot
+  4. replace current Universe-owned role/skill/location sections
+  5. upsert contact methods and links where allowed
+  6. record projection run status
+```
+
+## Company Flow
+
+For a company, the same pattern applies:
+
+```json
+{
+  "schema_version": "company_projection.v1",
+  "run_id": "enrich_run_01H...",
+  "universe_company_uuid": "uc_01H...",
+  "source_updated_at": "2026-06-30T19:00:00Z",
+  "card_snapshot": {
+    "display_name": "Northstar AI",
+    "domain": "northstar.ai",
+    "logo_url": "https://...",
+    "headline": "AI workflow infrastructure for enterprise teams",
+    "summary": "Northstar AI builds workflow automation tools for enterprise operations teams.",
+    "primary_location_label": "San Francisco, CA",
+    "industry_labels": ["Enterprise software", "Artificial intelligence"],
+    "employee_count_label": "51-200",
+    "funding_stage": "Series B",
+    "top_links": [
+      {"type": "website", "url": "https://northstar.ai"},
+      {"type": "linkedin", "url": "https://www.linkedin.com/company/..."}
+    ],
+    "enrichment_status": "complete"
+  },
+  "side_panel_facts": {
+    "company_financial": {
+      "funding_total": 42000000,
+      "funding_stage": "Series B",
+      "last_funding_date": "2025-09-12"
+    },
+    "primary_location": {
+      "city": "San Francisco",
+      "region": "California",
+      "country": "United States"
+    },
+    "links": [],
+    "founders": [],
+    "funding_rounds": [],
+    "social_profiles": []
+  }
+}
+```
+
+The company applier follows the same model:
+
+```text
+apply_company_projection(payload)
+  1. validate schema_version
+  2. resolve or create App company identity
+  3. upsert company_card_snapshot
+  4. replace current Universe-owned company fact sections
+  5. upsert links, financial facts, location, founders, and source references
+  6. record projection run status
+```
+
+## Snapshot Table Examples
+
+The snapshot tables are Backend-owned read models. They are not the Universe source of truth. They are optimized for fast card reads and stable product UI contracts.
+
+### `person_card_snapshot`
+
+| Field | Type | Purpose |
+| --- | --- | --- |
+| `id` | uuid/int | App backend row id |
+| `master_person_id` | int | App backend person identity |
+| `universe_person_uuid` | uuid/text | Stable Universe entity reference |
+| `universe_node_uuid` | uuid/text | Optional Universe graph node reference |
+| `projection_run_id` | uuid/text | Idempotency and replay key |
+| `schema_version` | text | Payload contract version |
+| `display_name` | text | Card title |
+| `headline` | text | Current title or best short descriptor |
+| `avatar_url` | text | Card image |
+| `primary_company_name` | text | Current company label |
+| `primary_company_domain` | text | Company matching/display support |
+| `location_label` | text | Compact location display |
+| `summary` | text | Short card-ready summary |
+| `top_skills` | json | Small ordered list for card display |
+| `top_links` | json | Small ordered list of visible links |
+| `badges` | json | Optional role/investor/creator badges |
+| `seeded_at` | timestamp | When Backend created the fast-response snapshot |
+| `seed_source` | text | What started the seed, such as user action, import, or workflow |
+| `source_updated_at` | timestamp | Universe source freshness |
+| `projection_synced_at` | timestamp | App backend sync freshness |
+| `enrichment_status` | text | `seeded`, `enriching`, `complete`, `partial`, `stale`, `failed` |
+
+### `company_card_snapshot`
+
+| Field | Type | Purpose |
+| --- | --- | --- |
+| `id` | uuid/int | App backend row id |
+| `master_company_id` | int | App backend company identity |
+| `universe_company_uuid` | uuid/text | Stable Universe entity reference |
+| `universe_node_uuid` | uuid/text | Optional Universe graph node reference |
+| `projection_run_id` | uuid/text | Idempotency and replay key |
+| `schema_version` | text | Payload contract version |
+| `display_name` | text | Card title |
+| `domain` | text | Company domain |
+| `logo_url` | text | Card image |
+| `headline` | text | Short company descriptor |
+| `summary` | text | Short card-ready summary |
+| `primary_location_label` | text | Compact location display |
+| `industry_labels` | json | Small ordered list for display |
+| `employee_count_label` | text | Display-safe size band |
+| `funding_stage` | text | Display-safe funding label |
+| `top_links` | json | Small ordered list of visible links |
+| `badges` | json | Optional investor/customer/media badges |
+| `seeded_at` | timestamp | When Backend created the fast-response snapshot |
+| `seed_source` | text | What started the seed, such as user action, import, or workflow |
+| `source_updated_at` | timestamp | Universe source freshness |
+| `projection_synced_at` | timestamp | App backend sync freshness |
+| `enrichment_status` | text | `seeded`, `enriching`, `complete`, `partial`, `stale`, `failed` |
+
+## Side-Panel Tables
+
+Side-panel data should stay normalized when structure matters.
+
+For contact/person side panels, the applier can update:
+
+- `role` / `role_join`
+- `skills`
+- `work_experience`
+- `primary_location`
+- `master_link`
+- `master_email`
+- `master_phone`
+- expertise/display sections that need drill-down
+
+For company side panels, the applier can update:
+
+- `company_financial`
+- `primary_location`
+- `master_link`
+- company social/profile links
+- founders and leadership sections
+- funding/acquisition sections
+- display facts needed by the company detail endpoint
+
+The key is ownership. Universe owns the source enrichment result. Backend owns how that result becomes product-readable tables.
+
+## Replace vs Merge
+
+The applier should use section-level rules instead of treating every table the same.
+
+| Section | Suggested write mode | Reason |
+| --- | --- | --- |
+| Card snapshot | Upsert one row | Cards need one current display state |
+| Current roles | Replace Universe-owned current set | Avoid stale titles |
+| Historical work experience | Merge by source key/date/company/title | Preserve history |
+| Skills | Replace or score-merge Universe-owned set | Avoid duplicate skills |
+| Links | Upsert by normalized URL/type | Avoid duplicate URLs |
+| Emails/phones | Conservative upsert | Contact data has product/privacy implications |
+| Financial/company facts | Upsert by company and source | Preserve freshness |
+| Projection status | Append per run | Needed for replay/debug |
+
+## Idempotency
+
+Every projection package should carry:
+
+- `schema_version`
+- `run_id`
+- `universe_entity_uuid`
+- `source_updated_at`
+- `projection_generated_at`
+
+The Backend applier should be safe to run more than once for the same `run_id`. That makes retries, replays, and backfills much safer.
+
+## Resulting Architecture
+
+```text
+Orbiter Universe
+  owns enrichment, source payloads, queues, and graph writes
+
+Projection package
+  one versioned request per completed person/company enrichment
+
+Orbiter Backend projection applier
+  validates, resolves identity, applies table writes, records status
+
+Orbiter Backend read models
+  card snapshots for fast cards
+  normalized facts for contact and company side panels
+```
+
+This keeps the Universe backend independent while giving the product backend a stable, efficient way to hydrate cards and side panels from one enrichment result.

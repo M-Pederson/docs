@@ -12,7 +12,7 @@ icon: "cloud-arrow-up"
 
 Rebuild the four enrichment pipelines — **Person**, **Company**, **Music**, and **Film & TV** (IMDb-sourced) — as **Go services on GCP**, writing into a **greenfield [Orbiter Universe](/guides/open-work/orbiter-univers-standalone)**: a brand-new FalkorDB graph + AlloyDB, standalone from day one. This is **not an in-place migration** — there is no backfill of the existing graph. The Go pipelines populate a clean Universe; the current Xano stack keeps serving the product, in parallel, until each pipeline is cut over.
 
-The hard part is not the Go — it's keeping the rebuild **faithful where it matters**. We hold the **data-correctness contracts** strict (graph node/edge shape & MERGE keys, dedup/identity, provenance, provider contracts, idempotency) while letting the **orchestration / queueing / LLM layers be redesigned** for Go + GCP. To make "faithful" measurable, two things are front-loaded before any Go is written: **hard-freeze the Xano enrichment** as a stable reference, and **turn that frozen XanoScript into a language-neutral spec + golden data-contract fixtures**.
+The hard part is not the Go — it's keeping the rebuild **faithful**. We reproduce the pipeline as-is — the **data-correctness contracts** (graph node/edge shape & MERGE keys, dedup/identity, provenance, provider contracts, idempotency) **and** the **orchestration / queueing / LLM flow**. The default is parity; a developer may redesign part of the flow only after discussing it with Mark and getting sign-off. To make "faithful" measurable, two things are front-loaded before any Go is written: **hard-freeze the Xano enrichment** as a stable reference, and **turn that frozen XanoScript into a language-neutral spec + golden fixtures**.
 
 <Note>
   **Why not "just rewrite it."** The pipelines are deep call graphs (the Person orchestrator alone is 13 phases; Company is a 15-step gated orchestrator) wired to ~8 external providers, an LLM layer, and a graph with strict MERGE/idempotency semantics. Rewriting from reading XanoScript would lose the load-bearing details — `first_notnull` zero-defaults, `coalesce(created_at)` on re-enrich, the 1 req/s MusicBrainz gate, the bounded-cascade fanout rules. The methodology below captures those *as contracts* — the flow around them is fair game to redesign.
@@ -26,7 +26,7 @@ These 9 decisions are settled and drive the rest of the page.
 |---|------|----------|
 | 1 | **Embeddings** | **Gemini `gemini-embedding-001` (3072) is canonical** for Universe nodes. OpenAI `text-embedding-3-small` (1536) is legacy and not carried into Universe. |
 | 2 | **Graph / data** | **Greenfield new Universe graph + AlloyDB. No backfill** of the existing graph — the Go pipelines populate a clean Universe. |
-| 3 | **Fidelity** | **Hybrid.** Data-correctness contracts (graph shape, dedup, provenance, provider contracts, idempotency) reproduced faithfully and parity-tested; orchestration / queueing / LLM flow free to be redesigned. |
+| 3 | **Fidelity** | **Parity-first.** Reproduce the pipeline faithfully — the data-correctness contracts (graph shape, dedup, provenance, provider contracts, idempotency) **and** the orchestration / queueing / LLM flow — all parity-tested. A dev may deviate from the flow only after discussing it with Mark and getting sign-off; absent that, **the default is flow parity.** |
 | 4 | **Dev model** | **Shared-foundations sprint first** (all 4 devs), **then one pipeline per dev**. Avoids four divergent graph/LLM/embedding clients. |
 | 5 | **Cutover** | **Parallel build; cut the product over per pipeline** as each reaches data-contract parity. Current Xano stays the product's source until then. |
 | 6 | **Read path** | **AlloyDB ScaNN for retrieval** (fused filter + vector), **FalkorDB for RAG** reasoning — the find-investors / personas pattern. |
@@ -67,16 +67,21 @@ Settled in the AlloyDB docs and adopted here unchanged — except the graph is *
 
 <Step title="Mark hard-freezes the Xano enrichment (owner: Mark)">
 
-The reference contract must not drift. The pipelines are actively churning — the `master-person-new` refactor, music crons still `active=false`, `OWNED_BY`/`SPECIALIZES_IN` edge work in flight, the `data_source` → source-string sweep half-done. **Step 1 is a hard freeze: Xano enrichment keeps *running* to serve the current product, but its code stops changing for the duration of the build.** It is also the **gate that starts the ~4-week dev clock** (see [Timeline](#timeline--sequencing) below) — so the long-lead GCP items get kicked off here, off the critical path.
+The reference contract must not drift. The pipelines are actively churning — the `master-person-new` refactor, music crons still `active=false`, `OWNED_BY`/`SPECIALIZES_IN` edge work in flight, the `data_source` → source-string sweep half-done. **Step 1 is a hard freeze: Xano enrichment keeps *running* to serve the current product, but its code stops changing for the duration of the build.** It is also the **gate that starts the ~4-week dev clock** (see [Timeline](#timeline--sequencing) below): the moment the freeze is signed off, the 4 devs begin Step 2.
 
 **Mark's checklist — Step 1 is complete (and the dev clock starts) when every box is checked:**
 
 - [ ] **Smoke-test 100 person/company batches** — run representative batches through the current pipelines and confirm clean output (no crashes, expected graph writes, dedup + provenance behaving). Confirms the reference is in a known-good state before everyone builds against it.
+- [ ] **Update & validate the Xano ↔ Mintlify enrichment + graph docs** — bring the Mintlify enrichment pages and the FalkorDB graph / cypher docs in line with the live Xano functions (run `sync-system-prompts`, `check-models`, and `cypher-sync-audit`) so the docs are a trustworthy reference for the Step 2 spec extraction.
+- [ ] **Finalize the Fundable changelog-update functions** — build/complete the changelog-update handling so it's part of the frozen reference (the Go rebuild reproduces it, and it drives the bulk Fundable seed in Step 6); its docs are covered by the doc-validation item above.
+- [ ] **Verify the expertise → Music / Film & TV hand-off** — confirm a person classified with music or film/TV expertise correctly triggers the music and film-TV enrichment, so the cross-pipeline routing is captured in the reference.
+- [ ] **Verify master_person creation from a non-LinkedIn profile URL** — confirm a person record is created correctly when the source profile URL is not LinkedIn (e.g. IMDb / MusicBrainz / a company team page), so that path is in a known-good state before freeze.
+- [ ] **Update & verify the graph indexes** — bring the FalkorDB indexes current and confirm them (the vector indexes on the `:Entity` base label, plus the btree / unique indexes) so KNN search and idempotency behave correctly — and so the index contract is captured for the new Universe graph to replicate.
+- [ ] **Verify the queue-drain crons** — confirm each pipeline's queue-processor / drain crons are in their intended state (cadence + `active` flag) so the reference's queue-draining behavior is captured (e.g. process-person-queue #126, process-company-queue #127, the music drain #13102).
 - [ ] **Resolve or explicitly defer each in-flight item** — keep `#12553` deprecated-frozen, leave music crons `active=false`, and freeze the half-done `data_source` → source-string sweep *as-is* (document the legacy `data_source_id` fallbacks).
 - [ ] **Tag a frozen release per pipeline** (`createRelease` / `exportRelease`) capturing every workspace-3 function/task body at the freeze instant.
 - [ ] **Write the freeze manifest** — the authoritative list of entry-point + sub-function IDs per pipeline (the table above is the starting point).
 - [ ] **Enforce the freeze** — no enrichment code changes ship during the build; anything genuinely urgent is mirrored into the spec and re-baselined first.
-- [ ] **Kick off the long-lead GCP items** — AlloyDB provisioning, IAM/Workload Identity + security review, the ScaNN org-flip, and sizing the Fundable seed. Starting these during the freeze is what keeps the post-freeze build to ~4 weeks.
 
 <Card icon="lock">
 
@@ -92,15 +97,20 @@ Xano enrichment hard freeze + tagged release (per pipeline) — owner: Mark
 
 <Step title="Generate a rebuild-grade spec for each pipeline">
 
+<Note>
+  **Parallel track — the Go/devops engineer kicks off the long-lead GCP infra now (day 1 of the dev clock).** AlloyDB provisioning, IAM/Workload Identity + security review, the ScaNN org-flip, and sizing the Fundable seed all carry real provisioning latency, so they start *immediately* and run in the background while the rest of the team does spec + fixtures — ready by the time the foundations step (Step 4) needs them. Kicking them off on day 1 is what keeps the build to ~4 weeks; the **security review** is the item most likely to slip.
+</Note>
+
 Turn the frozen XanoScript into a **language-neutral specification** a Go dev can implement *without reading XanoScript*. This is the documentation step — and it should be **mostly automated** by a read-only extraction skill (see [the next section](#documenting-the-pipelines-comment-the-xanoscript-or-generate-a-spec) for why we do **not** comment the live code).
 
-Each pipeline's spec must capture the **data contracts** (the strict part of decision #3):
+Each pipeline's spec must capture the full contract — what it does **and the order it does it in** (decision #3 is parity-first):
 
 - **I/O contract** per function — inputs, output shape, and crucially *which defaults use `first_notnull` vs `first_notempty`* (load-bearing for 0/false values like `priority_tier`, `cascade_depth`).
+- **Call graph / orchestration order** — the 13 Person phases, the 15 Company steps, the Music queue→drain ranks, the Film & TV 9-phase/7-phase orchestrators. This is a contract too: reproduce it unless Mark signs off a change.
 - **Every external-data-source call** — endpoint, auth, rate limit, retry/backoff, terminal-status rules (e.g. MusicBrainz 400/404 = terminal, 1 req/s, required User-Agent), pagination.
 - **Every LLM call** — cross-linked to the *already-excellent* [system-prompt](/guides/enrichment/person-pipeline/llm-system-prompts) and [model-summary](/guides/enrichment/all-models-summary) pages (model, temp, max_tokens, reasoning flag, timeout, fallback). **Do not duplicate these** — link them.
 - **Every graph write** as a normalized node/edge catalog — labels, MERGE keys, the standard envelope (`uuid`, `weight`, `coalesce(created_at)`, `updated_at`, `description`), edge weights.
-- **Idempotency keys** (mbid, linkedin_url, canonical domain, email/phone dedup) and the **outcomes** of queue/cascade logic (depth caps, dedup-wins, no runaway fanout) — these outcomes are contracts even though the *flow* that produces them is free to redesign.
+- **Idempotency keys** (mbid, linkedin_url, canonical domain, email/phone dedup) and **queue/cascade semantics** (depth caps, tiers, `count++`/lowest-tier-wins, seed-only fanout gates).
 
 <Tip>
   The docs are already deep at the orchestration level — the spec **builds on** them rather than starting over. The consistent *gaps* to fill: exact external-API request/response JSON schemas, the missing **Company + Person table schemas** (Music and Film & TV already have theirs), per-call retry/timeout matrices, and restated idempotency keys. Mark Xano-only workarounds (naming-collision helpers, serializer quirks) as **"Xano artifact — do not reimplement."**
@@ -110,7 +120,7 @@ Each pipeline's spec must capture the **data contracts** (the strict part of dec
 
 <Step title="Capture golden data-contract fixtures">
 
-While the frozen pipeline is still live, record representative **real inputs and the exact Xano outputs** they produce — the target the Go rebuild diffs against. Because fidelity is **hybrid**, fixtures assert the **data outputs** (graph subgraph + key table fields), *not* the internal phase order. Run against an **isolated data source** (sandbox / the staging Cinq fixture), never live.
+While the frozen pipeline is still live, record representative **real inputs and the exact Xano outputs** they produce — the target the Go rebuild diffs against. Fixtures assert the **data outputs** (graph subgraph + key table fields); flow parity (decision #3) is enforced through the spec + code review, since internal phase order isn't always observable in the output. Run against an **isolated data source** (sandbox / the staging Cinq fixture), never live.
 
 Per pipeline, a corpus of **10–30 cases** spanning happy-path, thin-data, dedup-hit, explicit-zero defaults, and known edge cases (Zeno Rocha for Person; Cinq/Sub Pop/Nirvana for Music; a seed company with Exa founders; an IMDb title+person with awards). For each: the input, the resulting **graph subgraph** dumped via Cypher (nodes+edges+properties), the key **table write-set** fields, and the **raw LLM + provider request/response pairs** captured at fixture time. Snapshot provider responses so fixtures are **replayable without re-hitting rate-limited APIs**. Version-pin everything to the Step 1 frozen reference.
 
@@ -133,11 +143,11 @@ The four pipelines share one substrate. Building it inside each pipeline produce
 
 <Step title="Rebuild each pipeline in Go, parity-test the data contracts">
 
-Reimplement each pipeline's behavior against the Step 2 spec, **continuously validated by the Step 3 fixtures**. Per decision #3, the harness asserts **data-correctness outputs**, not internal flow — devs are free to redesign orchestration as long as the outputs hold. The harness diffs:
+Reimplement each pipeline against the Step 2 spec, **continuously validated by the Step 3 fixtures**. Per decision #3 this is **parity-first** — reproduce the flow as specified; a dev takes any proposed redesign to Mark *before* building it, not after. The harness diffs:
 
 1. **Field-level table diff** — *exact* for structured/identity fields (ids, mbid, canonical domain, dedup keys, tiers, source strings); *tolerant* for LLM prose (assert presence, length ceilings, JSON well-formedness, optional cosine/judge similarity).
 2. **Graph-shape assertions** — node/edge sets by label+key and `(type, endpoints, weight)`; envelope invariants. Run each fixture **twice** and assert idempotency: counts don't grow, uuids stable, `created_at` unchanged on re-run while `updated_at` moves.
-3. **Outcome assertions** — dedup-wins, no runaway fanout, tier resolution — the *results* of the logic, however the Go flow is structured.
+3. **Outcome assertions** — dedup-wins, no runaway fanout, tier resolution — plus the orchestration order where it's observable; an unexplained deviation flags for review unless Mark has signed it off.
 
 Provider clients run in **replay mode** against the Step 3 cache, so CI runs are deterministic and free.
 
@@ -216,7 +226,7 @@ Each dev owns spec → rebuild → seed → cutover for one domain, building str
   Estimate assumes **AI-agent-parallel development** (the same convention as the [YuNet Build Plan](/guides/open-work/yunet-avatar-pipeline/build-plan): contract-freeze day 1, fake-adapters-first, daily-merge protocol) with the 4 devs effectively full-time. These pipelines are well-specified translation work (frozen spec → Go) validated by an objective parity harness — close to the ideal case for AI-assisted build.
 </Note>
 
-**Headline: ~4 weeks after Step 1 is complete.** Step 1 (Mark's hard freeze) is the gate. Because the long-lead GCP items are kicked off *during* the freeze, the dev clock that follows isn't gated by infra — the 4 weeks is pure build + parity + cutover. First pipeline cuts over around week 3–4. Tight ~3 weeks if the pipelines parallelize cleanly; ~5–6 weeks if seed volume or soak windows drag.
+**Headline: ~4 weeks after Step 1 is complete.** Step 1 (Mark's hard freeze) is the gate. Because the Go/devops engineer kicks off the long-lead GCP items on day 1 of the dev clock (the start of Step 2), they provision in parallel and don't gate the build — the 4 weeks is pure build + parity + cutover. First pipeline cuts over around week 3–4. Tight ~3 weeks if the pipelines parallelize cleanly; ~5–6 weeks if seed volume or soak windows drag.
 
 The phases map onto Steps 2–7 (elapsed from **T0 = "Step 1 complete"**):
 
@@ -224,7 +234,7 @@ The phases map onto Steps 2–7 (elapsed from **T0 = "Step 1 complete"**):
 |---|---|---|
 | **2. Spec extraction** | wk 0–1 | *Already* an AI task — the extraction skill drafts every spec sheet; humans review the gaps |
 | **3. Golden fixtures** | wk 0–1 (parallel) | AI generates fixtures + captures the frozen outputs |
-| **4. Foundations + harness** | wk 0.5–2 | AI cranks the Go `internal/*` + parity harness; **GCP infra is already provisioning from Step 1**, so it's off the critical path |
+| **4. Foundations + harness** | wk 0.5–2 | AI cranks the Go `internal/*` + parity harness; **the GCP infra kicked off at the start of Step 2 provisions in parallel**, so it's off the critical path |
 | **5. Per-pipeline rebuild + parity** | wk 1.5–3.5 | The big win — spec→Go behind the harness is a tight generate→test→fix loop AI runs largely autonomously, 4 pipelines concurrent (**Person is the long pole**) |
 | **6. Seed + validate** | wk 3–4 | Mark's list seeds fast; the **Fundable bulk drain runs unattended** (rate-limited, off the critical path) |
 | **7. Staggered cutover + soak** | wk 3.5–4 | Short soak per pipeline — parity is already proven by the harness + seed validation, so the windows are days, staggered |
@@ -242,12 +252,12 @@ The dev clock starts only once Step 1 is done. After that, the critical path is 
 </Warning>
 
 <Tip>
-  **The 4 weeks assumes the calendar-bound items were started in Step 1.** AlloyDB provisioning, IAM/security review, the ScaNN org-flip, and Fundable-seed sizing all run during Mark's freeze — so by the time the AI has pipelines passing parity, the infra is ready instead of being the thing you wait on. In the AI model, the Go/devops engineer owns the harness, the GCP infra, and the merge/cutover discipline that keeps 4 parallel AI-driven streams coherent.
+  **The 4 weeks assumes the calendar-bound items are kicked off on day 1 of the dev clock (start of Step 2), not deferred to the foundations step.** AlloyDB provisioning, IAM/security review, the ScaNN org-flip, and Fundable-seed sizing all provision in parallel with the spec + fixtures work — so by the time the AI has pipelines passing parity, the infra is ready instead of being the thing you wait on. In the AI model, the Go/devops engineer owns this infra kickoff plus the harness and the merge/cutover discipline that keeps 4 parallel AI-driven streams coherent.
 </Tip>
 
 ## What already exists vs. what the spec must add
 
-The docs are unusually deep — the spec extends them, focusing on the strict **data contracts**. Consistent gaps per pipeline:
+The docs are unusually deep — the spec extends them, covering the **data contracts and the flow** (parity-first). Consistent gaps per pipeline:
 
 | Pipeline | Already documented | Spec must add |
 |---|---|---|
@@ -276,8 +286,8 @@ MusicBrainz = 1 req/s, required User-Agent, 400/404 terminal. PDL/Exa/Enrich-Lay
 Defaulted bools and ints-that-can-legitimately-be-0 (`priority_tier 0`, `cascade_depth 0`, bootstrap rows) **must** use `first_notnull` or an explicit 0 is coerced back to the default. A dev reading "defaults to 4" silently breaks the bootstrap lane and tier-upgrade logic. **Mitigation:** the spec flags every defaulted field with its semantics; fixtures include an explicit-zero case.
 </Accordion>
 
-<Accordion title="Redesigned flow drops an outcome the old flow guaranteed">
-Because the flow is free to redesign (decision #3), the risk shifts from "wrong order" to "the new flow no longer produces an outcome the old one did" — dedup-wins, lowest-tier-wins, bounded (non-runaway) fanout. These only break at scale, not in single-fixture tests. **Mitigation:** spec the *outcomes* explicitly; assert them with multi-entity fixtures; validate aggregate distributions during the Step 6 seed.
+<Accordion title="Unapproved flow deviation introduces a regression">
+Parity-first (decision #3) means the flow is reproduced as specified — the risk is a dev quietly "improving" orchestration/queueing and dropping an outcome the old flow guaranteed: dedup-wins, lowest-tier-wins, bounded (non-runaway) fanout. These only break at scale, not in single-fixture tests. **Mitigation:** any flow change goes to Mark *first*; spec the order + outcomes explicitly; assert them with multi-entity fixtures; validate aggregate distributions during the Step 6 seed.
 </Accordion>
 
 <Accordion title="Provenance migration is half-done in the frozen reference">

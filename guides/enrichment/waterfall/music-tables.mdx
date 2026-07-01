@@ -1,13 +1,13 @@
 ---
 title: "Music Waterfall Tables"
-description: "Build spec — all 15 Xano tables for the MusicBrainz waterfall: 6 queue tables, 8 source-of-truth tables, and the mb_rate_limit singleton. Field-by-field schemas, indexes, and the conventions they mirror from the live IMDB pipeline."
+description: "Build spec — all 16 Xano tables for the MusicBrainz waterfall: 6 MusicBrainz queue tables, 8 source-of-truth tables, the mb_rate_limit singleton, and the person-resolution queue. Field-by-field schemas, indexes, and the conventions they mirror from the live IMDB pipeline."
 ---
 
 <Note>
-**Status: BUILT (2026-06-11).** All 15 tables now exist in Xano workspace 3 — IDs **#736–#750**, inventory below — created from this spec and verified field-by-field against the live schemas. This page covers [build-order step 1](/guides/enrichment/waterfall/music-industry-waterfall#build-order-when-we-proceed) of the [Music Industry Waterfall](/guides/enrichment/waterfall/music-industry-waterfall). Schemas mirror the **live IMDB pipeline tables** (`queue_imdb_person` #706, `queue_imdb_title` #707, `imdb_person` #394, `film_tv` #395) with deliberate deviations called out below. The `log_crash` phase-enum additions are also done; the kill switch was **skipped** (see the [build checklist](#build-checklist)) — table work for step 1 is complete.
+**Status: BUILT.** The original 15 MusicBrainz tables exist in Xano workspace 3 — IDs **#736–#750** — and the person-resolution queue **`queue_person_resolution` #751** was added on 2026-06-14. This page covers [build-order step 1](/guides/enrichment/waterfall/music-industry-waterfall#build-order-status) of the [Music Industry Waterfall](/guides/enrichment/waterfall/music-industry-waterfall). Schemas mirror the **live IMDB pipeline tables** (`queue_imdb_person` #706, `queue_imdb_title` #707, `imdb_person` #394, `film_tv` #395) with deliberate deviations called out below. The `log_crash` phase-enum additions are also done; the kill switch was **skipped** (see the [build checklist](#build-checklist)).
 </Note>
 
-## Table inventory — 15 tables
+## Table inventory — 16 tables
 
 | Table | Xano ID | Role |
 |---|--:|---|
@@ -47,14 +47,14 @@ These are the production conventions observed on the built IMDB pipeline tables 
 **Deliberate deviations from IMDB:**
 
 1. **`unique(mbid)` on source tables too.** IMDB enforces uniqueness only at the queue layer (`unique(imdb_url)`) because URLs need normalization. MBIDs are stable UUIDs straight from the API — a unique index on every `mb_*` table is free insurance against race-created duplicate stubs.
-2. **`next_attempt_at` + `retry_count` on queue tables.** The [retry policy](/guides/enrichment/waterfall/music-industry-waterfall#retry-policy) defers instead of sleeping — IMDB has no equivalent because it has no hard rate limit.
+2. **`next_attempt_at` + `retry_count` on queue tables.** The [retry policy](/guides/enrichment/waterfall/music-industry-waterfall#retry-policy) uses bounded sleeps inside the API helper and `next_attempt_at` between failed enrich-row attempts — IMDB has no equivalent because it has no hard rate limit.
 3. **No join tables.** IMDB needed `imdb_credit_join` (with its `edge_created` flag) because edges were written in a separate phase. Music orchestrators write edges inline from the lookup JSON, and the raw JSON is retained on the `mb_*` tables — edges are replayable without a join layer.
 
 **Reused infrastructure (no new tables):**
 
-- **Crashes** → the shared `log_crash` table (#542). Its `phase` enum carries the appended music values (done 2026-06-11): `mb_lookup`, `mb_browse`, `mb_node`, `mb_edges`, `mb_cascade`, `api_bad_request`, `api_exhausted` — plus (2026-06-12) `image_fetch`, `image_upload`, `node_description` for the media + description pipelines. **`phase` is a strict enum** — values outside the list fail at runtime (the IMDB poster backfill 13047 logs phase `poster_upload`, which is *not* in the enum — its catch path is latently broken).
+- **Crashes** → the shared `log_crash` table (#542). Its `phase` enum carries the appended music values (done 2026-06-11): `mb_lookup`, `mb_browse`, `mb_node`, `mb_edges`, `mb_cascade`, `api_bad_request`, `api_exhausted` — plus (2026-06-12) `image_fetch`, `image_upload`, `node_description` for the media + description pipelines. **`phase` is a strict enum** — values outside the list fail at runtime.
 - **Kill switch** → **skipped entirely (decided 2026-06-11)**. The cascade is structurally bounded — monotonic depth with a hard cap, MBID dedup via the unique indexes, 30-day enrich gate — and pausing the single unified cron in Xano is the manual kill. No env var, no table.
-- **Genres** → `Genre` nodes are created inline from the embedded `genres` array (name + mbid included in every lookup). No table.
+- **Genres** → `genres` / `tags` stay as properties on the source music nodes. No `Genre` table, no `Entity:Genre` nodes, and no `HAS_GENRE` edges in the live music waterfall.
 
 ---
 
@@ -62,7 +62,7 @@ These are the production conventions observed on the built IMDB pipeline tables 
 
 `queue_mb_artist` · `queue_mb_recording` · `queue_mb_label` · `queue_mb_event` · `queue_mb_release_group` · `queue_mb_work`
 
-One row per discovered-but-not-yet-enriched MBID. Written only by the `mb/queue/upsert-*` functions (keyed on `mbid`: duplicate discovery → `count++` + tier upgrade + FK backfill); drained only by the [unified cron](/guides/enrichment/waterfall/music-industry-waterfall#rate-limit-architecture).
+One row per discovered-but-not-yet-enriched MBID. Written only by the `mb/queue/upsert-*` functions (keyed on `mbid`: duplicate discovery → `count++` + tier upgrade + FK fill); drained only by the [unified cron](/guides/enrichment/waterfall/music-industry-waterfall#rate-limit-architecture).
 
 | Field | Type | Null / default | Notes |
 |---|---|---|---|
@@ -75,7 +75,7 @@ One row per discovered-but-not-yet-enriched MBID. Written only by the `mb/queue/
 | `count` | int | not null, `1`, min 0 | Incremented on duplicate discovery |
 | `cascade_depth` | int | not null, required, min 0 | `0` only for [bootstrap-lane](#bootstrap-lane-rows) rows; otherwise `1` or `2`; `3+` is never queued |
 | `priority_tier` | int | not null, `4`, min 0, max 4 | `0` = bootstrap lane; `1`–`4` per the [tier rules](/guides/enrichment/waterfall/music-industry-waterfall#priority-tiers). Upgraded (lowered) on duplicate discovery |
-| `source_function` | text | not null, `""`, trim | e.g. `cascade-from-artist` |
+| `source_function` | text | not null, `""`, trim | e.g. `run-base-artist-enrich` / inlined `mb_cascade` phase |
 | `source_entity_mbid` | text | not null, `""`, trim | MBID of the spawning entity |
 | `seed_mbid` | text | not null, `""`, trim | Root of the cascade (lineage) |
 | `next_attempt_at` | timestamp | nullable | Retry backoff gate — cron skips the row until `now ≥ next_attempt_at` |
@@ -88,9 +88,9 @@ One row per discovered-but-not-yet-enriched MBID. Written only by the `mb/queue/
 | primary | `id` | |
 | unique | `mbid` | Upsert dedup — one row per MBID |
 | btree | `processing, priority_tier, cascade_depth` | Worker pickup (mirrors `queue_imdb_person`) |
-| btree | `mb_<entity>_id` | FK backfill / stub lookups |
+| btree | `mb_<entity>_id` | FK fill / stub lookups |
 
-The `next_attempt_at ≤ now` filter is applied after the pickup index scan — at queue scale (thousands of rows, single-row pickup every ~2 s) it needs no dedicated index.
+The `next_attempt_at ≤ now` filter is applied after the pickup index scan — at queue scale (thousands of rows, batch-10 cron pickup every 60 s) it needs no dedicated index.
 
 ### Bootstrap-lane rows
 
@@ -155,7 +155,7 @@ mb_artist
 | `browse_json` | json, nullable | Paginated browse payloads (`recording?artist=`, `release-group?artist=`) accumulated across cascade pages |
 | `music_group_image_url` | text, nullable | *(added 2026-06-12)* First serper.dev Google Images result for `"<name> band <disambiguation>"` — groups only |
 | `gcp_music_group_image_url` | text, nullable | *(added 2026-06-12)* Re-hosted GCS WebP (`music-group-image/<mbid>.webp`) via `mvp/music/save-music-group-image` (13107). *(2026-06-14)* also written to the `Music_Group` node's `image_url` by `fetch-group-image` (13109 v1.3) |
-| `description_generated_at` | timestamp, nullable | *(added 2026-06-12)* Stamped when the `Music_Group` node's description + description-based embedding are written (13113) — the backfill's selection gate |
+| `description_generated_at` | timestamp, nullable | *(added 2026-06-12)* Stamped when a `Music_Group` or `Music_Artist` description + description-based vectors are written through #13117 — the finalizer gate |
 | `master_person_id` | int, not null, `0`, tableref → `master_person` (#139) | *(added 2026-06-14)* Stamped by [person-resolution](/guides/enrichment/waterfall/music-functions#person-resolution) when the `SAME_AS` → `master_person` bridge is written (`0` = unreconciled). Mirrors the `mb_label.master_company_id` / `imdb_person.master_person_id` convention |
 | `person_avatar_url` | text, nullable | *(added 2026-06-14)* Raw serper.dev avatar URL for a `Person:Music_Artist`, resolved via `mvp/music/fetch-person-avatar` (13120) |
 | `gcp_person_avatar_url` | text, nullable | *(added 2026-06-14)* Re-hosted GCS WebP (`music-person-avatar/<mbid>.webp`) via `mvp/music/save-person-avatar` (13119); also written to the `Person:Music_Artist` node's `image_url` |
@@ -192,7 +192,7 @@ mb_release           +  mb_release_group_id
 mb_place   (no queue, no orchestrator)
 ```
 
-Filled **inline** during recording/event enrich from the embedded `place-rels` object — `json` holds that embedded object (name, type, address, coordinates, area), not a lookup response. `enriched_at` = when inline-materialized; `cascade_depth` = depth of the enrich that embedded it; `enrich_success` = set true when the `Place` node write succeeds; `gone` is unused (always `false` — places are never individually looked up, so a 404 can't occur). If a future pass needs URL rels for places, the `mbid` is already here to drive a backfill without re-discovery.
+Filled **inline** during recording/event enrich from the embedded `place-rels` object — `json` holds that embedded object (name, type, address, coordinates, area), not a lookup response. `enriched_at` = when inline-materialized; `cascade_depth` = depth of the enrich that embedded it; `enrich_success` = set true when the `Place` node write succeeds; `gone` is unused (always `false` — places are never individually looked up, so a 404 can't occur). If a future pass needs URL rels for places, the `mbid` is already here to drive a scoped lookup without re-discovery.
 
 </Card>
 
@@ -206,7 +206,7 @@ mb_recording
 |---|---|---|
 | `cover_art_url` | text, nullable | *(added 2026-06-12)* Cover Art Archive front image (500px thumbnail preferred, `https`-normalized), resolved via the recording's releases (`Official` first) |
 | `gcp_cover_art_url` | text, nullable | *(added 2026-06-12)* Re-hosted GCS WebP (`music-cover-art/<mbid>.webp`) via `mvp/music/save-cover-art` (13104). *(2026-06-14)* also written to the `Recording` node's `image_url` by `fetch-recording-cover-art` (13108 v1.3) |
-| `description_generated_at` | timestamp, nullable | *(added 2026-06-12)* Stamped when the `Recording` node's description + description-based embedding are written (13113) — the backfill's selection gate |
+| `description_generated_at` | timestamp, nullable | *(added 2026-06-12)* Stamped when the `Recording` node's description + description-based vectors are written through #13117 — the finalizer gate |
 
 </Card>
 
@@ -221,7 +221,7 @@ Backs `mb/rate-limit/acquire` — the token-bucket gate every MusicBrainz call p
 | Field | Type | Null / default | Notes |
 |---|---|---|---|
 | `id` | int | PK | Always `1` |
-| `last_call_at` | timestamp | not null | Stamped on every granted call; `acquire` defers if `now − last_call_at < 1000 ms` |
+| `last_call_at` | timestamp | not null | Stamped on every granted call; `acquire` sleeps when `now − last_call_at < 1100 ms` |
 | `tokens` | int | not null, `1` | Binary gate (0 or 1) at the 1 req/s ceiling — kept as int so the bucket can widen if MusicBrainz ever raises the limit |
 
 **Indexes:** primary `id` only.
@@ -240,11 +240,12 @@ It carries the same fields as the [queue tables](#queue-tables-6-shared-shape) a
 
 ## Build checklist
 
-In dependency order (= [build-order step 1](/guides/enrichment/waterfall/music-industry-waterfall#build-order-when-we-proceed), expanded):
+In dependency order (= [build-order step 1](/guides/enrichment/waterfall/music-industry-waterfall#build-order-status), expanded):
 
 1. ✅ **Done 2026-06-11** — `mb_rate_limit` (#736) + singleton row (`id 1`, `last_call_at = 0`, `tokens = 1`) seeded in live/staging/sandbox.
 2. ✅ **Done 2026-06-11** — the 8 `mb_*` source tables (#737–#744; `mb_release_group` built before `mb_release`; `mb_label.master_company_id` tablerefs `master_company` #142).
 3. ✅ **Done 2026-06-11** — the 6 `queue_mb_*` tables (#745–#750), each FK'd to its source table.
 4. ✅ **Done 2026-06-11** — music `phase` values appended to the `log_crash` (#542) enum (verified by re-fetch; all other fields untouched).
 5. ❌ **Skipped (decided 2026-06-11)** — no `kill_switch_mb` env var. The cascade is structurally non-recursive (depth cap + MBID dedup), and pausing the unified cron is the manual kill.
-6. ✅ **Done 2026-06-11/12** — sandbox-first: the full function layer ([Music Waterfall Functions](/guides/enrichment/waterfall/music-functions), #13079–#13103) built and smoke-tested in the sandbox data source per the standard [backfill workflow](/guides/enrichment/waterfall/backfill-live-datasource). All smoke tests passed: Sub Pop label seed (3 browse pages / 300-release cap, 205 release-groups + 106 artists + 2 ownership labels queued), Nirvana artist seed (9 members T1, exactly 20 albums + 50 recordings T2), edge descriptions 11/11, unified drain end-to-end on 2 tier-1 artists, genre/area backfill 2 nodes 0 errors.
+6. ✅ **Done 2026-06-11/12** — sandbox-first: the forward pieces of the original function layer ([Music Waterfall Functions](/guides/enrichment/waterfall/music-functions), #13079–#13112 plus finalizer #13117) built and smoke-tested in the sandbox data source. All smoke tests passed: Sub Pop label seed (3 browse pages / 300-release cap, 205 release-groups + 106 artists + 2 ownership labels queued), Nirvana artist seed (9 members T1, exactly 20 albums + 50 recordings T2), edge descriptions 11/11, and unified drain end-to-end on 2 tier-1 member artists.
+7. ✅ **Done 2026-06-14 → 2026-06-17, updated 2026-06-30** — post-core forward additions: person-resolution queue/table (#751), person avatars, node finalization/dual vectors, release-scoped `ON_RECORD_LABEL`, label owner resolution (`OWNED_BY`), and the Company-shaped label / shared Event node updates.

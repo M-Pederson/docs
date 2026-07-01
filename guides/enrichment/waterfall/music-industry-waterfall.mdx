@@ -3,12 +3,23 @@ title: "Music Industry Waterfall Plan"
 description: "Design — queue-driven MusicBrainz enrichment with tiered cascade, depth cap, loop prevention, and a global 1 req/s rate limiter. Graphs the music industry: artists, recordings, labels, events, works, releases."
 ---
 
+<Note>
+**Forward-path scope.** This page intentionally documents what newly enriched MusicBrainz entities write from now on. Historical/catch-up sweeps and temporary image cron work are out of scope; legacy-named helpers are mentioned only when the live forward path invokes them for the entity currently being enriched.
+</Note>
+
 <Warning>
-**⚠️ Temporary cron to delete — Xano task #184 `TEMP-backfill-music-images-live`.** Runs every 30 min on the **`live`** data source, re-running the artist-avatar (`mvp/music/backfill-person-avatars` #13135) + group-image (#13111) backfills to sweep newly-enriched nodes. It is an **idle no-op (zero serper calls) when the backlog is empty**, so it costs nothing while waiting. **Delete it once the live MusicBrainz drain finishes** — the durable fix for cascade-artist avatars is activating the person-resolution cron (#182). Context: [Music image backfill](/guides/dev-updates/2026-06-17-music-image-backfill).
+**Live Xano audit callouts (2026-07-01, fixes published).**
+- **`SAME_AS` identity weight is fixed-forward.** Lower weight = stronger, `0` is disallowed, and identity uses the floor **`1`**. Live #13091 and #13121 now write `SAME_AS.weight = 1` for label→Company and Music_Artist→master-person bridges.
+- **Three documented edge types are allowlisted but unwired:** `COLLABORATED_WITH`, `SUPPORTING_MUSICIAN_FOR`, and `TRIBUTE_TO` have no live writer in the audited music orchestrators. They remain design/deferred entries until a writer lands.
+- **Generated node descriptions cover only three node types:** `Recording`, `Music_Group`, and `Music_Artist`. `Work`, `Release_Group`, `Release`, `Event`, `Place`, and `Company:Music_Label` get dual vectors from `name + disambiguation`; forward writers now stamp `description = null` / `description_generated_at = null` semantically on create.
+- **Edge description envelope is fixed-forward.** Forward edge writers now stamp `description = null` and `description_generated_at = null` on create; the async edge describer later fills GOOD descriptions.
+- **Recording credit edges are type-aware.** `PLAYED_ON`, `PRODUCED`, and `ENGINEERED` can originate from `Music_Group` as well as `Person:Music_Artist`; #13100 splits credits by the MusicBrainz `artist.type`.
+- **Forward-only vector coverage is fixed.** `Work`, `Release_Group`, canonical `Release`, `Event`, and inline `Place` are now covered by `finalize-music-node` #13117 with `kind=other`; generated-description nodes still vectorize from description.
+- **Remaining forward-only graph gap:** `FROM_AREA` is currently graph-derived outside the ingest path while sweeps are excluded.
 </Warning>
 
 <Note>
-**Status: BUILT (2026-06-11/12) — all 15 tables ([build-order step 1](#build-order-when-we-proceed), IDs #736–#750 — see [Music Waterfall Tables](/guides/enrichment/waterfall/music-tables)) AND the full function layer (#13079–#13113 + 2 tasks + the `musicbrainz` API group — see [Music Waterfall Functions](/guides/enrichment/waterfall/music-functions)) are built; the 6/11–12 core is sandbox-verified. The unified cron shipped inactive. The second 2026-06-12 session built the event path (gate 13106 + orchestrator 13105, drain rank 3 live, artist→event discovery at T3), recording cover-art + group-image pipelines, and LLM node descriptions with description-based embeddings — all smoke-tested green on sandbox the same day.** This page scopes the node + edge ontology and the waterfall architecture for ingesting [MusicBrainz](https://musicbrainz.org/doc/MusicBrainz_API) into the Orbiter graph. It mirrors the [IMDB Waterfall](/guides/enrichment/waterfall/imdb-waterfall-plan) — queue tables, depth-capped cascade, priority tiers, upsert dedup — with two structural differences: MusicBrainz is a **structured JSON API** (no HTML scrape, no LLM extraction), and it enforces a **hard 1 request/second global limit**, which becomes the central design constraint. Node/edge specs below are derived from real API responses (Nirvana / *Nevermind* / Sub Pop / Reading Festival 1992). **We designed here first, then built.** All six open design questions were resolved on 2026-06-11 — see [Resolved design decisions](#resolved-design-decisions-2026-06-11).
+**Status: BUILT and live-audited (2026-07-01), forward path only.** The original 15 MusicBrainz tables (#736–#750) plus the person-resolution queue (#751) exist in Xano workspace 3; the forward function layer is core #13079–#13112, finalizer #13117, person-resolution #13118–#13123, and forward-wired derived/owner helpers #13131–#13134. Backfill-only sweeps are excluded from this page. The 6/11–12 core is sandbox-verified; later hardening moved labels to `Entity:Company:Music_Label`, events to shared `Entity:Event` + `Music_*` subtype labels, and genres fully to properties. This page scopes the node + edge ontology and the waterfall architecture for ingesting [MusicBrainz](https://musicbrainz.org/doc/MusicBrainz_API) into the Orbiter graph. It mirrors the [IMDB Waterfall](/guides/enrichment/waterfall/imdb-waterfall-plan) — queue tables, depth-capped cascade, priority tiers, upsert dedup — with two structural differences: MusicBrainz is a **structured JSON API** (no HTML scrape, no LLM extraction), and it enforces a **hard 1 request/second global limit**, which becomes the central design constraint. Node/edge specs below are derived from real API responses (Nirvana / *Nevermind* / Sub Pop / Reading Festival 1992). **We designed here first, then built.** All six open design questions were resolved on 2026-06-11 — see [Resolved design decisions](#resolved-design-decisions-2026-06-11).
 </Note>
 
 ## Source: the MusicBrainz API
@@ -36,7 +47,7 @@ MusicBrainz's 13 core entities map to Orbiter graph nodes as follows. **Seed ent
 
 | MusicBrainz entity | Graph node label | Seed? | Bridges to existing Orbiter node |
 |---|---|:--:|---|
-| `artist` (type = Person) | `Entity:Person:Music_Artist` | ✅ | **is** an Orbiter `Person` (dedup-reconciled, not a separate node) |
+| `artist` (type = Person) | `Entity:Person:Music_Artist` | ✅ | Person-shaped music node; depth-0 person-resolution can bridge to canonical `master_person` via `SAME_AS` |
 | `artist` (Group / Orchestra / Choir) | `Entity:Music_Group` | ✅ | — (new node type — a band is never a `Person`) |
 | `recording` | `Entity:Recording` | ✅ | — |
 | `label` | `Entity:Company:Music_Label` | ✅ | Company-shaped; optional `SAME_AS` to canonical `Company` |
@@ -49,7 +60,7 @@ MusicBrainz's 13 core entities map to Orbiter graph nodes as follows. **Seed ent
 | `genre` | property on source music node | inline | — |
 | `series` / `instrument` / `url` | properties / deferred | — | — |
 
-Every node follows Orbiter conventions: base `Entity` label, `uuid` (random) **plus `mbid`** as the natural MERGE key, `display_label`, `visibility`, `name_embedding` (vecf32), and `created_at` / `updated_at` stamped via Cypher `timestamp()` on create and update (see [Node Types](/guides/ontology/nodes) and the [timestamp convention](/guides/ontology/nodes#timestamp-coverage-audit)).
+Every node follows Orbiter conventions: base `Entity` label, `uuid` (random) **plus `mbid`** as the natural MERGE key, `display_label`, `visibility`, dual vectors (`name_embedding` from `openai/text-embedding-3-small` via #4676 and `embeddings` from `google/gemini-embedding-001` via #13114), and `created_at` / `updated_at` stamped via Cypher `timestamp()` on create and update (see [Node Types](/guides/ontology/nodes) and the [timestamp convention](/guides/ontology/nodes#timestamp-coverage-audit)). Generated `description` currently exists only for `Recording`, `Music_Group`, and `Music_Artist`; other music node types vectorize `name + disambiguation`.
 
 ---
 
@@ -79,7 +90,7 @@ The central node — split by MusicBrainz `type`. A **person** artist gets the `
 | `ipis` / `isnis` | string (csv) | rights-society identifiers |
 | `rating` / `rating_votes` | number / int | `4.6` / `46` |
 | `genres` / `tags` | string (csv) | `grunge, alternative rock, noise rock` |
-| `name_embedding` | vecf32 | semantic embedding of name + disambiguation |
+| `name_embedding` / `embeddings` | vecf32 | OpenAI + Gemini vectors; description-based only after #13117 finalizes `Music_Artist` / `Music_Group` |
 | `created_at` / `updated_at` | timestamp | `timestamp()` |
 
 </Card>
@@ -101,7 +112,7 @@ A specific audio capture (one performance of a Work). Keyed on `mbid`.
 | `isrcs` | string (csv) | recording identifiers |
 | `first_release_date` | string | `1991-09-10` |
 | `genres` | string (csv) | |
-| `uuid` · `name_embedding` · `created_at` · `updated_at` | | |
+| `uuid` · `name_embedding` · `embeddings` · `created_at` · `updated_at` | | |
 
 </Card>
 
@@ -121,7 +132,7 @@ The underlying composition (lyrics + score), independent of any recording.
 | `languages` | string (csv) | `eng` |
 | `iswcs` | string (csv) | `T-070.243.691-6` |
 | `pro_ids` | json | `{ASCAP, BMI, SACEM, …}` rights-society codes (from `attributes`) |
-| `uuid` · `name_embedding` · `created_at` · `updated_at` | | |
+| `uuid` · `name_embedding` · `embeddings` · `created_at` · `updated_at` | | |
 
 </Card>
 
@@ -162,7 +173,7 @@ A record label, publisher, or distributor. It is company-shaped in the graph; re
 | `label_code` | int | `8323` |
 | `begin_year` / `end_year` / `ended` | int / bool | `1979` / — / `false` |
 | `rating` / `genres` | | `4.5` |
-| `uuid` · `name_embedding` · `created_at` · `updated_at` | | |
+| `uuid` · `name_embedding` · `embeddings` · `created_at` · `updated_at` | | |
 
 </Card>
 
@@ -182,7 +193,7 @@ A live event — festival, concert, ceremony. Sub-label from controlled `type`, 
 | `begin_date` / `end_date` / `ended` | string / bool | `1992-08-28` / `1992-08-30` / `true` |
 | `cancelled` | bool | `false` |
 | `time` / `setlist` | string | |
-| `uuid` · `name_embedding` · `created_at` · `updated_at` | | |
+| `uuid` · `name_embedding` · `embeddings` · `created_at` · `updated_at` | | |
 
 </Card>
 
@@ -202,7 +213,7 @@ Place  —  Entity:Place  (+ :Studio | :Venue | :Stadium | :Amphitheater)
 | `address` | string | `Richfield Avenue` |
 | `latitude` / `longitude` | float | `51.467222` / `-1.011944` |
 | `area` | string | `Reading` |
-| `uuid` · `name_embedding` · `created_at` · `updated_at` | | |
+| `uuid` · `name_embedding` · `embeddings` · `created_at` · `updated_at` | | |
 
 </Card>
 
@@ -213,7 +224,7 @@ Place  —  Entity:Place  (+ :Studio | :Venue | :Stadium | :Amphitheater)
 Weights follow the canonical [Edge Weights](/guides/ontology/edge-weights) scale (**lower = stronger**; hub-node edges sit Weak or below; never sub-1). Every edge stamps `uuid`, `created_at`, `updated_at` via `timestamp()`. The bands: Defining 1–5, Very strong 6–15, Strong 16–25, Moderate 26–40, Weak 41–65, Negligible 100.
 
 <Note>
-The tables below summarize each edge. For the **full parameter list per edge** — including the standard envelope (`uuid`, `weight`, `created_at`, `updated_at`, `description`, `description_generated_at`) carried by every edge — see the dedicated **[Music Edges](/guides/enrichment/waterfall/music-edges)** reference. **`Artist`** in a pattern means `Person:Music_Artist` or `Music_Group`; `MEMBER_OF` is always `(Person:Music_Artist)→(Music_Group)`.
+The tables below summarize each edge. For the **full parameter list per edge** — including the standard envelope (`uuid`, `weight`, `created_at`, `updated_at`, `description`, `description_generated_at`) carried by every edge — see the dedicated **[Music Edges](/guides/enrichment/waterfall/music-edges)** reference. **`Artist`** in a pattern means `Person:Music_Artist` or `Music_Group`; `MEMBER_OF` is always `(Person:Music_Artist)→(Music_Group)`. The docs now list 25 edge types because that is the description allowlist; 21 are actively forward-emitted today, while `COLLABORATED_WITH`, `SUPPORTING_MUSICIAN_FOR`, `TRIBUTE_TO`, and `FROM_AREA` need forward writers.
 </Note>
 
 ### Membership & artist-to-artist
@@ -221,9 +232,9 @@ The tables below summarize each edge. For the **full parameter list per edge** �
 | Edge | Pattern | Weight | Properties | Rationale |
 |---|---|:--:|---|---|
 | `[:MEMBER_OF]` | `(Person)→(Group)` | **5** current / **12** past | `instruments` (csv), `begin`, `end`, `ended`, `original` (bool) | Band membership is identity-defining — sits with `FOUNDED`. From `member of band` rel. |
-| `[:COLLABORATED_WITH]` | `(Artist)↔(Artist)` | **15** | `project`, `begin`, `end` | Direct creative collaboration. |
-| `[:SUPPORTING_MUSICIAN_FOR]` | `(Person)→(Artist)` | **18** | `instruments`, `vocal` | `instrumental/vocal supporting musician`. |
-| `[:TRIBUTE_TO]` | `(Artist)→(Artist)` | **40** | | Tribute / named-after. Moderate. |
+| `[:COLLABORATED_WITH]` | `(Artist)↔(Artist)` | **15** | `project`, `begin`, `end` | Direct creative collaboration; **deferred/unwired** in current Xano. |
+| `[:SUPPORTING_MUSICIAN_FOR]` | `(Person:Music_Artist)→(Artist)` | **18** | `instruments`, `vocal` | `instrumental/vocal supporting musician`; **deferred/unwired** in current Xano. |
+| `[:TRIBUTE_TO]` | `(Artist)→(Artist)` | **40** | | Tribute / named-after; **deferred/unwired** in current Xano. |
 
 ### Creative credits (the heart of the music graph)
 
@@ -233,9 +244,9 @@ The tables below summarize each edge. For the **full parameter list per edge** �
 | `[:WROTE_LYRICS]` | `(Artist)→(Work)` | **12** | | `lyricist` |
 | `[:WROTE]` | `(Artist)→(Work)` | **10** | `role` | `writer`/`arranger` |
 | `[:PERFORMED]` | `(Artist)→(Recording)` | **10** | `guest` (bool) | main artist-credit |
-| `[:PLAYED_ON]` | `(Person)→(Recording)` | **20** | `instruments`, `vocal` | instrument/vocal rel |
-| `[:PRODUCED]` | `(Person)→(Recording)` | **18** | | `producer` |
-| `[:ENGINEERED]` | `(Person)→(Recording)` | **22** | `role` (engineer/mix/master) | `engineer`/`mix` |
+| `[:PLAYED_ON]` | `(Artist)→(Recording)` | **20** | `instruments`, `vocal` | instrument/vocal rel; Xano is type-aware and may originate from `Music_Group` or `Music_Artist` |
+| `[:PRODUCED]` | `(Artist)→(Recording)` | **18** | | `producer`; Xano is type-aware and may originate from `Music_Group` or `Music_Artist` |
+| `[:ENGINEERED]` | `(Artist)→(Recording)` | **22** | `role` (engineer/mix/master) | `engineer`/`mix`; Xano is type-aware and may originate from `Music_Group` or `Music_Artist` |
 
 ### Structural music (hub-aware)
 
@@ -246,7 +257,7 @@ The tables below summarize each edge. For the **full parameter list per edge** �
 | `[:RELEASE_OF]` | `(Release)→(Release_Group)` | **30** | | Structural; RG is hub. |
 | `[:APPEARS_ON]` | `(Recording)→(Release)` | **45** | `track_number`, `position`, `disc` | Release is a hub (many tracks) → Weak. |
 | `[:RELEASED_ON]` | `(Release)→(Company:Music_Label)` | **50** | `catalog_number` | Label is a **massive** hub → Weak. From release `label-info`. |
-| `[:ON_RECORD_LABEL]` | `(Recording)→(Company:Music_Label)` | **55** | `via_release`, `catalog_number` | **Derived convenience edge** (graph-side backfill #13131, no MB fetch). One-hop shortcut of `(Recording)→APPEARS_ON→(Release)→RELEASED_ON→(Company:Music_Label)`, sourced from the **canonical release**'s label; one notch weaker than `RELEASED_ON` (50). `RELEASED_ON` stays source of truth. |
+| `[:ON_RECORD_LABEL]` | `(Recording)→(Company:Music_Label)` | **55** | `via_release`, `catalog_number` | **Forward-derived convenience edge** (#13131 called with `release_mbid` by #13099, no MB fetch). One-hop shortcut of `(Recording)→APPEARS_ON→(Release)→RELEASED_ON→(Company:Music_Label)`, sourced from the **canonical release**'s label; one notch weaker than `RELEASED_ON` (50). `RELEASED_ON` stays source of truth. |
 | `[:SUBSIDIARY_OF]` | `(Company:Music_Label)→(Company:Music_Label)` | **15** | | `label ownership`. |
 
 ### Events and geography
@@ -257,13 +268,14 @@ The tables below summarize each edge. For the **full parameter list per edge** �
 | `[:PERFORMED_AT]` | `(Artist)→(Event:Music_*)` | **45** | `role` | support act. |
 | `[:HELD_AT]` | `(Event:Music_*)→(Place)` | **30** | | `held at`. |
 | `[:RECORDED_AT]` | `(Recording)→(Place)` | **35** | | studio `recorded at`. |
-| `[:FROM_AREA]` | `(Artist / Company:Music_Label / Place)→(Country / Region / City)` | **70** | | Geography hub — matches `LOCATED_IN` (§3.6). |
+| `[:FROM_AREA]` | `(Artist / Company:Music_Label / Place)→(Country / Region / City)` | **70** | | **Forward gap** while sweeps are excluded; geography hub — matches `LOCATED_IN` (§3.6). |
 
 ### Identity bridges (reconcile to the existing Orbiter graph)
 
 | Edge | Pattern | Weight | Note |
 |---|---|:--:|---|
-| `[:SAME_AS]` | `(Company:Music_Label)→(Company)` | **1** | Written by the **separate post-ingest reconciliation pass** (name + URLs/ISNI) — never at ingest ([decided](#resolved-design-decisions-2026-06-11)). **Person artists are not bridged** — a `Person:Music_Artist` *is* a `Person` node, reconciled by dedup/MERGE in the same pass. |
+| `[:SAME_AS]` | `(Company:Music_Label)→(Company)` and `(Person:Music_Artist)→(Person/master_person)` | **1** | Identity bridge; fixed-forward 2026-07-01 in #13091/#13121. |
+| `[:OWNED_BY]` | `(Company:Music_Label)→(Company)` | **15** | Label owner resolution (#13132–#13134) links labels to owner companies with `match_method`, `source`, and `confidence`. |
 
 ---
 
@@ -272,7 +284,7 @@ The tables below summarize each edge. For the **full parameter list per edge** �
 Mirrors IMDB: **gates** → **orchestrators** → **inlined cascades** → **queue infra** → **unified cron**, all under a **namespace `mb/`** in Xano workspace 3. No LLM/scrape phases in the structural path — orchestrators map structured JSON straight to Cypher (an LLM pass fills edge `description`s afterwards).
 
 <Note>
-**Built 2026-06-12.** The complete function inventory — including the release-group (13099) and work (13101) orchestrators, node writers, the LLM edge-description trio, the genre/area hub-edge backfill, operator endpoints, and the deviations from this design — lives on the dedicated **[Music Waterfall Functions](/guides/enrichment/waterfall/music-functions)** page.
+**Built and live-audited 2026-07-01.** The forward-path function inventory lives on the dedicated **[Music Waterfall Functions](/guides/enrichment/waterfall/music-functions)** page. Backfill-only functions/endpoints/tasks are intentionally excluded there too.
 </Note>
 
 ### Entry gates
@@ -285,9 +297,10 @@ mb/get-add/artist — 13088
 mb/get-add/release-group — 13089
 mb/get-add/recording — 13093
 mb/get-add/work — 13098
+mb/get-add/event — 13106
 ```
 
-One gate per enrichable entity (**no event gate — events deferred**). Each: normalize MBID → dedup on a 30-day `enriched_at` window → skip `gone`-tombstoned rows → ensure stub row (`mb_artist` / `mb_recording` / …) → branch: **sync-enrich** when `cascade_depth == 0 && queue == false` (invoke the orchestrator directly), else **upsert the queue row**. Seed-id propagation: when no caller seed is passed, the just-created stub is the seed. The MBID is the natural key — no URL normalization needed (unlike IMDB).
+One gate per enrichable entity, including event. Each: normalize MBID → dedup on a 30-day `enriched_at` window → skip `gone`-tombstoned rows → ensure stub row (`mb_artist` / `mb_recording` / …) → branch: **sync-enrich** when `cascade_depth == 0 && queue == false` (invoke the orchestrator directly), else **upsert the queue row**. Seed-id propagation: when no caller seed is passed, the just-created stub is the seed. The MBID is the natural key — no URL normalization needed (unlike IMDB).
 
 </Card>
 
@@ -299,7 +312,7 @@ One gate per enrichable entity (**no event gate — events deferred**). Each: no
 mb/run-base-artist-enrich — 13094
 ```
 
-**Phases:** 1 throttled lookup `artist/{mbid}?inc=aliases+tags+genres+ratings+url-rels+artist-rels` → 2 save raw JSON to `mb_artist` → 3 `MERGE` Artist node (+`:Person`/`:Group`, via writer 13092) + stamp `node_uuid` → 4 `MEMBER_OF` edges from `member of band` rels (w5 current / w12 past; instruments, begin/end/ended, original — members queued T1) → 5 cascade: browse `release-group?artist=` (Albums, cap 20 chronological, T2) + `recording?artist=` (cap 50, T2) → 6 stamp `enriched_at` / `enrich_success` / `cascade_depth`. Per-phase `try_catch` → `log_crash`. `FROM_AREA` is written by the separate graph-derived backfill (13103); genres stay node properties.
+**Phases:** 1 throttled lookup `artist/{mbid}?inc=aliases+tags+genres+ratings+url-rels+artist-rels+event-rels` → 2 save raw JSON to `mb_artist` → 3 `MERGE` Artist node (+`:Person`/`:Group`, via writer 13092) + stamp `node_uuid` → 4 `MEMBER_OF` edges from `member of band` rels (w5 current / w12 past; instruments, begin/end/ended, original — members queued T1) → 5 finalize node media/description/vectors through #13117 where applicable → 6 cascade: browse `release-group?artist=` (Albums, cap 20 chronological, T2) + `recording?artist=` (cap 50, T2) + depth-0 main-performer events (T3); depth-0 person artists also enqueue person-resolution (#13122) and fetch person avatar (#13120) → 7 stamp `enriched_at` / `enrich_success` / `cascade_depth`. Per-phase `try_catch` → `log_crash`. `FROM_AREA` is not forward-wired in the audited ingest path; genres stay node properties.
 
 </Card>
 
@@ -360,7 +373,7 @@ mb/queue/upsert-release-group — 13085
 mb/queue/upsert-work — 13086
 ```
 
-Single source of truth for queue writes, keyed on `mbid`: if already queued, `count++` + upgrade `priority_tier` (**lowest tier wins**) + backfill the entity id. Source metadata on INSERT only. Inputs default via `first_notnull` (tier 4 / depth 1), so explicitly passed bootstrap `0`s survive. **Kill switch: skipped (decided 2026-06-11)** — the cascade is structurally bounded (see [loop prevention](#loop-prevention-six-layers)), and pausing the unified cron (Task 180) is the manual kill.
+Single source of truth for queue writes, keyed on `mbid`: if already queued, `count++` + upgrade `priority_tier` (**lowest tier wins**) + fill the entity id when the stub exists. Source metadata on INSERT only. Inputs default via `first_notnull` (tier 4 / depth 1), so explicitly passed bootstrap `0`s survive. **Kill switch: skipped (decided 2026-06-11)** — the cascade is structurally bounded (see [loop prevention](#loop-prevention-six-layers)), and pausing the unified cron (Task 180) is the manual kill.
 
 </Card>
 
@@ -431,8 +444,8 @@ terminal       = {400, 404}                     # never retried
 on_exhaustion  = release lock · log_crash phase="api_exhausted" · re-queue one tier lower
 ```
 
-- **Defer, don't sleep.** Xano functions shouldn't block, so `acquire` and the retry wrapper **re-queue** the entity with a `next_attempt_at` backoff timestamp instead of sleeping in-process. The unified cron skips rows whose `next_attempt_at` is in the future.
-- **Backoff is per-entity; pacing is global.** The 1 req/s token bucket governs *spacing* between any two calls; the retry backoff governs *re-attempts* of one failed call. Both invariants hold simultaneously.
+- **Live implementation uses bounded sleeps inside the API helper.** `mb/rate-limit/acquire` sleeps when the global 1 req/s floor has not elapsed, and `mb/api/request` sleeps between its internal retry attempts. Queue-level failures still use `next_attempt_at`, so the unified cron skips rows whose full enrich retry window is in the future.
+- **Backoff is per-entity; pacing is global.** The 1 req/s token bucket governs *spacing* between any two calls; the API retry backoff governs *re-attempts* of one failed HTTP call; the queue backoff governs failed enrich rows. All three invariants hold simultaneously.
 - **Retries are idempotent.** Every write is `MERGE`-based with `coalesce`d `created_at`, so re-running a partially-applied enrich never duplicates nodes or edges.
 
 <Card icon="cloud-arrow-up">
@@ -450,7 +463,7 @@ Single choke-point for every MusicBrainz call: calls `acquire` (13079) for pacin
 ## Priority tiers
 
 <Note>
-**Tier 0 — bootstrap lane (decided).** Large manual seed batches (e.g. a full label roster) are queued at `priority_tier = 0`, a reserved lane that drains ahead of all cascade traffic. There is no offline dump import — everything rides the live 1 req/s API, and multi-day backfills are accepted (see [Resolved](#resolved-design-decisions-2026-06-11)). The tiers below (1–4) apply to cascade-discovered entities.
+**Tier 0 — bootstrap lane (decided).** Large manual seed batches (e.g. a full label roster) are queued at `priority_tier = 0`, a reserved lane that drains ahead of all cascade traffic. There is no offline dump import — everything rides the live 1 req/s API, and multi-day bootstraps are accepted (see [Resolved](#resolved-design-decisions-2026-06-11)). The tiers below (1–4) apply to cascade-discovered entities.
 </Note>
 
 ### `queue_mb_artist` (1 = highest)
@@ -539,16 +552,16 @@ Identical to IMDB — hard cap at depth 2.
     Lookup `mb_artist` by `mbid`, return if enriched &lt; 30 days. (No kill-switch check — skipped by design; pause the unified cron to stop the pipeline.)
   </Step>
   <Step title="Throttled lookup">
-    `acquire` token → `GET artist/{mbid}?inc=aliases+tags+genres+ratings+url-rels+artist-rels`. Save raw JSON.
+    `acquire` token → `GET artist/{mbid}?inc=aliases+tags+genres+ratings+url-rels+artist-rels+event-rels`. Save raw JSON.
   </Step>
   <Step title="Node + base edges">
-    `MERGE` the artist node on `mbid` — `Entity:Person:Music_Artist` (person) or `Entity:Music_Group` (group) by `type` — stamp `created_at`/`updated_at`. Write `FROM_AREA`; keep genres as node properties. No reconciliation here — linking to existing Orbiter `Person` nodes happens in the [separate post-ingest pass](#resolved-design-decisions-2026-06-11).
+    `MERGE` the artist node on `mbid` — `Entity:Person:Music_Artist` (person) or `Entity:Music_Group` (group) by `type` — stamp `created_at`/`updated_at`, dual vectors, and media/description where the finalizer applies. `FROM_AREA` is a forward-path gap while sweeps are excluded; genres stay node properties. No inline reconciliation here — depth-0 person artists enter the [person-resolution bridge](#resolved-design-decisions-2026-06-11).
   </Step>
   <Step title="Membership edges">
     For each `member of band` rel → `MEMBER_OF` edge (instrument/dates/original) + queue the member artist at **T1**.
   </Step>
   <Step title="Cascade (browse, throttled, paginated)">
-    `release-group?artist=` (albums, cap 20) → T2; `recording?artist=` (cap 50) → T2; collaborators → T2; events → T3. Each child via `get-add` at `depth+1`.
+    `release-group?artist=` (albums, cap 20) → T2; `recording?artist=` (cap 50) → T2; depth-0 main-performer events → T3; collaborators remain deferred. Each child via `get-add` at `depth+1`.
   </Step>
   <Step title="Mark success">
     `enriched_at = now`, `enrich_success = true`, `cascade_depth = 0`.
@@ -561,10 +574,10 @@ Same shape: 1 throttled lookup with the entity's `inc=` set → `MERGE` node →
 
 ---
 
-## Queue tables (proposed schema)
+## Queue tables (live schema overview)
 
 <Note>
-The authoritative, build-ready spec for **all 15 tables** — field-by-field schemas, indexes, per-table extras, and the live IMDB conventions they mirror — is on the dedicated **[Music Waterfall Tables](/guides/enrichment/waterfall/music-tables)** page. The summary below is the design-level overview.
+The authoritative spec for the original **15 MusicBrainz tables** plus the post-core **person-resolution queue** (#751) — field-by-field schemas, indexes, per-table extras, and the live IMDB conventions they mirror — is on the dedicated **[Music Waterfall Tables](/guides/enrichment/waterfall/music-tables)** page. The summary below is the architecture-level overview.
 </Note>
 
 One table per seedable entity, keyed on normalized `mbid`. Shared shape:
@@ -580,13 +593,13 @@ One table per seedable entity, keyed on normalized `mbid`. Shared shape:
 | `count` | int default 1 | incremented on duplicate discovery |
 | `cascade_depth` | int | 0 (bootstrap lane) / 1 / 2 |
 | `priority_tier` | int 0–4 default 4 | tier rule; **0 = bootstrap lane** (manual seed batches, drains first) |
-| `source_function` | text | e.g. `cascade-from-artist` |
+| `source_function` | text | e.g. `run-base-artist-enrich` / inlined `mb_cascade` phase |
 | `source_entity_mbid` | text | spawning entity |
 | `seed_mbid` | text default `""` | root of the cascade (lineage); bootstrap rows set it to their own `mbid` |
 | `next_attempt_at` | timestamp nullable | retry backoff gate — cron skips the row until `now ≥ next_attempt_at` (see [retry policy](#retry-policy)) |
 | `retry_count` | int default 0 | attempts so far; drives the exponential backoff curve |
 
-Tables: `queue_mb_artist`, `queue_mb_recording`, `queue_mb_label`, `queue_mb_event`, `queue_mb_release_group`, `queue_mb_work`. Source-of-truth tables `mb_artist` / `mb_recording` / `mb_label` / `mb_event` / `mb_release_group` / `mb_release` / `mb_work` / `mb_place` carry the raw JSON + `enriched_at` / `cascade_depth` / `enrich_success` / `node_uuid`.
+Tables: `queue_mb_artist`, `queue_mb_recording`, `queue_mb_label`, `queue_mb_event`, `queue_mb_release_group`, `queue_mb_work`, plus `queue_person_resolution` for the post-core people bridge. Source-of-truth tables `mb_artist` / `mb_recording` / `mb_label` / `mb_event` / `mb_release_group` / `mb_release` / `mb_work` / `mb_place` carry the raw JSON + `enriched_at` / `cascade_depth` / `enrich_success` / `node_uuid`; `mb_rate_limit` is the singleton limiter table.
 
 ---
 
@@ -596,7 +609,7 @@ The open questions from the original design, each resolved before build (the six
 
 <CardGroup cols={1}>
   <Card title="Artist ↔ Person reconciliation — separate post-ingest pass" icon="link">
-    **Decided.** Ingest creates `Person:Music_Artist` and `Company:Music_Label` nodes keyed on `mbid` — no reconciliation inline. A separate post-ingest pass links them to the existing Orbiter graph, keyed on name + shared URLs (Wikidata/IMDb/social) + ISNI: person artists **merge** with their existing `Person` node (node dedup, not an edge); `Company:Music_Label` can get a `SAME_AS` edge to a canonical `Company`. Never at ingest — avoids false merges and keeps the 1 req/s pipeline simple.
+    **Decided; built.** Ingest creates `Person:Music_Artist` and `Company:Music_Label` nodes keyed on `mbid` — no reconciliation inline. The built person-resolution path (#13118–#13123) bridges depth-0 person artists to a canonical `master_person` with `SAME_AS` and verified social links; label-owner resolution (#13132–#13134) writes `OWNED_BY`. Label→Company `SAME_AS` exists in live code as well. Fixed-forward 2026-07-01: both live `SAME_AS` writers use identity weight `1`.
   </Card>
   <Card title="Area mapping — reuse Orbiter geography" icon="earth-americas">
     **Decided.** MusicBrainz areas MERGE into the existing `Country` / `Region` / `City` nodes by name, stamping `mbid` on match. No dedicated `Music_Area` node type and no mapping table. Unmappable or historical areas fall back to the nearest modern parent (e.g. a historical region maps to its present-day country).
@@ -607,21 +620,21 @@ The open questions from the original design, each resolved before build (the six
   <Card title="Canonical release — one Official release per release-group" icon="compact-disc">
     **Decided.** Each `Release_Group` materializes exactly **one** `Release` node: `status = Official`, earliest release date (any country). Tracklists and `APPEARS_ON` edges hang off that canonical edition. All other pressings remain in the raw JSON on the `mb_*` source tables, so the decision is reversible without re-fetching.
   </Card>
-  <Card title="Backfill — live API only, bootstrap priority lane" icon="gauge-high">
-    **Decided.** No offline import from the [MusicBrainz database dumps](https://musicbrainz.org/doc/MusicBrainz_Database/Download). Large bootstraps (e.g. a full label roster) ride the same 1 req/s live API, queued at **`priority_tier = 0`** — a reserved bootstrap lane that drains ahead of all cascade traffic. One code path, no dump tooling; multi-day backfills are accepted.
+  <Card title="Bootstrap — live API only, priority lane" icon="gauge-high">
+    **Decided.** No offline import from the [MusicBrainz database dumps](https://musicbrainz.org/doc/MusicBrainz_Database/Download). Large bootstraps (e.g. a full label roster) ride the same 1 req/s live API, queued at **`priority_tier = 0`** — a reserved bootstrap lane that drains ahead of all cascade traffic. One code path, no dump tooling; multi-day seed loads are accepted.
   </Card>
   <Card title="Places — inline materialization, no queue" icon="location-dot">
-    **Decided.** `Place` nodes are written directly during recording/event enrich from the place object embedded in `place-rels` (name, type, address, coordinates, area — everything the node spec needs). No `queue_mb_place`, no place orchestrator, zero extra API calls at the 1 req/s ceiling. The `mb_place` source table stores the embedded JSON and `mbid`, so a URL-rels backfill pass can be added later without re-discovery.
+    **Decided.** `Place` nodes are written directly during recording/event enrich from the place object embedded in `place-rels` (name, type, address, coordinates, area — everything the node spec needs). No `queue_mb_place`, no place orchestrator, zero extra API calls at the 1 req/s ceiling. The `mb_place` source table stores the embedded JSON and `mbid`, so a future scoped lookup can add URL rels without re-discovery.
   </Card>
 </CardGroup>
 
-## Build order (when we proceed)
+## Build order status
 
-1. ✅ **Done 2026-06-11** — Tables (#736–#750, full spec: [Music Waterfall Tables](/guides/enrichment/waterfall/music-tables)) + `mb/rate-limit/acquire` (13079, built 2026-06-12) + `mb/api/request` (13080); kill switch skipped by design.
-2. ✅ **Done 2026-06-12** — `mb/get-add/artist` (13088) + `mb/run-base-artist-enrich` (13094) + artist node writer (13092) + `MEMBER_OF` edges — proven end-to-end on Nirvana in the sandbox. (`FROM_AREA` moved to the graph-derived backfill `mb/tool/backfill-genre-area-edges`, 13103; function name is legacy.)
+1. ✅ **Done 2026-06-11 / audited 2026-07-01** — Tables (#736–#750) plus post-core `queue_person_resolution` (#751), full spec: [Music Waterfall Tables](/guides/enrichment/waterfall/music-tables). `mb/rate-limit/acquire` (13079) + `mb/api/request` (13080); kill switch skipped by design.
+2. ✅ **Done 2026-06-12** — `mb/get-add/artist` (13088) + `mb/run-base-artist-enrich` (13094) + artist node writer (13092) + `MEMBER_OF` edges — proven end-to-end on Nirvana in the sandbox. `FROM_AREA` is a forward-path gap if we keep excluding sweeps.
 3. ✅ **Done 2026-06-12** — cascading inlined per orchestrator (no standalone `cascade-from-artist`) + unified drain `mb/queue/process-next` (13102) + `process-queue-musicbrainz` Task 180 (60 s × 10/tick, shipped **inactive**) — drain verified on 2 tier-1 member artists.
 4. ✅ **Done 2026-06-12** — Recording + Work path (`run-base-recording-enrich` 13100, `run-base-work-enrich` 13101: `RECORDING_OF` / `PERFORMED` / `COMPOSED` / …).
-5. ✅ **Done 2026-06-12** — Label + Release path (`run-base-label-enrich` 13091, `run-base-release-group-enrich` 13099; `Place` nodes materialize inline in 13100). Plus the LLM edge-description trio (13095–13097, Task 181 inactive) and operator endpoints — see [Music Waterfall Functions](/guides/enrichment/waterfall/music-functions).
+5. ✅ **Done 2026-06-12** — Label + Release path (`run-base-label-enrich` 13091, `run-base-release-group-enrich` 13099; `Place` nodes materialize inline in 13100). Plus the async edge-description trio (13095–13097, Task 181 active as of 2026-06-17) and operator endpoints — see [Music Waterfall Functions](/guides/enrichment/waterfall/music-functions).
 6. ✅ **Done 2026-06-12 (second session, sandbox smoke-tested)** — Event path: `mb/get-add/event` (13106) + `mb/run-base-event-enrich` (13105) + drain rank-3 wiring (13102 v1.1) + artist→event discovery (13094 v1.1) + `POST seed/event` (8649). Verified on Reading Festival 1992: Event node + `:Music_Festival` sub-label, `HEADLINED`, inline-`HELD_AT` Place, headliner cascade — all phases green.
-7. ✅ **Done 2026-06-12 (second session, sandbox smoke-tested)** — Media + descriptions: cover-art pipeline (13104, 13108, 13110), group-image pipeline via serper.dev (13107, 13109, 13111), and Recording/Music_Group node descriptions with description-based `name_embedding` (13112–13113, `deepseek/deepseek-v4-flash`) — see [Music Waterfall Functions](/guides/enrichment/waterfall/music-functions#cover-art--group-images). Verified end-to-end: Nirvana GCS group photo + LLM description/embedding; Smells Like Teen Spirit CAA art → 44 KB GCS WebP.
-8. ⏳ **Pending** — post-ingest reconciliation pass to bridge into the existing people/company graph — `Person` artists merge with their existing `Person` node (node dedup, no edge); `Company:Music_Label` can get `SAME_AS` → canonical `Company`. **Scoped 2026-06-12** — see [Music Reconciliation](/guides/enrichment/waterfall/music-reconciliation).
+7. ✅ **Done 2026-06-12 / hardened through 2026-06-15** — Forward media + descriptions/vectors: cover-art helpers (13104, 13108), group-image helpers via serper.dev (13107, 13109), person avatars (13119–13120), and generated descriptions for `Recording`, `Music_Group`, and `Music_Artist` only (13112 + finalizer 13117, `deepseek/deepseek-v4-flash`). Vectors dual-write OpenAI `name_embedding` + Gemini `embeddings` where the forward writer/finalizer is wired.
+8. ✅ **Done 2026-06-14 through 2026-07-01** — Forward bridge and graph hardening: person-resolution (#13118–#13123), release-scoped `ON_RECORD_LABEL` (#13131 via #13099), label-owner `OWNED_BY` (#13132–#13134), `SAME_AS.weight = 1`, semantic-null node/edge description envelopes, and forward vectors for Event / inline Place. Remaining forward gap: wire `FROM_AREA` directly into ingest or keep it excluded while sweeps are out of scope.

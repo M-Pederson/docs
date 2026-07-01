@@ -4,6 +4,21 @@
 
 This is the Mintlify documentation site for Orbiter.io. API docs are generated from the Xano backend (workspace ID: 3, OrbiterV2).
 
+## Orbiter Universe display-table modeling memory
+
+When documenting Orbiter Universe graph nodes, card/read-model tables, or side-panel hydration, use this frame:
+
+- Start from the ideal entity list first: graph/source entities imply potential display/card types.
+- Then combine into physical App display tables where the UI contract is the same. These are **display tables**, not "snapshot" tables.
+- Use `*_display` names for greenfield App read models unless a table is truly card-only.
+- `person_display` and `company_display` are broad display tables for cards, search rows, side-panel headers, and compact side-panel summary data. Other entity display tables are card-only by default unless the product explicitly adds first-class detail panels for that type.
+- School, VC firm, and Organization stay company-shaped: combine into `company_display` with type/label discriminator fields unless the UI diverges.
+- Do not create card/display tables for location, expertise, or credential/achievement nodes by default. `Country`, `Region`, `State`, `City`, MusicBrainz `Place`, `DomainExpertise`, `SubDomainExpertise`, `Certification`, and `Honor` should appear as facets, filters, badges, side-panel context, or relationship metadata unless the product explicitly needs standalone cards later.
+- Side panels are composed views. Universe projection writes public/enrichment-backed display rows and public side-panel facts; the App backend also joins user/team/org-scoped dynamic data at read time, such as files, notes, collections, private relationship context, reminders, permissions, and workflow state. Universe projection must not overwrite those dynamic sections.
+- For Film/TV, keep `Film_TV` title subtypes (`Movie`, `TV_Series`, `TV_Movie`, `TV_Mini_Series`, `Short_Film`, `Documentary`, `TV_Special`, `Video_Game`, `Music_Video`) in one `film_tv_display` unless the UI needs separate contracts. `Film_TV_Award` gets its own `film_tv_award_display`.
+- IMDb people are source-specific person facts, not a separate card design or display table. Project/reconcile `imdb_person` data into the graph `Person` node and App `person_display`.
+- For MusicBrainz, the graph should have nine node types before display/card consolidation: `Person:Music_Artist`, `Music_Group`, `Recording`, `Work`, `Release_Group`, `Release`, `Company:Music_Label`, `Event:Music_*`, and `Place`. Genres are properties on music nodes, not `Entity:Genre` nodes or `HAS_GENRE` edges. Card/display tables are narrower than graph nodes: use separate card designs for `Person:Music_Artist`, `Music_Group`, and `Recording`; keep `Release_Group`, `Release`, and `Place` out by default because they are graph/support nodes, not standalone cards; fold `Company:Music_Label` into `company_display`; and fold `Event:Music_*` into the Event card design / `live_event_display`.
+
 ## Xano MCP Workflow
 
 When creating API documentation for a new group:

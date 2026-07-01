@@ -1,0 +1,91 @@
+---
+title: "IMDB Waterfall Tables"
+description: "Every Xano table + queue in the live IMDB (Film & TV) waterfall — imdb_person, film_tv, film_tv_award, the two URL-keyed queues, the expertise mirror, and the shared crash log. Field-by-field schemas, the enrichment-metadata additions, and URL-normalization keying."
+---
+
+The Xano storage layer for the [IMDB Waterfall](/guides/enrichment/waterfall/imdb-waterfall-plan). Queue tables are keyed on the **normalized `imdb_url`**, not on `imdb_person_id` / `film_tv_id`, because most discoveries happen before the underlying row exists.
+
+## Table inventory
+
+| Table | Xano ID | Role |
+| --- | :-: | --- |
+| `imdb_person` | **#394** | Source of truth — IMDB person records (raw `json` \+ `markdown` \+ enrichment metadata). Also holds `awards_json` \+ `award_markdown` populated by #12887. |
+| `film_tv` | **#395** | Source of truth — title (film/TV) records. Same schema additions \+ poster fields. |
+| `film_tv_award` | **#396** | Award rows written by `add-award-records-from-{person,title}`. `node_uuid` stamped by #2334. |
+| `queue_imdb_person` | **#706** | Person enrichment queue. Upsert-only, keyed on `imdb_url`. |
+| `queue_imdb_title` | **#707** | Title enrichment queue. Upsert-only, keyed on `imdb_url`. |
+| `person_has_expertise` | **#711** | Relational mirror of `HAS_EXPERTISE` graph edges. Written by `llm-identify-person-expertise` v2 via resolver #12926. |
+| `log_crash` | **#542** | Shared per-phase observability from orchestrators \+ cascades \+ crons. |
+
+<Note>
+  **`log_crash` is shared infrastructure, not IMDB-specific.** Filter by the IMDB `phase` enum values: `llm_extract`, `save_scrape`, `master_person`, `node_stamp`, `bios_optional`, `credit_edges`, `awards`, `cascades`. `phase` is a strict enum — values outside the list fail at runtime.
+</Note>
+
+---
+
+## Queue tables (2 — shared shape)
+
+`queue_imdb_person` · `queue_imdb_title`
+
+One row per discovered-but-not-yet-enriched IMDB URL. Written only by the `upsert-imdb-{person,title}` functions (keyed on normalized `imdb_url`: duplicate discovery → `count++` \+ tier upgrade \+ FK backfill); drained only by the [cron processors](/guides/enrichment/waterfall/imdb-functions#cron-processors-drain-the-queue-tables).
+
+### `queue_imdb_person`
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `id` | int | PK |
+| `created_at` | timestamp |  |
+| `imdb_url` | text (unique) | Normalized canonical URL |
+| `name` | text | Provisional name from discovery context (nullable) |
+| `imdb_person_id` | int nullable | Populated once the stub row exists |
+| `processing` | bool | Lock flag — cron sets `true` on pickup |
+| `count` | int default 1 | Incremented on duplicate discovery |
+| `cascade_depth` | int | Hops from seed (1 or 2) |
+| `priority_tier` | int 1–4 default 4 | Tier rule — see [Priority tiers](/guides/enrichment/waterfall/imdb-waterfall-plan#priority-tiers) |
+| `source_function` | text | e.g. `cascade-crew-from-title`, `cascade-awards-from-person` |
+| `source_entity_id` | int | ID of the spawning entity |
+| `source_entity_type` | text | `imdb_person` or `film_tv` |
+| `seed_imdb_person_id` | int nullable | Root of this cascade (lineage) |
+| `seed_film_tv_id` | int nullable | Root of this cascade (lineage) |
+
+### `queue_imdb_title`
+
+Identical shape with `imdb_url`, `title` (instead of `name`), and `film_tv_id` (instead of `imdb_person_id`).
+
+---
+
+## Source table schema additions
+
+The enrichment metadata layered onto the two source-of-truth tables by the waterfall.
+
+### On `imdb_person` and `film_tv`
+
+| Field | Type | Purpose |
+| --- | --- | --- |
+| `enriched_at` | timestamp nullable | Last full scrape. Used to skip re-scrape within 30 days |
+| `cascade_depth` | int nullable | Depth at which this entity was first enriched |
+| `enrich_success` | bool default false | Flipped true on successful orchestrator completion |
+
+### On `imdb_person` only (added by #12887 Fix #5 hardening)
+
+| Field | Type | Purpose |
+| --- | --- | --- |
+| `awards_json` | json nullable | Parsed LLM award array — post-hoc debug \+ idempotent re-process |
+| `award_markdown` | text nullable | Raw scrape of `{imdb_url}/awards/` for debug |
+
+### On `film_tv` only (poster subsystem, late May 2026)
+
+| Field | Type | Purpose |
+| --- | --- | --- |
+| `poster_url` | text nullable | Canonicalized IMDB poster URL (`@._V1_` size transform recomputed) |
+| `image_url` | text nullable | Re-hosted GCS WebP poster (`imdb-posters/<imdb_id>`) via `save-imbd-poster` #13044 |
+
+---
+
+## URL normalization
+
+All queue rows and `imdb_person` / `film_tv` rows are keyed on the **normalized** `imdb_url`. Normalization lives in the `get-add` gates: strip query params and the trailing slash.
+
+```text
+trim | split:"/?" | first | rtrim:"/"
+```

@@ -908,25 +908,464 @@ _Node labels: `Entity`, `Event`, `Live_Summit`_
 
 ## MusicBrainz Nodes
 
-MusicBrainz nodes are produced by the [Music Industry Waterfall](/guides/enrichment/waterfall/music-industry-waterfall). The deeper per-field reference stays on [Music Nodes](/guides/enrichment/waterfall/music-nodes); this section keeps the graph ontology inventory complete.
+MusicBrainz nodes are produced by the [Music Industry Waterfall](/guides/enrichment/waterfall/music-industry-waterfall). This section is the canonical graph contract for music node labels, properties, media fields, vector fields, and reconciliation behavior. The waterfall pages should link here instead of redefining node schemas.
 
 <Note>
-Genres are properties on music nodes, not `Entity:Genre` nodes. `Release_Group` and `Release` are graph nodes even though they are not standalone card/display-table types.
+Every enriched music node converges on the standard envelope: `created_at`, `updated_at`, `uuid`, `mbid`, `display_label`, `visibility`, semantic-null or GOOD `description`, and both vector fields. `Recording`, `Music_Group`, and `Person:Music_Artist` can additionally carry `image_url`.
 </Note>
 
-| Node | Labels | Materializes via | Notes |
-| --- | --- | --- | --- |
-| Person artist | `Entity:Person:Music_Artist` | `mb/run-base-artist-enrich` (#13094) + `mb/node/add-music-artist-node` (#13092) | Human MusicBrainz artist. Carries the shared `Person` label and `display_label = "Person"`; reconciles into the people graph through the music person-resolution pass. |
-| Music group | `Entity:Music_Group` | `mb/run-base-artist-enrich` (#13094) + `mb/node/add-music-artist-node` (#13092) | Band, orchestra, choir, or other non-person act. Dedicated card/display contract, with optional `image_url`. |
-| Recording | `Entity:Recording` | `mb/run-base-recording-enrich` (#13100) | Specific audio capture or track. Dedicated card/display contract, with optional cover-art `image_url`. |
-| Work | `Entity:Work` plus work-type sub-labels such as `Song` | `mb/run-base-work-enrich` (#13101) | Underlying composition or rights work, independent of any specific recording. |
-| Release group | `Entity:Release_Group` plus sub-labels such as `Album`, `Single`, `EP`, `Broadcast`, `Other` | `mb/run-base-release-group-enrich` (#13099) | Album/single/EP grouping. Graph node, not a card type. |
-| Release | `Entity:Release` | `mb/run-base-release-group-enrich` (#13099) | Canonical release materialized for a release group. Graph node, not a card type. |
-| Music label | `Entity:Company:Music_Label` | `mb/node/add-music-label-node` (#13090) + `mb/run-base-label-enrich` (#13091) | Label, distributor, publisher, or label-like organization. Uses the shared `Company` graph/card shape and `display_label = "Company"`. |
-| Music event | `Entity:Event:Music_Festival`, `Entity:Event:Music_Concert`, `Entity:Event:Music_Convention`, `Entity:Event:Music_Award_Ceremony` | `mb/run-base-event-enrich` (#13105) | Music-specific events use the shared `Event` model and `display_label = "Event"`. |
-| Place | `Entity:Place` plus place-type sub-labels such as `Studio`, `Venue`, `Stadium`, `Amphitheater` | Inline writers in `mb/run-base-recording-enrich` (#13100) and `mb/run-base-event-enrich` (#13105) | MusicBrainz place records used for studios and venues. Location-shaped graph node, not a card type. |
+<Warning>
+MusicBrainz `artist` records split into two graph shapes:
 
-All MusicBrainz graph nodes carry the standard music envelope: `uuid`, `mbid`, `display_label`, `visibility`, `created_at`, `updated_at`, and embedding fields. Node descriptions are generated where the music waterfall has description coverage; otherwise `description` remains `null` until a description pass supports that node type.
+- `type == "Person"` -> `Entity:Person:Music_Artist`
+- `type in {Group, Orchestra, Choir, Other}` -> `Entity:Music_Group`
+
+A band is never a `Person`. `MEMBER_OF` is therefore always `(Person:Music_Artist)->(Music_Group)`.
+</Warning>
+
+<a id="music-standard-node-envelope"></a>
+
+### Standard Music Node Envelope
+
+```cypher
+MERGE (n:<labels> {mbid: $mbid})
+SET n.uuid           = coalesce(n.uuid, randomUUID()),
+    n.display_label  = "<Label>",
+    n.visibility     = true,
+    n.description    = <good <=127 summary | null>,
+    n.name_embedding = vecf32($embedding),
+    n.embeddings     = vecf32($geminiEmbedding),
+    n.created_at     = coalesce(n.created_at, timestamp()),
+    n.updated_at     = timestamp()
+    // node-specific properties, plus image_url where supported
+```
+
+| Field | Type | Required | Notes |
+| --- | --- | :--: | --- |
+| `uuid` | string | Yes | `randomUUID()`, stable via `coalesce` |
+| `mbid` | string | Yes | MusicBrainz ID and MERGE key |
+| `display_label` | string | Yes | Product-facing label |
+| `visibility` | boolean | Yes | UI flag |
+| `description` | string/null | Yes | GOOD-or-null invariant: one clean factual sentence <=127 characters beginning with the entity name, or exactly `null` |
+| `name_embedding` | vecf32 | Yes | OpenAI `text-embedding-3-small`, 1536 dimensions; indexed on `:Entity` today |
+| `embeddings` | vecf32 | Yes | Google `gemini-embedding-001`, 3072 dimensions; written but index/read cutover is deferred |
+| `image_url` | string/null | Selective | Only `Recording`, `Music_Group`, and `Person:Music_Artist` |
+| `created_at` | timestamp | Yes | `coalesce(n.created_at, timestamp())` |
+| `updated_at` | timestamp | Yes | `timestamp()` on every write |
+
+`Recording`, `Music_Group`, and `Person:Music_Artist` receive generated descriptions through `mb/node/finalize-music-node` (#13117). Other music node types intentionally carry `description = null` unless a future description pass supports them. Null is preferred over low-quality generated text because descriptions are used as embedding source text.
+
+<a id="music-node-embeddings"></a>
+
+### Music Node Embeddings
+
+Forward-created music nodes carry both vector fields. `name_embedding` is the current indexed vector, and `embeddings` is the Gemini migration field.
+
+| Node type | Written by | Embed text |
+| --- | --- | --- |
+| `Company:Music_Label` | `mb/node/add-music-label-node` #13090 | name + disambiguation |
+| `Person:Music_Artist` | `mb/node/add-music-artist-node` #13092 initially; #13117 rewrites from description | description once finalized |
+| `Music_Group` | #13092 initially; #13117 rewrites from description | description once finalized |
+| `Recording` | `mb/run-base-recording-enrich` #13100 -> #13117 | description once finalized |
+| `Work` | `mb/run-base-work-enrich` #13101 -> #13117 (`kind=other`) | name + disambiguation |
+| `Release_Group` | `mb/run-base-release-group-enrich` #13099 -> #13117 (`kind=other`) | name + disambiguation |
+| `Release` | canonical release materialization in #13099 -> #13117 (`kind=other`) | name + disambiguation |
+| `Event:Music_*` | `mb/run-base-event-enrich` #13105 -> #13117 (`kind=other`) | name + disambiguation |
+| `Place` | inline materialization in #13100/#13105 -> #13117 (`kind=other`) | name + disambiguation |
+
+`disambiguation` is the MusicBrainz disambiguation comment, such as `1980s-1990s US grunge band` for Nirvana or `lead singer and guitarist for Nirvana` for Kurt Cobain. For name-based node types it is appended to the embed text so the vector carries era, genre, region, or identity context.
+
+<a id="music-person-artist"></a>
+
+### Person:Music_Artist
+
+A human musician. This is a `Person`-shaped graph node with the additive `Music_Artist` label, distinct from a business-side `master_person` node. The music person-resolution pass bridges the two with `SAME_AS` instead of merging the MusicBrainz artist node into the master-person node.
+
+**Labels:** `Entity:Person:Music_Artist`
+
+**Materializes via:** `mb/run-base-artist-enrich` (#13094) + `mb/node/add-music-artist-node` (#13092). Reconciles through `mb/resolve-and-link-music-person` (#13121).
+
+| Property | Type | Description |
+| --- | --- | --- |
+| `mbid` | string | MusicBrainz artist ID |
+| `name` / `sort_name` | string | Display and sort names |
+| `display_label` | string | `Music_Artist` |
+| `gender` | string | MusicBrainz gender value |
+| `country` | string | Country code |
+| `birth_date` / `death_date` | string | Life-span dates |
+| `begin_area` | string | Hometown/begin area |
+| `instruments` | string | Aggregated instruments from memberships and credits |
+| `isnis` / `ipis` | string | Rights-society identifiers |
+| `music_rating` / `music_rating_votes` | number/int | MusicBrainz rating metadata |
+| `genres` | string | Genre metadata property only |
+| `disambiguation` | string | MusicBrainz disambiguation comment |
+| `image_url` | string/null | Re-hosted avatar from person-resolution |
+| `social_links` | list | Verified social, streaming, and homepage URLs |
+| `social_resolved_at` | string | ISO timestamp for resolution pass |
+
+<Accordion title="Real example — Kurt Cobain">
+```json
+{
+  "mbid": "3c9b356d-d1db-4f4e-a7a3-2d00c1d70255",
+  "name": "Kurt Cobain",
+  "sort_name": "Cobain, Kurt",
+  "display_label": "Music_Artist",
+  "gender": "Male",
+  "country": "US",
+  "birth_date": "1967-02-20",
+  "death_date": "1994-04-05",
+  "begin_area": "Aberdeen",
+  "instruments": "guitar, vocals",
+  "isnis": "0000000110685005",
+  "music_rating": 5,
+  "genres": "grunge, rock",
+  "disambiguation": "lead singer and guitarist for Nirvana",
+  "description": "Kurt Cobain was an American musician and Nirvana singer-guitarist.",
+  "visibility": true
+}
+```
+_Node labels: `Entity`, `Person`, `Music_Artist`_
+</Accordion>
+
+<a id="music-group"></a>
+
+### Music_Group
+
+A band, orchestra, choir, or other non-person act.
+
+**Labels:** `Entity:Music_Group`
+
+**Materializes via:** `mb/run-base-artist-enrich` (#13094) + `mb/node/add-music-artist-node` (#13092).
+
+| Property | Type | Description |
+| --- | --- | --- |
+| `mbid` | string | MusicBrainz artist ID |
+| `name` / `sort_name` | string | Display and sort names |
+| `display_label` | string | `Music_Group` |
+| `group_type` | string | `Group`, `Orchestra`, `Choir`, or `Other` |
+| `country` / `area` | string | Country and area labels |
+| `formed_year` / `dissolved_year` / `ended` | int/int/bool | Life-span fields |
+| `music_rating` / `music_rating_votes` | number/int | MusicBrainz rating metadata |
+| `genres` | string | Genre metadata property only |
+| `tags` | string | Folksonomy metadata property only |
+| `disambiguation` | string | MusicBrainz disambiguation comment |
+| `image_url` | string/null | Re-hosted group image from GCS |
+
+<Accordion title="Real example — Nirvana">
+```json
+{
+  "mbid": "5b11f4ce-a62d-471e-81fc-a69a8278c7da",
+  "name": "Nirvana",
+  "display_label": "Music_Group",
+  "group_type": "Group",
+  "country": "US",
+  "area": "United States",
+  "formed_year": 1987,
+  "ended": true,
+  "music_rating": 4.6,
+  "genres": "grunge, alternative rock, noise rock",
+  "disambiguation": "1980s-1990s US grunge band",
+  "description": "Nirvana was an American grunge band formed in Aberdeen, Washington.",
+  "visibility": true
+}
+```
+_Node labels: `Entity`, `Music_Group`_
+</Accordion>
+
+<a id="music-recording"></a>
+
+### Recording
+
+A specific audio capture or track, independent of the underlying composition.
+
+**Labels:** `Entity:Recording`
+
+**Materializes via:** `mb/run-base-recording-enrich` (#13100).
+
+| Property | Type | Description |
+| --- | --- | --- |
+| `mbid` | string | MusicBrainz recording ID |
+| `title` | string | Recording title |
+| `length_ms` | int | Track length |
+| `video` | boolean | Whether the recording is a video |
+| `isrcs` | string | Recording identifiers |
+| `first_release_date` | string | First release date |
+| `genres` | string | Genre metadata property only |
+| `image_url` | string/null | Re-hosted GCS cover art |
+
+<Accordion title="Real example — Smells Like Teen Spirit recording">
+```json
+{
+  "mbid": "a8242652-c086-43b4-8971-5f8d68ae273b",
+  "title": "Smells Like Teen Spirit",
+  "length_ms": 275106,
+  "video": false,
+  "display_label": "Recording",
+  "description": "Smells Like Teen Spirit is a 4:35 studio recording by Nirvana.",
+  "visibility": true
+}
+```
+</Accordion>
+
+<a id="music-work"></a>
+
+### Work
+
+The underlying composition, lyrics, score, or rights work behind one or more recordings.
+
+**Labels:** `Entity:Work` plus optional work-type sub-labels such as `Song`, `Symphony`, or sanitized MusicBrainz work type.
+
+**Materializes via:** `mb/run-base-work-enrich` (#13101).
+
+| Property | Type | Description |
+| --- | --- | --- |
+| `mbid` | string | MusicBrainz work ID |
+| `title` | string | Work title |
+| `work_type` | string | MusicBrainz work type |
+| `languages` | string | Language codes |
+| `iswcs` | string | ISWC identifiers |
+| `pro_ids` | json | Rights-society identifiers |
+
+<Accordion title="Real example — Smells Like Teen Spirit work">
+```json
+{
+  "mbid": "9840e142-269d-3fa3-9805-041a9235c18a",
+  "title": "Smells Like Teen Spirit",
+  "work_type": "Song",
+  "languages": "eng",
+  "iswcs": "T-070.243.691-6",
+  "pro_ids": { "ASCAP": "905650303", "BMI": "1358504", "SACEM": "91 317 340 11" },
+  "display_label": "Work",
+  "description": null,
+  "visibility": true
+}
+```
+</Accordion>
+
+<a id="music-release-group"></a>
+
+### Release_Group
+
+The abstract album, single, EP, broadcast, or other grouped release concept.
+
+**Labels:** `Entity:Release_Group` plus optional sub-labels such as `Album`, `Single`, `EP`, `Broadcast`, or `Other`.
+
+**Materializes via:** `mb/run-base-release-group-enrich` (#13099).
+
+| Property | Type | Description |
+| --- | --- | --- |
+| `mbid` | string | MusicBrainz release-group ID |
+| `title` | string | Release-group title |
+| `primary_type` | string | Album, Single, EP, Broadcast, Other |
+| `secondary_types` | string | CSV of secondary types |
+| `first_release_date` | string | First known release date |
+| `music_rating` | number | MusicBrainz rating |
+| `genres` | string | Genre metadata property only |
+
+<a id="music-release"></a>
+
+### Release
+
+One concrete edition: a specific pressing, country, barcode, packaging, or format.
+
+**Labels:** `Entity:Release`
+
+**Materializes via:** `mb/run-base-release-group-enrich` (#13099).
+
+<Note>
+Canonical-release rule: exactly one `Release` node materializes per `Release_Group`: `status = Official`, earliest release date, any country. Other pressings stay in source-table JSON.
+</Note>
+
+| Property | Type | Description |
+| --- | --- | --- |
+| `mbid` | string | MusicBrainz release ID |
+| `title` | string | Release title |
+| `status` | string | Release status |
+| `date` / `country` | string | Release date and country |
+| `barcode` / `packaging` | string | Retail metadata |
+| `formats` / `track_count` | string/int | Format summary and track count |
+
+<Accordion title="Real examples — Nevermind release group and canonical release">
+```json
+{
+  "mbid": "1b022e01-4da6-387b-8658-8678046e4cef",
+  "title": "Nevermind",
+  "primary_type": "Album",
+  "first_release_date": "1991-09-24",
+  "display_label": "Release_Group",
+  "description": null,
+  "visibility": true
+}
+```
+```json
+{
+  "mbid": "eccae410-7577-4daa-b602-92d305828331",
+  "title": "Nevermind",
+  "status": "Official",
+  "date": "1991-09-24",
+  "country": "AU",
+  "barcode": "720642442524",
+  "packaging": "Jewel Case",
+  "formats": "CD",
+  "track_count": 12,
+  "display_label": "Release",
+  "description": null,
+  "visibility": true
+}
+```
+</Accordion>
+
+<a id="music-label"></a>
+
+### Music_Label
+
+A record label, publisher, distributor, or label-like music organization. This is company-shaped in the graph and can bridge to a canonical Orbiter `Company` through `SAME_AS`.
+
+**Labels:** `Entity:Company:Music_Label`
+
+**Materializes via:** `mb/node/add-music-label-node` (#13090) + `mb/run-base-label-enrich` (#13091).
+
+| Property | Type | Description |
+| --- | --- | --- |
+| `mbid` | string | MusicBrainz label ID |
+| `name` | string | Label name |
+| `label_type` | string | Original Production, Publisher, Distributor, Holding, etc. |
+| `country` / `area` | string | Country and area labels |
+| `label_code` | int | Label code |
+| `begin_year` / `end_year` / `ended` | int/int/bool | Life-span fields |
+| `music_rating` | number | MusicBrainz rating |
+| `genres` | string | Genre metadata property only |
+
+<Accordion title="Real example — Sub Pop Records">
+```json
+{
+  "mbid": "38dc88de-7720-4100-9d5b-3cdc41b0c474",
+  "name": "Sub Pop Records",
+  "label_type": "Original Production",
+  "country": "US",
+  "label_code": 8323,
+  "begin_year": 1979,
+  "ended": false,
+  "music_rating": 4.5,
+  "display_label": "Company",
+  "description": null,
+  "visibility": true
+}
+```
+</Accordion>
+
+<a id="music-event"></a>
+
+### Music Event
+
+A live music event: festival, concert, convention, or award ceremony. Music events share the `Event` model with live/business events but use `Music_` sub-labels.
+
+**Labels:** `Entity:Event:Music_Festival`, `Entity:Event:Music_Concert`, `Entity:Event:Music_Convention`, `Entity:Event:Music_Award_Ceremony`
+
+**Materializes via:** `mb/run-base-event-enrich` (#13105).
+
+| Property | Type | Description |
+| --- | --- | --- |
+| `mbid` | string | MusicBrainz event ID |
+| `name` | string | Event name |
+| `event_type` | string | Festival, Concert, Convention, Award Ceremony |
+| `begin_date` / `end_date` / `ended` | string/string/bool | Event dates |
+| `cancelled` | boolean | Cancellation flag |
+| `time` / `setlist` | string | Optional MusicBrainz event data |
+
+<Accordion title="Real example — Reading Festival 1992">
+```json
+{
+  "mbid": "cfc00c5b-b805-4f12-a704-4f28eb081532",
+  "name": "Reading Festival",
+  "event_type": "Festival",
+  "begin_date": "1992-08-28",
+  "end_date": "1992-08-30",
+  "ended": true,
+  "cancelled": false,
+  "display_label": "Event",
+  "description": null,
+  "visibility": true
+}
+```
+_Node labels: `Entity`, `Event`, `Music_Festival`_
+</Accordion>
+
+<a id="music-place"></a>
+
+### Place
+
+A venue, studio, stadium, amphitheater, or other MusicBrainz place used by recording and event relationships.
+
+**Labels:** `Entity:Place` plus optional place-type sub-labels such as `Studio`, `Venue`, `Stadium`, or `Amphitheater`.
+
+**Materializes via:** inline writers in `mb/run-base-recording-enrich` (#13100) and `mb/run-base-event-enrich` (#13105). There is no dedicated place lookup or queue.
+
+| Property | Type | Description |
+| --- | --- | --- |
+| `mbid` | string | MusicBrainz place ID |
+| `name` | string | Place name |
+| `place_type` | string | Venue, Studio, Stadium, etc. |
+| `address` | string | Street/location address |
+| `latitude` / `longitude` | float | Coordinates |
+| `area` | string | Area label |
+
+<Accordion title="Real example — Little John's Farm">
+```json
+{
+  "mbid": "fe133456-63a0-488b-b24e-5543890bf2c0",
+  "name": "Little John's Farm",
+  "place_type": "Venue",
+  "address": "Richfield Avenue",
+  "latitude": 51.467222,
+  "longitude": -1.011944,
+  "area": "Reading",
+  "display_label": "Place",
+  "description": null,
+  "visibility": true
+}
+```
+</Accordion>
+
+<a id="music-genre-policy"></a>
+
+### Music Genre Policy
+
+Genres are metadata properties on music nodes, not graph nodes.
+
+Do not create `Entity:Genre` nodes or `HAS_GENRE` edges. Keep genre values on the source music node as normalized `genres` metadata so the product can use them as facets, filters, badges, search text, or side-panel context without turning every genre into a first-class entity.
+
+<a id="music-media-image-url"></a>
+
+### Music Media (`image_url`)
+
+Three node types can carry a re-hosted image on `image_url`, matching the `film_tv.image_url` convention. The value is the GCS-hosted WebP URL, not the raw external URL. When no image is found, the property is explicitly set to `null`.
+
+| Node | Source field | GCS path | Raw source |
+| --- | --- | --- | --- |
+| `Recording` | `mb_recording.gcp_cover_art_url` (#738) | `music-cover-art/<mbid>.webp` | Cover Art Archive |
+| `Music_Group` | `mb_artist.gcp_music_group_image_url` (#737) | `music-group-image/<mbid>.webp` | serper.dev image search |
+| `Person:Music_Artist` | `mb_artist.gcp_person_avatar_url` (#737) | `music-person-avatar/<mbid>.webp` | serper.dev image search |
+
+Image writers are `mb/media/fetch-recording-cover-art` (#13108), `mb/media/fetch-group-image` (#13109), and `mb/media/fetch-person-avatar` (#13120). After the GCS URL is stamped on the source row, Cypher updates the node's `image_url`. The already-done path self-heals existing nodes.
+
+<a id="music-node-summary"></a>
+
+### Summary — All MusicBrainz Node Types
+
+| Node | Labels | Seed? | Description | Reconciles to |
+| --- | --- | :--: | :--: | --- |
+| Person artist | `Entity:Person:Music_Artist` | Yes | Generated | `master_person` `Person` through `SAME_AS` |
+| Group / band | `Entity:Music_Group` | Yes | Generated | — |
+| Recording | `Entity:Recording` | Yes | Generated | — |
+| Work | `Entity:Work` plus subtype labels | Cascade | null today | — |
+| Release group | `Entity:Release_Group` plus subtype labels | Cascade | null today | — |
+| Release | `Entity:Release` | Cascade | null today | — |
+| Label | `Entity:Company:Music_Label` | Yes | null today | Company card/display contract; optional `SAME_AS` |
+| Event | `Entity:Event:Music_*` | Yes | null today | Shared Event contract |
+| Place | `Entity:Place` plus subtype labels | Inline | null today | — |
+
+These nine node types all carry `created_at`, `updated_at`, semantic-null or generated `description`, `name_embedding`, `embeddings`, `uuid`, `mbid`, `display_label`, and `visibility`. Forward-only vector coverage is wired for every type.
 
 ---
 

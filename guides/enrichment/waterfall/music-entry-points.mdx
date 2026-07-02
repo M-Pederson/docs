@@ -1,10 +1,10 @@
 ---
 title: "Music Waterfall Entry Points"
 sidebarTitle: "Entry Points"
-description: "The functions that can start the MusicBrainz waterfall — the six per-entity get-add gates and the operator seed endpoints that feed them."
+description: "The functions that can start the MusicBrainz waterfall — the six per-entity get-add gates, the pipeline-wired reverse bridge (triggered automatically by the person & company enrichment waterfalls), and the operator seed endpoints."
 ---
 
-Every enrichable MusicBrainz entity type has its own **get-add gate** — the six functions below are how new work enters the waterfall, whether from a cascade discovery, a bootstrap batch, or a manual seed. The operator seed endpoints that feed them are listed below the gates. Architecture spec: [Music Industry Waterfall overview](/guides/enrichment/waterfall/music-waterfall) · function roster: [Music Waterfall Functions](/guides/enrichment/waterfall/music-functions) · queue drain: [Music Waterfall Crons](/guides/enrichment/waterfall/music-crons).
+Every enrichable MusicBrainz entity type has its own **get-add gate** — the six functions below are how new work enters the waterfall. Work reaches those gates three ways: **cascade discovery** (one MB entity discovering another), the **[reverse bridge](#pipeline-wired-entry--the-reverse-bridge)** (the *person and company enrichment waterfalls* trigger it automatically when they detect music-industry expertise — the only pipeline-wired entry), and **[operator seeds](#seed-endpoints-operator)** (a manual MBID). Architecture spec: [Music Industry Waterfall overview](/guides/enrichment/waterfall/music-waterfall) · function roster: [Music Waterfall Functions](/guides/enrichment/waterfall/music-functions) · queue drain: [Music Waterfall Crons](/guides/enrichment/waterfall/music-crons).
 
 ## Entry gates
 
@@ -27,9 +27,56 @@ Every enrichable MusicBrainz entity type has its own **get-add gate** — the si
   Bootstrap seed batches queue at **`priority_tier = 0`** — the reserved lane that drains ahead of all cascade traffic ([decision 5](/guides/enrichment/waterfall/music-waterfall#resolved-design-decisions-2026-06-11)). The queue upserts default via `first_notnull` (tier 4 / depth 1), so an explicitly passed `0` survives.
 </Note>
 
+## Pipeline-wired entry — the reverse bridge
+
+The get-add gates above are **MBID-first**: a caller must already hold a MusicBrainz ID. The **reverse bridge** is the exception — the only entry path that starts from an *Orbiter* entity (a name + signals) rather than a known MBID. It is **not operator-initiated. It is a function the person and company enrichment waterfalls call automatically** whenever they detect music-industry expertise, resolve that person/company to a MusicBrainz artist/label, and hand the resolved MBID to the matching get-add gate.
+
+<Card icon="play">
+
+```
+mb/reverse/detect-and-enter-artist — 13171   (Phase 8b of mvp/enrich/enrich-master-person 13040)
+mb/reverse/detect-and-enter-label  — 13175   (Step 12.5 of mvp/enrich/enrich-master-company 12992)
+```
+
+**Triggered by the person & company waterfalls, not by an operator.** Each runs as a non-fatal phase immediately after expertise/specialty resolution, and only searches MusicBrainz when the entity actually has music-industry expertise.
+
+</Card>
+
+- **Person → Artist.** `enrich-master-person` (#13040) runs **Phase 8b** right after expertise resolution (Phase 8). If the person's resolved expertise rolls up to a Music domain (or matches a curated music term), it resolves them to a MusicBrainz **artist** and enters via `mb/get-add/artist` (#13088).
+- **Company → Label.** `enrich-master-company` (#12992) runs **Step 12.5** right after specialty resolution (Step 12), gated to seed-depth (`$effectiveCascadeDepth == 0`). If the company has a music specialty, it resolves them to a MusicBrainz **label** and enters via `mb/get-add/label` (#13087).
+
+### The per-entity chain
+
+```text
+Person:   Phase 8b → detect-and-enter-artist 13171 → find-artist 13168
+            → enter-artist 13169 → link-artist-to-person 13170
+            → (queued cascade drains) run-base-artist-enrich 13094 · reverse branch
+Company:  Step 12.5 → detect-and-enter-label 13175 → find-label 13173
+            → enter-label 13174 → link-label-to-company 13172
+            → (queued cascade drains) run-base-label-enrich 13091 · reverse branch
+```
+
+The `detect → find → enter` step runs synchronously inside the person/company enrich; the resolved entity is queued at `priority_tier = 0` and its discography/roster cascade fills in when the [unified drain](/guides/enrichment/waterfall/music-crons) runs.
+
+### How a match is validated (never on name alone)
+
+`find-artist` / `find-label` resolve an Orbiter name to an MBID with a **≥1-signal-past-the-name** rule:
+
+- **Deterministic hard key → auto-bridge.** A person's `master_link` socials — or a company's `company_domain` — exact-matching a MusicBrainz `url-rel` (homepage / Discogs / social). `confidence 0.9`, `match_method: url_rel`.
+- **LLM adjudication → auto-bridge only with a real corroboration.** `google/gemini-3.1-flash-lite` picks among same-name candidates, but may auto-bridge **only** when it cites a non-name signal (area, alias, active dates). A name/fame-only pick is demoted to **async-confirm** (queued for the forward resolver to verify), never an immediate bridge.
+- **No confident match → no entry**, recorded in `music_reverse_probe` (#756) so refreshes don't re-search MusicBrainz.
+
+### The identity link & its invariant
+
+On a confident match the reverse bridge writes `(:Person:Music_Artist)-[:SAME_AS]->(:Person)` / `(:Company:Music_Label)-[:SAME_AS]->(:Company)` **and** stamps the relational `mb_artist.master_person_id` / `mb_label.master_company_id` in the same step — the invariant is **SAME_AS ⟺ the relational stamp, never one without the other**. When an Orbiter company maps to a MusicBrainz *cluster* (a parent publisher plus owned imprints — e.g. Primary Wave Music owning Primary Wave Records), the company bridges to the **parent**, and its owned imprints hang off it as `OWNED_BY` via the [label-owner resolver](/guides/enrichment/waterfall/music-reconciliation).
+
+### Gating
+
+Both phases sit behind the `reverse_music_bridge` env flag (unset = **off**), so the pipeline ships dormant on live and is enabled once the music-expertise taxonomy is promoted to the target data source.
+
 ## Seed endpoints (operator)
 
-Manual seeding rides the `musicbrainz` API group (1283, canonical `P8PNYYKM`, base URL `https://xh2o-yths-38lt.n7c.xano.io/api:P8PNYYKM`) — each endpoint routes straight into the matching get-add gate. None are pipeline-wired. The QA/tooling endpoints of the same group live on [Music Waterfall Functions → Operator endpoints](/guides/enrichment/waterfall/music-functions#operator-endpoints).
+Manual seeding rides the `musicbrainz` API group (1283, canonical `P8PNYYKM`, base URL `https://xh2o-yths-38lt.n7c.xano.io/api:P8PNYYKM`) — each endpoint routes straight into the matching get-add gate. These seed endpoints are **operator-only** — the automatic, pipeline-wired entry is the [reverse bridge](#pipeline-wired-entry--the-reverse-bridge) above. The QA/tooling endpoints of the same group live on [Music Waterfall Functions → Operator endpoints](/guides/enrichment/waterfall/music-functions#operator-endpoints).
 
 | Endpoint | Verb | ID | Purpose |
 | --- | :-: | --: | --- |

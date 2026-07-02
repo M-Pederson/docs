@@ -27,7 +27,7 @@ Every Xano table \+ queue in the MusicBrainz waterfall — field-by-field schema
 | `queue_person_resolution` | **751** | _(added 2026-06-14)_ Person-resolution work queue (clone of `queue_mb_artist`) — [see below](#queue_person_resolution-person-resolution) |
 
 <Warning>
-  **There is deliberately no `queue_mb_place`.** Places are **materialized inline** (decided 2026-06-11): MusicBrainz embeds the full place object (name, type, address, coordinates, area) inside `place-rels` on recording/event lookups — everything the canonical [Place node](/guides/ontology/nodes#music-place) needs — so a separate place lookup, queue, and orchestrator would only burn 1 req/s budget. `mb_place` (a source table) still exists to store the embedded JSON and the `node_uuid`.
+  **There is deliberately no `queue_mb_place`.** Places are **materialized inline** from the `place-rels` embedded in recording/event lookups ([decision 6](/guides/enrichment/waterfall/music-waterfall#resolved-design-decisions-2026-06-11)). `mb_place` (a source table) still exists to store the embedded JSON and the `node_uuid`.
 </Warning>
 
 ## Conventions (mirrored from live IMDB tables)
@@ -45,13 +45,13 @@ These are the production conventions observed on the built IMDB pipeline tables 
 **Deliberate deviations from IMDB:**
 
 1. **`unique(mbid)` on source tables too.** IMDB enforces uniqueness only at the queue layer (`unique(imdb_url)`) because URLs need normalization. MBIDs are stable UUIDs straight from the API — a unique index on every `mb_*` table is free insurance against race-created duplicate stubs.
-2. **`next_attempt_at` \+ `retry_count` on queue tables.** The [retry policy](/guides/enrichment/waterfall/music-industry-waterfall#retry-policy) uses bounded sleeps inside the API helper and `next_attempt_at` between failed enrich-row attempts — IMDB has no equivalent because it has no hard rate limit.
+2. **`next_attempt_at` \+ `retry_count` on queue tables.** The [retry policy](/guides/enrichment/waterfall/music-waterfall#retry-policy) uses bounded sleeps inside the API helper and `next_attempt_at` between failed enrich-row attempts — IMDB has no equivalent because it has no hard rate limit.
 3. **No join tables.** IMDB needed `imdb_credit_join` (with its `edge_created` flag) because edges were written in a separate phase. Music orchestrators write edges inline from the lookup JSON, and the raw JSON is retained on the `mb_*` tables — edges are replayable without a join layer.
 
 **Reused infrastructure (no new tables):**
 
 - **Crashes** → the shared `log_crash` table (#542). Its `phase` enum carries the appended music values (done 2026-06-11): `mb_lookup`, `mb_browse`, `mb_node`, `mb_edges`, `mb_cascade`, `api_bad_request`, `api_exhausted` — plus (2026-06-12) `image_fetch`, `image_upload`, `node_description` for the media \+ description pipelines. **`phase` is a strict enum** — values outside the list fail at runtime.
-- **Kill switch** → **skipped entirely (decided 2026-06-11)**. The cascade is structurally bounded — monotonic depth with a hard cap, MBID dedup via the unique indexes, 30-day enrich gate — and pausing the single unified cron in Xano is the manual kill. No env var, no table.
+- **Kill switch** → **none (decided 2026-06-11)**: no env var, no table — pausing the unified cron is the manual kill. Rationale: [loop prevention](/guides/enrichment/waterfall/music-waterfall#loop-prevention-six-layers) layer 5.
 - **Genres** → `genres` / `tags` stay as properties on the source music nodes. No `Genre` table, no `Entity:Genre` nodes, and no `HAS_GENRE` edges in the live music waterfall.
 
 ---
@@ -60,7 +60,7 @@ These are the production conventions observed on the built IMDB pipeline tables 
 
 `queue_mb_artist` · `queue_mb_recording` · `queue_mb_label` · `queue_mb_event` · `queue_mb_release_group` · `queue_mb_work`
 
-One row per discovered-but-not-yet-enriched MBID. Written only by the `mb/queue/upsert-*` functions (keyed on `mbid`: duplicate discovery → `count++` \+ tier upgrade \+ FK fill); drained only by the [unified cron](/guides/enrichment/waterfall/music-industry-waterfall#rate-limit-architecture).
+One row per discovered-but-not-yet-enriched MBID. Written only by the `mb/queue/upsert-*` functions (keyed on `mbid`: duplicate discovery → `count++` \+ tier upgrade \+ FK fill); drained only by the [unified cron](/guides/enrichment/waterfall/music-waterfall#rate-limit-architecture).
 
 | Field | Type | Null / default | Notes |
 | --- | --- | --- | --- |
@@ -72,7 +72,7 @@ One row per discovered-but-not-yet-enriched MBID. Written only by the `mb/queue/
 | `processing` | bool | not null, `false` | Lock flag — cron sets `true` on pickup |
 | `count` | int | not null, `1`, min 0 | Incremented on duplicate discovery |
 | `cascade_depth` | int | not null, required, min 0 | `0` only for [bootstrap-lane](#bootstrap-lane-rows) rows; otherwise `1` or `2`; `3+` is never queued |
-| `priority_tier` | int | not null, `4`, min 0, max 4 | `0` = bootstrap lane; `1`–`4` per the [tier rules](/guides/enrichment/waterfall/music-industry-waterfall#priority-tiers). Upgraded (lowered) on duplicate discovery |
+| `priority_tier` | int | not null, `4`, min 0, max 4 | `0` = bootstrap lane and the only drain-eligible tier (v1.2); `1`–`4` per the [tier rules](/guides/enrichment/waterfall/music-waterfall#priority-tiers). Promoted one step toward `0` on duplicate discovery (`max(0, min(existing, incoming) - 1)`) |
 | `source_function` | text | not null, `""`, trim | e.g. `run-base-artist-enrich` / inlined `mb_cascade` phase |
 | `source_entity_mbid` | text | not null, `""`, trim | MBID of the spawning entity |
 | `seed_mbid` | text | not null, `""`, trim | Root of the cascade (lineage) |
@@ -96,10 +96,10 @@ Bootstrap batches (decision 5) are ordinary queue rows inserted manually (or by 
 
 ### Unified cron ordering & `entity_rank`
 
-The cron selects **one** row per tick across all six queues:
+The drain (`mb/queue/process-next` #13102) selects **one row per call** across all six queues — the Task 180 cron makes up to **10 calls per 60 s tick**. Since v1.2 (2026-07-01) **only `priority_tier = 0` rows are drain-eligible** (nonzero tiers wait for duplicate-discovery promotion — see the [tier note](/guides/enrichment/waterfall/music-waterfall#priority-tiers)); among eligible rows the order is:
 
 ```text
-ORDER BY priority_tier ASC, cascade_depth ASC, entity_rank ASC, id ASC
+ORDER BY cascade_depth ASC, entity_rank ASC, id ASC
 ```
 
 `entity_rank` is **not a column** — it is a constant the cron assigns per queue table in the unified selector, biasing identity-rich entities ahead of bulk catalog:
@@ -119,7 +119,7 @@ ORDER BY priority_tier ASC, cascade_depth ASC, entity_rank ASC, id ASC
 
 `mb_artist` · `mb_recording` · `mb_label` · `mb_event` · `mb_release_group` · `mb_release` · `mb_work` · `mb_place`
 
-One row per MusicBrainz entity ever touched. Created as a **stub** by `mb/get-add/*` (mbid \+ provisional name), filled by the orchestrator (raw JSON \+ node stamp \+ success flags). Retained raw JSON makes every graph write replayable without re-fetching — this is what makes the [canonical-release decision](/guides/enrichment/waterfall/music-industry-waterfall#resolved-design-decisions-2026-06-11) reversible.
+One row per MusicBrainz entity ever touched. Created as a **stub** by `mb/get-add/*` (mbid \+ provisional name), filled by the orchestrator (raw JSON \+ node stamp \+ success flags). Retained raw JSON makes every graph write replayable without re-fetching — this is what makes the [canonical-release decision](/guides/enrichment/waterfall/music-waterfall#resolved-design-decisions-2026-06-11) reversible.
 
 **Shared base fields:**
 

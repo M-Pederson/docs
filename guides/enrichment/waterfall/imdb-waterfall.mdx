@@ -4,7 +4,11 @@ description: "Queue-driven IMDB enrichment with tiered cascade, depth cap, loop 
 sidebarTitle: "Overview"
 ---
 
-Queue-driven IMDB (Film & TV) enrichment with a tiered cascade, depth cap, loop prevention, and full credit-edge \+ expertise wiring. This is the design/plan doc; the live function inventory, table schemas, and graph node \+ edge references live on the companion pages below.
+Queue-driven IMDB (Film & TV) enrichment with a tiered cascade, depth cap, loop prevention, and full credit-edge \+ expertise wiring. This page is the architecture spec: source contract, depth model, tiers, seed flows, loop prevention, and the implementation invariants. The live function inventory, table schemas, and graph node \+ edge references live on the companion pages below.
+
+<Note>
+  **Status: SHIPPED \+ EXTENDED** (last full audit 2026-06-01; edge-description model migration verified live 2026-07-01). The full waterfall is live in Xano workspace 3 (OrbiterV2) — the function inventory with per-function version history is on [IMDB Waterfall Functions](/guides/enrichment/waterfall/imdb-functions). **Both queue crons ship `active = false`** — flip them in the Xano UI before enabling production enrichment.
+</Note>
 
 <CardGroup cols={2}>
   <Card title="IMDB Waterfall Functions" icon="diagram-project" href="/guides/enrichment/waterfall/imdb-functions">
@@ -25,6 +29,25 @@ Queue-driven IMDB (Film & TV) enrichment with a tiered cascade, depth cap, loop 
 </CardGroup>
 
 ---
+
+## Source contract — IMDb via Firecrawl
+
+Unlike the [Music waterfall](/guides/enrichment/waterfall/music-waterfall)'s structured JSON API, IMDb has no public API — every entity is a **Firecrawl scrape of a public IMDb page to markdown, followed by an LLM extraction to structured JSON**.
+
+| Property | Value |
+|---|---|
+| Person source | `https://www.imdb.com/name/nm…` → `imdb_person.markdown` → LLM → `imdb_person.json` |
+| Title source | `https://www.imdb.com/title/tt…` → `film_tv.markdown` → LLM → `film_tv.json` |
+| Awards source | `{imdb_url}/awards/` → `award_markdown` → LLM → `awards_json` \+ `film_tv_award` rows |
+| Posters | IMDb image CDN (`@._V1_` size transform recomputed) → re-hosted GCS WebP `imdb-poster/<imdb_id>` |
+| Natural key | **normalized `imdb_url`** — `trim \| split:"/?" \| first \| rtrim:"/"` (queues \+ source tables) |
+| Staleness gate | `enriched_at` within **30 days** → no re-scrape (`refresh: true` on the title gate forces one) |
+| Rate limiting | no provider hard limit — pacing comes from the single-row cron tick (600 s per queue) |
+| LLM extraction | models, temps, and token ceilings per function: [Film & TV model summary](/guides/enrichment/film-tv-pipeline/model-summary) · prompts: [Film & TV system prompts](/guides/enrichment/film-tv-pipeline/llm-system-prompts) — linked, not duplicated |
+
+<Note>
+  **Rebuild-spec gaps (per the [GCP migration plan](/guides/open-work/orbiter-univers-standalone/enrichment-gcp-migration#what-already-exists-vs-what-the-spec-must-add)):** the exact Firecrawl request contract, the LLM extraction JSON schemas (`credits[]`, `film_tv` shapes), and the award-scraper output schema are not yet written down — they are Step-2 spec-extraction deliverables, to be pulled from the frozen XanoScript rather than authored by hand.
+</Note>
 
 ## Depth model
 
@@ -168,6 +191,87 @@ Cron picks up, sets `processing: true`, runs orchestrator with `cascade_depth: 2
 
 ---
 
+## Cascade example — seed person end-to-end
+
+Here's what happens end-to-end when a person enters as a depth-0 seed via `get-add/imdb-person` (`cascade_depth: 0`, `queue: false`):
+
+```text
+Depth 0: seed person (imdb_url, cascade_depth: 0, queue: false)
+├── get-add gate (get-add/imdb-person)
+│   ├── dedup — normalized imdb_url already in imdb_person with enriched_at
+│   │   within 30 days → return existing, no scrape
+│   ├── stub exists → seed_imdb_person_id set to the stub's own id
+│   │   (no explicit seed passed)
+│   └── depth 0 AND queue == false → orchestrator invoked synchronously
+│       → returns action: "enriched_direct", no queue entry written
+│
+└── orchestrator (cascade_depth: 0)
+    ├── P1  kill switch — check-kill-switch-imdb #12870
+    │       active → return existing imdb_person, else log to
+    │       kill_switch_blocked_imdb + return empty
+    ├── P2  scrape + LLM extract — Firecrawl → LLM extractor
+    │       (~google/gemini-flash-latest) → save json / markdown / name /
+    │       image_url onto imdb_person
+    ├── P3  master_person + master_link + birthday_join
+    │       (dedup-guarded, idempotent on re-run)
+    ├── P4a CRITICAL — replace-avatar + add-person-biography + add-person-node
+    │       + update-person-node → stamp node_uuid + master_person_id back onto
+    │       imdb_person → SET p.visibility = true
+    ├── P4b OPTIONAL — create-llm-person-bios + deep-person-basic
+    │       + get-social-insights + llm-identify-person-expertise #12666
+    │       (all failures non-fatal)
+    ├── P4c credit edges — add-credit-edges-from-person #13013
+    │       → (Person)-[:WORKED_ON]->(Film_TV) per credit whose film's
+    │       node_uuid is already stamped
+    ├── P5  awards — add-award-records-from-imdb-person #12887
+    │       (cascade_depth passed through)
+    │       → Firecrawl {imdb_url}/awards/ → LLM extract → film_tv_award rows
+    ├── P6  cascades (pure dispatchers; each get-add call try_catch → log_crash)
+    │   ├── cascade-credits-from-person (sync_top_credits: 5)
+    │   │   ├── per credit → title stub via get-add (imdb_url + title only,
+    │   │   │   no scrape) → queue_imdb_title at depth 1:
+    │   │   │   ├── director / writer                                   → T1
+    │   │   │   ├── producer AND (rating ≥ 7 OR year = current_year)    → T2
+    │   │   │   ├── exec producer / cinematographer / minor role,
+    │   │   │   │   OR rating ≥ 7                                       → T3
+    │   │   │   │   (T3 capped at top 20 by rating)
+    │   │   │   ├── Video Game / Music Video, or Short with rating < 8  → T4
+    │   │   │   └── else skip · duplicate imdb_url → count++ + tier upgrade
+    │   │   │       (single queue row per URL, no duplicate scrape)
+    │   │   └── top 5 credits sync-enriched inline (person at depth 0) —
+    │   │       the seed returns with enriched films before the title cron runs
+    │   └── cascade-awards-from-person
+    │       └── shared_with people → person stubs → queue_imdb_person at depth 1:
+    │           ├── co-winner / co-nominee on the seed's award → T2
+    │           └── other shared_with people                   → T3
+    └── P7  mark success — enriched_at = now, enrich_success = true,
+            cascade_depth = 0
+
+Depth 1: cron drains both queues
+         (single-row tick, 600 s per queue; both crons ship active = false)
+├── pick order: priority_tier asc, cascade_depth asc, id asc → processing: true
+├── same orchestrator with cascade_depth: 1 — ALL phases run
+│   (scrape + LLM extract + master rows + edges + awards)
+└── P6 cascade helpers only queue T1–T2 discoveries at depth 2
+    (T3–T4 discarded)
+
+Depth 2: terminal
+├── cron picks up → same orchestrator with cascade_depth: 2
+├── entity scraped, data written, awards captured — cascade helpers skipped
+│   entirely, no children queued
+└── depth 3 never queued — helpers guard cascade_depth + 1 >= 3
+    → short-return action: "depth_exceeded"
+```
+
+External calls by depth (Firecrawl scrapes \+ LLM extracts):
+
+- **Depth 0:** two Firecrawl scrapes \+ two LLM extracts for the seed itself — the person page (P2) and `{imdb_url}/awards/` (P5) — plus up to five inline title enrichments via `sync_top_credits: 5`, each carrying its own scrape \+ extraction cost before the seed call returns.
+- **Depth 1:** queueing itself is free — stubs are created via `get-add` with no scrape. External calls fire only when the cron picks the row: the same full flow (page scrape \+ LLM extract, awards scrape \+ LLM extract) per entity.
+- **Depth 2:** same per-entity scrape \+ extraction cost, but cascade helpers are skipped — no new queue rows, so external calls stop here (depth 3 is never queued).
+- **Pacing:** no provider hard limit — the external call rate is bounded by the single-row cron tick (600 s per queue), and both queue crons ship `active = false`.
+
+---
+
 ## Loop prevention (five layers)
 
 1. **Dedup gate in `get-add`:** `imdb_url` already in `imdb_person` / `film_tv` with `enriched_at` within 30 days → return existing, no scrape.
@@ -180,12 +284,12 @@ Cron picks up, sets `processing: true`, runs orchestrator with `cascade_depth: 2
 
 ## Implementation notes captured during build
 
-- **URL normalization lives in get-add:** `trim | split:"/?" | first | rtrim:"/"`. All queue rows and `imdb_person` / `film_tv` rows are keyed on the normalized URL.
+- **URL normalization lives in get-add** — all queue rows and `imdb_person` / `film_tv` rows are keyed on the normalized URL (the chain is specified on [IMDB Tables](/guides/enrichment/waterfall/imdb-tables#url-normalization)).
 - **Xano function-call syntax:** use `function.run "path" { input = { ... } } as $result` — NOT `function.call` (not valid in Xano).
 - **Queue upsert is the single source of truth:** `get-add` always routes through `upsert-imdb-person` / `upsert-imdb-title`. No raw `db.add` into queue tables anywhere.
 - **Kill switch is fail-open:** missing env var → `try_catch` logs to `log_crash` and defaults OFF.
 - **`cascade_depth` \+ `queue` param on get-add:** when both `cascade_depth == 0` AND `queue == false`, `get-add` invokes the orchestrator synchronously after the stub exists and returns `action: "enriched_direct"` — no queue entry written.
-- **Orchestrators are per-phase `try_catch` → `log_crash`:** each phase emits one `log_crash` row with `qa_passed: true` (clean) or `qa_passed: false` \+ stack trace. Phase enums: `llm_extract`, `save_scrape`, `master_person`, `node_stamp`, `bios_optional`, `credit_edges`, `awards`, `cascades`.
+- **Orchestrators are per-phase `try_catch` → `log_crash`:** each phase emits one `log_crash` row with `qa_passed: true` (clean) or `qa_passed: false` \+ stack trace, using the IMDB `phase` enum (strict — listed on [IMDB Tables](/guides/enrichment/waterfall/imdb-tables#table-inventory)).
 - **Phase 1 guard:** if scrape\+LLM fails or returns no `name` / `title`, stamp `enrich_success: false` and return early — no `master_person` gets created from a junk row.
 - **Cascade helpers are pure dispatchers:** every helper guards `cascade_depth + 1 >= 3` and short-returns with `action: "depth_exceeded"`. Every `function.run` to `get-add` is wrapped in `try_catch` → `log_crash`.
 - **Seed ID propagation:** a depth-0 seed invocation via `get-add` must set `seed_imdb_person_id` / `seed_film_tv_id` to the just-created stub's own id when no explicit seed is passed. Required for loop-prevention to work.
@@ -201,7 +305,7 @@ Cron picks up, sets `processing: true`, runs orchestrator with `cascade_depth: 2
 
 A single IMDB person profile exposes **credits** (titles), each of which exposes more people (directors, writers, cast). Award pages expose **`shared_with`** people, each of whom exposes more credits. Without a bounded cascade, a single seed scrape of a prolific person or title can fan out to thousands of LLM-extracted scrapes over hours.
 
-The existing person \+ company waterfall solves this for LinkedIn/PDL/Enrich Layer (and now, in v4, for the post-PDL LLM stack). This plan applies the same pattern — **two queue tables, depth-capped cascade, priority-tiered processing, upsert dedup** — to IMDB.
+The existing person \+ company waterfall solves this for LinkedIn/PDL/Enrich Layer (and now, in v4, for the post-PDL LLM stack). This waterfall applies the same pattern — **two queue tables, depth-capped cascade, priority-tiered processing, upsert dedup** — to IMDB.
 
 **Goal:**
 
@@ -224,7 +328,7 @@ The existing person \+ company waterfall solves this for LinkedIn/PDL/Enrich Lay
   - **Fix #7** — `#10509 v1.2`: Phase-8 awards-scraper wiring. Closed the Phase-8 ⇄ #12880 Phase 5 asymmetry where main-pipeline IMDB entries skipped honoraries.
   - **Fix #8** — `#2334 v1.6`: NULL\_UUID bulletproofing via retry \+ MATCH fallback. Closed the 0.22% transient FalkorDB gap (1/451 on prior run); Scorsese re-run at 470/470 = 100% coverage.
 
-  The full per-fix changelogs (with sandbox repro details, raw response previews, telemetry counters, etc.) are preserved in `git log -- docs/guides/enrichment/waterfall/imdb-waterfall-plan.mdx`. Each fix's symptom \+ cause \+ remediation is recoverable from the commit history if needed for future audits.
+  The full per-fix changelogs (with sandbox repro details, raw response previews, telemetry counters, etc.) are preserved in `git log -- docs/guides/enrichment/waterfall/imdb-waterfall.mdx`. Each fix's symptom \+ cause \+ remediation is recoverable from the commit history if needed for future audits.
 </Accordion>
 
 <Accordion title="Pre-waterfall function graph + loop risk (before 2026-04-22)">

@@ -1,0 +1,96 @@
+---
+title: "Company Nodes"
+description: "Company Enrichment Waterfall node catalog — which node types the pipeline writes, with keys, writer functions, and vector coverage. Canonical node definitions live in the Orbiter ontology."
+---
+
+The [Company Enrichment Waterfall](/guides/enrichment/waterfall/company-waterfall) uses the canonical graph node definitions in [Ontology → Node Types](/guides/ontology/nodes). Companies get the shared `Company` node with create-time subtype labels; funding rounds get `Funding_Round`; specialty resolution mints `SubDomainExpertise` taxonomy nodes; discovered people reuse the **shared** `Person` node; HQ and office addresses fan out to the shared `City` / `Region` / `Country` location chain.
+
+This page is the **pipeline-scoped catalog**: which node types this pipeline writes, keyed how, by which function. Node labels, properties, vector fields, and examples should be edited only in the ontology source of truth.
+
+<Note>
+  Ground truth: [Node Types](/guides/ontology/nodes). Write-side Cypher for the company nodes lives on [Cyphers → Company Pipeline](/guides/cyphers/company-pipeline) and [Cyphers → Funding](/guides/cyphers/funding). Function versions cited below are the live workspace-3 bodies as of the 2026-07-02 audit — writer internals are on [Company Functions](/guides/enrichment/waterfall/company-functions).
+</Note>
+
+## Companies
+
+### Company
+
+Canonical section: [Company](/guides/ontology/nodes#company), with create-time subtype labels [School](/guides/ontology/nodes#school), [VC\_Firm](/guides/ontology/nodes#vc_firm), and [Organization](/guides/ontology/nodes#organization).
+
+**Create** — `add-company-node` #2602 (v1.6), invoked once per fresh `master_company` row from the entry gate (#12558 §10). This is a raw Cypher `CREATE`, **not MERGE-keyed**: uniqueness is caller-side, and a re-run against the same row would mint a duplicate node. Labels are `:Entity:Company` plus at most one subtype — `:School` (`.edu` domain or `is_school`), else `:VC_Firm` (`is_vc`), else `:Organization` (`.org`). The graph write retries up to 3 times; after 3 failures it logs a needs-backfill `log_crash` row and returns early. On success the new node's `uuid` is **stamped back** onto `master_company.node_uuid` — the durable row↔node identity link (see [Company Tables](/guides/enrichment/waterfall/company-tables)).
+
+**Sync** — `update-company-node` #4659 (v1.8), Step 15 of the orchestrator: `MATCH (n:Entity {uuid: node_uuid}) SET …` — idempotent, single attempt, a silent no-op when the node is missing, and **labels are never updated** (a company reclassified `is_vc` after create keeps its create-time labels; the deal-fanout `:VC_Firm` label upgrade self-skips live — see [Company Edges](/guides/enrichment/waterfall/company-edges)). Null and empty values are dropped from the SET, so stale node values are never cleared. The v1.6 property sync covers: identity/profile fields (`name`, `visibility`, `company_domain`, `website`, `logo`, `tagline`, `profiles`), firmographics (`company_founded`, `number_of_employees` \+ citation, `industry` and `specialties` lists, `ownership`, `annual_revenue_usd` \+ citation, `y_combinator_batch`), stock fields from `company_financial` (`stock_ticker`, `stock_exchange`, `went_public_on`, `stock_link`), investor-profile fields (`investment_exits`, `investment_range`, `investment_sweet_spot`, `invests_in_stages`), the `summary` / `description` pair (`about` / `about_500`), and the LLM product set (`business_model`, `primary_product_name` / `_category`, `other_product_names` / `_categories`, `target_customers`, `is_acquired`, `acquired_by`, `acquired_date`, `acquired_ticker`). Note the acquisition contrast: #2602 writes `is_acquired` only when true; #4659 writes the boolean including `false` (the shared JSON pruner preserves false/0). #4659 also forces `master_company.visibility = true` on every run, so the node's `visibility` property is always true after a sync.
+
+**Dual vectors** — both writers write `name_embedding` (OpenAI, 1536) **and** `embeddings` (Gemini, 3072, via helper #13125) since 2026-06-15. The embedded text differs: #2602 embeds `company_name`; #4659 embeds `about_500` → `company_domain` → `company_name` (first non-empty).
+
+**As-built (flagged):** #2602's null-domain fallback sets `is_vc: true` (plus a placeholder logo) on **every** company whose `company_domain` is null. This looks accidental but is the live behavior — port as-is or raise before changing.
+
+## Funding
+
+### Funding\_Round
+
+Canonical section: [Funding\_Round](/guides/ontology/nodes#funding_round). MERGE-keyed on `uuid = fundable_deals.id` — the Fundable deal id string is the node uuid (a natural key, not a random uuid). Written by `add-fundable-deal-node` #12701 per deal from the seed-gated deal cascade (#12856, dispatched by phase 7). Envelope: `visibility: true`, `display_label`, `name` = `<org name> - <financing type>`, `created_at` ON CREATE only; announced date, sizes, currency, descriptions, and investor counts are written only when present (sizes and counts only when > 0 — they are never written as, or zeroed to, 0 on refresh). Carries `name_embedding` only (re-embedded on every run from `long_description` → `short_description` → name fallback); this type has **no** Gemini `embeddings` vector. The node uuid is written back to `fundable_deals.funding_round_node_uuid`. The `RAISED` edge from the Company node — and the live status of the investor edges — are on [Company Edges](/guides/enrichment/waterfall/company-edges).
+
+## Expertise
+
+### SubDomainExpertise
+
+Canonical section: [SubDomainExpertise](/guides/ontology/nodes#subdomainexpertise). Step 12 (`resolve-company-specialties` #12746 v1.8) resolves each of the company's top-15 specialties against the expertise taxonomy — LLM blurb \+ Gemini-embedded `{specialty}: {blurb}` KNN, a 0.15/0.25 guard band with LLM adjudication, and a v1.8 exact-name guard (prompts and models: [LLM system prompts](/guides/enrichment/company-pipeline/llm-system-prompts) / [Model summary](/guides/enrichment/company-pipeline/model-summary)). Only when no match survives does it `CREATE` a new `Entity:SubDomainExpertise` node — there is no MERGE key; dedup **is** the matcher (on re-run the created node auto-matches itself at ~0 distance, with the exact-name guard as backstop). Envelope: `name` (raw specialty), `description` (the blurb), `source: "company_specialty"`, and dual vectors `name_embedding` (OpenAI 1536) \+ `expert_embeddings` (Gemini 3072) — deliberately **no** legacy `expertise_embedding`. v1.8 verifies the CREATE before any side effects; a failed create reports `create_failed` with no relational row, no edges, and no parent attach.
+
+Every verified create then:
+
+1. Inserts the `sub_domain_expertise` mirror row (`name`, `description`, `node_uuid`, `created_at` — see [Company Tables](/guides/enrichment/waterfall/company-tables)).
+2. Runs `attach-subdomain-parent` #13142, which LLM-picks a parent from the curated [DomainExpertise](/guides/ontology/nodes#domainexpertise) roster via #13141 (never auto-creates a domain) and MERGEs `HAS_SUBDOMAIN {weight: 100}` — deliberate hub damping, since [edge weights](/guides/ontology/edge-weights) are path distances (lower = stronger). A NONE verdict instead flags the node `parent_unresolved` for review.
+3. Dual-writes the relational FK `sub_domain_expertise.domain_expertise_id` when the returned parent name matches a `domain_expertise` row.
+
+The `SPECIALIZES_IN` edges themselves (destructively rebuilt on every run) are on [Company Edges](/guides/enrichment/waterfall/company-edges).
+
+## People
+
+### Person
+
+Canonical section: [Person](/guides/ontology/nodes#person). The company waterfall does **not** define a company-specific person type — discovered people land on the **shared** `Person` node via the shared writers (`add-person-node` #2601 / `update-person-node` #2758 — both dual-write `name_embedding` (OpenAI) **and** `embeddings` (Gemini 3072) since 2026-06-15). Two seed-only (depth-0) discovery paths:
+
+- **Exa C-suite/founders** — orchestrator Step 7 fetches via #12988 and upserts each match through `master-person-from-exa` #12997: dedup on the **normalized** `linkedin_url`, fresh people start `visibility: false` (v1.7), and the insert path calls #2601. People expansion is gated to seed depth — deeper runs only save the Exa response. Bios, `work_experience` rows, work edges, and the depth-1 person-enrichment dispatch are caller-side loop steps in #12992, not part of the node write.
+- **YC founders & partner** — `process-yc-people` #12700 resolves the merged Fundable \+ `yc_data` founder set (a LinkedIn URL is required — founders with none are dropped) and the primary YC partner through `master-person-new` (queued: founders tier 1, partner tier 2); the partner additionally gets a #2758 node refresh.
+
+Downstream enrichment of these people belongs to the person pipeline — see [Person Enrichment Phases](/guides/enrichment/waterfall/person-enrichment-phases).
+
+### contextFounded
+
+When a YC company has **more than one** founder, #12700 writes an `Entity:contextFounded` hub node: `name` = `<company>_Founded`, the LLM founding narrative as `description`, `name_embedding` (1536), `founded_year`, and a comma-joined `founders` string. It is delete-then-CREATE on every run (the old hub and its `FOUNDED` / `WAS_FOUNDED` edges are swept first), so it has no MERGE key. Single-founder companies get a direct MERGE'd `FOUNDED` edge to the Company node and no hub. The ontology's [master label list](/guides/ontology/nodes#master-label-list) carries `contextFounded` as a context-artifact label, and the timestamp audit flags it as missing `created_at`. The `FOUNDED` / `WAS_FOUNDED` / `MENTOR` edges are on [Company Edges](/guides/enrichment/waterfall/company-edges).
+
+## Locations
+
+Step 14 (`add-company-locations` #1924) drains every `master_address` row with `path_triples_added == false` into the graph via the shared writer `location-nodes-edges-company` #4528 (geocoding happened upstream, via Radar, when the address row was written). The `LOCATED_IN` / `IN_REGION` / `IN_COUNTRY` edges are on [Company Edges](/guides/enrichment/waterfall/company-edges).
+
+### Country
+
+Canonical section: [Country](/guides/ontology/nodes#country). MERGE-keyed on `{name: country_name}` from the relational `country` row; the node uuid is backfilled onto the row for reuse. Carries `name_embedding` from the row's description.
+
+**As-built (flagged):** a country lookup miss (name/alpha2 not in the `country` table) still runs the create branch and MERGEs a junk `Entity:Country {name: ""}` node — live behavior; do not silently paper over it in a port.
+
+### Region
+
+Canonical section: [Region](/guides/ontology/nodes#region). MERGE-keyed on `region_key = "<region>::<country>"` (lowercased). Labeled `:State` for US rows (hard-coded `country` row id 2), else `:Region`. Description is LLM-generated and embedded as `name_embedding`.
+
+### City
+
+Canonical section: [City](/guides/ontology/nodes#city). MERGE-keyed on `city_key = "<normalized city>::<region>::<country>"` (a trailing " City" is stripped for the key; the raw input city stays the node `name`). Description is LLM-generated and embedded as `name_embedding`.
+
+## Timestamp coverage
+
+Every node create reachable from the company waterfall stamps `created_at` on create and `updated_at` on update **except** `contextFounded` (no `created_at` in its CREATE — called out in the ontology audit's adjacent-types note). The per-node-type record is audited in [Node Types → Timestamp coverage audit](/guides/ontology/nodes#timestamp-coverage-audit).
+
+## Summary — company node types
+
+| Node | Labels | Key | Writer | Vector |
+| --- | --- | --- | --- | --- |
+| `Company` | `:Entity:Company` \+ optional `:School` / `:VC_Firm` / `:Organization` | none — CREATE once per row; identity `uuid` ↔ `master_company.node_uuid` | #2602 create / #4659 sync | `name_embedding` \+ `embeddings` (Gemini dual-write since 2026-06-15) |
+| `Funding_Round` | `:Funding_Round` | `uuid = fundable_deals.id` | #12701 via #12856 | `name_embedding` |
+| `SubDomainExpertise` | `:Entity:SubDomainExpertise` | none — CREATE; dedup = KNN \+ exact-name guard | #12746 (\+ #13142 parent attach) | `name_embedding` \+ `expert_embeddings` |
+| `Person` (shared) | `:Entity:Person` (\+ subtypes) | `uuid` / `master_person_id` | #2601 via #12997 / #12700 (\+ #2758 partner refresh) | `name_embedding` \+ `embeddings` |
+| `contextFounded` | `:Entity:contextFounded` | none — delete-then-CREATE per run | #12700 (multi-founder only) | `name_embedding` |
+| `Country` | `:Entity:Country` | `name` | #4528 via #1924 | `name_embedding` |
+| `Region` | `:Entity:State` or `:Entity:Region` | `region_key` | #4528 via #1924 | `name_embedding` |
+| `City` | `:Entity:City` | `city_key` | #4528 via #1924 | `name_embedding` |

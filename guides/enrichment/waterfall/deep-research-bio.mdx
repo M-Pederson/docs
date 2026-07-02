@@ -1,0 +1,165 @@
+---
+title: "Deep Research Bio"
+description: "The agentic web-research biography pipeline for people — the deep-person-basic prompt function, the async Cloud Run transport, the enrich-profile webhook, and every function the webhook fans out to."
+---
+
+Deep Research Bio is the optional, most expensive tier of person enrichment: an agentic LLM run with live web-search tools that expands a person's short `bio_500` into a comprehensive, citation-backed profile — biography paragraphs, a mapped relationship network, credentials, and unverified-claim flags. The result lands on `master_person.deep_bio` and feeds the derived-bio, social-insights, and graph-node sync steps.
+
+It is **asynchronous end-to-end**: Xano launches a job on an external runner and returns immediately; the runner executes the long tool-use loop and posts the result back to a webhook, which does all the write-back and fan-out.
+
+## Flow at a glance
+
+```text
+orchestrator (deep_research=true)          #13040 / #12880 phase 4b / batch tools
+  └─> mvp/deep-research/deep-person-basic  #12833  — context + researcher prompt
+        └─> mvp/enrich/deep-research-person-or-company  #12747 — payload + launch
+              └─> POST Cloud Run /enrich  (external runner, X-API-Key)
+                    ├─ inserts profile_enrichment_job (processing=true)
+                    └─ … runner executes Kimi K2.6 + web_search/web_fetch …
+                          └─> POST webhooks/enrich-profile  #8303  (callback)
+                                ├─ profile_enrichment_job ← result / error
+                                ├─ master_person.deep_bio ← biography[]
+                                └─ fan-out: #add-person-biography → #create-llm-person-bios
+                                           → #get-social-insights → #update-person-node
+```
+
+## Launch points
+
+The `deep_research` boolean threads through the person pipeline: `mvp/queue/upsert-enrich-person` (12854) carries it on queue rows (OR-promoted on upgrades), the person orchestrator `mvp/enrich/enrich-master-person` (13040) launches the run as an optional phase (launch warnings are excluded from the closeout failure aggregate — a deep-research hiccup never blocks `full_enrich`), and the IMDB person orchestrator `mvp/imdb/run-base-imdb-person-enrich` (12880) fires it in Phase 4b. Batch tools (e.g. the LSI registrant sweep, 12865) call the LITE variant directly.
+
+## The research function
+
+<Card icon="play">
+
+```
+mvp/deep-research/deep-person-basic — 12833
+```
+
+The prompt/agent definition (v4.1). Assembles the person's verified context — name, current title, company, `bio_500`, certifications, and work history via addons — into YAML, and pairs it with a senior-researcher system prompt: a **hard 12-search budget** (3 per thread), **footprint triage** (RICH / MODERATE / THIN sizes the effort and word count), an **identity-collision protocol** (2+ anchor matches required before trusting any source; same-name individuals tracked and surfaced in `identity_conflicts`), six parallel research threads (identity, career, credentials, relationship mapping, thought leadership, recognition), relationship-strength tiers (CONFIRMED / LIKELY / INFERRED), and a strict-JSON output contract (biography paragraph array, `biography_sections`, `relationships`, `citations`, `unverified_claims`, `extracted_entities`, `metadata`).
+
+Model: `moonshotai/kimi-k2.6`, provider-pinned to `["moonshotai", "fireworks"]` with `allow_fallbacks: false` (v4 fix — unpinned routing leaked raw tool-call tokens), temperature 0.6, top_p 0.9, max_tokens 16,000, reasoning capped at 8,000, tools `openrouter:web_search` (native engine, 6 per call / 24 total) + `openrouter:web_fetch` (6,000 content tokens).
+
+</Card>
+
+<Card icon="wrench">
+
+```
+mvp/deep-research/deep-person-basic-LITE — 12863
+```
+
+Slimmer sibling used by batch sweeps where full-depth research per person is not warranted.
+
+</Card>
+
+## The transport / launcher
+
+<Card icon="cloud-arrow-up">
+
+```
+mvp/enrich/deep-research-person-or-company — 12747
+```
+
+Shared person/company transport. Builds the OpenRouter chat payload from the caller's prompts + params (Perplexity models get collapsed to a single user message; `provider_order` and `allow_fallbacks` pass through), then POSTs it to the **external runner** — Cloud Run `https://orbiter-enrich-20506320032.us-east4.run.app/enrich`, authenticated with `X-API-Key: $env.deep_research_api_key` — along with the callback: `webhook_url = https://xh2o-yths-38lt.n7c.xano.io/api:nFBFWRKy/enrich-profile?x-data-source=<current datasource>` (the datasource is appended so the callback writes to the same data source the launch ran on).
+
+On a `job_id` response it inserts a **`profile_enrichment_job`** row (`processing: true`, storing the full payload, model, tokens, temperature) and returns — the Xano side is done until the webhook fires. A missing `job_id` writes a `log_crash` row and returns `"crushed"`.
+
+The runner itself is the long-running piece: it executes the multi-turn Kimi + web-search loop (minutes, beyond Xano's request budget) and posts the final message back. Historical API docs: `bio-enrich.fly.dev/docs` (the runner's earlier Fly.io home).
+
+</Card>
+
+<Card icon="database">
+
+```
+profile_enrichment_job — 686
+```
+
+The job ledger. One row per launch: `job_id`, `request_type` (`person` | company), `master_person_id` / `master_company_id`, the outbound `data` payload, `processing` flag, and — after the callback — `llm_response`, full `response`, or `error`. `processing = true` rows older than the runner's normal turnaround are the stuck-job queue.
+
+</Card>
+
+## The webhook
+
+<Card icon="globe">
+
+```
+webhooks/enrich-profile — 8303   (POST, api group 346, canonical nFBFWRKy)
+```
+
+**The active callback.** Receives the runner's result keyed on `job_id` (raw-input JSON, no auth — the obscure job_id is the correlation key).
+
+- **Error path:** `status == "error"` → marks the `profile_enrichment_job` row failed (`processing: false`, `error` + full `response` stored) and returns `"Successfully Failed"`. No downstream writes.
+- **Success path:** stores `llm_response` + `response` on the job row and responds immediately; everything else runs in `util.post_process` **after the HTTP response** (fast ACK to the runner). The post-process parses the LLM output (strips markdown fences, `JSON.parse`; falls back to paragraph-splitting plain text) and, for `request_type == "person"`, writes `master_person.deep_bio` = the biography paragraph array.
+</Card>
+
+### Functions the webhook calls
+
+After the `deep_bio` write, the success path fans out to **five functions**, in order:
+
+<Card icon="wrench">
+
+```
+mvp/bios/add-person-biography
+```
+
+Stores the joined biography text as a biography **source row** for the person (the raw-material record the bio pipeline reads from).
+
+</Card>
+
+<Card icon="play">
+
+```
+mvp/bios/create-llm-person-bios
+```
+
+Regenerates the person's derived LLM bios (e.g. `bio_500`) now that the deep-research material exists.
+
+</Card>
+
+<Card icon="cloud-arrow-up">
+
+```
+mvp/social/social-insights/get-social-insights
+```
+
+Refreshes the person's social-insights extraction with the enriched context.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+mvp/node/update-person-node — 2758
+```
+
+Syncs the refreshed person properties + embeddings onto the FalkorDB `Person` node (OpenAI `name_embedding` + Gemini `embeddings` dual-write).
+
+</Card>
+
+<Card icon="filter">
+
+```
+mvp/expertise/llm-identify-person-expertise — 12666
+```
+
+**Expertise re-run (added v1.1, 2026-07-02).** Re-extracts the person's domains of expertise now that the deep-research material exists, feeding the resolver `resolve-person-expertise-v2` (12926). Because the resolver chain is fully idempotent (exact-name guard, `HAS_EXPERTISE` MERGE aggregation, `person_has_expertise` dedupe), a person whose expertise was already resolved gets their edges **updated** — max confidence, strongest depth, distinct new evidence appended — and newly surfaced areas added, never duplicated. Runs in its own `try_catch` (logged to `log_crash` phase `webhook_post_process`, success and failure), so an expertise hiccup never blocks the rest of the fan-out.
+
+</Card>
+
+## Deprecated: the original webhook
+
+<Card icon="globe">
+
+```
+webhooks/deep-research-bio-webhook — 3082   (POST — tagged depreciated)
+```
+
+The first-generation callback (Dec 2025 – Apr 2026), keyed on the older **`deep_biography` (591)** table's `job_id`. On success it wrote `deep_biography.biography` + `master_person.deep_bio` and called **two** functions — `mvp/bios/create-llm-person-bios` and `mvp/node/update-person-node`. Superseded by `enrich-profile` + `profile_enrichment_job` (which added the job ledger, the JSON/plain-text parse fallback, the biography source row, and the social-insights refresh). The endpoint is still routable but nothing launches jobs against it; `deep_biography` is retained as historical data.
+
+</Card>
+
+## Operational notes
+
+- **Non-blocking by design:** the orchestrator treats a deep-research launch failure as a warning, not a pipeline failure — `full_enrich` reflects required-phase health only.
+- **Datasource propagation:** the callback URL carries `?x-data-source=<datasource>` from launch time, so sandbox launches write back to sandbox.
+- **Stuck jobs:** a job that never calls back leaves `profile_enrichment_job.processing = true` with no `response` — there is no timeout sweeper; check the ledger when `deep_bio` seems missing.
+- **Output tolerance:** the webhook accepts strict JSON (the v4 prompt's contract) *and* plain text (fence-stripped, paragraph-split) so older/degraded runner outputs still land as a usable biography array.

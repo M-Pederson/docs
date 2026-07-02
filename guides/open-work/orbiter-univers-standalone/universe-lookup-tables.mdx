@@ -1,0 +1,599 @@
+---
+title: "Universe Lookup Tables"
+description: "The AlloyDB backbone of the Universe backend — entity, entity_identifier, entity_fact, enrichment_payload — how identity resolution, strong/soft keys, and merges work, with worked examples."
+icon: "database"
+---
+
+Status: V1 draft for review.
+
+<Note>
+  This is a **design sketch, not applied DDL**. Everything lives in a `universe`
+  schema in a dedicated AlloyDB. UUIDs are v7, timestamps `TIMESTAMPTZ`, and any
+  reference to the App backend (`master_*`) is a **logical** cross-database
+  reference, never an enforced FK. Source of truth for this draft:
+  `docs/universe/schema.md` in the `orbiter-backend` repo.
+</Note>
+
+<Tip>
+  **How to read this page.** The model is **supertype/subtype**: one shared
+  backbone (`entity` + `identifier` + `fact` + `payload`) that every public
+  object plugs into, and thin typed detail tables (`person`, `company`,
+  `film_tv`, `imdb_person`, `fundable_*`) hanging off it. The SQL blocks are
+  optional detail for engineers — the analogies and stories carry the design
+  for everyone else.
+</Tip>
+
+## Core backbone
+
+Four tables carry every entity type. The typed tables further down only add
+type-specific *winner* fields.
+
+### `universe.entity` — the canonical public object
+
+One row per real-world public thing (a person, a company, a title…). It owns the
+canonical `id` (the `universe_entity_uuid` the App backend references), the graph
+node, and the enrichment lifecycle. No product ownership, no org/user context.
+
+```sql
+CREATE SCHEMA universe;
+
+CREATE TABLE universe.entity (
+    id                 UUID        PRIMARY KEY,
+    entity_type        TEXT        NOT NULL,            -- person|company|film_tv|mb_artist|…
+    graph_node_uuid    UUID,                            -- FalkorDB node in the Universe graph
+    display_name       TEXT,                            -- cheap ops/debug label
+    primary_identifier TEXT,                            -- strongest natural key (e.g. LinkedIn URL)
+    confidence         NUMERIC(4,3) NOT NULL DEFAULT 0, -- identity confidence 0..1
+
+    -- enrichment lifecycle (source-of-truth state, NOT product status)
+    enrichment_state   TEXT        NOT NULL DEFAULT 'new', -- new|queued|enriching|enriched|failed
+    cascade_depth      INT         NOT NULL DEFAULT 0,
+    last_enriched_at   TIMESTAMPTZ,
+    source_updated_at  TIMESTAMPTZ,                     -- when any source fact last changed
+    graph_written_at   TIMESTAMPTZ,                     -- graph replay/write audit
+
+    -- dedup recovery: if two entities turn out identical, the loser points here
+    merged_into        UUID        REFERENCES universe.entity(id),
+
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    -- lets subtype tables enforce "person row can only attach to a person entity"
+    UNIQUE (id, entity_type)
+);
+```
+
+<Warning>
+  `merged_into` is reserved from day one. Enrichment dedup **will** be wrong
+  sometimes; reads follow `merged_into` until `NULL`. Retrofitting a merge model
+  onto a live graph is the one thing you cannot cheaply defer.
+</Warning>
+
+### `universe.entity_identifier` — the resolve / dedup keys
+
+How "do we know this entity?" is answered. Many identifiers per entity. Strong
+keys (LinkedIn, IMDB id, MBID, Fundable id) resolve deterministically; soft keys
+(domain, generic email, name) are only hints and must be allowed to map to many
+entities. The [Identity resolution](#identity-resolution-how-identifiers-entities-and-merges-actually-work)
+section below explains this table in depth.
+
+```sql
+CREATE TABLE universe.entity_identifier (
+    id                UUID        PRIMARY KEY,
+    entity_id         UUID        NOT NULL REFERENCES universe.entity(id) ON DELETE CASCADE,
+    kind              TEXT        NOT NULL, -- linkedin|domain|email|phone|imdb|mbid|fundable|pdl
+    normalized_value  TEXT        NOT NULL,
+    is_strong_identity BOOLEAN    NOT NULL DEFAULT FALSE,
+    is_verified       BOOLEAN     NOT NULL DEFAULT FALSE,
+    confidence        NUMERIC(4,3) NOT NULL DEFAULT 0,
+    source            TEXT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- only STRONG identifiers are globally unique; soft ones (domain/name) may repeat
+CREATE UNIQUE INDEX entity_identifier_strong_uq
+    ON universe.entity_identifier (kind, normalized_value)
+    WHERE is_strong_identity;
+```
+
+### `universe.entity_fact` — normalized candidate facts (the "why")
+
+The evidence ledger. Every meaningful field gets one row **per source** with its
+confidence, so "why does the product show this title/company/badge?" always has
+an answer. A fact can carry a scalar **or** point at another entity (that's how
+relationships start life before any dedicated edge table exists).
+
+```sql
+CREATE TABLE universe.entity_fact (
+    id              UUID        PRIMARY KEY,
+    entity_id       UUID        NOT NULL REFERENCES universe.entity(id) ON DELETE CASCADE,
+    field           TEXT        NOT NULL, -- current_title|bio|current_company|invested_in|acted_in|…
+    value_text      TEXT,
+    value_number    NUMERIC,
+    value_bool      BOOLEAN,
+    value_json      JSONB,
+    value_entity_id UUID        REFERENCES universe.entity(id), -- set for relationship facts
+    source          TEXT        NOT NULL, -- pdl|exa|enrichlayer|fundable|imdb|musicbrainz
+    confidence      NUMERIC(4,3) NOT NULL DEFAULT 0,
+    observed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    is_chosen       BOOLEAN     NOT NULL DEFAULT FALSE, -- the distilled winner
+
+    CONSTRAINT one_value CHECK (
+        num_nonnulls(value_text, value_number, value_bool, value_json, value_entity_id) = 1
+    )
+);
+
+-- exactly one winner per scalar field
+CREATE UNIQUE INDEX entity_fact_scalar_winner
+    ON universe.entity_fact (entity_id, field)
+    WHERE is_chosen AND value_entity_id IS NULL;
+
+-- one winner per distinct edge (many acted_in allowed, no duplicate edge)
+CREATE UNIQUE INDEX entity_fact_relation_winner
+    ON universe.entity_fact (entity_id, field, value_entity_id)
+    WHERE is_chosen AND value_entity_id IS NOT NULL;
+
+-- reverse lookups: "who works at / invested in this entity?"
+CREATE INDEX entity_fact_value_entity
+    ON universe.entity_fact (value_entity_id)
+    WHERE value_entity_id IS NOT NULL;
+```
+
+<Note>
+  **No temporality in V1.** Facts capture "current chosen value," not history
+  (no `valid_from`/`valid_to`). Representing "was CEO 2018–2021" is a conscious
+  later migration, not an accident.
+</Note>
+
+### `universe.enrichment_payload` — raw provider responses
+
+Audit / replay / provider comparison. Big noisy blobs stay here as JSON; only the
+fields worth trusting get promoted into `entity_fact`.
+
+```sql
+CREATE TABLE universe.enrichment_payload (
+    id           UUID        PRIMARY KEY,
+    entity_id    UUID        NOT NULL REFERENCES universe.entity(id) ON DELETE CASCADE,
+    provider     TEXT        NOT NULL, -- pdl|exa|serper|imdb|musicbrainz|fundable
+    endpoint     TEXT,
+    request_hash TEXT,                 -- dedup identical calls
+    raw          JSONB       NOT NULL,
+    fetched_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+## How data flows through the backbone
+
+```
+  public keys (linkedin, imdb id, domain…)
+        │  resolve
+        ▼
+  entity_identifier ──▶ entity        (find-or-create, dedup on STRONG keys)
+        │                   │
+        │ enrich            │
+        ▼                   │
+  enrichment_payload  (raw provider JSON, per call)
+        │  normalize important fields
+        ▼
+  entity_fact         (candidates, per source, with confidence)
+        │  distill (pick is_chosen)
+        ▼
+  universe.person / company / film_tv / …   (materialized winners)
+        │  chosen relationship facts
+        ▼
+  FalkorDB Universe graph   (nodes = entity, edges = chosen relation facts)
+        │  publish package (one-way)
+        ▼
+  App backend  master_* / *_card projections
+```
+
+<Steps>
+  <Step title="Resolve">
+    Incoming identifiers hit `entity_identifier`. A strong-key match returns the
+    existing `entity`; otherwise a new `entity` is created.
+  </Step>
+  <Step title="Enrich">
+    Providers run; every response is stored verbatim in `enrichment_payload`.
+  </Step>
+  <Step title="Normalize">
+    Meaningful fields are extracted into `entity_fact` (many rows, one per
+    source, each with a confidence).
+  </Step>
+  <Step title="Distill">
+    A winner is chosen per field (`is_chosen`) and materialized into the typed
+    detail table. **The typed table is a rebuildable cache of chosen facts —
+    never authored directly.**
+  </Step>
+  <Step title="Graph write">
+    Chosen relationship facts (`value_entity_id`) become FalkorDB edges; the
+    entity is its node.
+  </Step>
+  <Step title="Project">
+    A canonical package is published; the App backend upserts its `master_*` /
+    `*_card` read models (one-way, Universe → App). See the
+    [Projection Pattern](/guides/open-work/orbiter-univers-standalone/projection-pattern).
+  </Step>
+</Steps>
+
+## Identity resolution — how identifiers, entities, and merges actually work
+
+This section explains **why `entity_identifier` exists** and walks two concrete
+stories through the tables. You don't need to read SQL to follow it — the SQL
+blocks are optional detail for the engineers.
+
+### The phone-book analogy
+
+Think of `universe.entity` as a **person**, and `universe.entity_identifier` as
+the **phone book**. One person has many ways to be reached: a LinkedIn URL, an
+IMDB id, two emails, a phone number. Each of those is one row in the phone book,
+and every row points at the same one person.
+
+```
+'linkedin.com/in/jane-doe' ──┐
+'nm1234567' (IMDB)           ├──▶ entity_identifier ──▶ entity (ONE Jane)
+'jane@acme.com'              │        (many rows)         (one row)
+'pdl:a1b2c3'  ───────────────┘
+```
+
+You never find a person by shouting their name into the street — you look up
+whichever number you happen to have. That's why **every lookup enters through
+`entity_identifier`, never `entity` directly**: `entity` is one row and can only
+hold one label, but the outside world knows the same person by many different
+keys. Data arrives from providers carrying *their* key (a LinkedIn URL, an IMDB
+id, a Fundable id) — never our internal UUID, because finding that UUID is
+exactly the job at hand.
+
+### Strong vs soft identifiers
+
+Not all keys prove identity equally:
+
+| | Strong keys | Soft keys |
+|---|---|---|
+| Examples | LinkedIn URL, IMDB id, MBID, Fundable id | name, domain, generic email, phone |
+| Meaning | "This **IS** the entity" | "This **MIGHT** be the entity" |
+| Uniqueness | Globally unique — two entities can never share one | May repeat — many "John Smith"s is normal |
+| On lookup | Match = deterministic answer, done | Match = a **candidate list** to score, never an answer |
+
+The database enforces this split with one partial unique index — uniqueness
+applies **only** to strong keys:
+
+```sql
+CREATE UNIQUE INDEX entity_identifier_strong_uq
+    ON universe.entity_identifier (kind, normalized_value)
+    WHERE is_strong_identity;
+```
+
+Two rules fall out of it:
+
+1. **A strong key can only ever belong to one entity.** If anything tries to
+   claim a strong key someone else owns, the database refuses — and that refusal
+   is a *feature* (see the merge story below).
+2. **Soft keys are allowed to repeat.** Two different real people named
+   "Sarah Chen" each get their own `(name, 'sarah chen')` row. A soft-key lookup
+   returning several candidates is correct behavior, not a bug.
+
+### The resolve flow (find-or-create)
+
+Given any incoming key — say a LinkedIn URL:
+
+```sql
+-- 1. normalize: "https://www.linkedin.com/in/Jane-Doe/" → "linkedin.com/in/jane-doe"
+-- 2. look up the IDENTIFIER, not the entity:
+SELECT e.*
+FROM universe.entity_identifier ei
+JOIN universe.entity e ON e.id = ei.entity_id
+WHERE ei.kind = 'linkedin'
+  AND ei.normalized_value = 'linkedin.com/in/jane-doe'
+  AND ei.is_strong_identity;
+```
+
+- **Hit** → that's our entity; reuse it (maybe re-enrich if stale).
+- **Miss** → create the `entity` and its first `entity_identifier` row in one
+  transaction. If two workers race, the unique index makes the second insert
+  fail — catch, re-select, use the winner. The database guarantees no duplicate.
+
+Enrichment then makes the entity **grow more doors**: each provider response
+usually reveals *additional* keys (PDL returns the person's email and IMDB id
+alongside the LinkedIn), and each revealed key becomes a new identifier row on
+the same entity. The more sources we've seen, the more likely the *next* lookup
+hits instead of creating a duplicate.
+
+### Story 1 — The Rock (same person, two sources, merged)
+
+Shows how a real duplicate is **born, detected, and healed**.
+
+**Day 1.** The IMDB scraper ingests `nm0425005`. Lookup misses (empty table) →
+create entity **E1** with identifier `(imdb, nm0425005, strong)`. His raw IMDB
+payload lands in `enrichment_payload`, his credits become `entity_fact` rows,
+winners distill into `person` + `imdb_person`, graph node written.
+
+**Day 30.** An App user adds a contact with `linkedin.com/in/dwayne-johnson`.
+Lookup misses (E1 only has an IMDB key) → create entity **E2**. Two Rocks now
+exist — and that's unavoidable: *no schema can know two strangers are the same
+person until some source says so.*
+
+**The detection.** We enrich E2 via PDL. PDL's response cross-references his
+keys: `{ linkedin: "dwayne-johnson", imdb_id: "nm0425005", email: ... }`. We try
+to attach the revealed keys to E2:
+
+```sql
+INSERT (E2, email, dj@sevenbucks.com, soft)   → OK
+INSERT (E2, imdb,  nm0425005,        strong)  → ❌ UNIQUE VIOLATION — E1 owns it!
+```
+
+That constraint violation **is the system discovering E1 = E2**. This is the
+single most important thing the identifier table does. Without it there is no
+insert, no conflict, no discovery — E1 and E2 stay separate forever, and every
+future source with a new key creates E3, E4, …
+
+**The merge.** E2 loses, E1 wins:
+
+- `entity`: set `E2.merged_into = E1`. E2's row survives forever as a tombstone
+  / forwarding address.
+- `entity_identifier`: repoint E2's rows to E1 — but first **dedupe soft keys**
+  (both may hold `(name, 'dwayne johnson')`; soft keys have no unique index, so
+  a blind move would silently duplicate):
+
+  ```sql
+  DELETE FROM universe.entity_identifier l
+  WHERE l.entity_id = 'E2'
+    AND EXISTS (SELECT 1 FROM universe.entity_identifier w
+                WHERE w.entity_id = 'E1'
+                  AND w.kind = l.kind AND w.normalized_value = l.normalized_value);
+  UPDATE universe.entity_identifier SET entity_id = 'E1' WHERE entity_id = 'E2';
+  ```
+
+- `entity_fact`: repoint both directions — facts E2 *owns* (`entity_id`) and
+  facts elsewhere *pointing at* E2 (`value_entity_id`; the
+  `entity_fact_value_entity` index serves this reverse lookup). If both entities
+  had a chosen winner for the same field, re-run distill to pick one.
+- Typed tables (`person`, `imdb_person`): delete the loser's row and re-distill
+  the winner — they are rebuildable caches, never hand-merged.
+- `fundable_*` mirrors: repoint their `entity_id` links.
+- Graph: merge E2's node/edges into E1's node.
+
+**Day 60.** A Fundable deal arrives carrying his LinkedIn. Lookup →
+instant hit on E1. New `invested_in` fact, new graph edge, no drama. This is
+the steady state: once an entity has a few doors, virtually everything hits.
+
+### Story 2 — Sarah Chen (different people, same name, kept apart)
+
+The flip side: identifiers also **prevent wrong merges**.
+
+- **P1** — Sarah Chen, CEO of Acme Robotics. Entered via
+  `(linkedin, sarah-chen-robotics, strong)`; PDL gives
+  `(email, sarah@acme.ai, soft)` and a `current_company` relationship fact
+  pointing at Acme's company entity → `(P1)-[:WORKS_AT]->(C1)` in the graph.
+- **P2** — Sarah Chen, an actress, a completely different human. Entered via
+  `(imdb, nm7788990, strong)`.
+
+Both carry a soft `(name, 'sarah chen')` row — allowed, because the unique
+index only covers strong keys. If resolve worked by querying `entity` on a name
+column, the actress's ingest would have **hit the CEO** and dumped a filmography
+onto a robotics founder. The identifier model makes that impossible: names are
+soft, and soft keys never decide identity alone.
+
+When an App user later adds a bare-name contact "Sarah Chen":
+
+```sql
+SELECT entity_id FROM universe.entity_identifier
+WHERE kind = 'name' AND normalized_value = 'sarah chen';
+-- → returns BOTH P1 and P2 (a candidate list, by design)
+```
+
+The resolver scores the candidates against context (company, email, industry) or
+asks the user — it never auto-picks. And if one day the CEO does a film cameo
+and gets her own IMDB id `nm9911223`, inserting it succeeds (different id from
+P2's) — same person gains a second strong key, the two Sarahs stay correctly
+separate. Had the payload instead revealed P2's exact id, the unique index would
+fire and trigger the merge flow from Story 1. **One mechanism handles both
+directions: strong-key collision = same entity; no collision = different
+entities; soft keys only ever nominate candidates.**
+
+### Reading a merged entity (and how the App heals)
+
+`merged_into` can chain (E2→E1, later E1→E0), so readers follow it **until
+NULL**, not just one hop:
+
+```sql
+WITH RECURSIVE alive AS (
+  SELECT * FROM universe.entity WHERE id = $incoming
+  UNION ALL
+  SELECT e.* FROM universe.entity e JOIN alive a ON e.id = a.merged_into
+)
+SELECT * FROM alive WHERE merged_into IS NULL;
+```
+
+The App backend never runs this itself (it never reads `universe.*` directly) —
+the Universe read/publish layer resolves the chain and always returns the
+**canonical id in every response** (e.g. `{ id: E0, requested_id: E2, … }`). An
+App row still holding a loser's `universe_entity_uuid` is a temporarily stale
+pointer that self-heals: reads resolve correctly through the chain, and the next
+published package overwrites the stored id with the winner's. The loser's
+tombstone row is kept forever, because old references (caches, queued jobs,
+exports) can surface at any time.
+
+### The one-paragraph takeaway
+
+Duplicates are born when sources arrive with disjoint keys — nothing can prevent
+that. Sources reveal sameness by putting two keys in one payload, and
+`entity_identifier` is where that testimony lands: an insert either **hits**
+(instant reuse) or **collides on a strong key** (duplicate detected → merge).
+`entity` is the answer; `entity_identifier` is the index of every question that
+leads to it. It doesn't stop duplicates being born — it makes them *findable,
+detectable, and mergeable*, while stopping identical-looking strangers from
+being wrongly fused.
+
+## Typed detail tables
+
+Each subtype is keyed by `entity_id` and pins its `entity_type` so it can only
+attach to the right kind of entity. Fields here are the **distilled winners**, not
+raw evidence.
+
+### `universe.person`
+
+```sql
+CREATE TABLE universe.person (
+    entity_id             UUID        PRIMARY KEY,
+    entity_type           TEXT        NOT NULL DEFAULT 'person' CHECK (entity_type = 'person'),
+    first_name            TEXT,
+    middle_name           TEXT,
+    last_name             TEXT,
+    prefix                TEXT,
+    suffix                TEXT,
+    current_title         TEXT,
+    current_company_id    UUID        REFERENCES universe.entity(id), -- another entity
+    bio                   TEXT,
+    bio_500               TEXT,
+    deep_bio              TEXT[]      NOT NULL DEFAULT '{}',
+    social_insights       TEXT,
+    social_media_influence TEXT[]     NOT NULL DEFAULT '{}',
+    is_angel              BOOLEAN     NOT NULL DEFAULT FALSE,
+    is_c_suite            BOOLEAN     NOT NULL DEFAULT FALSE,
+    sex                   TEXT,
+    avatar_url            TEXT,
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    FOREIGN KEY (entity_id, entity_type) REFERENCES universe.entity (id, entity_type)
+);
+```
+
+### `universe.company`
+
+```sql
+CREATE TABLE universe.company (
+    entity_id       UUID        PRIMARY KEY,
+    entity_type     TEXT        NOT NULL DEFAULT 'company' CHECK (entity_type = 'company'),
+    name            TEXT,
+    legal_name      TEXT,
+    domain          TEXT,
+    description     TEXT,
+    logo_url        TEXT,
+    founded_year    INT,
+    hq_location     TEXT,
+    employee_range  TEXT,
+    is_investor     BOOLEAN     NOT NULL DEFAULT FALSE,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    FOREIGN KEY (entity_id, entity_type) REFERENCES universe.entity (id, entity_type)
+);
+```
+
+### `universe.film_tv` (film / TV titles)
+
+A user-visible title (movie, show, short). Poster/summary are winners; raw IMDB
+title payloads live in `enrichment_payload`.
+
+```sql
+CREATE TABLE universe.film_tv (
+    entity_id     UUID        PRIMARY KEY,
+    entity_type   TEXT        NOT NULL DEFAULT 'film_tv' CHECK (entity_type = 'film_tv'),
+    title         TEXT,
+    title_type    TEXT,                 -- movie|tv|short|miniseries
+    release_year  INT,
+    release_date  DATE,
+    poster_url    TEXT,
+    tagline       TEXT,
+    summary       TEXT,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    FOREIGN KEY (entity_id, entity_type) REFERENCES universe.entity (id, entity_type)
+);
+```
+
+Credits (person → title) are relationship facts:
+`entity_fact(entity_id=person, field='acted_in'|'directed'|'credited_on',
+value_entity_id=film_tv)`.
+
+### `universe.imdb_person` (IMDB facet of a person)
+
+IMDB-specific source detail attached to a **person** entity (it does not create a
+separate identity — reconciliation/merge handles "same real person across
+sources"). Holds the IMDB natural key, scrape freshness, and credit-replay state.
+
+```sql
+CREATE TABLE universe.imdb_person (
+    entity_id         UUID        PRIMARY KEY,
+    entity_type       TEXT        NOT NULL DEFAULT 'person' CHECK (entity_type = 'person'),
+    imdb_id           TEXT        NOT NULL,          -- nmXXXXXXX (also a strong identifier)
+    headline          TEXT,
+    known_for         TEXT[]      NOT NULL DEFAULT '{}',
+    image_url         TEXT,
+    credit_count      INT         NOT NULL DEFAULT 0,
+    scrape_fresh_at   TIMESTAMPTZ,                   -- source freshness gate
+    credit_replay_state TEXT,                        -- credit-edge write state
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    UNIQUE (imdb_id),
+    FOREIGN KEY (entity_id, entity_type) REFERENCES universe.entity (id, entity_type)
+);
+```
+
+### `universe.fundable_*` (source mirror)
+
+Fundable is the cleanest Universe-only ownership line. These are **source mirror**
+tables: they keep the Fundable natural key and a nullable link to the reconciled
+entity (nullable because a Fundable row can be ingested before it is matched to a
+person/company). Deals become investment relationship facts.
+
+```sql
+CREATE TABLE universe.fundable_organization (
+    id             UUID        PRIMARY KEY,
+    fundable_id    TEXT        NOT NULL UNIQUE,       -- Fundable natural key
+    entity_id      UUID        REFERENCES universe.entity(id), -- company entity, once reconciled
+    name           TEXT,
+    domain         TEXT,
+    raw            JSONB,                             -- mirror payload
+    last_synced_at TIMESTAMPTZ,
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE universe.fundable_person (
+    id             UUID        PRIMARY KEY,
+    fundable_id    TEXT        NOT NULL UNIQUE,
+    entity_id      UUID        REFERENCES universe.entity(id), -- person entity, once reconciled
+    full_name      TEXT,
+    raw            JSONB,
+    last_synced_at TIMESTAMPTZ,
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE universe.fundable_deal (
+    id                UUID        PRIMARY KEY,
+    fundable_id       TEXT        NOT NULL UNIQUE,
+    org_entity_id     UUID        REFERENCES universe.entity(id), -- company that raised
+    round_type        TEXT,
+    amount            NUMERIC,
+    currency          TEXT,
+    announced_on      DATE,
+    source_url        TEXT,
+    raw               JSONB,
+    last_synced_at    TIMESTAMPTZ,
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+Investors → deals and people → deals become relationship facts
+(`field='invested_in'|'angel_in'`, `value_entity_id`), which later promote to
+FalkorDB edges.
+
+## Crossing to the App backend
+
+The App backend never reads these tables directly. It receives a published
+package and upserts its own product rows, carrying only references home
+(see the [Projection Pattern](/guides/open-work/orbiter-univers-standalone/projection-pattern)
+and [Tables: Universe vs Orbiter Backend](/guides/open-work/orbiter-univers-standalone/tables-universe-vs-orbiter-backend)):
+
+```sql
+-- on master_persons.master_persons and each *_card projection
+universe_entity_uuid  UUID         -- → universe.entity.id (logical, cross-DB)
+universe_node_uuid    UUID         -- → universe.entity.graph_node_uuid
+universe_entity_type  TEXT
+source_updated_at     TIMESTAMPTZ  -- Universe freshness, copied in
+projection_synced_at  TIMESTAMPTZ  -- when App last upserted from a package
+projection_version    INT
+enrichment_status     TEXT         -- product-facing: thin|pending|enriched
+```
+
+Product edits never write back to `universe.*`; corrections go through a
+proposed-correction flow and only reach Universe after public/source verification.

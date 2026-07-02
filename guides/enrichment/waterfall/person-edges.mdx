@@ -1,0 +1,174 @@
+---
+title: "Person Edges"
+description: "Person Enrichment Waterfall edge catalog — every edge type the pipeline emits, with patterns, weights, writer functions, and live status. Canonical edge definitions live in the Orbiter ontology."
+---
+
+The [Person Enrichment Waterfall](/guides/enrichment/waterfall/person-waterfall) uses the canonical graph edge definitions in [Ontology → Edge Types](/guides/ontology/edges). Write-side Cypher lives on [Cyphers → Person Pipeline](/guides/cyphers/person-pipeline) (funding on [Cyphers → Funding](/guides/cyphers/funding)); canonical weights are on [Edge Weights](/guides/ontology/edge-weights) (**lower = stronger**; hub-node edges sit Weak or below; never sub-1 — the same shared scale as the [company](/guides/enrichment/waterfall/company-edges), [IMDB](/guides/enrichment/waterfall/imdb-edges), and [music](/guides/enrichment/waterfall/music-edges) edges).
+
+This page is the **pipeline-scoped catalog**: which edges this pipeline emits, at what weight, from which writer — including per-edge **live status**, because this is the oldest edge family and two writers had verified outage/repair windows. Edge patterns, properties, and examples should be edited only in the ontology source of truth. Writer internals live on [Person Waterfall Functions](/guides/enrichment/waterfall/person-functions); node MERGE keys on [Person Nodes](/guides/enrichment/waterfall/person-nodes). Provenance map: work, education, certification, honor, work-product, and volunteering edges are written in **phase 7** (#12828 v1.2, 2026-06-25 — **skipped entirely** for `current_company_only` people); expertise is **phase 8**, funding **phase 9** (double-invoked by orchestrator #13040 v3.23, fanout opt-in), the location chain **phase 2**. Since the **2026-06-23 containment sweep** every phase-7 resolver resolves companies lookup-/local-only — a person run can link edges to companies but never enqueues company enrichment (the opt-in deal cascade is the sole exception).
+
+<Note>
+  Ground truth: [Edge Types](/guides/ontology/edges) \+ [Edge Weights](/guides/ontology/edge-weights). Live status and function versions reflect the extraction audit of workspace 3 branch `v1`, verified 2026-07-02.
+</Note>
+
+## Work edges
+
+Written by the shared `mvp/edges/create-work-edges` (#2800, **v1.8 (2026-06-25)**) — one Cypher writes all six types in a pass via per-edge `FOREACH (CASE WHEN …)` guards, with stable `r.uuid = coalesce(r.uuid, randomUUID())`, `created_at` coalesce, and `valid_from` / `valid_to` on every edge; v1.8 added safe `edgeRows` handling and retryable null `edge_uuid`. On this pipeline it is invoked from `resolve-edges-work` (#12562 v1.7, 2026-06-23), which since v1.6 syncs the best current role via `choose-best-current-role` (#12621) **before** edge creation and passes `write_descriptions: false` (the #2800 v1.7 flag — see [Edge descriptions](#edge-descriptions)). The company waterfall's Exa C-suite loop calls the same writer with descriptions inline — [Company Edges → Work-history edges](/guides/enrichment/waterfall/company-edges#work-history-edges-exa-path).
+
+- `(Person)-[:WORKS_AT]->(Company)` · weight = `seniority_rank` **\+20 when past** (no current role) — 14 buckets across 5–40, current C-suite strongest (5), past individual contributor weakest (40, the largest live bucket). Props `title`, `seniority_level`, `total_roles`, `role_history`. Full mapping: [Edge Weights → WORKS\_AT buckets](/guides/ontology/edge-weights#works_at-weight-buckets).
+- Title-classified alternatives: `(Person)-[:FOUNDED]->(Company)` · weight **5** (templated founded-vs-co-founded description) · `BOARD_MEMBER_OF` · **8** · `ADVISOR_TO` · **12** · `INVESTED_IN` · **15** (the out-of-band variant, not tied to a funding round — round-scoped variants: [Funding edges](#funding-edges-phase-9-opt-in)) · `MEMBER_OF` `(Person)→(Company / Organization)` · **20**.
+
+### Title routing & guards (§3.3 / §3.7)
+
+The v2.1 title classifier inside #2800 routes before it writes (fixed-forward 2026-05-31): **Limited Partner / Angel Investor / Board Observer → `INVESTED_IN` only**, never a parallel `WORKS_AT` (general/managing partners stay employment-eligible via `isOperatingPartner()`); **unions → `MEMBER_OF`**, suppressing `WORKS_AT` (name allowlist — SAG-AFTRA, the writers/directors guilds, IATSE, AFM, Actors' Equity, …); **non-executive directors → `BOARD_MEMBER_OF` only** (v1.4 substring fix); and the **`Unknown Company` stub guard** skips any company whose node is an unresolved stub (`name == "Unknown Company"`, empty `company_domain`) until resolution completes. Audit trail \+ backfill runbook: [edge-audit §3.3 / §3.7](/guides/robert-mark/edge-audit).
+
+### The `HAS_WORKED_AT` ghost
+
+**There is no `HAS_WORKED_AT` edge type** — no writer for it exists anywhere in workspace 3, and #2800 has never emitted one (the old C-suite-mode doc named it; past roles actually live on `WORKS_AT` at the \+20 buckets). Legacy `WORKED_AT` edges from the pre-#2800 writer linger in the graph **read-only** — swept by the #13006/#13008 description tooling, otherwise inert.
+
+## Education edges
+
+Written by `mvp/edges/create-education-edges` (#1898), called from `resolve-edges-education` (#12560 v1.2, 2026-06-23 — school companies resolve/create local rows only, no company enqueue).
+
+- `(Person)-[:ATTENDED]->(Company school)` · weight **40** · props `degree`, `field_of_study`, `activities_societies`, `valid_from` / `valid_to` — all `FOREACH`-gated so an empty string never overwrites a prior value; `valid_to` is year-guarded to drop the future end-dates LinkedIn sometimes emits.
+- `(Person)-[:ATTENDED_TOGETHER]-(Person)` (undirected) · weight **35 / 50 / 70** — same major / same field / time-overlap only, mirrored in `relationship_strength` 3/2/1.
+- `(Student:Person)-[:STUDIED_UNDER]->(Instructor:Person)` · weight **10** — **dormant**: it derives from a `TAUGHT_AT` edge on the same school, and no creator writes `TAUGHT_AT` yet.
+
+## Certification edges
+
+Written by `resolve-edges-certifications` (#12578, **v2.5 (2026-06-23)** \+ a headerless edit 2026-06-30 — re-extract before trusting the [documented Cypher](/guides/cyphers/person-pipeline)). v2.5 scopes every query to the input `master_person_id` and generates cert descriptions at resolve time via `openai/gpt-oss-120b` with OpenRouter web search for issuer domains; issuers are always `cascade_depth=1` leaves.
+
+- `(Person)-[:HAS_CERTIFICATION]->(Certification)` · weight **15** for FINRA `Series …` certs, **20** otherwise · props `valid_from` (issue date), `description`.
+- `(Certification)-[:GRANTED_BY]->(Organization:Company)` · weight **10** — the writer adds the `:Organization` label to the issuer's Company node.
+- `(Person)-[:CERTIFIED_BY]->(Organization:Company)` · weight **25** — the direct one-hop shortcut; `cert_type` is part of the MERGE key (one edge per cert type), `certification_count` bumped on re-merge.
+
+## Honor edges
+
+Written by `resolve-edges-honor` (#4574, **v4 (2026-06-23)** — issuer-resolution queries scoped to the input `master_person_id`; issuers are depth-1 leaves (v3), no company enqueue since the 2026-06-23 sweep). CREATE-only: each honor row mints a fresh `Honor` node — uniqueness is caller-side, not a MERGE key (see [Person Nodes](/guides/enrichment/waterfall/person-nodes)).
+
+- `(Person)-[:RECEIVED_HONOR]->(Honor)` · weight **20**.
+- `(Honor)-[:ISSUED_BY]->(Organization)` · weight **25** — fires only when the issuer node resolves (`OPTIONAL MATCH` \+ `FOREACH` guard).
+
+## Work-product edges
+
+Written by `resolve-edges-projects-publications` (#12579, **v5 (2026-06-23)** \+ a headerless edit 2026-07-01). Both blocks are CREATE-only writers — re-run protection lives in the relational rows (`node_uuid` still null), not the graph. Since v4 contributor resolution is **seed-person-only**; v5 makes publisher companies **leaf/local-only** (`queue=false` \+ `hold_downstream=true`).
+
+- `(Person)-[:CONTRIBUTED_TO]->(Project)` · weight **recency-graded 40 / 35 / 30 / 25 / 20 / 15** — 40 for current/ongoing projects, stepping down per year since `end_year`, 15 at 5\+ years · prop `is_current`.
+- `(Person)-[:AUTHORED]->(Work:Publication)` · weight **recency-graded 25 / 22 / 18 / 15** by publication year.
+- `(Work:Publication)-[:PUBLISHED_BY]->(Company)` · weight **20** — fires only when a publisher company node resolved.
+
+## Volunteering edges
+
+Written by `resolve-edges-volunteering` (#4575, **v4 (2026-06-04)** — all queries scoped to the input person; orgs resolve as depth-1 leaves — no company enqueue since the 2026-06-23 sweep). MERGEs the `Organization:Company` node by name, then CREATEs a per-row edge.
+
+- `(Person)-[:VOLUNTEERED_AT]->(Organization:Company)` · weight **38** current / **50** past (`endYear`-keyed, `isCurrent` prop) · props `title`, start/end month \+ year.
+
+## Location edges
+
+Written by `primary-location-nodes-edges_v2` (#4690) from phase 2 via `add-person-primary-location` (#2766) — the company side uses the sibling `location-nodes-edges-company` (#4528). One of four Cypher branches fires depending on which of city/region/country resolved; all endpoints MERGE.
+
+- `(Person)-[:LOCATED_IN]->(City / Region / State)` · weight **70**; direct `(Person)-[:LOCATED_IN]->(Country)` (no city/region) · weight **80** · stamps `valid_from` (`Y-m` of write time). _(§3.6 — was 10/50 pre-audit; at 10 everyone sharing a city hub was near-maximally linked.)_
+- `(City)-[:IN_REGION]->(Region / State)` · weight **25**.
+- `(Region / City)-[:IN_COUNTRY]->(Country)` · weight **50** — structural geography backbone, unchanged by the audit.
+
+## Expertise edges
+
+### HAS\_EXPERTISE
+
+`(Person)-[:HAS_EXPERTISE]->(SubDomainExpertise / DomainExpertise)` — written by `resolve-person-expertise-v2` (#12926, **v2.4 (2026-07-01)**; locked spec promoted 2026-06-18), fed by `llm-identify-person-expertise` (#12666, 2026-06-19: `google/gemini-3.1-flash-lite`, reasoning disabled, `max_tokens` 2500). #12666 **DELETEs all existing `HAS_EXPERTISE` edges for the person first** — every phase-8 run is a full rewrite, not incremental. #12926 runs a Gemini `expert_embeddings` KNN with a **3-way guard band** on vector distance: **\< 0.15** auto-match · **0.15–0.25** LLM adjudicate · **\> 0.25** create a new `SubDomainExpertise` node.
+
+Two weight rules — the score is a vector **distance** (lower = closer):
+
+- **Matched** to an existing node: `weight = min(round(10 + match_score × 160), 50)` — 10 at distance 0, capped at 50 near the create threshold.
+- **Created** node: fixed `weight = 10` — a freshly minted node perfectly represents the identified expertise. _(Older docs and #12925's Xano input note still say `× 80` — a stale comment; the live resolver writes `× 160`. Do not propagate it.)_
+
+`expertise_strength` is a **separate 0–100 property**, decoupled from the path weight — computed from depth \+ recency \+ duration signals (the v5 prompt emits per-signal `start_year` / `end_year`). On re-merge, `evidence` / `identified_as` / `signal_type` pipe-concatenate, the `depth` and `recency` ladders only escalate, and `match_score` / `weight` only improve (decrease). Every successful MERGE dual-writes `person_has_expertise` (table 711) via #12925 (v1.2, 2026-07-02 — `|concat` fix \+ `CONTAINS` dedupe guards); the deep-research webhook (#8303 v1.1, 2026-07-02) re-runs the whole chain on success, relying on this idempotency.
+
+### HAS\_SUBDOMAIN
+
+`(Entity:DomainExpertise)-[:HAS_SUBDOMAIN]->(Entity:SubDomainExpertise)` · weight **100** — a **deliberate hub-damping value, not closeness**. Written by `attach-subdomain-parent` (#13142) from #12926's create branch after each verified node CREATE, parent picked by the `resolve-parent-domain` #13141 LLM resolver (v1.4, 2026-07-02 — never auto-creates a domain, throws after 3 failed attempts); on a NONE verdict #13142 instead flags the node `parent_unresolved`. The same forward-fix serves the company pipeline's `SPECIALIZES_IN` create branch — detail on [Company Edges](/guides/enrichment/waterfall/company-edges#has_subdomain) \+ [Cyphers → Expertise](/guides/cyphers/expertise).
+
+## Mentorship edges
+
+`(Person YC partner)-[:MENTOR]->(Person founder)` · weight **14** · `source: 'inferred'`, `domain: 'accelerator'` — person-to-person, but written by the **company** pipeline's seed-only YC path (`process-yc-people` #12700), not by any person-run phase; listed because both endpoints are this pipeline's `Person` nodes. **As-built (flagged):** the MERGE key includes `company_uuid` **and** `valid_from` (derived from `master_company.founded ?? 1970`), so a changed founding year mints a duplicate edge — detail on [Company Edges → YC founding & mentorship](/guides/enrichment/waterfall/company-edges#yc-founding--mentorship-edges).
+
+## Funding edges (phase 9, opt-in)
+
+<Note>
+  **Opt-in \+ repaired.** Deal-network fanout is explicit opt-in since `process-person-phase-9` #12830 v3.2: it requires `allow_investor_network_cascade=true` **and** `cascade_depth=0` — depth 0 alone no longer fans out. Orchestrator #13040 v3.23 invokes the phase **twice** (early `build_investment_thesis=false`, late `=true`); the MERGEs keep the double pass idempotent. **Historical window:** `resolve-investors-edges` #12702 self-skipped on every invocation from v1.11 (2026-06-23, a `first_notempty` depth coercion) until the v1.12 `first_notnull` repair (2026-07-02) — deals in that window carry `Funding_Round` \+ `RAISED` only (backfill declined 2026-07-02, accepted as historical). v1.13 (same day) floors the ms→s date division so stray milliseconds can't crash the Twig `date()` render; #12701 got the same hardening, caller `cascade-deal-participants` #12856 v1.6 the same depth guard.
+</Note>
+
+For an opted-in seed person, phase 9 loops `fundable_angel_investments` and routes each deal through #12856 — portfolio-company get-add (local-only, `hold_downstream` since v1.4), IPO signal, `Funding_Round` node, then #12702 for the investor side:
+
+- `(Company)-[:RAISED]->(Funding_Round)` · weight **10** — written by #12701 after the node MERGE; edge `created_at` coalesces to the deal's announced date; deterministic `uuid`.
+- `(Company:VC_Firm)-[:LEAD_INVESTED_IN]->(Funding_Round)` · weight **15** · `is_lead_investor: true` — lead detection is the Fundable `lead_investor` column, no inference; the `:VC_Firm` label is added on the same pass.
+- `(Company:VC_Firm)-[:INVESTED_IN]->(Funding_Round)` · weight **20** — non-lead; or `FOLLOW_ON_INVESTED_IN` · weight **20** when an `OPTIONAL MATCH` finds an earlier round the same firm backed (strict `<` date compare, so re-runs don't self-count).
+- `(Person:Angel)-[:LEAD_INVESTED_IN]->(Funding_Round)` · weight **15**, or `(Person:Angel)-[:INVESTED_IN]->(Funding_Round)` · weight **25** — angels get the `:Angel` label, no follow-on detection, and a deliberately weaker non-lead weight than institutional.
+- `(Person)-[:INVESTMENT_PARTNER_IN]->(Funding_Round)` · weight **15** \+ `(Person)-[:INVESTMENT_PARTNER_AT]->(Company:VC_Firm)` · weight **20** — one Cypher pair per resolved deal partner (no `Angel` label since v1.10).
+
+Co-investor people and companies are created as **queued depth-1 leaves** (v1.8–v1.10), not full-enriched inline — under the opt-in flag this is the only path by which a person run still writes queue rows. Deep per-edge treatment (type-flip hazard, Twig quoting trap, sandbox verification): [Company Edges → Investor edge set](/guides/enrichment/waterfall/company-edges#investor-edge-set-12702) — linked, not duplicated. Cypher: [Cyphers → Funding](/guides/cyphers/funding).
+
+## Film & TV edges (phase 8 handoff)
+
+The person pipeline writes none of these directly. Phase 8 (#12829 v1.1), on `film_industry=true`, verifies the person's IMDb URL (`verify-imdb-url` #12677), stores it via `create-master-link` #2541, and links the row — from there the **IMDB waterfall's** writers own the edges: `WORKED_ON` `(Person)→(Film_TV)` w**30** (#13013 / #13015 / #2334), `HAS_AWARD` `(Film_TV)→(Film_TV_Award)` w**40**, `WON_AWARD` w**30** and `NOMINATED_FOR` w**35** `(Person)→(Film_TV_Award)` (both #2334). All four were raised out of erroneous sub-1 values by the §3.6 audit. Catalog: [IMDB Edges](/guides/enrichment/waterfall/imdb-edges) — linked, not duplicated.
+
+## SAME\_AS
+
+This pipeline writes no identity bridges — but it is the **target** of one: `(Person:Music_Artist)-[:SAME_AS]->(Person)` · weight **1**, written by the music person-resolution orchestrator `mb/run-person-resolution` (#13121, v2.7, 2026-07-02). The bridge has carried the canonical identity-floor weight **1 since v2.5 (2026-07-01)** — the `w100` in the 2026-06-14 dev-update is historical, superseded. Since v2.6, no-match MB people still mint/link a `master_person` through this family's entry gate (#13039) plus music profile helper #13159; v2.7 added a post-bridge MB-credit expertise emitter (#13160) that writes `HAS_EXPERTISE` onto the bridged Person idempotently. Detail: [Music Edges → Identity & ownership bridges](/guides/enrichment/waterfall/music-edges#identity-bridges).
+
+## Edge descriptions
+
+**Work \+ relationship edges** use the shared trios: `create-work-edge-description-from-graph` #13003 → `write-work-edge-description-to-graph` #13008 for `WORKS_AT` (and legacy `WORKED_AT`), and #13009 → #13010 for `BOARD_MEMBER_OF` / `ADVISOR_TO` / `INVESTED_IN` / `MEMBER_OF` — both create functions on `deepseek/deepseek-v4-flash` (reasoning off; the 2026-06-17 v2 swap fixed the gpt-oss-120b dropped-space/U\+2011 artifacts). #2800 v1.6 wired them inline at edge creation — **but the person path passes `write_descriptions: false`** (#2800 v1.7 via #12562 v1.6), so phase-7 work edges are born description-less and rely on the async drainers: #13006 (Tasks #171/#167/#168, keyed `description IS NULL`) and #13011 (Tasks #166/#169/#170, keyed `description_generated_at IS NULL`). **All six tasks are inactive** (the legacy drain finished), so edges written since the v1.7 flag accumulate as an **open backfill candidate**. Contrast: these drainers key on per-edge description markers, the [IMDB trio](/guides/enrichment/waterfall/imdb-edges#edge-descriptions) keys on `(person_uuid, film_uuid)` endpoint pairs, and the [music trio](/guides/enrichment/waterfall/music-edges#edge-descriptions) keys on `e.uuid`.
+
+**`HAS_EXPERTISE`** gets a 15–30-word LLM sentence via `write-expertise-edge-description-to-graph` #13020 (**v1.1 (2026-06-25)** safe-rows fix), called **inline from both branches** of #12926 with `description_generated_at` as the skip marker — phase 8's delete-then-rewrite wipes the markers, so re-enriched people get fresh descriptions in-band. Catch-up backfill: **Task #177** `backfill-expertise-edge-descriptions-v2` → #13046 (20 edges/batch, 120 s tick, ships `active = false`, deactivate at `no_pending_edges`). **Task #176 was DELETED** (buggy) — any doc still citing it is stale. The create side #13019 is on the same `deepseek/deepseek-v4-flash` pattern (v1.2, 2026-06-18, reasoning off), plus a v1.3 out-of-credits guard that throws loudly on OpenRouter 402s — via `mvp/llm/check-openrouter` #13136 — instead of silently writing null.
+
+**Certifications and education** generate their description text at resolve time — #12578 v2.5 via `openai/gpt-oss-120b` \+ OpenRouter web search; #1898's `ATTENDED` description via `openai/gpt-oss-120b` (since 2026-05-30). **Everything else** — `FOUNDED`, honors, work products, volunteering, location, funding, `MENTOR` — carries **inline templated description strings** written in the edge Cypher itself, not LLM output.
+
+<Warning>
+  **Descriptions are one-shot.** The backfills generate only where the marker is absent and never regenerate when edge data later changes — describe only **after** data cleanups, or stale facts are baked into prose permanently (observed live on a union `WORKS_AT` later converted to `MEMBER_OF`). Coverage matrix: [edge-audit → description coverage](/guides/robert-mark/edge-audit); model migration: [Refactor Edge Descriptions](/guides/robert-mark/refactor-edge-descriptions).
+</Warning>
+
+## Summary — person edges at a glance
+
+| Edge | Pattern | Weight | Writer(s) | Live status |
+| --- | --- | :-: | --- | --- |
+| `FOUNDED` | `(Person)→(Company)` | 5 | #2800 | ✅ Live |
+| `WORKS_AT` | `(Person)→(Company)` | 5–40 (rank \+20 past) | #2800 | ✅ Live |
+| `BOARD_MEMBER_OF` | `(Person)→(Company)` | 8 | #2800 | ✅ Live |
+| `ADVISOR_TO` | `(Person)→(Company)` | 12 | #2800 | ✅ Live |
+| `INVESTED_IN` (work-derived) | `(Person)→(Company)` | 15 | #2800 | ✅ Live |
+| `MEMBER_OF` | `(Person)→(Company / Organization)` | 20 | #2800 | ✅ Live (unions route here) |
+| `ATTENDED` | `(Person)→(Company school)` | 40 | #1898 via #12560 | ✅ Live |
+| `ATTENDED_TOGETHER` | `(Person)↔(Person)` | 35 / 50 / 70 | #1898 (derived) | ✅ Live |
+| `STUDIED_UNDER` | `(Person)→(Person instructor)` | 10 | #1898 (derived) | Dormant — no `TAUGHT_AT` writer |
+| `HAS_CERTIFICATION` | `(Person)→(Certification)` | 15 / 20 | #12578 | ✅ Live |
+| `GRANTED_BY` | `(Certification)→(Organization)` | 10 | #12578 | ✅ Live |
+| `CERTIFIED_BY` | `(Person)→(Organization)` | 25 | #12578 | ✅ Live |
+| `RECEIVED_HONOR` | `(Person)→(Honor)` | 20 | #4574 | ✅ Live |
+| `ISSUED_BY` | `(Honor)→(Organization)` | 25 | #4574 | ✅ Live (issuer-gated) |
+| `CONTRIBUTED_TO` | `(Person)→(Project)` | 15–40 (recency) | #12579 | ✅ Live |
+| `AUTHORED` | `(Person)→(Work:Publication)` | 15–25 (recency) | #12579 | ✅ Live |
+| `PUBLISHED_BY` | `(Work:Publication)→(Company)` | 20 | #12579 | ✅ Live (publisher-gated) |
+| `VOLUNTEERED_AT` | `(Person)→(Organization)` | 38 / 50 | #4575 | ✅ Live |
+| `LOCATED_IN` | `(Person)→(City/Region)` · `→(Country)` | 70 / 80 | #4690 via #2766 | ✅ Live (§3.6 re-set) |
+| `IN_REGION` | `(City)→(Region/State)` | 25 | #4690 | ✅ Live |
+| `IN_COUNTRY` | `(Region/City)→(Country)` | 50 | #4690 | ✅ Live |
+| `HAS_EXPERTISE` | `(Person)→(Sub/DomainExpertise)` | 10–50 formula / 10 fixed (created) | #12926 via #12666 | ✅ Live |
+| `HAS_SUBDOMAIN` | `(DomainExpertise)→(SubDomainExpertise)` | 100 | #13142 via #12926 | ✅ Live |
+| `MENTOR` | `(Person)→(Person)` | 14 | #12700 (company pipeline) | ✅ Live (dup risk on `valid_from`) |
+| `RAISED` | `(Company)→(Funding_Round)` | 10 | #12701 via #12856 | ✅ Live (opt-in path) |
+| `LEAD_INVESTED_IN` | `(VC_Firm / Person:Angel)→(Funding_Round)` | 15 | #12702 | ✅ Live (repaired v1.12, 2026-07-02) |
+| `INVESTED_IN` (institutional) | `(Company:VC_Firm)→(Funding_Round)` | 20 | #12702 | ✅ Live (repaired v1.12, 2026-07-02) |
+| `INVESTED_IN` (angel) | `(Person:Angel)→(Funding_Round)` | 25 | #12702 | ✅ Live (repaired v1.12, 2026-07-02) |
+| `FOLLOW_ON_INVESTED_IN` | `(Company:VC_Firm)→(Funding_Round)` | 20 | #12702 | ✅ Live (repaired v1.12, 2026-07-02) |
+| `INVESTMENT_PARTNER_IN` | `(Person)→(Funding_Round)` | 15 | #12702 | ✅ Live (repaired v1.12, 2026-07-02) |
+| `INVESTMENT_PARTNER_AT` | `(Person)→(Company:VC_Firm)` | 20 | #12702 | ✅ Live (repaired v1.12, 2026-07-02) |
+| `WORKED_ON` | `(Person)→(Film_TV)` | 30 | #13013 / #13015 / #2334 (IMDB) | ✅ Live (handoff) |
+| `HAS_AWARD` | `(Film_TV)→(Film_TV_Award)` | 40 | #2334 (IMDB) | ✅ Live (handoff) |
+| `WON_AWARD` | `(Person)→(Film_TV_Award:Winner)` | 30 | #2334 (IMDB) | ✅ Live (handoff) |
+| `NOMINATED_FOR` | `(Person)→(Film_TV_Award:Nominee)` | 35 | #2334 (IMDB) | ✅ Live (handoff) |
+| `SAME_AS` | `(Person:Music_Artist)→(Person)` | **1** | #13121 (music pipeline) | ✅ Live (w1 since 2026-07-01) |
+
+<Note>
+  **§3.6 edge-weight audit (2026-05-31)** re-set several of this family's write values: `LOCATED_IN` 10/50 → **70/80**, `LEAD_INVESTED_IN` 30 → **15**, `FOLLOW_ON_INVESTED_IN` 25 → **20**, the film/TV set sub-1 → **30–40**, `HAS_SUBDOMAIN` `null` → **100**; `WORKS_AT`'s 5–40 buckets were confirmed canonical and published rather than changed. Fix-forward is live in all creators; existing rows are reweighted by `tool/backfill-edge-weights` (#13063). Before→after detail: [Edge Weights → Weight audit](/guides/ontology/edge-weights#weight-audit--applied-adjustments).
+</Note>

@@ -68,7 +68,7 @@ The company cascade is non-recursive by construction — depth only ever increas
 
 | Depth | Meaning | Behavior |
 | :-: | --- | --- |
-| **0** | Seed (user / smoke / direct) | Full pipeline: LLM \+ Fundable \+ Exa **people expansion** \+ YC **people** \+ deal fanout (deal fanout additionally requires a **seed marker** — `is_vc`, `seeded_by_user == 1`, or source `"User Input"` / `"ScrapeCreators Linkedin"`) |
+| **0** | Seed (user / smoke / direct) | Full pipeline: LLM \+ Fundable \+ Exa **people expansion** \+ YC **people** \+ deal fanout (every depth-0 company with a fundable org fans out — the **seed-marker requirement was removed 2026-07-03**; depth 0 alone is the gate) |
 | **1** | Direct discovery from a seed | Company data fully enriched (LLM, Fundable, Signal, thesis, specialties, about, locations, node sync). Exa responses **saved but not processed into people**; YC people and deal fanout skipped |
 | **2\+** | Transitive (weak-edge sources) | **Lookup-only / create-blocked** for governor-listed sources (the 2026-06-25 fan-out governor): all `resolve-edges-work` at depth \> 0, weak edge resolvers (volunteering/education/projects-publications/certifications/honor) at depth \> 0, `process-person-phase-3` at depth \> 1, `cascade-deal-participants` at depth \> 0 — these **match existing companies but never mint new ones and never queue work** |
 
@@ -87,7 +87,7 @@ The company cascade is non-recursive by construction — depth only ever increas
 | **1** | Current employer of an enriched person — person phase-3 calls #12558 with `queue: true, cascade_depth: 1, priority_tier: 1` | live |
 | **2** | VC firms from `resolve-investors-edges` #12702 (depth 1) | live — repaired v1.12, 2026-07-02 (see [Cascade examples](#bounded-cascade-example-person-investor-at-depth-0)) |
 | — | Portfolio companies from deal fanout | **NOT queued** — created via get-add with `hold_downstream: true, queue: false` at depth `effective+1` (1 from seed deals since the 2026-07-02 depth repair), tier 2 passed but never used |
-| **4** | Any §11 queue path without an explicit tier — `priority_tier|first_notempty:4` also **coerces an explicit tier 0 → 4** | live (load-bearing coercion) |
+| **4** | Any §11 queue path without an explicit tier (the default). Since 2026-07-03 `priority_tier|first_notnull:4` stores an explicit tier 0 / 1 instead of coercing it to 4 | live |
 
 Adjacent person-queue tiers written by this pipeline: **YC founders → T1**, **YC partner → T2** (both `queue: true`, depth `input+1`, via `master-person-new`); Exa C-suite people are **direct-dispatched** (`enrich-master-person` async at depth `effective+1`, `current_company_only: true`) — no `queue_enrich_person` row; co-angels / VC partners → T1 via #12702 (live again since the 2026-07-02 v1.12 repair).
 
@@ -107,7 +107,7 @@ When the same `master_company_id` is enqueued twice, `upsert-enrich-company` #12
 - **Sync-enrich branch:** at §11 of the entry gate, `cascade_depth == 0 && queue == false && !hold_downstream` → dispatch `enrich-master-company` #12992 **async-shared** immediately. No queue row. (v2.18 removed the `!debug.stop` that used to sit in front of this dispatch — the old doc's Info box about it is stale and gone.)
 - **Forced queue at depth \> 0:** `queue || cascade_depth > 0` always routes to the queue upsert — a depth-1 discovery can never trigger inline full enrichment.
 - **Governor flags on the entry gate:** `hold_downstream` (no dispatch, no queue row, Fundable bulk-link downstream suppressed — read with `first_notnull:false` so explicit `false` survives), `lookup_only` / `allow_create: false` (match-only; miss returns a null shell), `return_fast` (skips only the synchronous §5 LLM preflight; dedup, Fundable, create, dispatch all still run — the async orchestrator owns the LLM waterfall).
-- **The §11 tier coercion is load-bearing (and violates the house `first_notnull` rule):** `priority_tier|first_notempty:4` coerces an explicit tier `0 → 4` — live behavior a parity port must reproduce, flagged not fixed. (The matching deal-cascade depth coercion in #12856/#12702 was **fixed 2026-07-02**: `cascade_depth` is now a nullable input read via `first_notnull`, so an explicit seed `0` survives.)
+- **The §11 tier coercion is now `first_notnull` (fixed 2026-07-03):** `priority_tier|first_notnull:4` stores an explicit tier `0` / `1` instead of coercing it to `4` — a parity port must reproduce the **fixed** behavior. (The matching deal-cascade depth coercion in #12856/#12702 was fixed 2026-07-02: `cascade_depth` is now a nullable input read via `first_notnull`, so an explicit seed `0` survives.)
 - **Drain layer:** Task #127 (cron, **`active = false` live**) picks **one** row per 600 s tick — `priority_tier asc, cascade_depth asc, id asc` — locks it (`processing: true`, non-atomic), runs #12992 synchronously, deletes on success, releases \+ `log_crash` on failure (no retry counter — a deterministically-crashing row head-of-line blocks the queue). Operator batch drain #12816 serves both queues with tier/depth/count filters and `dry_run`. Legacy tool #12672 targets the deprecated #4513 orchestrator — historical only. Cron detail: [Company Waterfall Crons](/guides/enrichment/waterfall/company-crons).
 
 Full field-by-field schemas: [Company Waterfall Tables](/guides/enrichment/waterfall/company-tables).
@@ -145,7 +145,7 @@ The orchestrator opens with a **60-second debounce** (a prior run for the same `
 | 8 | **process-company-phase-3** #12799 — YC | YC detection (Fundable deal ∩ YC org) → Firecrawl scrape \+ LLM extract → relational fanout, at any depth. `process-yc-people` #12700 is **seed-only** (founders → person queue T1, partner → T2, both `queue: true`; FOUNDED/WAS\_FOUNDED/MENTOR edges). Depth \> 0 logs `SKIP: YC people gated to seed company depth`. |
 | 9 | **process-company-phase-5** #12809 — Fundable backfill | **Once-ever**: gated on `company_enrich_data.fundable` empty; a miss writes the `"no_data"` sentinel and permanently retires the phase. Live effect is lookup \+ abouts \+ links \+ backlink (the industries/HQ/follower/banner branches are dead under the v1.1 mapped lookup shape). |
 | 10 | **process-company-phase-6** #12810 — Back-link \+ financial | Domain-only Fundable back-link repair (when `fundable_org_id` empty) \+ `company_financial` upsert of `funding_total` / `total_rounds_raised` / `is_public` — **fill-empty/escalate-only since v1.1 (2026-07-02)**: `funding_total` only when Fundable total \> 0, existing value empty, and not `is_vc`; `total_rounds_raised` fill-forward; `is_public` escalate-only (pre-v1.1 it was an unconditional overwrite including 0/false). There is **no profile-URL canonicalization** in this phase (the old doc's claim was wrong). |
-| 11 | **process-company-phase-7** #12813 — Deals | **Depth 0 AND a seed marker required** (`is_vc` / `seeded_by_user == 1` / source `"User Input"` / `"ScrapeCreators Linkedin"`) — plain depth-0 companies are SKIPped. Repairs depth from the queue row (v1.3). Calls `add-all-fundable-deals` #12703 (v2.1: **25 raised \+ 25 invested caps** per invocation, `"fanout capped"` log on overflow) → `cascade-deal-participants` #12856 v1.6 per deal (staleness gate on `processed_at`; portfolio co ensured `hold_downstream` at depth 1; IPO flip; `Funding_Round` \+ `RAISED`; investor edges \+ co-investor queueing via #12702 v1.12 — repaired 2026-07-02, see [Cascade examples](#bounded-cascade-example-person-investor-at-depth-0)). |
+| 11 | **process-company-phase-7** #12813 — Deals | **Depth 0 only** (the recursion guard) — the seed-marker requirement was removed 2026-07-03, so every depth-0 company with a fundable org fans out; depth > 0 is SKIPped. Repairs depth from the queue row (v1.3). Calls `add-all-fundable-deals` #12703 (v2.1: **25 raised \+ 25 invested caps** per invocation, `"fanout capped"` log on overflow) → `cascade-deal-participants` #12856 v1.6 per deal (staleness gate on `processed_at`; portfolio co ensured `hold_downstream` at depth 1; IPO flip; `Funding_Round` \+ `RAISED`; investor edges \+ co-investor queueing via #12702 v1.12 — repaired 2026-07-02, see [Cascade examples](#bounded-cascade-example-person-investor-at-depth-0)). |
 | 12 | **resolve-company-specialties** #12746 (v1.8) | **Destructive rebuild**: deletes ALL of the company's `SPECIALIZES_IN` edges, then per specialty (top 15 by frequency): blurb LLM → Gemini 3072 embedding → KNN over `expert_embeddings` → 0.15/0.25 guard band with LLM adjudication → exact-name guard → MERGE edge with `weight = min(round(10 + match_score*160), 50)`; **created** nodes get fixed weight 10, a `sub_domain_expertise` row, parent attach via #13142 (`HAS_SUBDOMAIN {weight: 100}` or `parent_unresolved` flag) \+ relational FK dual-write. Edge descriptions via #13144 after every MERGE. Cypher: [company pipeline](/guides/cyphers/company-pipeline). |
 | 13 | **llm-company-about** #2545 | LLM (kimi-k2.5) writes `tagline`, `about` (≤ 229), `about_500` (≤ 500) onto `master_company` (there is no `company_about` column), then `industry-specialties-llm` #4517 (gpt-4o) classifies the about into industries \+ specialties join rows. |
 | 14 | **add-company-locations** #1924 | **Drains already-geocoded `master_address` rows** (`path_triples_added: false`) into City/Region/Country nodes \+ `LOCATED_IN`/`IN_REGION`/`IN_COUNTRY` edges via #4528. No address resolution happens here — geocoding lives upstream (#2451 \+ Radar #2000). |
@@ -173,7 +173,7 @@ The full function roster with per-function version history (including the quick-
     `db.add master_company` \+ `company_enrich_data`, `apply-company-llm-payload` #12989, `add-company-node` #2602 (dual vectors), Fundable fanout (industries, abouts, banner, HQ address, followers, bulk links).
   </Step>
   <Step title="Dispatch">
-    Depth 0 \+ `queue: false` \+ no hold → **async** `enrich-master-company` #12992 at depth 0. The orchestrator runs all 15 steps with seed privileges: Exa people expansion, YC people, and (with a seed marker) deal fanout.
+    Depth 0 \+ `queue: false` \+ no hold → **async** `enrich-master-company` #12992 at depth 0. The orchestrator runs all 15 steps with seed privileges: Exa people expansion, YC people, and deal fanout (every depth-0 company).
   </Step>
 </Steps>
 
@@ -234,7 +234,7 @@ Depth 0: resend.com
     │                 → current employer only → queue_enrich_company leaf (depth 1, T1)
     ├── Step 8:   YC — founders → person queue T1, partner → T2 (seed-only)
     ├── Steps 9–10: Fundable backfill (once-ever) + back-link/financial fill-empty repair
-    ├── Step 11:  Deals — depth 0 AND seed marker required
+    ├── Step 11:  Deals — depth 0 only (seed-marker gate removed)
     │             └── add-all-fundable-deals #12703 v2.1 (25 raised + 25 invested caps)
     │                 per deal → cascade-deal-participants #12856 v1.6
     │                 ├── portfolio co via get-add (depth 1, hold_downstream — NOT queued)
@@ -247,7 +247,7 @@ Depth 0: resend.com
     └── Finalize: enrich_history_company.enrich_success = true
 ```
 
-Seed company enrichment can create a direct depth-1 wave, but downstream fanout is gated. External APIs are called at depth 0 during both `get-add` (LLM \+ Serper) and the orchestrator's pre-phase steps (Exa, Signal NFX, investment thesis — Fundable is a local mirror read). Seed-company Exa C-suite people are enriched immediately, but only their current companies are resolved and queued. Deeper companies may save provider responses and enrich company data, but Exa people, YC people, and Fundable deal fanout stay seed-only — and deal fanout additionally requires a seed marker.
+Seed company enrichment can create a direct depth-1 wave, but downstream fanout is gated. External APIs are called at depth 0 during both `get-add` (LLM \+ Serper) and the orchestrator's pre-phase steps (Exa, Signal NFX, investment thesis — Fundable is a local mirror read). Seed-company Exa C-suite people are enriched immediately, but only their current companies are resolved and queued. Deeper companies may save provider responses and enrich company data, but Exa people, YC people, and Fundable deal fanout stay seed-only (deal fanout runs for every depth-0 company; the seed-marker requirement was removed 2026-07-03).
 
 ## Bounded cascade example: person investor at depth 0
 
@@ -278,7 +278,7 @@ Depth 0: Person investor
     ├── depth-1 people can enrich and resolve current employers as leaves
     ├── depth-1 companies enrich their own company data
     ├── depth-1 companies save Exa C-suite responses but do not create people
-    ├── YC people + deal fanout stay gated to seed depth (+ seed marker)
+    ├── YC people + deal fanout stay gated to seed depth
     └── VC firms discovered from funding rounds suppress full company enrichment
 ```
 
@@ -288,7 +288,7 @@ Depth 0: Person investor
 
 - **Seed cost:** one full person enrichment and one direct investment-network pass when the person is an angel.
 - **Direct fanout:** the current employer is queued at depth 1 / tier 1; portfolio companies are linked but **not** queued; co-angels and VC partners are queued at depth 1 / tier 1 and VC firms at depth 1 / tier 2 (live again since the 2026-07-02 #12702 repair).
-- **No recursive investment closure:** when a queued company processes later, it does not discover every other round and recurse into every investor on those rounds (deal fanout needs depth 0 \+ a seed marker).
+- **No recursive investment closure:** when a queued company processes later, it does not discover every other round and recurse into every investor on those rounds (deal fanout needs depth 0).
 - **Idempotency:** queue upsert semantics collapse repeated discoveries into one row with `count++`, best `priority_tier`, and best/lowest `cascade_depth`.
 
 ---
@@ -297,7 +297,7 @@ Depth 0: Person investor
 
 1. **Dedup ladder in the entry gate:** quick-check (§3), kill-switch/fanout local ladders, post-LLM link \+ domain (§6/§7), post-Fundable domain/original-domain/known-URLs (§9) — an existing company is returned, never re-created.
 2. **Queue upsert:** duplicate `master_company_id` → `count++`, min-tier, min-depth. Single row per company (app-level).
-3. **Seed-only fanout gates** (effective depth 0): Exa people expansion, YC people, and deal fanout — deal fanout additionally requires a seed marker.
+3. **Seed-only fanout gates** (effective depth 0): Exa people expansion, YC people, and deal fanout.
 4. **Depth-2\+ create blocks / lookup-only leaves:** the 2026-06-25 fan-out governor makes weak-edge sources match-only at depth \> 0; portfolio companies are created `hold_downstream` and never queued.
 5. **VC-via-funding-rounds suppression:** VCs that entered through investor resolution skip the entire orchestrator (early return, history row marked clean).
 6. **60 s debounce** on the orchestrator (per company, `source: "Base Company Enrich"`).

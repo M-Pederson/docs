@@ -4,6 +4,16 @@
 
 This is the Mintlify documentation site for Orbiter.io. API docs are generated from the Xano backend (workspace ID: 3, OrbiterV2).
 
+## Orbiter Backend navigation is script-managed
+
+The "Orbiter Backend" group in `docs.json` lists its endpoints explicitly (subgroups per OpenAPI tag, alphabetical; entries as `"METHOD /path"`) because Mintlify cannot sort auto-generated OpenAPI navigation. **Do not hand-edit that group.** After any change to `api-reference/orbiter-backend/openapi.yaml`, run:
+
+```bash
+node scripts/sync-orbiter-backend-nav.mjs
+```
+
+CI does this automatically on pushes to `main` that touch the spec (`.github/workflows/sync-orbiter-backend-nav.yml`), and the daily Xano sync runs it as a safety net. Use `--check` to verify sync status, `--dry-run` to preview.
+
 ## Orbiter Universe display-table modeling memory
 
 When documenting Orbiter Universe graph nodes, card/read-model tables, or side-panel hydration, use this frame:

@@ -1,0 +1,1419 @@
+---
+title: "Company Go/AlloyDB Rebuild Spec"
+sidebarTitle: "Go Rebuild Spec"
+description: "Rebuild-grade implementation contract for porting the Company waterfall from frozen Xano workspace 3 into Go services on GCP, AlloyDB, and Orbiter Universe."
+---
+
+# Company Go/AlloyDB Rebuild Spec
+
+## 1. Executive Summary
+
+This page is the implementation contract for rebuilding the Company enrichment waterfall in Go on GCP, AlloyDB, and the standalone Orbiter Universe graph. It is extracted from:
+
+- The current Company waterfall docs, especially [Company Waterfall](/guides/enrichment/waterfall/company-waterfall), [Entry Points](/guides/enrichment/waterfall/company-entry-points), [Functions](/guides/enrichment/waterfall/company-functions), [Tables](/guides/enrichment/waterfall/company-tables), [Nodes](/guides/enrichment/waterfall/company-nodes), [Edges](/guides/enrichment/waterfall/company-edges), and [Crons](/guides/enrichment/waterfall/company-crons).
+- Read-only Xano workspace 3 exports for 61 Company-related functions under `/Users/markpederson/work/rebuild_specs/company/functions/`.
+- Read-only Task #127 metadata from Xano MCP, confirming `process-company-queue` is `active: false`.
+
+The Go rebuild must preserve the live data contract: procedural dedup, whole-envelope payload storage, queue tier/depth semantics, graph node/edge shape, provider gates, LLM parse/repair behavior, and non-recursive depth policy. Flow changes are allowed only after Mark approval.
+
+This spec does not claim parity is proven. Golden fixtures have not been captured or run.
+
+## 2. How to Use This Spec
+
+Use this page as the authoritative build contract for the Go port. The existing Company waterfall pages remain canonical narrative reference and detailed source catalogs; they are not the implementation checklist.
+
+Implement the shared Go foundations first, then the Company pipeline on top of them. Any proposed change to orchestration order, dedup keys, graph shape, queue semantics, provider request contracts, or historical bug/fix decisions needs Mark approval before implementation.
+
+When in doubt, preserve current live behavior unless this page explicitly marks a behavior as `Fix in Go` or `Xano artifact - do not reimplement`.
+
+## 3. Shared Go Foundations Expected
+
+The Company pipeline must depend on these shared packages instead of rebuilding clients inline:
+
+| Package | Required for Company | Contract |
+| --- | --- | --- |
+| `internal/config` | Required | Env, provider keys, GCP base URLs, runtime datasource, feature flags, kill-switch config. |
+| `internal/provenance` | Required | Canonical source strings: `Base Company Enrich`, `Company_LLM`, `Fundable`, `Signal NFX`, `YC`, `Funding Rounds`, `User Input`, `ScrapeCreators Linkedin`. |
+| `internal/providers` | Required | Typed clients for OpenRouter, Serper, Exa, Brave Search, Firecrawl, Radar, BigQuery, logo URL construction, and the GCP thesis service. |
+| `internal/llm` | Required | OpenRouter client, model registry, JSON extraction, code-fence stripping, retry/repair helpers, reasoning-off support, fixture replay. |
+| `internal/embeddings` | Required | Gemini `gemini-embedding-001` 3072-dim embedding client and vector normalization. OpenAI 1536 vectors are legacy reference context; Universe writes Gemini 3072 as canonical. |
+| `internal/graph` | Required | FalkorDB parameterized node/edge helpers, null/empty property pruning, MERGE envelope, `created_at` coalesce, `updated_at`, deterministic UUID support where required. |
+| `internal/store` | Required | AlloyDB repositories, transactions, idempotency constraints, procedural dedup replicas, JSONB payload persistence. |
+| `internal/queues` | Required | Queue upsert, worker leases, row locking with `FOR UPDATE SKIP LOCKED`, retry, poison handling, DLQ. |
+| `internal/projections` | Required | Company card/read-model snapshot writer for app consumption. |
+| `internal/fixtures` | Required | Recorded provider and LLM replay fixtures plus table/graph parity assertions. |
+
+Provider clients required before the Company pipeline can run: OpenRouter, Serper, Exa, Brave Search, Firecrawl, Radar, BigQuery, GCP thesis builder, FalkorDB, Gemini embeddings, and the local Fundable mirror repositories.
+
+## 4. Freeze Manifest
+
+### Core source set
+
+| Role | Xano item | ID | Updated at / live state | Go role |
+| --- | --- | ---: | --- | --- |
+| Entry gate | `mvp/get-add/master-company-new` | 12558 | `2026-06-29 16:18:28+0000` | Public get-or-create, dedup, create, dispatch/queue. |
+| LLM stage | `mvp/enrich/new-company-enrichment` | 12974 | `2026-06-04 12:50:27+0000` | Web-grounded company research plus Serper profile discovery. |
+| Apply LLM payload | `mvp/enrich/apply-company-llm-payload` | 12989 | `2026-07-02 09:38:48+0000` | Deterministic LLM-to-relational fanout. |
+| Orchestrator | `mvp/enrich/enrich-master-company` | 12992 | `2026-06-29 16:18:17+0000` | Fifteen-step gated worker. |
+| Queue upsert | `mvp/queue/upsert-enrich-company` | 12855 | `2026-06-03 10:12:51+0000` | Single sanctioned queue writer. |
+| Queue batch drain | `mvp/queue/process-enrichment-queue` | 12816 | `2026-06-03 09:53:54+0000` | Operator drain for person/company queues. |
+| Scheduled drain | `process-company-queue` | Task 127 | Updated `2026-07-02 09:37:41+0000`, `active: false`, schedule 600s | Cron reference; not auto-running live. |
+
+### Active function roster
+
+| Group | Function IDs |
+| --- | --- |
+| Domain and entry helpers | 4587, 12696, 12789 |
+| Gated pre-phase | 12991, 12990, 12978, 12911, 12988, 12997 |
+| YC subsystem | 12799, 12700, 4628, 4516, 10503, 12563 |
+| Fundable phase chain | 12809, 12810, 12813, 12703, 12856, 12701, 12702 |
+| Expertise and descriptions | 12746, 13142, 13141, 13143, 13144 |
+| About, tags, locations | 2545, 2538, 4517, 1924, 2451, 4653, 4528, 2000 |
+| Graph writers | 2602, 4659, 2800 |
+| Relational fanout | 2547, 2548, 2446, 2710, 2450, 2540, 281, 2806 |
+| Fundable mirror | 12698, 12689, 12690, 12691, 12692, 12794 |
+| Signal support | 2640, 4515 |
+
+### Tables touched
+
+| Area | Tables |
+| --- | --- |
+| Core company | `master_company` #142, `company_enrich_data` #485, `enrich_history_company` #404, `queue_enrich_company` #583 |
+| Financial/investor | `company_financial` #287, `investor_profile_company` #478, `investment_thesis` #709 |
+| Text/tags/taxonomy | `about_company` #366, `industry_join` #307, `industry` #192, `speciality_join` #456, `specialty` #455, `sub_domain_expertise` #654, `domain_expertise` #459 |
+| Identity | `master_link` #166, `master_address` #164, `master_email` #155, `master_phone` #151 |
+| Logs/config | `log_enrichment_company` #632, `log_crash` #542, `environment_variables` #272 |
+| Fundable mirror | `fundable_organizations` #666, `fundable_people` #667, `fundable_deals` #671, `fundable_institutional_investments` #678, `fundable_angel_investments` #679, and related mirror tables #668-681, #723, #626 |
+
+### External providers
+
+| Provider | Used by | Contract |
+| --- | --- | --- |
+| OpenRouter | 12974, 12990, 12746, 13141, 13143, 2545, 4517, 12700, 4628, 4516, 2540 | LLM calls with model-specific temperature, max tokens, timeout, and parse rules. |
+| Serper | 12974 | Batch profile discovery, 7 platform queries, 30s timeout, silent `[]` on failure. |
+| Exa | 12988 | People search plus optional company contents expansion, 60s timeout, no retry. |
+| Brave Search | 2640 via 12991 | Signal NFX URL discovery. |
+| Firecrawl | 4515 via 12991 and 4628 | Scrape/search wrapper, retry behavior per caller. |
+| GCP thesis service | 12978 | `POST /v1/outcomes/investment-thesis/build`, 180s timeout, one immediate retry. |
+| BigQuery | 12689, 12690 | Mirror ingestion only; not in live synchronous company enrichment. |
+| Radar | 2000 via 2451 | Forward geocoding for addresses before location graph drain. |
+| logo.dev | 12558 | Logo URL string construction only; not fetched. |
+
+### Prompt/model and graph source pages
+
+Use [Company system prompts](/guides/enrichment/company-pipeline/llm-system-prompts), [Company model summary](/guides/enrichment/company-pipeline/model-summary), [All models summary](/guides/enrichment/all-models-summary), [Company cyphers](/guides/cyphers/company-pipeline), and [Funding cyphers](/guides/cyphers/funding) as supporting references. This page restates only the implementation contract needed for the Go rebuild.
+
+## 5. Source Docs Read
+
+Primary:
+
+- [Enrichment GCP Migration](/guides/open-work/orbiter-univers-standalone/enrichment-gcp-migration)
+- [Company Waterfall](/guides/enrichment/waterfall/company-waterfall)
+- [Company Waterfall Entry Points](/guides/enrichment/waterfall/company-entry-points)
+- [Company Waterfall Functions](/guides/enrichment/waterfall/company-functions)
+- [Company Waterfall Tables](/guides/enrichment/waterfall/company-tables)
+- [Company Nodes](/guides/enrichment/waterfall/company-nodes)
+- [Company Edges](/guides/enrichment/waterfall/company-edges)
+- [Company Waterfall Crons](/guides/enrichment/waterfall/company-crons)
+
+Supporting:
+
+- [Company system prompts](/guides/enrichment/company-pipeline/llm-system-prompts)
+- [Company model summary](/guides/enrichment/company-pipeline/model-summary)
+- [Company cyphers](/guides/cyphers/company-pipeline)
+- [Funding cyphers](/guides/cyphers/funding)
+- [Ontology node types](/guides/ontology/nodes)
+- [Ontology edge types](/guides/ontology/edges)
+- [Edge weights](/guides/ontology/edge-weights)
+
+## 6. Entry Points and Public Contracts
+
+### `POST /internal/enrichment/company/get-add`
+
+Go equivalent of `mvp/get-add/master-company-new` #12558.
+
+Input:
+
+| Name | Type | Required | Default | Xano default semantic | Go semantic |
+| --- | --- | --- | --- | --- | --- |
+| `domain` | string | No | `""` | Trimmed; URL-shaped values become null after #4587 | Trim before parse; bare host only becomes registrable domain. |
+| `profile_url` | string | No | `""` | Trimmed; used in `master_link` quick check | Normalize trailing slash, LinkedIn `//linkedin` to `//www.linkedin`. |
+| `company_name` | string | No | `""` | Trimmed; placeholder guard input | Trim; use only as hint. |
+| `source` | string | No | `""` | `first_notempty` to `Base Company Enrich` on create | Canonical source string. |
+| `data_source_id` | int | No | `0` | Legacy, mostly ignored | Accept for compatibility; do not build new behavior on it. |
+| `is_vc` | bool | No | empty | Mostly dead hint | Accept but derive VC status from evidence. |
+| `is_school` | bool | No | empty | Escalate true only | Preserve escalate-only behavior. |
+| `queue` | bool | No | empty | Truthy forces queue path | Explicit bool; default false. |
+| `hold_downstream` | bool | No | empty | `first_notnull:false`; explicit false survives | Suppress enrich and queue fanout when true. |
+| `return_fast` | bool | No | empty | `first_notnull:false`; skips sync LLM only | Async orchestrator still owns enrichment. |
+| `lookup_only` | bool | No | empty | Fanout governor create block | Match-only; miss returns null shell. |
+| `allow_create` | bool | No | empty | `false` creates lookup-only | Default true unless caller explicitly false. |
+| `cascade_depth` | int | No | `0` | `first_notempty:0` in #12558 | Preserve explicit zero at entry gate; note downstream queue tier quirk separately. |
+| `priority_tier` | int | No | `0` | Section 11 uses `first_notempty:4`, so `0 -> 4` | Preserve for parity unless Mark approves fixing. |
+| `source_function` | string | No | `""` | Trace metadata | Persist to queue on insert/update by improvement. |
+| `source_entity_id` | int | No | `0` | Trace metadata | Persist to queue. |
+| `source_entity_uuid` | string | No | `""` | Trace metadata | Persist to queue. |
+| `source_entity_type` | string | No | `""` | Trace metadata and Fundable exact-id gate | Preserve exact string comparisons. |
+| `seeded_by_user` | int | No | `0` | Raw write to company row | Preserve as nullable/int; read by seed-marker gate. |
+
+Return shape:
+
+```json
+{
+  "id": 142001,
+  "company_name": "Resend",
+  "company_domain": "resend.com",
+  "node_uuid": "company-node-uuid",
+  "fundable_org_id": null,
+  "action": "created|found|lookup_only_miss|null_guard"
+}
+```
+
+The Go handler should return the canonical row/shell shape used by product callers, plus enough action metadata for observability. Exact Xano response variants differ by branch; fixtures must pin the fields product code depends on.
+
+### `POST /internal/enrichment/company/run`
+
+Go equivalent of `mvp/enrich/enrich-master-company` #12992.
+
+Input:
+
+| Name | Type | Required | Default | Xano semantic | Go semantic |
+| --- | --- | --- | --- | --- | --- |
+| `master_company_id` | int | No | `0` | Missing row guard; errors mostly logged | Required in Go API; validation error if 0. |
+| `cascade_depth` | int | No | `0` | Repaired against deepest queue row | Compute effective depth from input and queue state. |
+| `data_source_id` | int | No | `0` | Dead legacy | Accept only if compatibility needs it. |
+
+## 7. End-to-End Worked Example
+
+### Example: `resend.com` seed company
+
+Input:
+
+```json
+{
+  "domain": "resend.com",
+  "profile_url": "https://www.linkedin.com/company/resend",
+  "company_name": "Resend",
+  "source": "User Input",
+  "cascade_depth": 0,
+  "priority_tier": 1,
+  "queue": false,
+  "hold_downstream": false,
+  "return_fast": false
+}
+```
+
+Expected control flow:
+
+1. Entry gate rejects placeholders, normalizes domain, resolves redirects, and checks profile URL in `master_link`.
+2. Kill switch reads `environment_variables.name = kill_switch_company`; if active and no local match, return a null shell with no provider calls.
+3. Fanout governor is not active for this seed; create is allowed.
+4. LLM preflight runs #12974 unless `return_fast` is true. It stores the whole response envelope, not only `data`.
+5. Post-LLM dedup checks discovered profile links and domains.
+6. Fundable lookup #12698 reads the local mirror; miss stores the literal JSON string `"no_data"`.
+7. Fresh create writes `master_company`, `company_enrich_data`, relational fanout from #12989, initial Company graph node via #2602, and Fundable fanout if present.
+8. Depth 0, not queue, not hold: dispatch #12992 asynchronously. No queue row is written.
+9. Orchestrator applies its 60s debounce, repairs effective depth from queue context, and runs the 15-step chain.
+10. At seed depth, Exa C-suite/founder people expansion, YC people, and seed-marker deal fanout are allowed. Downstream leaves are depth 1 and bounded.
+
+Expected key AlloyDB writes:
+
+| Table | Key | Important fields |
+| --- | --- | --- |
+| `company` | procedural dedup on `canonical_domain = resend.com` and links | `name`, `canonical_domain`, `source`, `visibility=false`, `is_vc` derived, `node_uuid` after graph create |
+| `company_enrich_data` | `company_id` | `company_llm` full envelope, `fundable` payload or `"no_data"`, later `exa_c_suite`, `yc_data`, `signal_nfx_*` |
+| `company_financial` | `company_id` | Preserve-existing writes from LLM/Fundable; `is_public` escalate-only |
+| `company_enrichment_history` | `(company_id, source, created_at)` | Base row processing lifecycle, `Company_LLM`, `Fundable`, provider trace rows |
+| `company_link` | `(company_id, normalized_url)` | One canonical URL per platform when identity-gated |
+| `about_company` | `(company_id, md5(emoji_stripped_text))` | LLM/Fundable/YC text corpus |
+
+Expected graph writes:
+
+| Node/Edge | Key | Required properties |
+| --- | --- | --- |
+| `Company` | Created once; row stores `node_uuid` | `uuid`, `master_company_id`, `name`, `company_domain`, `display_label`, `created_at`, `name_embedding`, Gemini `embeddings` |
+| `SPECIALIZES_IN` | `(company_uuid, expertise_uuid)` | Destructive rebuild; weight formula for matched nodes; fixed 10 for created nodes |
+| `Funding_Round` | `uuid = fundable_deals.id` | Only when Fundable deals exist and seed-marker gate passes |
+| `RAISED` | `(company_uuid, funding_round_uuid)` | Weight 10, deterministic uuid, created_at from announced date when present |
+| Investor edge set | `(investor_uuid, type, funding_round_uuid)` | Repaired live since 2026-07-02; seed depth only |
+| `WORKS_AT` and title edges | Work experience rows from Exa loop | Written by #2800 after `master-person-from-exa` returns |
+| Location edges | Address graph drain | `LOCATED_IN`, `IN_REGION`, `IN_COUNTRY` from already-geocoded addresses |
+
+Queue/projection side effects:
+
+- No `queue_enrich_company` row for this seed input.
+- Depth-1 companies discovered later must queue through `upsert-enrich-company`.
+- Projection writer must emit or refresh `company_card_snapshot` after create and again after enrichment completion.
+
+Acceptance checks:
+
+- Re-running the same seed does not create a second canonical company row when dedup keys match.
+- Re-running within 60 seconds does not run a second orchestrator pass.
+- The Company node is not created twice after `node_uuid` is already set.
+- Empty/null optional graph properties are absent, not present as nulls.
+- A duplicate queue request for the same company increments `count` and preserves best tier/depth.
+- Explicit `priority_tier: 0` through the queue path behaves as documented: it becomes tier 4.
+
+## 8. Function Contract Sheets
+
+### `mvp/get-add/master-company-new` #12558
+
+Role: synchronous entry gate and only sanctioned Company get-or-create path.
+
+Reads:
+
+- `master_link`, `master_company`, `company_enrich_data`, `environment_variables`, `fundable_organizations`, `log_enrichment_company`.
+
+Writes:
+
+- `log_enrichment_company`, `log_crash`, `enrich_history_company`, `master_company`, `company_enrich_data`, `company_financial`, identity/tag/about tables, `fundable_organizations` backlinks, initial Company graph node.
+
+Calls:
+
+- #4587, #12696, #12789, #12974, #12698, #12989, #2602, #12855, #12992, plus fanout helpers #2547, #2548, #2538, #2446, #2451, #281.
+
+External providers:
+
+- OpenRouter and Serper via #12974. Fundable lookup is local mirror only. logo.dev URL is constructed, never fetched.
+
+Queue behavior:
+
+- `hold_downstream` true: no queue and no orchestrator dispatch.
+- `cascade_depth == 0 && queue == false && hold_downstream == false`: async orchestrator dispatch.
+- Otherwise: sync `upsert-enrich-company` #12855.
+
+Pseudo-code:
+
+```go
+func GetAddCompany(ctx context.Context, in CompanySeed) (*CompanyResult, error) {
+    if placeholderCompany(in.CompanyName, in.ProfileURL) {
+        logQAPass("placeholder blocked")
+        return nil, nil
+    }
+
+    normalized := normalizeCompanySeed(in)
+    if hit := findByProfileLink(ctx, normalized.ProfileURL); hit != nil {
+        maybeQueueOrDispatch(ctx, hit.ID, in)
+        return hit, nil
+    }
+
+    if killSwitchOn(ctx) {
+        return localOnlyCompanyLookup(ctx, normalized)
+    }
+
+    if isLookupOnly(normalized) {
+        return localOnlyCompanyLookup(ctx, normalized)
+    }
+
+    var llm CompanyLLMEnvelope
+    if !in.ReturnFast && hasIdentityHint(normalized) {
+        llm = providers.CompanyResearch(ctx, normalized)
+    }
+
+    if hit := postLLMDedup(ctx, normalized, llm); hit != nil {
+        maybeQueueOrDispatch(ctx, hit.ID, in)
+        return hit, nil
+    }
+
+    fundable := store.LookupFundableCompany(ctx, normalized)
+    if hit := postFundableDedup(ctx, normalized, fundable); hit != nil {
+        maybeQueueOrDispatch(ctx, hit.ID, in)
+        return hit, nil
+    }
+
+    return store.WithTx(ctx, func(tx Tx) (*CompanyResult, error) {
+        company := tx.CreateCompany(normalized, llm, fundable)
+        tx.CreateCompanyEnrichData(company.ID, llm, fundableOrNoData(fundable))
+        tx.ApplyCompanyLLMPayload(company.ID, "Company_LLM")
+        graph.CreateCompanyNode(ctx, tx, company.ID)
+        tx.ApplyFundableFanout(company.ID, fundable, in.HoldDownstream)
+        maybeQueueOrDispatch(ctx, company.ID, in)
+        projections.WriteCompanyCardSnapshot(ctx, tx, company.ID)
+        return company, nil
+    })
+}
+```
+
+Go implementation notes:
+
+- Use a transaction for row creation and relational fanout, but treat graph writes as idempotent side effects with recovery/backfill.
+- Preserve procedural dedup keys, but intentionally add unique constraints in AlloyDB where this spec calls them out. The Go code must still mimic branch behavior on conflict.
+- Do not trust `is_vc` input; derive from domain/profile/Fundable/LLM evidence.
+
+Artifact decisions:
+
+- Xano serializer workarounds (`{}|set`, double-prefix URL lookup, dead `$modelUsed`) are not ported.
+- Preserve the load-bearing smoke-test typo only if external callers still send it: `seed-invetment-thesis-smoke-test`.
+
+Acceptance checks:
+
+- Placeholder company returns null and creates no row/node.
+- URL-shaped `domain` does not become a bad domain.
+- Kill switch blocks new creation and makes no provider calls.
+- Lookup-only hit returns existing company without queueing.
+- Fresh seed dispatches the orchestrator; depth-1 leaf queues.
+
+### `mvp/enrich/new-company-enrichment` #12974
+
+Role: pure compute Company research envelope.
+
+Inputs:
+
+| Name | Type | Required | Go semantic |
+| --- | --- | --- | --- |
+| `company_name` | string | Yes | Must be present unless exact source evidence is sufficient by caller policy. |
+| `company_domain` | string | No | Identity hint, not always official domain. |
+| `linkedin_url` | string | No | Exact known LinkedIn wins profile merge. |
+| `source_urls` | JSON array | No | Exact evidence pages for weak identities. |
+| `source_facts` | JSON object | No | Deterministic overrides and evidence facts. |
+
+Output shape:
+
+```json
+{
+  "data": {
+    "name": "Resend",
+    "legal_name": null,
+    "aliases": [],
+    "domain": "resend.com",
+    "alt_domains": [],
+    "company_type": "Private Company",
+    "profiles": [],
+    "_meta": {
+      "confidence": { "overall": 0.82 },
+      "sources": [],
+      "notes": []
+    }
+  },
+  "model_used": "google/gemini-3.1-flash-lite",
+  "escalated": false,
+  "gemini_confidence": 0.82
+}
+```
+
+Provider calls:
+
+- OpenRouter tier 1: `google/gemini-3.1-flash-lite`, `openrouter:web_search`, temperature 0, max tokens 8000, timeout 180s, `provider.data_collection = deny`.
+- Escalation: `anthropic/claude-sonnet-4.6`, `openrouter:web_search`, temperature 0.2, max tokens 8000, timeout 240s, when parse fails, confidence is missing/non-numeric, or confidence is below 0.7.
+- Serper: `POST https://google.serper.dev/search`, batch of seven platform queries, timeout 30s, silent `[]` on failure.
+
+Pseudo-code:
+
+```go
+func CompanyResearch(ctx context.Context, in ResearchInput) (CompanyLLMEnvelope, error) {
+    requireIdentityHint(in.CompanyDomain, in.LinkedInURL, in.SourceURLs, in.SourceFacts)
+    tier1 := openrouter.Chat(ctx, geminiCompanyPrompt(in), GeminiFlashLite, 180*time.Second)
+    parsed := parseCompanyJSON(tier1)
+    confidence := parsed.Meta.Confidence.Overall
+    envelope := envelopeFrom(parsed, GeminiFlashLite)
+    if !parsed.Valid || confidence == nil || *confidence < 0.7 {
+        tier2 := openrouter.Chat(ctx, companyPrompt(in), ClaudeSonnet46, 240*time.Second)
+        parsed2 := parseCompanyJSON(tier2)
+        envelope = envelopeFrom(parsed2, ClaudeSonnet46)
+        envelope.Escalated = true
+    }
+    serperURLs := serper.ProfileSearch(ctx, in)
+    envelope.Data.Profiles = mergeAndIdentityGateProfiles(envelope.Data.Profiles, serperURLs, in)
+    normalizeCompanyResearch(&envelope.Data, in.SourceFacts)
+    return envelope, nil
+}
+```
+
+Acceptance checks:
+
+- A tier-1 response with missing `_meta.confidence.overall` escalates.
+- A tier-2 parse failure returns an envelope with `data._error`; callers do not treat it as success.
+- Serper failure does not fail the LLM stage.
+- Profile merge emits at most one URL per platform and rejects person/content URLs.
+
+### `mvp/enrich/apply-company-llm-payload` #12989
+
+Role: deterministic mapping from `company_enrich_data.company_llm.data` into relational tables.
+
+Writes:
+
+- `master_company`: preserve-existing scalar fills, `is_school`/`is_vc` true-only escalation except documented repair paths outside this helper.
+- `company_financial`: preserve-existing per field since v1.8, VC funding suppression after coalesce.
+- `master_link`, `industry_join`, `speciality_join`, `about_company`, `master_address`, `master_email`, `master_phone`.
+
+Pseudo-code:
+
+```go
+func ApplyCompanyLLMPayload(ctx context.Context, tx Tx, companyID int64) error {
+    ced := tx.GetCompanyEnrichData(companyID)
+    data := ced.CompanyLLM.Data
+    if data.Empty() {
+        return nil
+    }
+    tx.PreserveCompanyScalars(companyID, data)
+    tx.UpsertCompanyFinancialPreserveExisting(companyID, data, ced.Fundable)
+    tx.UpsertProfileLinks(companyID, identityGateProfiles(data.Profiles), "Company_LLM")
+    tx.AddIndustryArray(companyID, industriesFrom(data))
+    tx.AddSpecialtyArray(companyID, specialtiesFrom(data))
+    tx.AddAboutRows(companyID, aboutTextsFrom(data), "Company_LLM")
+    tx.AddAddresses(companyID, addressesFrom(data), "Company_LLM")
+    tx.AddEmailAndPhones(companyID, data)
+    return nil
+}
+```
+
+Acceptance checks:
+
+- Existing non-empty `company_financial` fields are not clobbered by sparse LLM output.
+- `angel.co` and `wellfound.com` profiles pass the current v1.8 regex.
+- Short aliases do not validate unrelated social handles.
+
+### `mvp/enrich/enrich-master-company` #12992
+
+Role: fifteen-step orchestrator.
+
+State machine:
+
+1. Debounce: if a `Base Company Enrich` history row exists for this company within 60s, log QA pass and return before base history row.
+2. Add base `enrich_history_company` row with `processing = true`.
+3. Load company and deepest queue row; compute effective depth.
+4. Suppress funding-round-sourced VCs at depth greater than 0.
+5. Guard missing `company_enrich_data`.
+6. Step 1+2: LLM preflight when `company_llm.data` empty; persist whole envelope.
+7. Step 3: apply LLM payload only when LLM just ran.
+8. Step 4/4.5: Fundable re-lookup and VC classification repair.
+9. Step 5: Signal NFX when gated.
+10. Step 6: investment thesis when gated.
+11. Step 7: Exa C-suite; seed-depth people expansion only.
+12. Steps 8-11: YC, Fundable backfill, financial/backlink repair, deal fanout.
+13. Step 12: specialties destructive rebuild.
+14. Step 13: about and industry classifier.
+15. Step 14: location graph drain.
+16. Step 15: update Company node.
+17. Step 15.5: `is_vc` re-assert.
+18. Finalize base history row.
+
+Failure behavior:
+
+- Most steps are isolated in try/catch, append `log_crash`, set `$hasCrash = true`, and continue.
+- Inner Exa per-person and avatar warnings do not set crash state.
+- Inline repair/finalize blocks are less protected in Xano; Go should make finalization robust while recording parity notes.
+
+Pseudo-code:
+
+```go
+func EnrichMasterCompany(ctx context.Context, companyID int64, depth int) error {
+    if store.RecentBaseCompanyRun(ctx, companyID, 60*time.Second) {
+        logs.QAPass(ctx, companyID, "DUPLICATE TRIGGER")
+        return nil
+    }
+    hist := store.StartCompanyHistory(ctx, companyID, "Base Company Enrich")
+    crash := false
+
+    c := store.GetCompany(ctx, companyID)
+    effectiveDepth := max(depth, store.DeepestQueuedDepth(ctx, companyID))
+    if shouldSuppressFundingRoundVC(c, effectiveDepth) {
+        store.FinishCompanyHistory(ctx, hist.ID, true)
+        return nil
+    }
+    if !store.HasCompanyEnrichData(ctx, companyID) {
+        store.FinishCompanyHistory(ctx, hist.ID, false)
+        return nil
+    }
+
+    crash = runStep(ctx, &crash, "Company_LLM", func() error { return maybeRunCompanyLLM(ctx, companyID) })
+    crash = runStep(ctx, &crash, "Apply LLM", func() error { return maybeApplyCompanyLLM(ctx, companyID) })
+    crash = runStep(ctx, &crash, "Fundable", func() error { return fundableRelookupAndVCRepair(ctx, companyID) })
+    crash = runStep(ctx, &crash, "Signal NFX", func() error { return maybeSignalNFX(ctx, companyID) })
+    crash = runStep(ctx, &crash, "Thesis", func() error { return maybeBuildThesis(ctx, companyID) })
+    crash = runStep(ctx, &crash, "Exa", func() error { return maybeExaCSuite(ctx, companyID, effectiveDepth) })
+    crash = runStep(ctx, &crash, "YC", func() error { return processYC(ctx, companyID, effectiveDepth) })
+    crash = runStep(ctx, &crash, "Fundable Backfill", func() error { return processFundableBackfill(ctx, companyID) })
+    crash = runStep(ctx, &crash, "Financial", func() error { return processFinancialRepair(ctx, companyID) })
+    crash = runStep(ctx, &crash, "Deals", func() error { return maybeDealFanout(ctx, companyID, effectiveDepth) })
+    crash = runStep(ctx, &crash, "Specialties", func() error { return resolveCompanySpecialties(ctx, companyID) })
+    crash = runStep(ctx, &crash, "About", func() error { return writeCompanyAbout(ctx, companyID) })
+    crash = runStep(ctx, &crash, "Locations", func() error { return addCompanyLocations(ctx, companyID) })
+    crash = runStep(ctx, &crash, "Node Sync", func() error { return graph.UpdateCompanyNode(ctx, companyID) })
+    reassertVC(ctx, companyID)
+    store.FinishCompanyHistory(ctx, hist.ID, !crash)
+    projections.WriteCompanyCardSnapshot(ctx, companyID)
+    return nil
+}
+```
+
+Acceptance checks:
+
+- A duplicate run inside 60s writes only the duplicate marker.
+- Effective depth cannot be lowered by a stale direct async call.
+- Leaf companies at depth 1 save Exa results but do not create people.
+- A failure in one step does not skip later isolated steps.
+
+### Queue contracts: #12855, #12816, Task #127
+
+Role: bounded at-least-once processing of cascade leaves.
+
+`upsert-enrich-company` #12855:
+
+- Guard `master_company_id` null/0 -> `skipped_no_id`, no write.
+- `cascade_depth|first_notempty:0`.
+- `priority_tier|first_notempty:4`; explicit 0 becomes 4.
+- Existing row: `count++`, `priority_tier = min(existing, incoming)`, `cascade_depth = min(existing, incoming)`.
+- Source metadata updates only when incoming depth is strictly better, or equal depth with better tier; empty incoming fields do not wipe existing metadata.
+- Insert: `processing=false`, `count=1`, effective depth/tier, source metadata.
+
+Task #127:
+
+- `active = false` live.
+- Schedule every 600s when enabled.
+- Pick one `queue_enrich_company` row where `processing=false`, sorted `priority_tier asc, cascade_depth asc, id asc`.
+- Set `processing=true`, run #12992 synchronously with row depth, delete on success, log and release on failure.
+- No kill-switch check, retry counter, or DLQ.
+
+Operator #12816:
+
+- Processes person queue before company queue when `entity_type=both`.
+- Checks kill switches.
+- Reads first 100 company rows sorted by `priority_tier asc`; filters in memory by max tier, max depth, min count; caps to `max_items`.
+- `dry_run` is read-only for writes but counters are response counters, not actual processed rows.
+
+Go worker contract:
+
+```sql
+SELECT *
+FROM company_enrichment_queue
+WHERE processing = false
+ORDER BY priority_tier ASC, cascade_depth ASC, id ASC
+FOR UPDATE SKIP LOCKED
+LIMIT 1;
+```
+
+Add a retry counter and DLQ in Go, but keep data-contract behavior for successful rows.
+
+### Provider and phase functions
+
+| Function | Role | Go contract |
+| --- | --- | --- |
+| #12991 / #12990 | Signal NFX scrape and parse | 30-day attempt debounce on `Signal NFX`, Brave URL discovery, Firecrawl scrape, parse JSON, write `signal_nfx_*`, upsert investor profile, flip `is_vc=true`. |
+| #12978 / #12911 | Investment thesis | Gather 36-month context with all-time fallback; POST to GCP; retry once; firm-name mismatch writes rejection sentinel. |
+| #12988 / #12997 | Exa C-suite | Fetch once, save envelope at any depth, seed-depth people expansion only. |
+| #12799 / #12700 / #4628 | YC | YC detection and scrape; people seed-only; founder without LinkedIn is dropped. |
+| #12809 | Fundable backfill | Once-ever based on `company_enrich_data.fundable` emptiness; `"no_data"` miss retires this phase. |
+| #12810 | Financial repair | Domain-only Fundable backlink plus fill-empty/escalate-only financial repair. |
+| #12813 / #12703 / #12856 | Deal fanout | Requires effective depth 0 and seed marker; 25 raised plus 25 invested cap; per-deal cascade self-gates on staleness. |
+| #12701 / #12702 | Funding graph and investor edges | Funding_Round plus RAISED always when materialized; investor edge set only from repaired seed-depth path. |
+| #12746 / #13142 / #13141 / #13143 / #13144 | Expertise | Destructive `SPECIALIZES_IN` rebuild; KNN/exact-name/LLM guard; parent attach; edge description generation. |
+| #2545 / #4517 | About/classifier | Kimi about writer, then GPT-4o industry/specialty classifier. |
+| #1924 / #4528 | Locations | Drain geocoded addresses into graph, then mark `path_triples_added`. |
+| #2602 / #4659 | Company graph node | Create once with row-stamped uuid; sync properties later without label repair. |
+
+## 9. Orchestration State Machine
+
+```text
+seed/request
+  -> get-add gate
+     -> placeholder/kill/governor short-circuit
+     -> LLM + Fundable sourcing
+     -> procedural dedup
+     -> row + node create
+     -> dispatch decision
+        -> seed immediate async orchestrator
+        -> depth leaf queue upsert
+        -> hold_downstream no-op
+
+queue drain or async dispatch
+  -> 60s debounce
+  -> effective-depth repair
+  -> funding-round VC suppression
+  -> LLM/apply/Fundable/Signal/thesis/Exa/YC/Fundable/deal/specialty/about/location/node
+  -> projection refresh
+```
+
+Seed-only gates:
+
+| Gate | Seed behavior | Depth greater than 0 |
+| --- | --- | --- |
+| Exa people expansion | Create/update people, work edges, async person enrichment | Save envelope only |
+| YC people | Founders T1, partner T2 into person queue | Skip people |
+| Deal fanout | Requires seed marker in addition to depth 0 | Skip |
+| Funding investor edge set | Repaired #12702 fires from explicit seed 0 | Omitted depth fails closed to 1 |
+
+## 10. Provider Contracts
+
+### OpenRouter Company Research
+
+Called by: #12974.
+
+Request:
+
+```http
+POST /api/v1/chat/completions
+Authorization: Bearer ${OPENROUTER_API_KEY}
+Content-Type: application/json
+```
+
+Tier 1:
+
+```json
+{
+  "model": "google/gemini-3.1-flash-lite",
+  "temperature": 0,
+  "max_tokens": 8000,
+  "tools": [{ "type": "openrouter:web_search" }],
+  "provider": { "sort": "throughput", "allow_fallbacks": true, "data_collection": "deny" }
+}
+```
+
+Tier 2:
+
+```json
+{
+  "model": "anthropic/claude-sonnet-4.6",
+  "temperature": 0.2,
+  "max_tokens": 8000,
+  "tools": [{ "type": "openrouter:web_search" }],
+  "provider": { "sort": "throughput", "allow_fallbacks": true, "data_collection": "deny" }
+}
+```
+
+Timeouts: 180s tier 1, 240s tier 2. No retry beyond the tier-2 escalation. Persist raw parsed envelope in JSONB.
+
+### Serper Profile Discovery
+
+Called by: #12974.
+
+Request:
+
+```http
+POST https://google.serper.dev/search
+X-API-KEY: ${SERPER_API_KEY}
+Content-Type: application/json
+```
+
+Body: batch of 7 `site:` queries for LinkedIn, X/Twitter, Facebook, Instagram, YouTube, Crunchbase, and Wellfound.
+
+Timeout: 30s. Failure returns `[]` and does not fail #12974.
+
+### Exa C-suite Search
+
+Called by: #12988 from orchestrator Step 7.
+
+Request:
+
+```http
+POST https://api.exa.ai/search
+x-api-key: ${EXA_API_KEY}
+Content-Type: application/json
+```
+
+```json
+{
+  "query": "Find only founders, co-founders, C-suite executives...",
+  "category": "people",
+  "numResults": 6,
+  "type": "auto",
+  "contents": {
+    "highlights": true,
+    "summary": {
+      "query": "Professional bio: current role, full work history with companies and dates, education, notable achievements, location"
+    }
+  }
+}
+```
+
+Optional expansion:
+
+```http
+POST https://api.exa.ai/contents
+```
+
+Purpose: expand referenced companies and schools into richer objects. Timeout 60s. No retry. Zero-match envelope is saved and permanently satisfies the fetch-once gate.
+
+### Signal NFX
+
+Called by: #12991 when `fundable_org_id` and `is_vc` are true and `signal_nfx_json` is empty.
+
+Flow:
+
+1. 30-day debounce on `enrich_history_company.source = "Signal NFX"`.
+2. Brave Search helper #2640 discovers a Signal NFX URL.
+3. Firecrawl helper #4515 scrapes the page.
+4. #12990 parses markdown to JSON using `$env.LLM_MODEL_JSON_PARSE`, temperature 0.1, 4000 max tokens, 60s.
+5. Persist raw scrape and parsed JSON; upsert investor profile; flip `is_vc = true`.
+
+Terminal statuses:
+
+- No URL: close history as success/no-op.
+- Scrape failure: structured failure object may be persisted; tolerate `markdown = null`.
+- Parse null: leaves `signal_nfx_json` empty, but 30-day debounce suppresses retry.
+
+### GCP Investment Thesis
+
+Called by: #12978.
+
+Request:
+
+```http
+POST ${GCP_BACKEND_URL}/v1/outcomes/investment-thesis/build
+Content-Type: application/json
+```
+
+```json
+{
+  "master_company_id": 142001,
+  "context": { "entity_type": "company", "deals": [], "stats": {} },
+  "data_source": "xano_company_enrichment"
+}
+```
+
+Timeout: 180s. Retry: exactly one immediate retry on non-200. Both fail -> input/badrequest style failure. No auth header in Xano; Go should use service-to-service auth if the Cloud Run endpoint requires it, with Mark approval if that changes contract.
+
+### Fundable Mirror and BigQuery
+
+Live enrichment reads the local Fundable mirror. It does not query BigQuery inline.
+
+`fundable-lookup` #12698 precedence:
+
+1. Exact `fundable_org_id`.
+2. Domain.
+3. Original domain.
+4. LinkedIn URL.
+5. Crunchbase URL.
+
+Returns null or a single-row legacy-array shape in Xano. Go should expose row-or-nil internally while preserving caller semantics.
+
+BigQuery mirror ingestion #12689/#12690 is a separate substrate. It pulls one organization and related subgraph into `fundable_*` tables. Its trigger is not identified in the active Company waterfall.
+
+## 11. LLM Contracts
+
+| Function | Model | Temp | Max tokens | Timeout | Parse behavior |
+| --- | --- | ---: | ---: | ---: | --- |
+| #12974 tier 1 | `google/gemini-3.1-flash-lite` | 0 | 8000 | 180s | Extract JSON object, normalize schema, escalate on bad/missing confidence. |
+| #12974 tier 2 | `anthropic/claude-sonnet-4.6` | 0.2 | 8000 | 240s | Replaces tier-1 result, may return `data._error`. |
+| #12990 Signal parse | `$env.LLM_MODEL_JSON_PARSE` | 0.1 | 4000 | 60s | Strip fences; parse object; return null on any failure. |
+| #12746 specialty blurb | `google/gemini-3.1-flash-lite` | 0.2 | not fixed in docs | 25s | Fallback to specialty name if decode fails. |
+| #12746 guard-band adjudication | `google/gemini-3.1-flash-lite` | 0 | not fixed in docs | 20s | `{"same": bool}`; decode failure creates new node. |
+| #13141 parent domain | `google/gemini-3.1-flash-lite` | 0 | 2000 | 90s | Three attempts, fail-loud after exhaustion. |
+| #13143 edge description | `deepseek/deepseek-v4-flash` | 0.3 | 300 | 120s | Good-or-null; out-of-credits guard throws. |
+| #2545 about | `moonshotai/kimi-k2.5` | 0.2 then 0.3 retry | 2000 | 60s each | Parse JSON, clamp lengths, failure logs and returns empty. |
+| #4517 industry classifier | `openai/gpt-4o` | 0 | 4000 | 60s | Shape failures degrade to `{industry:null,specialties:[]}`. |
+| #12563 founder LinkedIn | direct Groq `groq/compound` | 0.2 | 1024 | 30s | Raw string; no validation; empty drops founder. |
+
+Do not duplicate long prompts in Go code tests. Store prompt fixtures and model configs in `internal/llm` and cross-link this page to prompt docs.
+
+## 12. AlloyDB Target Schema
+
+The Go schema should close Xano double-create windows with intentional unique constraints while preserving branch behavior through `ON CONFLICT` handling.
+
+### `company`
+
+Purpose: canonical company record.
+
+Source Xano table: `master_company` #142.
+
+Primary key: `id`.
+
+Natural/idempotency keys: canonical domain, normalized LinkedIn/Crunchbase links, and profile URLs through `company_link`.
+
+```sql
+CREATE TABLE company (
+  id BIGSERIAL PRIMARY KEY,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ,
+  node_uuid TEXT UNIQUE,
+  label TEXT NOT NULL DEFAULT 'Company',
+  visibility BOOLEAN NOT NULL DEFAULT false,
+  name TEXT,
+  legal_name TEXT,
+  aliases TEXT[] DEFAULT '{}',
+  canonical_domain TEXT,
+  alternative_domains TEXT[] DEFAULT '{}',
+  linkedin_url TEXT,
+  logo_url TEXT,
+  tagline TEXT,
+  about TEXT,
+  about_500 TEXT,
+  founded_year INT,
+  employees JSONB,
+  is_school BOOLEAN NOT NULL DEFAULT false,
+  is_vc BOOLEAN NOT NULL DEFAULT false,
+  seeded_by_user BIGINT,
+  fundable_org_id UUID,
+  source TEXT
+);
+
+CREATE UNIQUE INDEX company_domain_uq
+  ON company (canonical_domain)
+  WHERE canonical_domain IS NOT NULL AND canonical_domain <> '';
+```
+
+Migration notes:
+
+- Xano has no unique index on `company_domain`; the Go port intentionally adds one to close a race. Conflict handling must return the existing row and then run the same dispatch/queue branch as a dedup hit.
+- Keep `source` text; do not revive `data_source_id` as a primary provenance field.
+- Null-domain companies are legal and cannot be domain-unique.
+
+### `company_enrich_data`
+
+Purpose: one-row provider payload store.
+
+Source Xano table: `company_enrich_data` #485.
+
+```sql
+CREATE TABLE company_enrich_data (
+  company_id BIGINT PRIMARY KEY REFERENCES company(id),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ,
+  fundable JSONB,
+  company_llm JSONB NOT NULL DEFAULT '{}'::jsonb,
+  exa_c_suite JSONB,
+  yc_data JSONB,
+  yc_partner_page JSONB,
+  signal_nfx_scrape JSONB,
+  signal_nfx_json JSONB,
+  legacy_payloads JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+```
+
+JSONB fields:
+
+| Field | Shape | Producer | Consumer |
+| --- | --- | --- | --- |
+| `company_llm` | Full #12974 envelope | Entry gate or orchestrator | #12989, dedup, Fundable relink, node sync |
+| `fundable` | Mirror payload or JSON string `"no_data"` | Entry gate, phase 5 | Financials, about/link fanout, phase gates |
+| `exa_c_suite` | #12988 envelope | Orchestrator Step 7 | Fetch-once gate and people expansion |
+| `yc_data` | YC JSON or `"no_data"` | #4628 | Phase 3, YC people |
+| `signal_nfx_*` | Scrape and parse JSON | #12991 | VC proof, investor profile |
+
+### `company_enrichment_history`
+
+Purpose: append-mostly attempt log and debounce surface.
+
+Source Xano table: `enrich_history_company` #404.
+
+```sql
+CREATE TABLE company_enrichment_history (
+  id BIGSERIAL PRIMARY KEY,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ,
+  company_id BIGINT REFERENCES company(id),
+  source TEXT NOT NULL DEFAULT '',
+  processing BOOLEAN NOT NULL DEFAULT false,
+  enrich_success BOOLEAN NOT NULL DEFAULT false,
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  qa_passed BOOLEAN,
+  note TEXT
+);
+
+CREATE INDEX company_history_debounce_idx
+  ON company_enrichment_history (company_id, source, created_at DESC);
+```
+
+### `company_enrichment_queue`
+
+Purpose: company cascade queue.
+
+Source Xano table: `queue_enrich_company` #583.
+
+```sql
+CREATE TABLE company_enrichment_queue (
+  id BIGSERIAL PRIMARY KEY,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ,
+  company_id BIGINT NOT NULL REFERENCES company(id),
+  processing BOOLEAN NOT NULL DEFAULT false,
+  count INT NOT NULL DEFAULT 1,
+  cascade_depth INT NOT NULL DEFAULT 0,
+  priority_tier INT NOT NULL DEFAULT 4,
+  source_function TEXT,
+  source_entity_id BIGINT,
+  source_entity_uuid TEXT,
+  source_entity_type TEXT,
+  retry_count INT NOT NULL DEFAULT 0,
+  last_error TEXT
+);
+
+CREATE UNIQUE INDEX company_enrichment_queue_company_uq
+  ON company_enrichment_queue (company_id);
+
+CREATE INDEX company_enrichment_queue_pick_idx
+  ON company_enrichment_queue (processing, priority_tier, cascade_depth, id);
+```
+
+Migration notes:
+
+- Xano has no unique index here; Go intentionally adds one and implements #12855 semantics with an upsert.
+- Preserve `priority_tier: 0 -> 4` in the queue writer unless Mark approves a fix.
+
+### `company_financial`
+
+```sql
+CREATE TABLE company_financial (
+  company_id BIGINT PRIMARY KEY REFERENCES company(id),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ,
+  company_type TEXT DEFAULT 'Privately Held',
+  yc_batch TEXT,
+  funding_total JSONB,
+  total_rounds_raised INT,
+  is_public BOOLEAN NOT NULL DEFAULT false,
+  went_public_on DATE,
+  stock_label TEXT,
+  ticker TEXT,
+  primary_exchange TEXT,
+  stock_link TEXT,
+  revenue JSONB,
+  acquisition JSONB
+);
+```
+
+Writer precedence: #12989 preserve-existing, YC force company type, #12810 fill-empty/escalate-only, #12856 IPO escalate-only.
+
+### `company_investor_profile`
+
+```sql
+CREATE TABLE company_investor_profile (
+  company_id BIGINT PRIMARY KEY REFERENCES company(id),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ,
+  location TEXT,
+  exits TEXT,
+  investment_range TEXT,
+  investment_sweet_spot TEXT,
+  investment_stages TEXT,
+  derived_thesis_summary TEXT
+);
+```
+
+Notes: the Xano default `exits = "null"` is a historical string quirk; Go should use nullable text unless fixtures require exact projection.
+
+### `investment_thesis`
+
+```sql
+CREATE TABLE investment_thesis (
+  id BIGSERIAL PRIMARY KEY,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ,
+  node_uuid TEXT,
+  person_id BIGINT,
+  company_id BIGINT,
+  firm_name TEXT,
+  investor_type TEXT,
+  industries JSONB,
+  stage_focus JSONB,
+  geography JSONB,
+  check_size_min NUMERIC,
+  check_size_max NUMERIC,
+  check_size_sweet_spot NUMERIC,
+  total_deals_count INT,
+  lead_deals_count INT,
+  lead_ratio NUMERIC,
+  last_lead_date DATE,
+  last_investment_date DATE,
+  declared_thesis_summary TEXT,
+  derived_thesis_summary TEXT,
+  data_sources JSONB,
+  last_validated_date DATE
+);
+
+CREATE INDEX investment_thesis_company_idx ON investment_thesis (company_id);
+CREATE INDEX investment_thesis_person_idx ON investment_thesis (person_id);
+```
+
+### Supporting tables
+
+| Table | Go key | Notes |
+| --- | --- | --- |
+| `company_link` | Unique `(company_id, normalized_url)` | Normalize trailing slash, Twitter -> X, lowercase; source text retained. |
+| `about_company` | Unique `(company_id, hash)` | Hash emoji-stripped text; source is not part of key. |
+| `company_industry_join` | Unique `(company_id, lower(industry_name))` | Preserve historical duplicate rows only if imported; Go should avoid new duplicates. |
+| `company_specialty_join` | Unique `(company_id, specialty_name)` | Case-sensitive exact name. |
+| `company_address` | Unique semantic key from geocoded city/region/country | `path_triples_added` gates location graph drain. |
+| `company_email` | Unique `(company_id, email_address)` | Lowercase email. |
+| `company_phone` | Unique `(company_id, e164_phone)` | E.164 result is dedup key. |
+| `fundable_*` | Mirror keys from BigQuery | Preserve `processed_at` and `funding_round_node_uuid` on sync. |
+
+## 13. Queue and Worker Contract
+
+### `company_enrichment_queue` worker
+
+Insert/upsert key: `company_id`.
+
+Priority ordering: `priority_tier asc`, `cascade_depth asc`, `id asc`.
+
+Locking SQL:
+
+```sql
+WITH picked AS (
+  SELECT id
+  FROM company_enrichment_queue
+  WHERE processing = false
+  ORDER BY priority_tier ASC, cascade_depth ASC, id ASC
+  FOR UPDATE SKIP LOCKED
+  LIMIT 1
+)
+UPDATE company_enrichment_queue q
+SET processing = true, updated_at = now()
+FROM picked
+WHERE q.id = picked.id
+RETURNING q.*;
+```
+
+Processing transaction boundary:
+
+- Queue lock/update is its own short transaction.
+- Worker runs orchestration outside the lock transaction.
+- Success deletes row.
+- Failure releases row and increments retry count; after configured max retries, move to DLQ.
+
+Retry policy:
+
+- Xano has no retry counter and can poison-block. Go must add bounded retries and DLQ for operational safety.
+- Data-contract parity is table/graph idempotency, not infinite poison retry.
+
+Explicit-zero behavior:
+
+- `priority_tier: 0` becomes 4.
+- `cascade_depth: 0` remains 0 in #12855 because fallback is also 0.
+
+Acceptance checks:
+
+- Duplicate queue hit increments `count`.
+- Better tier/depth improves the existing row.
+- Source metadata updates only on improvement.
+- Worker uses row locks and cannot double-process a row concurrently.
+
+## 14. Graph Node and Edge Contract
+
+Graph writes target the standalone Universe FalkorDB graph. Use parameterized queries through `internal/graph`; do not string-splice Cypher.
+
+### Company node
+
+Writer: #2602 create, #4659 sync.
+
+Labels/type: `:Entity:Company` plus create-time subtype `:School`, `:VC_Firm`, or `:Organization`.
+
+Create key: none in Xano; CREATE once and persist generated uuid to `company.node_uuid`.
+
+Go helper:
+
+```go
+type CompanyNodeWrite struct {
+    CompanyID int64
+    UUID      string
+    Labels    []string
+    Props     map[string]any
+    Embedding []float32
+}
+```
+
+Rules:
+
+- Do not create if `node_uuid` already exists.
+- Null/empty optional properties are omitted.
+- `updated_at` changes on sync; `created_at` remains stable.
+- Universe canonical vector is Gemini 3072.
+- Label changes after create are not handled by #4659; Go may add an explicit label-repair step only with Mark approval.
+
+### Funding_Round node and RAISED edge
+
+Writer: #12701.
+
+Node key: `Funding_Round.uuid = fundable_deals.id`.
+
+Edge: `(Company)-[:RAISED]->(Funding_Round)`, weight 10, deterministic uuid `<companyNodeUuid>-<dealId>`, `created_at` from announced date floored to UTC midnight when present.
+
+Idempotency:
+
+- Funding node is MERGE keyed.
+- RAISED is MERGE keyed by endpoints/type.
+- `processed_at` on the deal is set only when node materialization returns a `funding_round_node_uuid`.
+
+### Investor edge set
+
+Writer: #12702.
+
+Edges:
+
+| Edge | Source | Target | Weight |
+| --- | --- | --- | ---: |
+| `LEAD_INVESTED_IN` | `Company:VC_Firm` or `Person:Angel` | `Funding_Round` | 15 |
+| `INVESTED_IN` | `Company:VC_Firm` | `Funding_Round` | 20 |
+| `FOLLOW_ON_INVESTED_IN` | `Company:VC_Firm` | `Funding_Round` | 20 |
+| `INVESTED_IN` | `Person:Angel` | `Funding_Round` | 25 |
+| `INVESTMENT_PARTNER_IN` | `Person` | `Funding_Round` | 15 |
+| `INVESTMENT_PARTNER_AT` | `Person` | `Company:VC_Firm` | 20 |
+
+Rules:
+
+- Live repaired behavior requires nullable `cascade_depth` read via `first_notnull`; explicit seed 0 fires.
+- Chronological processing matters for follow-on detection.
+- Type flips can create multiple typed edges; do not silently delete old typed edges unless a cleanup plan exists.
+
+### SPECIALIZES_IN and HAS_SUBDOMAIN
+
+Writer: #12746 and #13142.
+
+Rules:
+
+- Before each run, delete all existing `SPECIALIZES_IN` edges from the company.
+- For each top specialty, generate a blurb, embed with Gemini 3072, KNN over `Entity.expert_embeddings`.
+- Distance below 0.15 auto-matches; 0.15 to 0.25 uses LLM adjudication; 0.25+ creates.
+- Exact-name guard can rescue stale/missing vector index.
+- Matched edge weight: `min(round(10 + match_score * 160), 50)`.
+- Created node edge weight: 10.
+- New `SubDomainExpertise` gets parent via `HAS_SUBDOMAIN` weight 100 or `parent_unresolved`.
+
+### Work, YC, and location edges
+
+| Edge family | Writer | Rules |
+| --- | --- | --- |
+| Work history | #2800 | `WORKS_AT` rank weight, plus `FOUNDED`, `BOARD_MEMBER_OF`, `ADVISOR_TO`, `INVESTED_IN`, `MEMBER_OF` by title classification. |
+| YC founding | #12700 | Multi-founder `contextFounded` hub with `FOUNDED` w5 and `WAS_FOUNDED` w1; single founder direct `FOUNDED` w5. |
+| YC mentor | #12700 | `MENTOR` w14; duplicate risk if `valid_from` changes. |
+| Locations | #4528 | `LOCATED_IN` w70/w80, `IN_REGION` w25, `IN_COUNTRY` w50. |
+
+## 15. Projection Contract
+
+### `company_card_snapshot`
+
+Purpose: app-facing read model for Company cards and side panels.
+
+Written by: entry gate after create/dedup hit when relevant, and orchestrator finalization.
+
+Read by: product app; should not read internal enrichment tables directly.
+
+```sql
+CREATE TABLE company_card_snapshot (
+  company_id BIGINT PRIMARY KEY,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  name TEXT,
+  domain TEXT,
+  logo_url TEXT,
+  tagline TEXT,
+  about TEXT,
+  about_500 TEXT,
+  is_vc BOOLEAN NOT NULL DEFAULT false,
+  is_school BOOLEAN NOT NULL DEFAULT false,
+  fundable_org_id UUID,
+  funding_total JSONB,
+  total_rounds_raised INT,
+  is_public BOOLEAN,
+  stock JSONB,
+  headquarters JSONB,
+  industries TEXT[] DEFAULT '{}',
+  specialties TEXT[] DEFAULT '{}',
+  graph_node_uuid TEXT,
+  enrichment_status TEXT,
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+```
+
+Fields:
+
+| Field | Source | Refresh rule |
+| --- | --- | --- |
+| Identity | `company` | Immediately after create/dedup and after node sync. |
+| About | `company.tagline/about/about_500` | After #2545. |
+| Financial | `company_financial` | After #12989/#12810/#12799/#12856. |
+| Tags | industry/specialty joins | After #12989, #2545, #12746. |
+| Graph uuid | `company.node_uuid` | After #2602 or backfill. |
+| Status | queue/history | After queue insert, worker start, worker completion/failure. |
+
+Projection payload example:
+
+```json
+{
+  "company_id": 142001,
+  "name": "Resend",
+  "domain": "resend.com",
+  "logo_url": "https://img.logo.dev/resend.com?...",
+  "is_vc": false,
+  "graph_node_uuid": "uuid",
+  "enrichment_status": "enriched"
+}
+```
+
+Acceptance checks:
+
+- Snapshot is available immediately after fresh create.
+- Snapshot refreshes after enrichment without requiring app reads from provider payload tables.
+- Null optional values are omitted from the `payload` subobject, not serialized as noisy nulls.
+
+## 16. Idempotency and Dedup Contract
+
+Company dedup order:
+
+1. Incoming/profile URL through `master_link`.
+2. Resolved canonical domain.
+3. Original pre-redirect domain.
+4. LLM alt domains against existing canonical domains.
+5. LLM-discovered and Fundable-known profile URLs.
+6. Fundable resolved domain/original domain/known URLs.
+
+Queue idempotency:
+
+- One logical row per company in Go via unique `company_id`.
+- Upsert must mimic #12855 update semantics.
+
+Graph idempotency:
+
+- Company create is row-gated by `node_uuid`, not graph MERGE.
+- Funding_Round and most edges are MERGE keyed.
+- `SPECIALIZES_IN` is destructive rebuild.
+- Location drain marks address processed even if endpoint MATCH no-ops in Xano; Go should make endpoint absence observable and retryable unless Mark wants exact no-op parity.
+
+Provider idempotency:
+
+- `company_llm.data` empty gates LLM.
+- `exa_c_suite` empty gates Exa; zero-match envelope is non-empty and fetch-once.
+- `yc_data == "no_data"` retries; `fundable == "no_data"` does not.
+- `Signal NFX` 30-day history row gates retry, including failed attempts.
+- Thesis rebuilds on no row, empty derived summary, or stale older than 30 days.
+
+## 17. Error Handling and Observability
+
+Structured logs:
+
+- Replace Xano `log_crash` with structured event logs carrying company id, function/step name, severity, QA pass/fail, error, provider status, queue id, and fixture correlation id.
+- Preserve important source names for parity comparisons.
+
+Continuations:
+
+- Most orchestrator steps continue after failure and mark final success false.
+- Provider failures that write sentinel payloads must remain distinguishable from true misses.
+- Graph writer failures should leave retryable state: e.g. no `node_uuid`, no `processed_at`.
+
+Operational improvements allowed:
+
+- Add queue retry counters and DLQ.
+- Add stale processing reapers for queue and history.
+- Add unique indexes and conflict handling.
+- Add provider replay mode.
+
+Do not hide these as parity. Document them as intentional Go reliability upgrades.
+
+## 18. Golden Fixture Plan
+
+Minimum fixture corpus:
+
+| Fixture | Input | Frozen payloads | Assertions |
+| --- | --- | --- | --- |
+| `company_resend_seed` | `domain=resend.com`, source `User Input`, depth 0 | OpenRouter #12974, Serper, Exa, graph responses | Create company, node, LLM envelope, no queue, orchestrator runs. |
+| `company_duplicate_domain` | Same input twice | Replay same providers | Second run returns existing row, no duplicate company/node, 60s debounce behavior. |
+| `company_return_fast` | `return_fast=true` | Orchestrator LLM payload | Entry gate skips sync LLM; orchestrator fills `company_llm`. |
+| `company_depth1_leaf` | Existing company with `queue=true`, depth 1, tier 1 | None required | Queue insert/update; worker enriches company data but no Exa people/YC people/deals. |
+| `company_priority_zero` | Queue request with `priority_tier=0` | None | Queue row priority becomes 4. |
+| `company_fundable_vc` | Fundable org id for VC | Fundable mirror, Signal, thesis | Signal/thesis gates, `is_vc` classification, investor profile. |
+| `company_deal_cascade` | Seed VC with Fundable deals | Fundable deals/investors, graph responses | Funding_Round, RAISED, investor edges, queue co-investors. |
+| `company_yc` | YC-backed company | YC Firecrawl, LLM extracts | YC data, founder/partner queue, founding edges. |
+| `company_specialty_match` | Company with known specialties | LLM blurb, embedding/KNN | Destructive rebuild, weight formula, parent attach. |
+| `company_signal_parse_null` | Signal scrape with null parse | Brave/Firecrawl/OpenRouter parse fail | Debounce row suppresses retry; `signal_nfx_json` empty. |
+
+Each fixture must include:
+
+- Input request.
+- Frozen provider and LLM request/response snapshots.
+- Expected AlloyDB write-set.
+- Expected graph subgraph.
+- Expected queue side effects.
+- Expected projection row.
+- Exact-match fields and semantic-tolerance fields.
+- Re-run assertions.
+
+## 19. Acceptance Checks
+
+### Contract checks
+
+- Given a placeholder employer, the entry gate returns null and writes no company/node.
+- Given `resend.com`, the entry gate returns a canonical company row with `company_domain = resend.com`.
+- Duplicate canonical domain or profile URL does not create a second canonical row.
+- `return_fast: true` skips only the entry-gate LLM preflight.
+- `priority_tier: 0` on the queue path becomes 4.
+- `cascade_depth: 0` survives the repaired deal-cascade path.
+
+### Provider replay checks
+
+- With fixture `company_resend_seed`, provider clients consume recorded payloads and produce the same normalized structs.
+- Tier-1 LLM parse with missing confidence escalates to tier 2.
+- Serper failure yields an empty profile candidate list and does not fail the stage.
+- Exa zero-match saves a non-empty envelope and blocks refetch.
+
+### Graph checks
+
+- Re-run does not duplicate MERGE-keyed nodes/edges.
+- Company node `created_at` stays stable and `updated_at` moves on sync.
+- Empty/null optional graph properties are absent.
+- Funding_Round node materialization controls `fundable_deals.processed_at`.
+- `SPECIALIZES_IN` destructive rebuild leaves exactly the expected edge set.
+
+### Queue checks
+
+- Duplicate queue hit increments `count`.
+- Better tier/depth improves row ordering.
+- Worker locks one row and releases or DLQs according to policy.
+- Cron reference remains inactive unless explicitly enabled in Go deployment config.
+
+### Projection checks
+
+- Snapshot row exists immediately after create.
+- Enrichment completion refreshes about, financial, tag, and graph fields.
+- Failure state is visible without reading internal logs.
+
+## 20. Xano Artifact Decision Table
+
+| Behavior | Classification | Go decision |
+| --- | --- | --- |
+| `priority_tier|first_notempty:4` makes `0 -> 4` | Preserve for parity | Implement in queue writer; fixture explicit zero. |
+| `cascade_depth` repaired with nullable/`first_notnull` in #12856/#12702 | Preserve repaired contract | Explicit seed 0 must fire investor edge set. |
+| `db.query list+paging+output` empty-array trap | Xano artifact | Do not reproduce; normal SQL queries return rows. |
+| String-built `lambda_filter` in #12816 | Xano artifact | Plain typed comparisons in Go. |
+| Twig/string-spliced Cypher | Xano artifact | Parameterized FalkorDB queries only. |
+| Whole-envelope `company_llm` and `exa_c_suite` storage | Preserve for parity | Store full JSONB envelopes. |
+| `"no_data"` sentinel asymmetry | Preserve for parity | Fundable miss retires; YC miss retries. |
+| 60s orchestrator debounce | Preserve for parity | Use history or lock table. |
+| No queue retry/DLQ | Fix in Go | Add bounded retry and DLQ, but keep idempotent writes. |
+| No DB unique indexes on company/queue | Fix in Go | Add unique constraints with conflict behavior matching dedup branches. |
+| Dead `data_source_id`, `$modelUsed`, old PDL/Enrich Layer paths | Xano artifact | Accept legacy inputs if needed; do not implement behavior. |
+| `log_queue_company` #640 | Xano artifact | Do not port. |
+| #12689 all-empty BigQuery query can mirror arbitrary org | Fix in Go | Add input guard. |
+| #12794 exists to dodge Xano db.edit UUID bug | Xano artifact | Inline repository update. |
+| Prompt/model docs drift | Docs stale | Source model config from live Xano export until docs are updated. |
+
+## 21. Docs-vs-Xano Gap Report
+
+### Docs match live Xano
+
+- Company overview, functions, tables, nodes, edges, and crons accurately capture the July 2, 2026 queue, depth, deal-cascade, and graph repair notes.
+- Task #127 is confirmed `active: false`, 600s schedule, one-row tick.
+- #12855 queue upsert docs match live XanoScript.
+- #12974 uses `google/gemini-3.1-flash-lite` tier 1 and `anthropic/claude-sonnet-4.6` tier 2 with `openrouter:web_search`.
+- #12992 has the documented 15-step orchestrator and 60s debounce.
+
+### Docs are stale
+
+- [Company system prompts](/guides/enrichment/company-pipeline/llm-system-prompts) still labels #2545 as `anthropic/claude-sonnet-4.5` in the prompt section, while live #2545 uses `moonshotai/kimi-k2.5`.
+- The prompt/model pages do not appear to document the current #12974 `new-company-enrichment` prompt/model contract, even though it is the live primary company research stage.
+- Some prompt docs cover older deep-company/scrape functions (#12591, #2814, #5326, #12593) that are not the current get-add/orchestrator LLM path described by the waterfall pages.
+
+### Docs are accurate but not rebuild-grade
+
+- Provider request/response snapshots are not frozen as replay fixtures.
+- The exact BigQuery SQL and pagination/error behavior for the mirror substrate is summarized, but not fixture-pinned.
+- Product projection schema is not yet specified elsewhere; this page proposes `company_card_snapshot`.
+- The Go unique-index decisions are new rebuild decisions, not Xano parity facts.
+
+### Xano behavior is uncertain and needs fixture/runtime confirmation
+
+- Exact product response shape consumed from #12558 branches.
+- Whether any external caller depends on the smoke-test typo `seed-invetment-thesis-smoke-test`.
+- Whether Go should preserve Xano's location-drain no-op marking when graph endpoints are missing.
+- Whether to preserve or fix `investment_thesis` absent-side `0` versus null in the new schema.
+- Production trigger for #12689 BigQuery mirror ingestion.
+- Company-side specialty-description backfill function claimed in comments but not found in function roster.
+
+## 22. Open Questions for Mark
+
+1. Should the Go queue preserve `priority_tier: 0 -> 4` forever, or only for parity fixtures with a later cleanup migration?
+2. Should the new AlloyDB schema enforce `unique(company.canonical_domain)` from day one, accepting intentional behavior improvement over Xano's double-create race?
+3. Should `company_card_snapshot` be the App read model name, or should it align with an existing app-side table convention?
+4. Should Universe write only Gemini 3072 vectors, or also preserve legacy OpenAI 1536 `name_embedding` for graph query compatibility during cutover?
+5. Should Signal NFX failed scrape/parse attempts keep the 30-day debounce, or should Go distinguish transient failure from terminal no-data?
+6. Should #12689 BigQuery mirror ingestion be rebuilt as part of Company pipeline scope or handled by a separate Fundable ingestion service?
+7. Should location graph drain retry on missing graph endpoint instead of marking `path_triples_added` true like Xano?
+8. Should old historical bugs accepted on 2026-07-02 remain fixture-visible only, or should the Go seed ignore historical poisoned rows entirely in greenfield Universe?

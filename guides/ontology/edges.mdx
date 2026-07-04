@@ -11,7 +11,7 @@ Most core entries on this page are generated from the live `util.template_engine
 - For generated core sections, the **actual MERGE/CREATE Cypher snippet** that writes the edge — copied verbatim from the function (Twig templating preserved, so you can see exactly which properties are conditional).
 - The **edge pattern**, **weight** (lower = more important), and the **inputs** the writer reads.
 
-**Weight convention:** Lower numbers indicate stronger / more important relationships. IMDB film/TV edges use a 0.0–1.0 scale; all other edges use an integer 5–70 scale.
+**Weight convention:** Lower numbers indicate stronger / more important relationships. IMDB film/TV edges use a 0.0–1.0 scale; all other edges use an integer 5–100 scale.
 
 ---
 
@@ -1047,7 +1047,7 @@ mvp/expertise/resolve-person-expertise-v2 — #12926
 mvp/expertise/upsert-person-has-expertise — #12925
 ```
 
-**v5 / v2 chain (2026-05-17).** Person-side: LLM identifies domains of expertise via `mvp/expertise/llm-identify-person-expertise` (#12666), which calls #12926 for each. #12926 vector-searches against existing `Entity:SubDomainExpertise` / `Entity:DomainExpertise` nodes, creates a new node if no match, and `MERGE`s the `HAS_EXPERTISE` edge with persisted `r.weight`. Successful graph MERGE triggers #12925 to dual-write into `person_has_expertise` (Xano table 711). Companies use a parallel path: `mvp/expertise/resolve-company-specialties` (#12746) writes `SPECIALIZES_IN`. The hierarchical `HAS_SUBDOMAIN` edge is written by `mvp/node/sync-domain-expertise-nodes` (#12663).
+**v5 / v2 chain (2026-05-17).** Person-side: LLM identifies domains of expertise via `mvp/expertise/llm-identify-person-expertise` (#12666), which calls #12926 for each. #12926 vector-searches against existing `Entity:SubDomainExpertise` / `Entity:DomainExpertise` nodes, creates a new node if no match, and `MERGE`s the `HAS_EXPERTISE` edge with persisted `r.weight`. Successful graph MERGE triggers #12925 to dual-write into `person_has_expertise` (Xano table 711). Companies use a parallel path: `mvp/expertise/resolve-company-specialties` (#12746) writes `SPECIALIZES_IN`. The hierarchical `HAS_SUBDOMAIN` edge is written by the relational sync (#12663), forward-path parent attach (#13142), and taxonomy seeder (#13161); all three now stamp the full edge metadata envelope.
 
 </Card>
 
@@ -1154,16 +1154,40 @@ Hierarchical parent→child link between expertise nodes.
 |---|---|
 | **Pattern** | `(DomainExpertise)-[HAS_SUBDOMAIN]->(SubDomainExpertise)` |
 | **Weight** | **100** *(§3.6 — deliberate hub damping, not closeness; see [Edge Weights → Weight audit](/guides/ontology/edge-weights#weight-audit--applied-adjustments))* |
-| **Writer** | `mvp/node/sync-domain-expertise-nodes` (#12663) — relational→graph sync for `sub_domain_expertise` rows missing a `node_uuid` — alongside `mvp/expertise/attach-subdomain-parent` (#13142) — forward-path parent attach for SubDomain nodes freshly created by `resolve-company-specialties` (#12746), parent picked by the #13141 LLM resolver |
+| **Writers** | `mvp/node/sync-domain-expertise-nodes` (#12663), `mvp/expertise/attach-subdomain-parent` (#13142), `mvp/expertise/seed-expertise-graph-batch` (#13161) |
 
 ```cypher
 MATCH (d:Entity:DomainExpertise {uuid: $parentDomainUuid})
 MATCH (s:Entity:SubDomainExpertise {uuid: $subNodeUuid})
-CREATE (d)-[:HAS_SUBDOMAIN]->(s)
-RETURN d.uuid AS domain_uuid, s.uuid AS sub_uuid
+MERGE (d)-[r:HAS_SUBDOMAIN]->(s)
+ON CREATE SET
+  r.uuid = randomUUID(),
+  r.created_at = timestamp(),
+  r.updated_at = timestamp(),
+  r.weight = 100,
+  r.description = coalesce(d.name, 'Domain') + ' includes ' + coalesce(s.name, 'subdomain'),
+  r.description_generated_at = timestamp()
+ON MATCH SET
+  r.uuid = coalesce(r.uuid, randomUUID()),
+  r.created_at = coalesce(r.created_at, timestamp()),
+  r.updated_at = timestamp(),
+  r.weight = coalesce(r.weight, 100),
+  r.description = coalesce(r.description, coalesce(d.name, 'Domain') + ' includes ' + coalesce(s.name, 'subdomain')),
+  r.description_generated_at = coalesce(r.description_generated_at, timestamp())
+RETURN d.uuid AS domain_uuid
 ```
 
-The forward-path writer (#13142) `MERGE`s with `{weight: 100}`; the §3.6 audit set the same explicit `100` on legacy null-weight rows.
+`HAS_SUBDOMAIN` is a taxonomy backbone, not a semantic closeness edge. The weight is intentionally **100** so domain rollups remain available without making two people close just because their expertise maps through the same broad domain. The description is deterministic, not LLM-generated; #12663 / #13161 use the wording `SubDomain is a subdomain of Domain.`, while #13142 uses `Domain includes SubDomain`.
+
+| Property | Description |
+|----------|-------------|
+| `uuid` | Stable edge identifier; backfilled or preserved with `coalesce` on re-runs |
+| `created_at` / `updated_at` | FalkorDB server timestamps |
+| `weight` | Always `100` |
+| `description` | Deterministic taxonomy sentence; required to be non-empty for graph QA |
+| `description_generated_at` | Timestamp stamped by the writer when the deterministic description is written |
+
+As of **2026-07-04**, all three live writers stamp this envelope. A one-time sandbox repair also backfilled metadata on existing `HAS_SUBDOMAIN` edges created before the envelope was standardized.
 
 ---
 

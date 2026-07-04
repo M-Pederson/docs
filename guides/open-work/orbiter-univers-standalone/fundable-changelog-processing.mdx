@@ -1,6 +1,7 @@
 ---
 title: "Fundable Changelog Processing"
 description: "Dispatch plan for the BigQuery → fundable_* sync changelog: which existing workspace-3 functions handle each change case, and the few new pieces that must be built."
+icon: "route"
 ---
 
 **Status: open work / plan.** Nothing on this page is built. Fundable is a living database in BigQuery; the Xano `fundable_*` tables are currently a static import. The lane being built: a sync cron pulls new/changed rows from BigQuery into the mirror tables and writes a **changelog**; after the cron completes, a **worker** loops the changelog and dispatches graph/table updates. The dispatch targets are almost entirely **existing** workspace-3 functions — this page maps each change case to the function that already handles it, and calls out the small set of genuinely new pieces.
@@ -36,6 +37,88 @@ Child tables carry no node UUIDs of their own; a change to any of them means "re
 | `fundable_angel_investments` #679 | parent `deal_id` |
 
 Changelog-only in v1 (no graph action): `fundable_articles` #680, `fundable_valuations` #672, `fundable_organization_associations` #673, the industry tables #670/#674, and the `fundable_linkedin_*` family #668/#669/#675/#676/#677.
+
+## Building the changelog
+
+The changelog is the contract between the sync cron and the worker: the cron writes it inside the same batch as the mirror upserts, and the worker never re-diffs anything — it trusts `changed_fields`, the resolved refs, and the link snapshot below. Run-level state (`queue_stage`, watermark, counts) lives on `fundable_sync_runs`; one changelog row describes one changed source record.
+
+### Watermark semantics
+
+The window is **the last successful run's watermark vs the source's `updated_at`** — with four refinements:
+
+1. **Watermark of the last successful run, not the cron's wall-clock.** Each run stores `watermark_after` on `fundable_sync_runs`; the next run fetches `updated_at` newer than `watermark_after - lookback`, up to a `window_end` captured **before** fetching starts. A failed run never advances the watermark, so nothing it missed gets skipped.
+2. **Overlap on purpose; the diff makes it free.** The lookback buffer (start at 10 minutes) deliberately re-fetches a slice of already-seen rows to absorb clock drift between BigQuery and the runner, plus late-committing rows. Because every fetched row is diffed against the mirror before a changelog row is written, overlap produces zero duplicate changelog entries — an unchanged re-fetch is bookkeeping only.
+3. **Trust `updated_at` only after probing it.** Every `fundable_*` table carries `updated_at` from the feed, but the build must confirm the feed actually maintains it — that it moves on every field change and is not reset by bulk rebuilds of `fundable_data_feed_production`. Probe each table via `_bq-execute` #12690 before wiring the cron; any table with unreliable timestamps falls back to full scans with row compare.
+4. **`updated_at` windows never see deletes.** A row removed upstream simply stops appearing in the window — nothing announces it. `remove` detection is a separate, lower-frequency reconciliation pass: ids present in the mirror but absent from BigQuery become `remove` changelog rows (tombstone only in v1 — no graph deletes).
+
+Each table gets its own window on its own `updated_at` — a new investor row on an old deal surfaces in the `fundable_institutional_investments` window even though the deal row itself never changed, which is exactly what rolls up to a parent-deal replay.
+
+### Per-batch build order
+
+1. **Fetch** the window for one table via #12690.
+2. **Sync tables in FK order** — organizations → people → deals → institutional investments → investments\_person → angel investments → articles — so parents land in the mirror before children arriving in the same window, and ref resolution never misses.
+3. **Classify each fetched row against the mirror**: no mirror row → `insert`; any business field differs → `update` (build `changed_fields` plus a shallow before/after `diff_json`); identical → unchanged, no changelog row.
+4. **Upsert the mirror row** — and never write the `master_*` / node-uuid backlink columns from BigQuery data (the feed doesn't know them; #12691/#12692 already preserve them across re-upserts — the new upsert helpers must follow the same rule).
+5. **Resolve entity refs** (table below) and snapshot the join/link columns from the resolved rows.
+6. **Precompute the gate**: `graph_eligible` \+ `skip_reason` per the Stage-1 rule.
+7. **Write the changelog row**: `processing_status = "logged"` when eligible, `"ignored"` otherwise.
+8. **Close the run**: stamp `watermark_after` and per-table fetched/changed/ignored counts.
+
+### Every row resolves to organizations, deals & people
+
+No matter which physical table changed, the changelog row must name the core entities it touches, so all filtering and dispatch happens in terms of the three graph-linked tables. Changes to join tables appear in the changelog **attributed to the org / deal / person they join to**:
+
+| Changed table | `fundable_org_id` | `fundable_deal_id` | `fundable_person_id` |
+| --- | --- | --- | --- |
+| `fundable_organizations` | itself | — | — |
+| `fundable_people` | — | — | itself |
+| `fundable_deals` | portfolio org via `organization_id` | itself | — |
+| `fundable_institutional_investments` | portfolio org via `deal_id` (investor org → `secondary_refs_json`) | `deal_id` | — |
+| `fundable_institutional_investments_person` | portfolio org via investment → deal (investor org → secondary) | via `institutional_investment_id` | `person_id` |
+| `fundable_angel_investments` | portfolio org via `deal_id` | `deal_id` | `person_id` |
+| `fundable_organization_associations`_(changelog-only v1)_ | `organization_id` | — | `person_id` |
+| `fundable_valuations`_(changelog-only v1)_ | `organization_id` | — | — |
+| `fundable_articles`_(changelog-only v1)_ | — | deals in the `canonical_deal_id` group → secondary | — |
+| `fundable_linkedin_person` / `_positions` / `_person_education`_(changelog-only v1)_ | — | — | `person_id` |
+
+Deal-rooted rows always resolve `fundable_org_id` to the **portfolio** org — that is the org whose master link gates eligibility. Investor orgs ride along in `secondary_refs_json`; an unlinked investor is non-gating by design (#12702 creates investor participants as local leaves).
+
+### Link snapshot — the pre-unlimited-PDL filter
+
+At changelog-write time the cron copies the canonical join state from the resolved rows onto the changelog row itself:
+
+| Snapshot column | Copied from |
+| --- | --- |
+| `master_company_id`, `master_company_node_uuid` | the resolved `fundable_organizations` row |
+| `master_person_id`, `master_person_node_uuid` | the resolved `fundable_people` row |
+| `funding_round_node_uuid`, `deal_processed_at` | the resolved `fundable_deals` row |
+| `graph_eligible`, `skip_reason` | computed from the above per the Stage-1 gate |
+
+This is what makes the pre-unlimited-PDL stage cheap: the worker's candidate query is one indexed read — `processing_status = "logged" AND graph_eligible = true` — and every change without master links is already parked as `ignored` with a reason, without a single join at worker time. When unlimited PDL arrives (Stage 2), the same rows re-qualify: the resolution columns say exactly which org / deal / person each ignored row needs bootstrapped first.
+
+<Note>
+  **Snapshot for filtering, live rows for acting.** Links move between sync and dispatch — an org gets linked by an entry gate, a merge re-points a node uuid (the resync sweeps #12963/#12964 exist precisely for that). The worker filters on the snapshot but re-reads the live `fundable_*` and `master_*` rows at dispatch time before calling anything.
+</Note>
+
+**Releasing held rows.** When an org or person gains its master link after its changes were parked (case 6's link-only reconcile, #12810 Block-1 domain repair, #12793/#12794, or any entry-gate crossing), the parked rows re-open with one indexed query: `processing_status = "ignored" AND fundable_org_id = <newly linked org>`. v1: run this as a **release sweep** at the top of every worker run. Optional later: a Xano table trigger on the `fundable_organizations.master_company_id` / `fundable_people.master_person_id` null→set transition that writes a `link_established` changelog row instead.
+
+### Proposed changelog schema
+
+```text
+identity/audit   id · sync_run_id · source_table · source_id · change_type (insert|update|remove)
+                 changed_fields (text list) · diff_json · created_at · updated_at
+resolved refs    fundable_org_id · fundable_deal_id · fundable_person_id · secondary_refs_json
+link snapshot    master_company_id · master_company_node_uuid
+                 master_person_id · master_person_node_uuid
+                 funding_round_node_uuid · deal_processed_at
+gate             graph_eligible (bool) · skip_reason
+lifecycle        processing_status (logged|queued|complete|ignored|failed)
+                 dispatched_function · result_json · processed_at
+indexes          (processing_status, created_at) · fundable_org_id · fundable_deal_id
+                 fundable_person_id · sync_run_id
+```
+
+Keep the field names aligned with the sibling page's AlloyDB DDL so the eventual port is mechanical; the resolved-ref and link-snapshot columns are this page's addition to that design.
 
 ## The workhorse: the existing deal cascade
 
@@ -83,7 +166,7 @@ Properties the worker leans on:
 
 ## Eligibility gate
 
-Same Stage-1 principle as [Fundable table updates](/guides/open-work/fundable-table-updates#graph-eligibility-gate): a changed row earns graph work only when it is already connected to the canonical layer.
+Same Stage-1 principle as [Fundable table updates](/guides/open-work/fundable-table-updates#graph-eligibility-gate): a changed row earns graph work only when it is already connected to the canonical layer. The sync precomputes this gate onto every changelog row — resolved refs, master-link snapshot, `graph_eligible` — so the worker filters without joins (see [Building the changelog](#building-the-changelog)) and re-verifies against live rows at dispatch time.
 
 | Change on | Dispatch only when | Otherwise |
 | --- | --- | --- |
@@ -115,7 +198,7 @@ This gate matters because #12856 has get-add semantics — pointed at a deal who
 
 1. **Collapse child changes to one replay per deal.** Dedupe key `deal_replay:<fundable_deal_id>` — a new deal arriving with 3 investments and 2 partner rows is six changelog rows but **one** #12856 dispatch.
 2. **Chronological order within an org.** When several deals for one company are pending, dispatch oldest-first (`date asc`) — the #12703 v2.3 lesson: `FOLLOW_ON_INVESTED_IN` detection needs earlier rounds in the graph before later ones.
-3. **Org link events before deal replays.** Soft ordering — the cascade self-heals — but processing a `link-fundable-org` event first converts that org's held deal rows from `ignored` to eligible within the same run.
+3. **Release sweep first, then org link events before deal replays.** At the top of each run, re-open `ignored` rows whose org / person gained master links since parking (one indexed query on the changelog's resolved refs). After that, soft ordering — the cascade self-heals — but processing a `link-fundable-org` event first converts that org's held deal rows to eligible within the same run.
 4. **Per-action `try_catch`** (the #12703 pattern): one bad deal never aborts the batch. Failures stay `failed` on the changelog for retry; #12856 v1.8 guarantees a failed node write is retryable.
 5. **Always pass an explicit `cascade_depth: 0`.** The depth inputs are nullable and read via `first_notnull`; an **omitted** depth fails closed to 1, and the investor-edge half (#12702) silently never runs.
 6. **Cap batch size per run** and record overflow, mirroring the 25\+25 fan-out governor thinking in #12703.
@@ -184,11 +267,11 @@ What the plumbing does **not** do today: table-level incremental windows. Everyt
 Tables (Xano twins of the sibling page's control-table design — keep the field names aligned so the AlloyDB port is mechanical):
 
 1. `fundable_sync_runs` — one row per cron run: status, window, watermark before/after, per-table counts.
-2. `fundable_change_log` — one row per changed source record: `sync_run_id`, `source_table`, `source_id`, `change_type` (insert / update / remove), `changed_fields`, `diff_json`, `processing_status` (logged / queued / complete / ignored / failed), `skip_reason`, `dispatched_function`, `result_json`.
+2. `fundable_change_log` — one row per changed source record, carrying the resolved org / deal / person refs, the master-link snapshot columns, and the precomputed gate. Full field list: [Proposed changelog schema](#proposed-changelog-schema).
 
 Functions:
 
-1. **`fundable/sync-from-bigquery`** (\+ scheduled task, ship `active = false`) — watermark window per table via #12690, diff against the mirror, upsert (reuse #12691/#12692; add thin upsert helpers for deals / investments / angels / articles, whose upserts today exist only inline inside #12689), write changelog rows.
+1. **`fundable/sync-from-bigquery`** (\+ scheduled task, ship `active = false`) — watermark window per table via #12690, diff against the mirror, upsert (reuse #12691/#12692; add thin upsert helpers for deals / investments / angels / articles, whose upserts today exist only inline inside #12689), write changelog rows with ref resolution \+ the link snapshot per [Building the changelog](#building-the-changelog), plus the lower-frequency full-id reconciliation pass for `remove` detection.
 2. **`fundable/process-change-log`** (\+ scheduled task, ship `active = false`) — the worker implementing the dispatch map and mechanics above.
 3. **`fundable/apply-org-field-updates`** — closes case 7: map changed `fundable_organizations` fields onto `master_company` / `company_financial` (respecting the #12989 VC `funding_total` suppression and #12810's escalate-only philosophy), then re-sync the node via #4659.
 4. **`fundable/apply-person-field-updates`** — closes case 9: Fundable profile URLs as `master_link` rows (`source: "Fundable"`), name/title/avatar/contact deltas, then re-sync via #2758.

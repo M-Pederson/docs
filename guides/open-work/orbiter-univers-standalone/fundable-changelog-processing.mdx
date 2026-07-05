@@ -230,6 +230,98 @@ This gate matters because #12856 has get-add semantics — pointed at a deal who
   </Step>
 </Steps>
 
+## Simulated sync run (sample changelog)
+
+A concrete sample of what one cron run produces, built on **real live rows** (checked 2026-07-04): Writer's actual `fundable_organizations` row `960a7860-ce1e-4fc6-9529-11d3613c201d`, its real Series A `06d2f3b5-71ec-46df-ac3c-6c5337084f30` and participants (Insight Partners org `18cca946…` was the real lead), and Ryan Reynolds' genuinely linked `fundable_people` row `2c0010d4…` → `master_person` 8 / node `dc0d0277…`. The _changes_ are simulated: a new Series C (deal uuid `5e71e5c0-aaaa-…`), the org/person field deltas, and Writer's eventual master link (`master_company_id: 8412`).
+
+**Scenario:** the nightly cron finds Writer raised a new round with Ryan Reynolds as an angel, Writer's org totals changed, Ryan's profile changed, a new unlinked person appeared, and one stale deal disappeared from BigQuery.
+
+### The `fundable_sync_runs` row
+
+```json
+{
+  "id": "run_8f21",
+  "status": "complete",
+  "queue_stage": "pre_unlimited_pdl",
+  "watermark_before": "2026-07-04T20:00:00Z",
+  "source_window": "2026-07-04T19:50:00Z → 2026-07-04T21:00:00Z",
+  "watermark_after": "2026-07-04T21:00:00Z",
+  "fetched_counts": { "fundable_deals": 214, "fundable_organizations": 1876, "fundable_people": 3402, "fundable_angel_investments": 41, "fundable_institutional_investments": 388, "fundable_articles": 96 },
+  "changed_counts": { "insert": 5, "update": 4, "remove": 1, "unchanged": 6007 }
+}
+```
+
+The window starts 10 minutes before the last successful watermark — the lookback overlap. The 6,007 unchanged re-fetches produce zero changelog rows.
+
+### One row fully expanded — "Writer raises a new round"
+
+```json
+{
+  "id": "cl_001",
+  "sync_run_id": "run_8f21",
+  "source_table": "fundable_deals",
+  "source_id": "5e71e5c0-aaaa-4bbb-8ccc-111111111111",
+  "change_type": "insert",
+  "changed_fields": ["*"],
+  "diff_json": {
+    "size_usd": { "before": null, "after": 200 },
+    "financing_type": { "before": null, "after": "SERIES_C" },
+    "date": { "before": null, "after": "2026-07-01" }
+  },
+
+  "fundable_org_id": "960a7860-ce1e-4fc6-9529-11d3613c201d",
+  "fundable_deal_id": "5e71e5c0-aaaa-4bbb-8ccc-111111111111",
+  "fundable_person_id": null,
+  "secondary_refs_json": { "investor_org_ids": ["18cca946-4813-4b8e-a48e-f7acec33bbd5"] },
+
+  "master_company_id": null,
+  "master_company_node_uuid": null,
+  "master_person_id": null,
+  "master_person_node_uuid": null,
+  "funding_round_node_uuid": null,
+  "deal_processed_at": null,
+
+  "graph_eligible": false,
+  "skip_reason": "missing_master_company_link",
+  "processing_status": "ignored",
+  "dispatched_function": null,
+  "result_json": {}
+}
+```
+
+The `master_company_id: null` snapshot is Writer's **real live link state** — see the reality check below.
+
+### The full run (10 rows, compact)
+
+| # | source\_table | type | changed\_fields | resolves to | eligible | status |
+| --- | --- | --- | --- | --- | --- | --- |
+| cl\_001 | `fundable_deals` | insert | new Series C, \$200M | org **Writer** · deal `5e71e5c0…` | ❌ `missing_master_company_link` | ignored |
+| cl\_002 | `fundable_institutional_investments` | insert | Insight joins, `lead_investor: true` | same deal (investor org → secondary) | ❌ same | ignored |
+| cl\_003 | `fundable_angel_investments` | insert | Ryan Reynolds angel on the new deal | deal `5e71e5c0…` · person `2c0010d4…` | ❌ same | ignored |
+| cl\_004 | `fundable_organizations` | update | `total_raised` 326→526 · `num_funding_rounds` 4→5 · `latest_valuation_usd` 1900→3800 | org **Writer** | ❌ same | ignored |
+| cl\_005 | `fundable_people` | update | `linkedin_title` "Co-Founder"→"Founder & CBO" · `followers` 3658823→3702110 | person **Ryan Reynolds** → mp 8, node `dc0d0277…` (real link) | ✅ | logged |
+| cl\_006 | `fundable_articles` | insert | article on the round's canonical group | canonical deal → secondary | — `changelog_only_v1` | ignored |
+| cl\_007 | `fundable_people` | insert | new person "Val Escher" (`a9cd784f…`, real unlinked row) | person only | ❌ `unlinked_person_log_only` | ignored |
+| cl\_008 | `fundable_valuations` | insert | \$3.8B post-money | org **Writer** | — `changelog_only_v1` | ignored |
+| cl\_009 | `fundable_deals` | update | `size_usd` 21→21.5 on the **real** Series A `06d2f3b5…` (`processed_at` already set 2026-04-20) | org Writer · deal `06d2f3b5…` | ❌ `missing_master_company_link` | ignored |
+| cl\_010 | `fundable_deals` | remove | duplicate deal row gone from BQ | org Writer | — tombstone, manual review | ignored |
+
+### The worker pass — after Writer gets linked
+
+Suppose Writer is seeded through `master-company-new` #12558 that evening → `master_company_id: 8412` \+ node uuid stamped _(simulated values)_. The worker's **release sweep** finds every parked row for `fundable_org_id = 960a7860…` and re-opens cl\_001–004 \+ cl\_009. Dedupe collapses them to **three dispatches**:
+
+| Dispatch | Rows | Call | Note |
+| --- | --- | --- | --- |
+| `deal_replay` | cl\_001 \+ cl\_002 \+ cl\_003 | `#12856 {fundable_deal_id: "5e71e5c0…", cascade_depth: 0, origin_master_company_id: 8412}` | New deal → `processed_at` null, no force needed. The cascade writes `Funding_Round` \+ `RAISED`, Insight's `LEAD_INVESTED_IN`, Ryan's angel `INVESTED_IN` (MERGEs against his existing Person node, mp 8), and queues co-investors at tier 1. |
+| `deal_replay` | cl\_009 | `#12856` on `06d2f3b5…` | Staleness gate passes (`updated_at` newer than the 2026-04-20 `processed_at`); MERGE refreshes `size_usd`. If the _only_ change had been a new **angel** row on this processed deal, the worker would null `processed_at` first — the blind spot. |
+| `person_field_refresh` | cl\_005 | `apply-person-field-updates` (gap fn) → `update-person-node` #2758 | Ryan's title/followers delta onto `master_person` 8, node re-synced. |
+
+cl\_004 folds into the org's refresh (`#12810` \+ `#4659` today; the proposed `apply-org-field-updates` properly). Each completed row gets `processing_status: "complete"`, `dispatched_function`, and a `result_json` like `{"funding_round_node_uuid": "…", "edges_written": 17, "queued_tier1": 4}`.
+
+<Note>
+  **Reality check (live, 2026-07-04).** Writer — 4 rounds, \$326M raised, a name-brand AI company — is **unlinked on live** (`master_company_id: null`), and its real Series A carries a pre-v1.8 `processed_at` stamp with a **null** `funding_round_node_uuid`. Live holds 146,174 deals and 528,045 people, overwhelmingly unlinked. The most common changelog row by far will be `ignored / missing_master_company_link` — the Stage-1 gate doing its job — and it is why the release sweep matters: linking one company can release months of parked changelog history in a single worker run.
+</Note>
+
 ## Sync-side reuse (BigQuery plumbing that already exists)
 
 The cron itself is new build, but not from scratch:

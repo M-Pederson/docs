@@ -1,0 +1,175 @@
+---
+title: "Crunchbase Person Investments"
+description: "Deferred plan for turning Crunchbase-only personal investment evidence into structured candidates, matches, and optional non-recursive graph/queue work."
+---
+
+> **Status: planned / deferred.** This page captures the current behavior and the future design decision. Do not treat Crunchbase-only person investments as active queue fanout until this work is explicitly built.
+
+## Current behavior
+
+Crunchbase person pages can mention personal investments even when the person has not matched to Fundable's `fundable_people` / `fundable_angel_investments` data. Today that evidence is captured, but it does not create funding queues, company enrichment queues, or graph investment edges by itself.
+
+| Storage location | What lands there | Notes |
+| --- | --- | --- |
+| `permalink_person.cb_person_page` | Firecrawl scrape payload for the Crunchbase person page | Includes `markdown`, `linksOnPage`, `canonical_url`, `canonical_permalink`, and `requested_url` after `mvp/crunchbase/parse-person-page` canonicalization. |
+| `permalink_person.cb_extract.personal_investments.summary` | LLM-extracted personal-investment prose | Current parser schema extracts only a summary string, not a structured company/deal list. |
+| `investor_profile_person` | Investor profile fields derived from Crunchbase and Signal/Fundable overlays | Current Crunchbase path copies the personal-investment summary into an investor-profile field; this should be cleaned up in the future structured design. |
+| Person biography rows | Crunchbase-sourced biography evidence | `mvp/bios/add-person-biography` stores the personal-investment prose as source evidence for the person. |
+
+## What does not happen today
+
+Crunchbase-only personal investment evidence does **not** write to:
+
+- `queue_enrich_funding`
+- `queue_enrich_company`
+- `fundable_angel_investments`
+- `fundable_deals`
+- graph `INVESTED_IN` edges
+- company graph nodes for portfolio companies
+
+The existing active investment graph path is different: `mvp/enrich/process-person-phase-9` uses Fundable-matched angel investment rows. When a seed-depth angel has matched Fundable investment rows, that path can write direct, non-recursive `INVESTED_IN` edges. Crunchbase-only text/list evidence is not enough to enter that path.
+
+## Why fanout is deferred
+
+Automatic fanout from Crunchbase-only person pages would be tempting, but it needs a deliberate matching and containment contract first.
+
+The risks:
+
+- The current parser only captures a prose summary, so company names and funding-round URLs are not normalized.
+- Crunchbase profile links may point to organizations, funding rounds, investor profiles, or page chrome; they need classification before materialization.
+- Creating companies directly from weak evidence can mint noise nodes, especially if a link is only a social/profile URL.
+- Funding and company queues can reintroduce recursive waterfall pressure unless every created item is explicitly depth-1, held, or direct-edge-only.
+- A Crunchbase investment mention is evidence, not proof of a canonical Fundable deal match.
+
+## Future design
+
+Build this as a two-step candidate pipeline, not direct queue fanout.
+
+### 1. Structured extraction
+
+Extend `mvp/crunchbase/parse-cb-person` so `personal_investments` returns both prose and structured candidates:
+
+```json
+{
+  "personal_investments": {
+    "description": "Hazel Savage has 5 personal investments...",
+    "companies": [
+      {
+        "company_name": "Doji",
+        "company_crunchbase_url": "https://www.crunchbase.com/organization/doji",
+        "funding_round_url": "https://www.crunchbase.com/funding_round/...",
+        "announced_date": null,
+        "evidence_text": "..."
+      }
+    ]
+  }
+}
+```
+
+Prefer `description` for the human-readable text in the future schema. During migration, keep a compatibility read from the current `summary` key so old `cb_extract` rows do not break.
+
+### 2. Candidate storage
+
+Store extracted candidates as reviewable evidence before queueing anything. Acceptable homes:
+
+- a dedicated `person_investment_candidate` table, if we want lifecycle/status/review fields; or
+- a structured JSON field under `permalink_person.cb_extract.personal_investments.companies`, if this stays source-local for now.
+
+Recommended candidate fields:
+
+| Field | Purpose |
+| --- | --- |
+| `master_person_id` | Source person. |
+| `person_permalink_id` | Source Crunchbase permalink row. |
+| `company_name` | Raw extracted company name. |
+| `company_crunchbase_url` | Crunchbase organization URL when present. |
+| `funding_round_url` | Crunchbase funding-round URL when present. |
+| `evidence_text` | Exact nearby text from the page. |
+| `source` | `Crunchbase Person`. |
+| `confidence` | Parser/matcher confidence. |
+| `status` | `captured`, `matched`, `needs_review`, `queued`, `skipped`. |
+| `matched_fundable_deal_id` | Filled only after a Fundable/deal match. |
+| `matched_fundable_org_id` | Filled only after an org match. |
+
+### 3. Match before materialize
+
+Before any graph or queue write, resolve candidates against canonical sources:
+
+1. Match by Crunchbase organization permalink to existing `permalink_company` / `master_company`.
+2. Match by Fundable organization and deal evidence where available.
+3. Match funding-round URLs only if there is a reliable map to `fundable_deals` or a deliberate Crunchbase-round table.
+4. Require a confidence threshold and log low-confidence candidates for review.
+
+### 4. Non-recursive materialization
+
+If/when enabled, materialization should stay bounded:
+
+- For matched Fundable deals, reuse the existing Fundable investment path or a direct-edge-only helper.
+- For company-only evidence, create at most a candidate company link or a direct `INVESTED_IN` edge after match confidence is high.
+- Any queue rows must be depth-1 and explicitly non-recursive.
+- Do not create founder/C-suite people from these portfolio companies during the same person waterfall.
+- Do not create company nodes from social/profile expanded URLs unless there is an explicit employer or investment relationship.
+
+## QA requirements
+
+When this work is built, `qa-the-sandbox` should report:
+
+- how many Crunchbase personal investment candidates were captured
+- how many matched existing companies or Fundable rows
+- how many remained `needs_review`
+- whether any `queue_enrich_funding` / `queue_enrich_company` rows were created
+- whether any graph `INVESTED_IN` edges were written
+- whether all created graph nodes/edges have `uuid` and `description`
+- whether queue fanout stayed non-recursive after settlement polling
+
+## Open decisions
+
+| Decision | Default recommendation |
+| --- | --- |
+| Candidate home | Use a dedicated table if this becomes operational; keep JSON-only if it remains source evidence. |
+| Queue fanout | Off by default. Only enable after candidate matching exists. |
+| Graph write target | Prefer direct `Person -> Company` `INVESTED_IN` edges for confirmed portfolio companies; avoid funding-round nodes unless a true funding-round entity is matched. |
+| Human review | Required for low-confidence matches and companies that only appear in prose. |
+| Migration | Keep reading old `personal_investments.summary`; write new prose as `description`. |
+
+## Related Xano functions
+
+<Card icon="file-search">
+
+```
+mvp/crunchbase/parse-person-page — 2760
+```
+
+Scrapes Crunchbase person pages, canonicalizes discovered Crunchbase permalinks, stores raw page evidence on `permalink_person.cb_person_page`, and calls the parser.
+
+</Card>
+
+<Card icon="brackets-curly">
+
+```
+mvp/crunchbase/parse-cb-person — 2677
+```
+
+LLM parser for Crunchbase person markdown. Future work should extend this schema to structured `personal_investments.companies[]`.
+
+</Card>
+
+<Card icon="user-round-cog">
+
+```
+mvp/crunchbase/process-person-profile — 2765
+```
+
+Processes `permalink_person.cb_extract` into person profile fields, biographies, links, investor profile fields, and related work/location records.
+
+</Card>
+
+<Card icon="network">
+
+```
+mvp/enrich/process-person-phase-9 — 12830
+```
+
+Existing Fundable-matched angel investment path. This is the active path for non-recursive `INVESTED_IN` edges when a person is already matched to Fundable investment data.
+
+</Card>

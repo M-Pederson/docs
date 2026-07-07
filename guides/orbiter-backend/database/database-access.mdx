@@ -24,6 +24,10 @@ It covers **who** can connect, **how** they authenticate, and **why** the setup 
   </Card>
 </CardGroup>
 
+<Info>
+  **Our cluster is private.** AlloyDB has **no public IP** (org policy). From a laptop you reach it through an **IAP tunnel to a bastion** ([`scripts/dev-db.sh`](https://github.com/M-Pederson/orbiter-infra/blob/main/scripts/dev-db.sh)) and the IAM token is minted client-side by impersonation. There is **no public-IP Auth Proxy** in our setup, and connections use `sslmode=require` (TLS end-to-end). Deployed services (Cloud Run) connect over **Direct VPC egress** as the attached SA. Names are per-environment (`orbiter-dev`, `orbiter-staging`, `orbiter-prod`); examples use `orbiter-dev`.
+</Info>
+
 ## Stack & ground rules
 
 We run on **AlloyDB for PostgreSQL** as the operational database. It speaks standard Postgres, so drivers, migrations, and SQL semantics all behave normally — but it adds managed HA, automated backups, IAM auth (the foundation of everything else in this doc), and the feature that decided the choice for us: **first-class vector search**.
@@ -36,7 +40,7 @@ We run on **AlloyDB for PostgreSQL** as the operational database. It speaks stan
     The Go shim that lets `pgx` / `sqlc` read and write `vector` columns natively as `[]float32` instead of parsing string-encoded vectors.
   </Accordion>
   <Accordion title="golang-migrate" icon="arrow-up-right-from-square">
-    Runs schema migrations. Everything in `migrations/` is applied in order via `make migrate-up-local` (Docker pgvector) or `make migrate-up-alloydb` (real AlloyDB through the auth proxy).
+    Runs schema migrations. Everything in `migrations/` is applied in order via `make migrate-up-local` (Docker pgvector) or `make migrate-up-alloydb` (real AlloyDB, through the IAP tunnel).
   </Accordion>
   <Accordion title="sqlc" icon="code">
     Generates the typed Go query layer from the `.sql` files in each feature's `db/` directory. Run `make sqlc-generate` after editing a query.
@@ -104,6 +108,18 @@ Three problems we're solving at once:
 
 The group role is the durable owner. Every other identity is a *vehicle* that can drive into the group via membership.
 
+<Note>
+  How each vehicle reaches our **private** cluster:
+  - **Migration SA** (laptop): impersonate it, mint a token, connect over the IAP tunnel. Cloud Run: attached SA + Direct VPC egress, connector mints the token.
+  - **Human**: AlloyDB Studio only for reads. `gcloud` cannot mint an `alloydb.login` token for a human identity, so laptop `psql`-as-yourself is not possible; to write, impersonate the SA:
+
+    ```bash
+    gcloud auth print-access-token \
+      --impersonate-service-account=<MIGRATION_SA> \
+      --scopes=https://www.googleapis.com/auth/alloydb.login
+    ```
+</Note>
+
 ## Identities
 
 ### Human IAM users
@@ -129,10 +145,10 @@ They are **not** used to run migrations directly. See [Login vs. Impersonation](
 In AlloyDB it appears as the IAM user `orbiter-database-account@orbiter-io.iam` (AlloyDB trims `.gserviceaccount.com` from SA emails when creating the corresponding Postgres role).
 
 <Info>
-**GCP IAM roles it holds** (granted on the `orbiter-io` project):
+**GCP IAM roles it holds** (granted per-environment project, e.g. `orbiter-dev`, via Terraform (not the console) in [`environments/dev/database.tf`](https://github.com/M-Pederson/orbiter-infra/blob/main/environments/dev/database.tf)):
 
-- `roles/alloydb.client` — lets it connect to AlloyDB via the proxy.
-- `roles/alloydb.databaseUser` — permits IAM-based DB authentication.
+- `roles/alloydb.client`: lets it connect to AlloyDB.
+- `roles/alloydb.databaseUser`: permits IAM-based DB authentication.
 
 That's all. It does **not** have `editor`, `owner`, or any compute permissions. It cannot SSH into anything, modify firewall rules, or read GCS. It can only authenticate to AlloyDB.
 </Info>
@@ -188,8 +204,8 @@ There are two ways to authenticate gcloud, and they behave very differently when
     This authenticates ADC as your human identity **but** records that ADC should mint tokens for the migration SA. The flow on every connection:
 
     1. ADC asks Google: "I am denis. Give me a token to act as `orbiter-database-account`."
-    2. Google checks: does denis have `roles/iam.serviceAccountTokenCreator` on that SA? Yes → mints a short-lived token. No → 403.
-    3. Proxy uses that token to connect to AlloyDB as the migration SA.
+    2. Google checks: does denis have `roles/iam.serviceAccountTokenCreator` on that SA? Yes → mints a short-lived (`alloydb.login`-scoped) token. No → 403.
+    3. That token is passed as the connection **password** over the IAP tunnel (`sslmode=require`); AlloyDB validates it and logs you in as the migration SA. (No Auth Proxy in our setup; the token *is* the password.)
     4. Migration SA auto-SETs role to `orbiter_migrator`.
     5. Every object created is owned by `orbiter_migrator`.
 
@@ -209,18 +225,12 @@ Impersonation is the cleanest path for local dev because it doesn't require down
 
 ## Why each principal needs its own Token Creator grant
 
-When you grant `roles/iam.serviceAccountTokenCreator` on the migration SA, you do it **per principal**, scoped to **the SA resource**:
-
-- Console → IAM & Admin → Service Accounts → click into `orbiter-database-account` → **Permissions** tab → **+ GRANT ACCESS**.
-- Principal: e.g. `new-teammate@orbiter.io`.
-- Role: `Service Account Token Creator`.
-
-You do **not** grant this at the project level. Here's why:
+`roles/iam.serviceAccountTokenCreator` is granted **per principal**, scoped to **the SA resource**, in Terraform ([`environments/dev/database.tf`](https://github.com/M-Pederson/orbiter-infra/blob/main/environments/dev/database.tf), `google_service_account_iam_member` over `developer_members`). It is **not** granted at the project level. Why:
 
 | Where granted | Effect | Risk |
 |---|---|---|
-| **On the SA itself** | Principal can impersonate **only this one SA** | Minimal |
-| **Project-wide** | Principal can impersonate **every SA in `orbiter-io`** | Includes `orbiter-api`, `orbiter-worker`, future SAs |
+| On the SA itself | Principal can impersonate only this one SA | Minimal |
+| Project-wide | Principal can impersonate every SA in the project | Includes `orbiter-api`, `orbiter-worker`, future SAs |
 
 <Warning>
 A project-wide grant would let any compromised developer credential impersonate every service account we have — including the API and worker SAs that read/write GCS and publish to Pub/Sub. That's the "keys to the kingdom" pattern. Resource-scoped grants keep blast radius to "this one SA can mint tokens for this one job."
@@ -322,44 +332,38 @@ This section documents the historical setup for reference. If you're spinning up
 ## Daily workflow: running migrations from your laptop
 
 <Steps>
-  <Step title="Authenticate gcloud with impersonation">
+  <Step title="Log in as yourself">
     ```bash
-    gcloud auth application-default login \
-      --impersonate-service-account=orbiter-database-account@orbiter-io.iam.gserviceaccount.com
+    gcloud auth login          # your @orbiter.io account
     ```
 
-    Browser opens, log in as your human Google account. Done.
+    You need `roles/iam.serviceAccountTokenCreator` on the migration SA (granted via Terraform in [`environments/dev/database.tf`](https://github.com/M-Pederson/orbiter-infra/blob/main/environments/dev/database.tf)). Impersonation happens when you mint the token in step 3, not here.
   </Step>
 
-  <Step title="Start the AlloyDB Auth Proxy in a separate terminal">
+  <Step title="Open the IAP tunnel in a separate terminal">
     ```bash
-    alloydb-auth-proxy \
-      --address 127.0.0.1 \
-      --port 5434 \
-      --public-ip \
-      --auto-iam-authn \
-      projects/orbiter-io/locations/us-central1/clusters/free-trial-cluster/instances/primary
+    ./scripts/dev-db.sh          # tunnels localhost:5432 → bastion → private AlloyDB
     ```
 
-    Wait for `The proxy has started successfully and is ready for new connections!` before proceeding.
-
-    <Tip>
-    The `--auto-iam-authn` flag is load-bearing — it tells the proxy to inject IAM tokens instead of passing through whatever password the client sends.
-    </Tip>
+    Wait for `Listening on port [5432]`. (No Auth Proxy; our DB is private and the tunnel is a plain TLS relay.) Script: [`scripts/dev-db.sh`](https://github.com/M-Pederson/orbiter-infra/blob/main/scripts/dev-db.sh).
   </Step>
 
-  <Step title="Check .env">
-    `DB_DSN_ALLOYDB` should be:
+  <Step title="Set the DSN and mint a token">
+    `.env` holds coordinates only, **no password/token** (it's ~1h-lived; mint at runtime):
 
     ```bash
-    DB_DSN_ALLOYDB=postgres://orbiter-database-account%40orbiter-io.iam:password@localhost:5434/orbiter?sslmode=disable
+    DB_DSN_ALLOYDB=postgres://orbiter-database-account%40orbiter-dev.iam@localhost:5432/orbiter_universe?sslmode=require
     ```
 
-    Notes on this DSN:
+    - `@` in the username is URL-encoded as `%40`; `.gserviceaccount.com` is trimmed.
+    - `sslmode=require`: TLS is end-to-end to AlloyDB (no proxy terminating it). `disable` fails with `no pg_hba.conf entry … no encryption`.
+    - The token is the password. goose has no password flag; its Postgres driver (`lib/pq`/`pgx`) reads the libpq `PGPASSWORD` env var when the DSN omits one, so export it at runtime rather than baking a ~1h token into the DSN:
 
-    - The `@` in the username is URL-encoded as `%40`.
-    - `.gserviceaccount.com` is **trimmed** — AlloyDB's Postgres role is `orbiter-database-account@orbiter-io.iam`, not the full email.
-    - The literal word `password` is a no-op placeholder. With `--auto-iam-authn` the proxy ignores it and injects a real IAM token.
+    ```bash
+    export PGPASSWORD="$(gcloud auth print-access-token \
+      --impersonate-service-account=orbiter-database-account@orbiter-dev.iam.gserviceaccount.com \
+      --scopes=https://www.googleapis.com/auth/alloydb.login)"
+    ```
   </Step>
 
   <Step title="Run the migration">
@@ -367,7 +371,7 @@ This section documents the historical setup for reference. If you're spinning up
     make migrate-up-alloydb
     ```
 
-    Done. New objects are owned by `orbiter_migrator` automatically.
+    New objects are owned by `orbiter_migrator` automatically. Re-export `PGPASSWORD` if the token expires.
   </Step>
 </Steps>
 
@@ -400,21 +404,12 @@ This is safe and idempotent.
 When a new engineer joins, two grants:
 
 <Steps>
-  <Step title="In GCP IAM Console">
-    Service Accounts → `orbiter-database-account` → **Permissions** → **+ GRANT ACCESS**:
-
-    - Principal: `<their-email>@orbiter.io`
-    - Role: `Service Account Token Creator`
+  <Step title="In Terraform">
+    Add their email to `developer_members` and `developer_db_users` in the env's tfvars, then apply. This grants `serviceAccountTokenCreator` on the migration SA (resource-scoped) and registers them as an AlloyDB IAM user. See [`environments/dev/database.tf`](https://github.com/M-Pederson/orbiter-infra/blob/main/environments/dev/database.tf) and [`environments/dev/main.tf`](https://github.com/M-Pederson/orbiter-infra/blob/main/environments/dev/main.tf).
   </Step>
 
-  <Step title="In AlloyDB">
-    Add them as an IAM user in the cluster's Users panel:
-
-    - Type: **IAM**
-    - Principal: `<their-email>@orbiter.io`
-    - Roles: `alloydbiamuser` (minimum), or `alloydbsuperuser` if they need full cluster admin (rare).
-
-    Then in Studio, add them to the migrator group:
+  <Step title="In SQL (Studio)">
+    Add them to the migrator group:
 
     ```sql
     GRANT orbiter_migrator TO "<their-email>@orbiter.io";
@@ -572,16 +567,21 @@ Drop these into Studio whenever something feels off.
     ```
   </Accordion>
 
-  <Accordion title="instance closed the connection" icon="triangle-exclamation">
-    The proxy reached AlloyDB but AlloyDB rejected the auth handshake. Causes, in order of likelihood:
-
-    1. DSN username doesn't match the IAM principal. For SAs, the role name is the email **without** `.gserviceaccount.com`. URL-encode the `@` as `%40`.
-    2. The principal doesn't have `roles/alloydb.databaseUser` at the project level.
-    3. The principal isn't registered as an IAM user in the AlloyDB cluster.
+  <Accordion title="no pg_hba.conf entry … no encryption" icon="triangle-exclamation">
+    Your DSN has `sslmode=disable`. Our cluster requires TLS and there is no proxy terminating it on our path. Use **`sslmode=require`**.
   </Accordion>
 
-  <Accordion title="password authentication failed" icon="triangle-exclamation">
-    The proxy is running without `--auto-iam-authn`, so it forwarded the literal `password` from the DSN, which AlloyDB rejected. Restart the proxy with `--auto-iam-authn`.
+  <Accordion title="AlloyDB rejected the auth handshake" icon="triangle-exclamation">
+    Causes, in order of likelihood:
+
+    1. Empty/wrong password: the token isn't set. Mint it and export `PGPASSWORD` (see daily workflow, step 3); it lasts ~1h.
+    2. Token minted for yourself instead of the SA: `invalid scope: alloydb.login` is not allowed for a human identity, so you must `--impersonate-service-account` the migration SA.
+    3. DSN username doesn't match the IAM principal: role name is the email **without** `.gserviceaccount.com`, `@` URL-encoded as `%40`, correct project (`orbiter-dev`).
+    4. Principal lacks `roles/alloydb.databaseUser`, or isn't registered as an IAM user in the cluster.
+  </Accordion>
+
+  <Accordion title="connection refused / can't reach localhost" icon="triangle-exclamation">
+    The IAP tunnel isn't up (or the bastion is stopped). Run [`scripts/dev-db.sh`](https://github.com/M-Pederson/orbiter-infra/blob/main/scripts/dev-db.sh) and wait for `Listening on port`.
   </Accordion>
 
   <Accordion title="permission denied for schema public on REASSIGN OWNED BY" icon="triangle-exclamation">
@@ -610,13 +610,14 @@ Drop these into Studio whenever something feels off.
 | **ADC** | Application Default Credentials — credentials cached by gcloud at `~/.config/gcloud/application_default_credentials.json`. Used by GCP client libraries (and the AlloyDB proxy) automatically. |
 | **Impersonation** | The act of one identity assuming another's permissions via short-lived tokens. Requires `roles/iam.serviceAccountTokenCreator` on the target. |
 | **Service account (SA)** | A non-human GCP identity. Used by automation (CI, Cloud Run services) and by humans via impersonation. Has no password, only a token-mint protocol. |
-| **IAM auth (AlloyDB)** | AlloyDB authenticates the session against the IAM principal carried in the connection token, instead of a username/password. Enabled by `--auto-iam-authn` on the proxy. |
+| **IAM auth (AlloyDB)** | AlloyDB authenticates the session against the IAM principal carried in a short-lived `alloydb.login` token passed as the connection password. Token is minted by impersonation (laptop) or the attached SA (Cloud Run); no proxy required. |
 | **LOGIN role** | A Postgres role that can authenticate and start a session. Every IAM user maps to one. |
 | **NOLOGIN role** | A Postgres role used only as a group / ownership target. Members inherit its privileges. `orbiter_migrator` is this. |
 | **`ALTER ROLE … SET role`** | A Postgres setting that auto-runs `SET ROLE <other>` at session start. We use it on the migration SA so its sessions always act as `orbiter_migrator`. |
 | **`REASSIGN OWNED BY A TO B`** | Bulk-transfers ownership of every object owned by role A to role B, in the current database. Skips extension-owned objects. |
 | **`alloydbsuperuser`** | AlloyDB's strongest customer-facing role. Strong, but not equivalent to Postgres's true `SUPERUSER` (which AlloyDB does not expose). |
-| **AlloyDB Auth Proxy** | A local process that opens a Postgres-protocol tunnel to AlloyDB, handling encryption and (with `--auto-iam-authn`) IAM token injection. Run it once per dev session. |
+| **AlloyDB Auth Proxy** | Local process that proxies to AlloyDB and can inject IAM tokens. **Not used in our setup**; the DB is private (no public IP). Laptops use the IAP tunnel + bastion; Cloud Run uses the connector/attached SA. |
+| **IAP tunnel + bastion** | How a laptop reaches the private DB: `dev-db.sh` forwards `localhost` through an IAP tunnel to a bastion that relays TCP to the private AlloyDB IP. Plain TLS relay; it does not inject tokens, so you supply the token yourself. |
 
 ## When in doubt
 

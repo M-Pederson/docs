@@ -99,6 +99,184 @@ key        sha256(canonical) = b7d1a2...        (or place_id = ChIJ2eUgeAK6j4AR.
 
 Each Universe row has its own `uuid` primary key **and** carries `xano_master_person_id` (and `xano_master_company_id`) so the apply endpoint can resolve the parent across systems. The child upsert key is always `(master_person_id, natural_key)`. Xano keeps its existing `int` primary keys untouched.
 
+## How the sync works
+
+The enrichment engine never writes to Xano directly. Each completed person is shipped as a **package** and applied by a single transactional endpoint on the Orbiter backend.
+
+```mermaid
+flowchart LR
+  A[Enrichment run] -->|same txn| B[(AlloyDB Universe rows)]
+  A -->|same txn| O[[outbox]]
+  O --> D{{Cloud Run drainer}}
+  D -->|project to Xano subset| P[/person package/]
+  P -->|POST| E[apply_person_package]
+  E -->|reconcile by natural_key| X[(Xano master_* tables)]
+  E -->|receipt| D
+```
+
+<Steps>
+  <Step title="Enrich + enqueue — one AlloyDB transaction">
+    The run writes/updates the person's Universe rows and inserts an `outbox` row `(universe_person_id, run_id)` in the **same** Postgres transaction. A crash can never half-sync.
+  </Step>
+  <Step title="Drain + build the package">
+    A Cloud Run drainer polls the outbox, reads the person's current Universe rows, and **projects** them down to the Xano subset (shared columns \+ the four sync columns) — one envelope per person.
+  </Step>
+  <Step title="POST /enrichment/apply_person_package">
+    The drainer sends the envelope. On `2xx` it marks the outbox row done; on error it retries (at-least-once delivery).
+  </Step>
+  <Step title="Reconcile per collection — one Xano transaction">
+    The endpoint resolves the parent via `master_person_id`, then reconciles each collection by `natural_key` (rules below), wrapped in a single DB transaction — all-or-nothing per person.
+  </Step>
+  <Step title="Return a receipt">
+    The response reports created / updated / soft-deleted / skipped counts plus any conflicts, so the drainer can log and alert.
+  </Step>
+</Steps>
+
+### Reconcile rules
+
+Per collection, for each row keyed on `(master_person_id, natural_key)`:
+
+| Situation | Action |
+| --- | --- |
+| In package, row exists, **not**`locked` | **Update** in place |
+| In package, row exists, `locked = true` | **Skip** — user hand-edit wins |
+| In package, no matching row | **Insert** |
+| `content_hash` unchanged vs stored | **Skip** — idempotent no-op |
+| Row exists, absent from package, `authoritative = true` | **Soft-delete** (`active_status = false`) |
+| Row exists, absent from package, `authoritative = false` | **Leave** — additive merge |
+
+`authoritative` is a per-collection flag on the envelope: `true` means "this is the complete set for this person, reconcile deletes"; `false` means "merge these in, touch nothing else."
+
+## Sync package example
+
+One envelope for Jane Doe, matching the example records above. Universe-only fields like `confidence` ride along so the Orbiter side _can_ store them if wanted, but only the shared \+ sync columns are actually written.
+
+```json
+{
+  "schema_version": "1.0",
+  "run_id": "enr_2026_07_08_abc",
+  "generated_at": "2026-07-08T14:03:00Z",
+  "person": {
+    "universe_person_id": "a3f9c2e1-6b04-4d8e-8f12-77b0e5c4de84",
+    "master_person_id": 84213
+  },
+  "collections": {
+    "emails": {
+      "authoritative": true,
+      "rows": [
+        {
+          "natural_key": "jane.doe@acmerobotics.com",
+          "content_hash": "sha256:7b21f0",
+          "email_address": "jane.doe@acmerobotics.com",
+          "email_type": "work",
+          "full_name": "Jane Doe",
+          "active_status": true,
+          "data_source_id": 91,
+          "source": "pdl",
+          "confidence": 0.92,
+          "first_seen_at": "2026-05-01T09:12:00Z",
+          "last_seen_at": "2026-07-08T14:03:00Z"
+        }
+      ]
+    },
+    "phones": {
+      "authoritative": true,
+      "rows": [
+        {
+          "natural_key": "+14155551234",
+          "content_hash": "sha256:c40a9d",
+          "phone_number": "4155551234",
+          "country_calling_code": "1",
+          "local_display_phone": "(415) 555-1234",
+          "phone_type": "mobile",
+          "first_name": "Jane",
+          "last_name": "Doe",
+          "connected_only": true,
+          "data_source_id": 94,
+          "source": "enrich_layer",
+          "confidence": 0.81,
+          "first_seen_at": "2026-05-01T09:12:00Z",
+          "last_seen_at": "2026-07-08T14:03:00Z"
+        }
+      ]
+    },
+    "links": {
+      "authoritative": true,
+      "rows": [
+        {
+          "natural_key": "linkedin.com/in/janedoe",
+          "content_hash": "sha256:1f8e3c",
+          "service": "linkedin",
+          "service_label": "LinkedIn",
+          "icon_url": "https://cdn.orbiter.io/icons/linkedin.svg",
+          "link_url": "https://www.linkedin.com/in/janedoe/",
+          "profile": true,
+          "data_source_id": 101,
+          "source": "exa",
+          "confidence": 0.99,
+          "first_seen_at": "2026-05-01T09:12:00Z",
+          "last_seen_at": "2026-07-08T14:03:00Z"
+        }
+      ]
+    },
+    "addresses": {
+      "authoritative": false,
+      "rows": [
+        {
+          "natural_key": "sha256:b7d1a2",
+          "place_id": "ChIJ2eUgeAK6j4AR",
+          "content_hash": "sha256:e3aa71",
+          "address_label": "HQ",
+          "formatted_address": "500 Terry A Francois Blvd, San Francisco, CA 94158, USA",
+          "number": "500",
+          "address_line_1": "Terry A Francois Blvd",
+          "city": "San Francisco",
+          "state_region": "California",
+          "region_code": "CA",
+          "postal_code": "94158",
+          "country": "United States",
+          "country_code": "US",
+          "latitude": "37.7706",
+          "longitude": "-122.3892",
+          "timezone": "America/Los_Angeles",
+          "mailing_address": true,
+          "data_source_id": 78,
+          "source": "base_company_enrich",
+          "confidence": 0.88,
+          "first_seen_at": "2026-05-01T09:12:00Z",
+          "last_seen_at": "2026-07-08T14:03:00Z"
+        }
+      ]
+    }
+  }
+}
+```
+
+## Apply: request then response
+
+**Request** — `POST /enrichment/apply_person_package` with the envelope above.
+
+**Response** — a receipt. Here `emails` and `phones` were new inserts, `links` was an update, and `addresses` was an unchanged no-op (`content_hash` matched):
+
+```json
+{
+  "run_id": "enr_2026_07_08_abc",
+  "master_person_id": 84213,
+  "applied": {
+    "emails":    { "created": 1, "updated": 0, "soft_deleted": 0, "skipped": 0 },
+    "phones":    { "created": 1, "updated": 0, "soft_deleted": 0, "skipped": 0 },
+    "links":     { "created": 0, "updated": 1, "soft_deleted": 0, "skipped": 0 },
+    "addresses": { "created": 0, "updated": 0, "soft_deleted": 0, "skipped": 1 }
+  },
+  "conflicts": [],
+  "locked_skipped": []
+}
+```
+
+<Note>
+  **Idempotency \+ the lock loop.** Re-delivering the same `run_id` is safe — every row whose `content_hash` matches the stored value is skipped (lands in `skipped`), so retries never duplicate. When a user edits a row in the app, set `locked = true`; the apply step then never overwrites it. The clean v2 is to feed that user edit back into AlloyDB as top-tier evidence, so the master re-resolves to the user's value and the next package reaffirms it — at which point the lock becomes optional.
+</Note>
+
 ## Still open
 
 - **Confirm none of these four tables is datasource/tenant-scoped.** As pulled from workspace 3, parenting is purely `master_person_id` / `master_company_id` — no datasource column — which keeps the sync grain simple. Worth verifying against app usage before locking the apply endpoint.

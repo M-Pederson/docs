@@ -23,7 +23,7 @@ Every Universe row carries **two** identifiers, doing different jobs:
 Which `node_uuid` a row carries depends on whether the thing is a **graph node**:
 
 - **Entities / nodes** — `master_person`, `master_company`, `film_tv`, `film_tv_award` — carry their **own** `node_uuid`.
-- **Attribute facets** — `master_email`, `master_phone`, `master_link`, `master_address` — are _not_ nodes; they carry the **parent entity's** `node_uuid` (one column replaces both `master_person_id` and `master_company_id`) and are identified by `(node_uuid, natural_key)`.
+- **Attribute facets** — `master_email`, `master_phone`, `master_link`, `master_address` — are _not_ nodes; they carry the **parent entity's** `node_uuid`, a single FK into the node registry (below) that replaces both `master_person_id` and `master_company_id`, and are identified by `(node_uuid, natural_key)`.
 
 Rule of thumb: _is it a graph node?_ then it gets its own `node_uuid`; _is it a plain attribute of a node?_ then it carries the parent's. `film_tv_award` is both — a node (own `node_uuid`) **and** an edge-like link that references the film's and the person's `node_uuid`s.
 
@@ -32,6 +32,47 @@ Rule of thumb: _is it a graph node?_ then it gets its own `node_uuid`; _is it a 
 - **Universe-only** — enrichment internals that stay in AlloyDB and are _not_ projected: `confidence`, `peak_confidence`, `evidence`, `first_seen_at`, `last_seen_at`, `geohash`, `match_embedding`, `embedding`. (`id` is also effectively per-system — same column name in Xano, different value space.)
 - **Added to Orbiter** — four sync-machinery columns added to every Xano table: `natural_key`, `content_hash`, `source_run_id`, `locked` (plus optional `place_id` on addresses).
 - Everything else is **shared** — including `node_uuid` (entities already carry it in Xano; facet tables would need it added, or resolved on apply).
+
+---
+
+## Registries
+
+A **node registry** — one row per node (`node_uuid` \+ its type) — lives on _both_ sides, but for different reasons and in different shapes.
+
+### `universe_node` — Universe (write-side)
+
+The single table every entity and facet shares a `node_uuid` with. It solves the polymorphic-FK problem: a facet can belong to a person _or_ a company, and Postgres can't foreign-key one column to two tables — so facets reference the registry instead.
+
+```sql
+CREATE TABLE universe_node (
+  node_uuid   uuid PRIMARY KEY,
+  entity_type text NOT NULL,   -- logical label: 'person' | 'company' | 'film_tv' | 'film_tv_award'
+  created_at  timestamptz DEFAULT now()
+  -- + cross-entity node metadata: merge lineage, soft-delete, canonical name…
+);
+```
+
+- Entities share their `node_uuid` with it (`master_person.node_uuid → universe_node`).
+- **Facets reference only this** — `master_email.node_uuid → universe_node` is the sole parenting column. No `owner_kind`, no parent PK; the type is `universe_node.entity_type`.
+- `entity_type` is a **logical label**, not the physical table name — it survives table renames and matches the graph labels. (If you resolve it to a table via dynamic SQL, validate against an allowlist.)
+
+### Orbiter card registry — Xano (read-side)
+
+A different job: a **UI read-model** so the app can render a card for any `node_uuid` — person, company, or film — in a single fetch, without knowing the type first. This generalizes what the loop/discover render path already does for person cards.
+
+| node\_uuid | entity\_type | display\_name | subtitle | image\_url | datasource\_id |
+| --- | --- | --- | --- | --- | --- |
+| `a3f9c2e1…` | person | Jane Doe | CTO @ Acme Robotics | `….jpg` | 3 |
+| `7d1e9b02…` | company | Acme Robotics | acmerobotics.com | `….png` | 3 |
+| `b2f4a6c8…` | film\_tv | The Matrix | 1999 · movie | `….jpg` | 3 |
+
+- Carries **denormalized card fields** (`display_name`, `subtitle`, `image_url`) so the UI joins to the full entity only on the detail view.
+- **Datasource-scoped** — because Xano's `node_uuid` repoints per datasource, the key is `(datasource_id, node_uuid)`.
+- Populated by the sync as a **second projection target** (see below).
+
+<Note>
+  Same `node_uuid → entity_type` core on both sides, opposite purposes: `universe_node` enforces write-side identity \+ FK integrity; the Orbiter registry serves read-side card rendering. The Universe copy is globally unique; the Orbiter copy fans out per datasource.
+</Note>
 
 ---
 
@@ -67,7 +108,9 @@ Xano table `film_tv_award` (#396). An award is its **own** node _and_ links a fi
 
 #### Orbiter backend (Xano)
 
-| id | created\_at | node\_uuid | year | award\_type | award\_description | nominee\_or\_winner | shared\_with | film\_tv\_id | project\_title | project\_imdb\_url | imdb\_person\_id | natural\_key | content\_hash | source\_run\_id | locked | |-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-| | 90210 | 2026-06-15T10:05Z | `c3a5b7d9-2e4f-4a6b-8c0d-1f3a5b7d9e20` | 2000 | Academy Award | Best Film Editing | winner | `{}` | 4021 | The Matrix | `https://www.imdb.com/title/tt0133093/` | 771 | `sha256:4b8e2a` | `sha256:1c2d3e` | `enr_2026_07_08_film` | false |
+| id | created\_at | node\_uuid | year | award\_type | award\_description | nominee\_or\_winner | shared\_with | film\_tv\_id | project\_title | project\_imdb\_url | imdb\_person\_id | natural\_key | content\_hash | source\_run\_id | locked |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 90210 | 2026-06-15T10:05Z | `c3a5b7d9-2e4f-4a6b-8c0d-1f3a5b7d9e20` | 2000 | Academy Award | Best Film Editing | winner | `{}` | 4021 | The Matrix | `https://www.imdb.com/title/tt0133093/` | 771 | `sha256:4b8e2a` | `sha256:1c2d3e` | `enr_2026_07_08_film` | false |
 
 ---
 
@@ -87,7 +130,9 @@ Xano table `master_email` (#155). Natural key = the normalized `email_address` (
 
 #### Orbiter backend (Xano)
 
-| id | created\_at | updated\_at | master\_person\_id | master\_company\_id | email\_address | email\_type | full\_name | active\_status | share\_publicly | connected\_only | orbiter\_verified | data\_source\_id | created\_by\_user\_id | source | natural\_key | content\_hash | source\_run\_id | locked | |-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-| | 55012 | 2026-05-01T09:12Z | 2026-07-08T14:03Z | 84213 | null | `jane.doe@acmerobotics.com` | work | Jane Doe | true | false | false | false | 91 | null | pdl | `jane.doe@acmerobotics.com` | `sha256:7b21f0` | `enr_2026_07_08_abc` | false |
+| id | created\_at | updated\_at | master\_person\_id | master\_company\_id | email\_address | email\_type | full\_name | active\_status | share\_publicly | connected\_only | orbiter\_verified | data\_source\_id | created\_by\_user\_id | source | natural\_key | content\_hash | source\_run\_id | locked |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 55012 | 2026-05-01T09:12Z | 2026-07-08T14:03Z | 84213 | null | `jane.doe@acmerobotics.com` | work | Jane Doe | true | false | false | false | 91 | null | pdl | `jane.doe@acmerobotics.com` | `sha256:7b21f0` | `enr_2026_07_08_abc` | false |
 
 ### master\_phone
 
@@ -101,7 +146,9 @@ Xano table `master_phone` (#151). Pieces stored separately; the Universe compute
 
 #### Orbiter backend (Xano)
 
-| id | created\_at | updated\_at | master\_person\_id | master\_company\_id | first\_name | last\_name | phone\_number | country\_calling\_code | local\_display\_phone | phone\_extension | phone\_type | connected\_only | orbiter\_verified | data\_source\_id | created\_by\_user\_id | source | natural\_key | content\_hash | source\_run\_id | locked | |-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-| | 33188 | 2026-05-01T09:12Z | 2026-07-08T14:03Z | 84213 | null | Jane | Doe | 4155551234 | 1 | (415) 555-1234 | null | mobile | true | false | 94 | null | enrich\_layer | `+14155551234` | `sha256:c40a9d` | `enr_2026_07_08_abc` | false |
+| id | created\_at | updated\_at | master\_person\_id | master\_company\_id | first\_name | last\_name | phone\_number | country\_calling\_code | local\_display\_phone | phone\_extension | phone\_type | connected\_only | orbiter\_verified | data\_source\_id | created\_by\_user\_id | source | natural\_key | content\_hash | source\_run\_id | locked |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 33188 | 2026-05-01T09:12Z | 2026-07-08T14:03Z | 84213 | null | Jane | Doe | 4155551234 | 1 | (415) 555-1234 | null | mobile | true | false | 94 | null | enrich\_layer | `+14155551234` | `sha256:c40a9d` | `enr_2026_07_08_abc` | false |
 
 ### master\_link
 
@@ -115,7 +162,9 @@ Xano table `master_link` (#166). Natural key = canonical URL (lower-case host, d
 
 #### Orbiter backend (Xano)
 
-| id | created\_at | updated\_at | master\_person\_id | master\_company\_id | service | service\_label | icon\_url | link\_url | data\_source\_id | created\_by\_user\_id | profile | source | natural\_key | content\_hash | source\_run\_id | locked | |-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-| | 71204 | 2026-05-01T09:12Z | 2026-07-08T14:03Z | 84213 | null | linkedin | LinkedIn | `https://cdn.orbiter.io/icons/linkedin.svg` | `https://www.linkedin.com/in/janedoe/` | 101 | null | true | exa | `linkedin.com/in/janedoe` | `sha256:1f8e3c` | `enr_2026_07_08_abc` | false |
+| id | created\_at | updated\_at | master\_person\_id | master\_company\_id | service | service\_label | icon\_url | link\_url | data\_source\_id | created\_by\_user\_id | profile | source | natural\_key | content\_hash | source\_run\_id | locked |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 71204 | 2026-05-01T09:12Z | 2026-07-08T14:03Z | 84213 | null | linkedin | LinkedIn | `https://cdn.orbiter.io/icons/linkedin.svg` | `https://www.linkedin.com/in/janedoe/` | 101 | null | true | exa | `linkedin.com/in/janedoe` | `sha256:1f8e3c` | `enr_2026_07_08_abc` | false |
 
 ### master\_address
 
@@ -137,7 +186,9 @@ key        sha256(canonical) = b7d1a2...        (or place_id = ChIJ2eUgeAK6j4AR.
 
 #### Orbiter backend (Xano)
 
-| id | created\_at | updated\_at | master\_company\_id | master\_person\_id | address\_label | formatted\_address | unit | number | address\_line\_1 | address\_line\_2 | city | state\_region | region\_code | postal\_code | country | country\_code | connected\_only | mailing\_address | data\_source\_id | longitude | latitude | timezone | path\_triples\_added | created\_by\_user\_id | source | natural\_key | place\_id | content\_hash | source\_run\_id | locked | |-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-| | 20933 | 2026-05-01T09:12Z | 2026-07-08T14:03Z | null | 84213 | HQ | 500 Terry A Francois Blvd, San Francisco, CA 94158, USA | null | 500 | Terry A Francois Blvd | null | San Francisco | California | CA | 94158 | United States | US | false | true | 78 | -122.3892 | 37.7706 | `America/Los_Angeles` | false | null | base\_company\_enrich | `sha256:b7d1a2` | `ChIJ2eUgeAK6j4AR` | `sha256:e3aa71` | `enr_2026_07_08_abc` | false |
+| id | created\_at | updated\_at | master\_company\_id | master\_person\_id | address\_label | formatted\_address | unit | number | address\_line\_1 | address\_line\_2 | city | state\_region | region\_code | postal\_code | country | country\_code | connected\_only | mailing\_address | data\_source\_id | longitude | latitude | timezone | path\_triples\_added | created\_by\_user\_id | source | natural\_key | place\_id | content\_hash | source\_run\_id | locked |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 20933 | 2026-05-01T09:12Z | 2026-07-08T14:03Z | null | 84213 | HQ | 500 Terry A Francois Blvd, San Francisco, CA 94158, USA | null | 500 | Terry A Francois Blvd | null | San Francisco | California | CA | 94158 | United States | US | false | true | 78 | -122.3892 | 37.7706 | `America/Los_Angeles` | false | null | base\_company\_enrich | `sha256:b7d1a2` | `ChIJ2eUgeAK6j4AR` | `sha256:e3aa71` | `enr_2026_07_08_abc` | false |
 
 ---
 
@@ -153,6 +204,7 @@ flowchart LR
   D -->|project to Xano subset| P[/node package/]
   P -->|POST| E[apply_person_package]
   E -->|match by node_uuid + natural_key| X[(Xano master_* tables)]
+  E -->|upsert card row| R[(Xano card registry)]
   E -->|receipt| D
 ```
 
@@ -188,6 +240,10 @@ Per collection, for each row keyed on `(node_uuid, natural_key)`:
 | Row exists, absent from package, `authoritative = false` | **Leave** — additive merge |
 
 `authoritative` is a per-collection flag on the envelope: `true` means "this is the complete set for this node, reconcile deletes"; `false` means "merge these in, touch nothing else."
+
+### Second projection: card rows
+
+When a node is enriched, the drainer writes **two** things to Xano — the entity/facet rows _and_ the node's **card registry row** (`display_name`, `subtitle`, `image_url` derived from the entity) — so cards render immediately in that datasource. Same package, one extra upsert.
 
 ## Sync package example
 
@@ -317,5 +373,6 @@ Entity nodes (`film_tv`, `film_tv_award`) ship the same way — a package whose 
 
 - **Confirm `node_uuid` is globally stable in the Universe.** Prior notes flag that Xano's `node_uuid` can _repoint per datasource_ — in the source of truth it must be globally unique, or one Universe `node_uuid` maps to several Xano rows.
 - **Facet `node_uuid` on the Xano side.** Facet tables key on `master_person_id` today, not `node_uuid`. Either add `node_uuid` to the Xano facet tables, or have the apply endpoint resolve `node_uuid → master_person_id` via `master_person` before matching.
+- **Registries:** does an Orbiter node/card table already exist (the one the loop/discover render path leans on) to model against, or is it net-new? Lock the card registry's `(datasource_id, node_uuid)` key.
 - **Address key:** decide `place_id` (needs a geocode step) vs. component hash.
-- **Next artifacts:** AlloyDB `CREATE TABLE` DDL (entities \+ facets, `bigint` identity PKs, native `uuid` / `text[]` / `jsonb`), `ALTER TABLE` adding the four sync columns on the Xano side, and the `apply_person_package` endpoint contract.
+- **Next artifacts:** AlloyDB `CREATE TABLE` DDL (entities \+ facets \+ `universe_node`, `bigint` identity PKs, native `uuid` / `text[]` / `jsonb`), `ALTER TABLE` adding the four sync columns on the Xano side, and the `apply_person_package` endpoint contract.

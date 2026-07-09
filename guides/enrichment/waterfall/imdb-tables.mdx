@@ -3,6 +3,10 @@ title: "IMDB Waterfall Tables"
 description: "Every Xano table + queue in the live IMDB (Film & TV) waterfall — imdb_person, film_tv, film_tv_award, the two URL-keyed queues, the expertise mirror, and the shared crash log. Field-by-field schemas, the enrichment-metadata additions, and URL-normalization keying."
 ---
 
+<Note>
+  **Last reviewed & updated: 2026-07-09** — audited against live XanoScript (workspace 3 `OrbiterV2`, branch `v1`).
+</Note>
+
 The Xano storage layer for the [IMDB Waterfall](/guides/enrichment/waterfall/imdb-waterfall). Queue tables are keyed on the **normalized `imdb_url`**, not on `imdb_person_id` / `film_tv_id`, because most discoveries happen before the underlying row exists.
 
 ## Table inventory
@@ -10,15 +14,17 @@ The Xano storage layer for the [IMDB Waterfall](/guides/enrichment/waterfall/imd
 | Table | Xano ID | Role |
 | --- | :-: | --- |
 | `imdb_person` | **#394** | Source of truth — IMDB person records (raw `json` \+ `markdown` \+ enrichment metadata). Also holds `awards_json` \+ `award_markdown` populated by #12887. |
-| `film_tv` | **#395** | Source of truth — title (film/TV) records. Same schema additions \+ poster fields. |
+| `film_tv` | **#395** | Source of truth — title (film/TV) records. Same schema additions \+ the poster field. |
 | `film_tv_award` | **#396** | Award rows written by `add-award-records-from-{person,title}`. `node_uuid` stamped by #2334. |
+| `imdb_credit_join` | **#397** | Relational mirror of `WORKED_ON` credit edges. Upserted by #13013 / #13015 — including **pending** rows (`edge_created: false`) for credit-derived `film_tv` stubs. |
 | `queue_imdb_person` | **#706** | Person enrichment queue. Upsert-only, keyed on `imdb_url`. |
 | `queue_imdb_title` | **#707** | Title enrichment queue. Upsert-only, keyed on `imdb_url`. |
-| `person_has_expertise` | **#711** | Relational mirror of `HAS_EXPERTISE` graph edges. Written by `llm-identify-person-expertise` v2 via resolver #12926. |
+| `person_has_expertise` | **#711** | Relational mirror of `HAS_EXPERTISE` graph edges. Written by `llm-identify-person-expertise` #12666 via resolver #12926 (re-resolution clears and rewrites the person's rows). |
+| `node_registry` | **#758** | Cross-pipeline registry of graph node UUIDs → source-table names. #2320 and #2334 register `Film_TV` / `Film_TV_Award` UUIDs here (the live type column is spelled `entitiy_type`). |
 | `log_crash` | **#542** | Shared per-phase observability from orchestrators \+ cascades \+ crons. |
 
 <Note>
-  **`log_crash` is shared infrastructure, not IMDB-specific.** Filter by the IMDB `phase` enum values: `llm_extract`, `save_scrape`, `master_person`, `node_stamp`, `bios_optional`, `credit_edges`, `awards`, `cascades`. `phase` is a strict enum — values outside the list fail at runtime.
+  **`log_crash` is shared infrastructure, not IMDB-specific.** The IMDB waterfall writes these `phase` enum values: `llm_extract`, `save_scrape`, `master_person`, `node_stamp`, `bios_optional`, `credit_edges`, `credit_edges_person`, `awards`, `cascades`, `tagline`, `film_tv_node`, `image_upload`, `load`, and `api_bad_request` (plus `phase-8` via the #13185 bridge default). `phase` is a strict enum — values outside the table's list fail at runtime.
 </Note>
 
 ---
@@ -34,8 +40,8 @@ The production conventions on these tables — the reference the [music tables](
 - **FKs** are int, not null, **default `0` = unset**, with a Xano `tableref` — named for the target table, not generic `entity_id`.
 - **Text fields** carry `trim` validators.
 - **Queue keys:** `unique(imdb_url)` — uniqueness is enforced at the queue layer only (URLs need normalization first; the music tables also add `unique(mbid)` on source tables because MBIDs are stable).
-- **Queue worker pickup index:** composite `btree(processing, priority_tier, cascade_depth)`.
-- **Source-table index:** `btree(created_at desc)` on `imdb_person` / `film_tv` (verified live 2026-07-01 — the convention the music source tables mirror).
+- **Queue worker pickup index:** composite `btree(processing, priority_tier, cascade_depth)`, plus a `btree` on the FK (`imdb_person_id` / `film_tv_id`).
+- **Source-table index:** `btree(created_at desc)` on `imdb_person` / `film_tv` (the convention the music source tables mirror); `film_tv_award` and `imdb_credit_join` carry the same `btree(created_at)`.
 
 ## Queue tables (2 — shared shape)
 
@@ -87,12 +93,32 @@ The enrichment metadata layered onto the two source-of-truth tables by the water
 | `awards_json` | json nullable | Parsed LLM award array — post-hoc debug \+ idempotent re-process |
 | `award_markdown` | text nullable | Raw scrape of `{imdb_url}/awards/` for debug |
 
-### On `film_tv` only (poster subsystem, late May 2026)
+### On `film_tv` only (poster subsystem)
 
 | Field | Type | Purpose |
 | --- | --- | --- |
-| `poster_url` | text nullable | Canonicalized IMDB poster URL (`@._V1_` size transform recomputed) |
-| `image_url` | text nullable | Re-hosted GCS WebP poster (`imdb-posters/<imdb_id>`) via `save-imbd-poster` #13044 |
+| `image_url` | text nullable | The title poster. `run-base-imdb-title-enrich` #12881 canonicalizes the LLM-extracted `poster_url` (`@._V1_` size transform recomputed), uploads it via `save-imbd-poster` #13044, and persists the re-hosted GCS WebP URL (`imdb-posters/<imdb_id>`) — falling back to the canonicalized IMDB URL if the upload fails. There is no separate `poster_url` column; that name exists only inside the extraction JSON. |
+
+---
+
+## `imdb_credit_join` (#397)
+
+Relational mirror of the `(Person)-[:WORKED_ON]->(Film_TV)` graph edges, written by the credit-edge writers so relational QA can verify person/title joins without querying FalkorDB.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `id` | int | PK |
+| `created_at` | timestamp |  |
+| `imdb_person_id` | int nullable | Person side (row FK) |
+| `person_node_uuid` | text nullable | Person graph UUID |
+| `imdb_person_url` | text nullable | Normalized person URL |
+| `roles` | text | Credit role text |
+| `position` | text nullable | Bill/credit position when known |
+| `film_tv_id` | int nullable | Title side (row FK) |
+| `film_tv_node_uuid` | text nullable | Title graph UUID |
+| `imdb_title_url` | text nullable | Normalized title URL |
+| `edge_created` | bool | `false` = pending — the film exists only as a queued stub; the same idempotent writer flips it `true` once the graph edge lands |
+| `source` | text nullable | Writer provenance |
 
 ---
 

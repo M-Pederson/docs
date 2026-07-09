@@ -7,12 +7,14 @@ sidebarTitle: "Overview"
 Queue-driven IMDB (Film & TV) enrichment with a tiered cascade, depth cap, loop prevention, and full credit-edge \+ expertise wiring. This page is the architecture spec: source contract, depth model, tiers, seed flows, loop prevention, and the implementation invariants. The live function inventory, table schemas, and graph node \+ edge references live on the companion pages below.
 
 <Note>
-  **Status: SHIPPED \+ EXTENDED** (last full audit 2026-06-01; edge-description model migration verified live 2026-07-01). The full waterfall is live in Xano workspace 3 (OrbiterV2) — the function inventory with per-function version history is on [IMDB Waterfall Functions](/guides/enrichment/waterfall/imdb-functions). **Both queue crons ship `active = false`** — flip them in the Xano UI before enabling production enrichment.
+  **Last reviewed & updated: 2026-07-09** — audited against live XanoScript (workspace 3 `OrbiterV2`, branch `v1`).
 </Note>
+
+The full waterfall is live in Xano workspace 3 (OrbiterV2) — the function inventory with per-function version history is on [IMDB Waterfall Functions](/guides/enrichment/waterfall/imdb-functions). **Both queue crons are `active = false`** — flip them in the Xano UI before enabling production enrichment.
 
 <CardGroup cols={2}>
   <Card title="IMDB Waterfall Entry Points" icon="play" href="/guides/enrichment/waterfall/imdb-entry-points">
-    The functions that can start the waterfall — the person \+ title get-add gates, the master-person attach path, and reverse IMDB-URL verification.
+    The functions that can start the waterfall — the person \+ title get-add gates, the master-person attach path, reverse IMDB-URL verification, and the cross-waterfall expertise bridge.
   </Card>
 
   <Card title="IMDB Waterfall Functions" icon="diagram-project" href="/guides/enrichment/waterfall/imdb-functions">
@@ -20,7 +22,7 @@ Queue-driven IMDB (Film & TV) enrichment with a tiered cascade, depth cap, loop 
   </Card>
 
   <Card title="IMDB Waterfall Tables" icon="table" href="/guides/enrichment/waterfall/imdb-tables">
-    Xano tables \+ queues — `imdb_person`, `film_tv`, `film_tv_award`, the two URL-keyed queues, and the expertise mirror, with field-by-field schemas.
+    Xano tables \+ queues — `imdb_person`, `film_tv`, `film_tv_award`, the credit-join mirror, the two URL-keyed queues, and the expertise mirror, with field-by-field schemas.
   </Card>
 
   <Card title="IMDB Nodes" icon="circle-nodes" href="/guides/enrichment/waterfall/imdb-nodes">
@@ -32,7 +34,7 @@ Queue-driven IMDB (Film & TV) enrichment with a tiered cascade, depth cap, loop 
   </Card>
 
   <Card title="IMDB Waterfall Crons" icon="clock-rotate-left" href="/guides/enrichment/waterfall/imdb-crons">
-    The two queue-drain crons — Task #159 (person) and Task #160 (title), single-row ticks every 600 s, both shipping inactive.
+    The queue-drain crons — Task #159 (person) and Task #160 (title), single-row ticks every 600 s — plus the UTA seeder and poster-backfill tasks. All inactive.
   </Card>
 </CardGroup>
 
@@ -49,7 +51,7 @@ Unlike the [Music waterfall](/guides/enrichment/waterfall/music-waterfall)'s str
 | Awards source | `{imdb_url}/awards/` → `award_markdown` → LLM → `awards_json` \+ `film_tv_award` rows |
 | Posters | IMDb image CDN (`@._V1_` size transform recomputed) → re-hosted GCS WebP `imdb-posters/<imdb_id>` |
 | Natural key | **normalized `imdb_url`** — \`trim | split:"/?" | first | rtrim:"/"\` (queues \+ source tables) |
-| Staleness gate | `enriched_at` within **30 days** → no re-scrape (`refresh: true` on the title gate forces one) |
+| Staleness gate | person gate: `enriched_at` within **30 days** → no re-scrape. Title gate: **any** existing `film_tv` row dedups (v1.4) — except sparse/unenriched rows, which fall through for queue repair or sync-enrich (v1.7–v1.10); `refresh: true` forces a re-scrape |
 | Rate limiting | no provider hard limit — pacing comes from the single-row cron tick (600 s per queue) |
 | Firecrawl wrapper | `mvp/firecrawl/scrape` #4515 calls Firecrawl v2 `/scrape` for markdown \+ links. **v1.6 (2026-07-07):** treats Xano optional-input `0`/empty-string sentinels as missing for `timeout_ms`, `request_timeout_seconds`, and `proxy`, restoring the intended defaults of 60000 ms, 60 s, and `auto`. Required person/title page scrapes stay hard-fail; optional awards-page scrapes pass `soft_fail: true` and skip cleanly on no markdown. |
 | LLM extraction | models, temps, and token ceilings per function: [Film & TV model summary](/guides/enrichment/film-tv-pipeline/model-summary) · prompts: [Film & TV system prompts](/guides/enrichment/film-tv-pipeline/llm-system-prompts) — linked, not duplicated |
@@ -136,7 +138,7 @@ When the same `imdb_url` is discovered twice (e.g., an actor appears on two seed
 
 <Steps>
   <Step title="Kill switch (P1)">
-    `check-kill-switch-imdb` (#12870). If active, return existing `imdb_person` if found; otherwise log to `kill_switch_blocked_imdb` and return empty.
+    `check-kill-switch-imdb` (#12870). If active, return existing `imdb_person` if found; otherwise write a `log_crash` row (`kill switch active - new imdb_person blocked`) and return empty.
   </Step>
   <Step title="Dedup + scrape + LLM extract (P2)">
     Lookup by normalized `imdb_url`. If `enriched_at` within 30 days → return existing. Otherwise scrape via Firecrawl, run LLM extractor (`~google/gemini-flash-latest`), save `json` / `markdown` / `name` / `image_url` onto `imdb_person`.
@@ -148,16 +150,16 @@ When the same `imdb_url` is discovered twice (e.g., an actor appears on two seed
     `mvp/avatar/replace-avatar` \+ `mvp/bios/add-person-biography` \+ `mvp/node/add-person-node` \+ `mvp/node/update-person-node`. Stamp `node_uuid` \+ `master_person_id` back onto `imdb_person`. Run explicit `SET p.visibility = true` Cypher.
   </Step>
   <Step title="Phase 4b — OPTIONAL (P4b)">
-    `mvp/bios/create-llm-person-bios` \+ `mvp/deep-research/deep-person-basic` \+ `mvp/social/social-insights/get-social-insights` \+ (v1.8) `mvp/expertise/llm-identify-person-expertise` (#12666 v2). All failures non-fatal.
+    `mvp/bios/create-llm-person-bios` \+ `mvp/deep-research/deep-person-basic` \+ `mvp/social/social-insights/get-social-insights` \+ `mvp/expertise/llm-identify-person-expertise` (#12666) \+ `kickoff-cross-waterfalls-from-expertise` (#13185 — `run_imdb: false` / `run_music: true`, so a `music_industry` flag can bridge into MusicBrainz). All failures non-fatal.
   </Step>
   <Step title="Phase 4c — credit edges (P4c)">
-    `mvp/imdb/add-credit-edges-from-person` (#13013). Writes `(Person)-[:WORKED_ON]->(Film_TV)` edges for every credit whose film's `node_uuid` is already stamped.
+    `mvp/imdb/add-credit-edges-from-person` (#13013). Writes `(Person)-[:WORKED_ON]->(Film_TV)` edges — `uuid` \+ description stamped at write time — for every credit whose film's `node_uuid` is already stamped, and `imdb_credit_join` rows (pending `edge_created: false` for stub-only films).
   </Step>
   <Step title="Awards (P5)">
-    `add-award-records-from-imdb-person` (#12887) — scrape `{imdb_url}/awards/`, LLM extract, write `film_tv_award` rows. Passes `cascade_depth` through.
+    `add-award-records-from-imdb-person` (#12887) — scrape `{imdb_url}/awards/`, LLM extract, write `film_tv_award` rows. Passes `cascade_depth` through. Bulk award **graph** writes are deferred to `tool/backfill-award-edges-imdb` #13014 batches (v1.1p).
   </Step>
   <Step title="Cascades (P6)">
-    `cascade-credits-from-person` (with `sync_top_credits: 5`) \+ `cascade-awards-from-person`.
+    `cascade-credits-from-person` (with `sync_top_credits: 5`), then a #13013 replay so sync-created titles get their `WORKED_ON` edges immediately (v1.9), then `cascade-awards-from-person`.
   </Step>
   <Step title="Mark success (P7)">
     `enriched_at = now`, `enrich_success = true`, `cascade_depth = 0`.
@@ -171,19 +173,19 @@ When the same `imdb_url` is discovered twice (e.g., an actor appears on two seed
     Same as person flow.
   </Step>
   <Step title="Scrape + LLM extract + tagline + save (P2)">
-    Scrape \+ LLM (`google/gemini-3.1-flash-lite`). Save `json` / `markdown` / `title` / `year` / `imdb_rating` / etc. Generate \+ save tagline via `tagline-generator` (#10516 v4). Upload the poster to GCS via `save-imbd-poster` (#13044) and persist the public URL on the `film_tv` row (v1.7).
+    Scrape \+ LLM (`google/gemini-3.1-flash-lite`), payload cleaned via the IMDb-specific `sanitize-title-json` (#13182). Save `json` / `markdown` / `title` / `year` / `imdb_rating` / etc. Generate \+ save tagline via `tagline-generator` (#10516 v4). Canonicalize the extracted poster URL, upload to GCS via `save-imbd-poster` (#13044), and persist the public URL on `film_tv.image_url` (IMDB-URL fallback on upload failure).
   </Step>
   <Step title="Film_TV node (P3)">
-    `mvp/node/add-film-tv-node` (#2320 v2, MERGE-keyed on `imdb_url`) \+ re-stamp `node_uuid`.
+    `mvp/node/add-film-tv-node` (#2320 v2, MERGE-keyed on `imdb_url`) \+ re-stamp `node_uuid` \+ register the UUID in `node_registry`.
   </Step>
   <Step title="Credit edges (P3.5)">
-    `mvp/imdb/add-credit-edges-from-title` (#13015). Writes `(Person)-[:WORKED_ON {role}]->(Film_TV)` edges for every cast/crew member whose `imdb_person.node_uuid` is already stamped.
+    `mvp/imdb/add-credit-edges-from-title` (#13015). Writes `(Person)-[:WORKED_ON {role}]->(Film_TV)` edges — `uuid` \+ description stamped at write time — for every cast/crew member whose `imdb_person.node_uuid` is already stamped, plus `imdb_credit_join` rows.
   </Step>
   <Step title="Awards (P5)">
-    `add-award-records-from-title` (#12879 v1.11) — optional scrape of `{imdb_url}/awards/` with `soft_fail: true`, LLM extract when markdown exists, write `film_tv_award` rows. Resolves `primary_nominee_imdb_url` via `get-add/imdb-person` at T2/depth\+1.
+    `add-award-records-from-title` (#12879) — optional scrape of `{imdb_url}/awards/` with `soft_fail: true`; visible Winner/Nominee rows parse deterministically, the LLM (`deepseek/deepseek-v4-flash`) only cleans up (v1.15). Writes `film_tv_award` rows; resolves `primary_nominee_imdb_url` via `get-add/imdb-person` at T2/depth\+1. Bulk award **graph** writes are deferred to #13014 batches (v1.17).
   </Step>
   <Step title="Cascades (P6)">
-    `cascade-crew-from-title` \+ `cascade-awards-from-title`.
+    `cascade-crew-from-title` \+ `cascade-awards-from-title` (seed ids validated first, v1.14).
   </Step>
   <Step title="Mark success (P7)">
     `enriched_at = now`, `enrich_success = true`, `cascade_depth = 0`.
@@ -216,8 +218,8 @@ Depth 0: seed person (imdb_url, cascade_depth: 0, queue: false)
 │
 └── orchestrator (cascade_depth: 0)
     ├── P1  kill switch — check-kill-switch-imdb #12870
-    │       active → return existing imdb_person, else log to
-    │       kill_switch_blocked_imdb + return empty
+    │       active → return existing imdb_person, else write a log_crash
+    │       row + return empty
     ├── P2  scrape + LLM extract — Firecrawl → LLM extractor
     │       (~google/gemini-flash-latest) → save json / markdown / name /
     │       image_url onto imdb_person
@@ -228,13 +230,17 @@ Depth 0: seed person (imdb_url, cascade_depth: 0, queue: false)
     │       imdb_person → SET p.visibility = true
     ├── P4b OPTIONAL — create-llm-person-bios + deep-person-basic
     │       + get-social-insights + llm-identify-person-expertise #12666
+    │       + kickoff-cross-waterfalls-from-expertise #13185
+    │         (run_imdb: false — a music_industry flag bridges into MusicBrainz)
     │       (all failures non-fatal)
     ├── P4c credit edges — add-credit-edges-from-person #13013
     │       → (Person)-[:WORKED_ON]->(Film_TV) per credit whose film's
-    │       node_uuid is already stamped
+    │       node_uuid is already stamped (uuid + description at write time;
+    │       imdb_credit_join rows, pending edge_created:false for stubs)
     ├── P5  awards — add-award-records-from-imdb-person #12887
     │       (cascade_depth passed through)
     │       → Firecrawl {imdb_url}/awards/ → LLM extract → film_tv_award rows
+    │       (bulk award graph writes deferred to backfill-award-edges-imdb #13014)
     ├── P6  cascades (pure dispatchers; each get-add call try_catch → log_crash)
     │   ├── cascade-credits-from-person (sync_top_credits: 5)
     │   │   ├── per credit → title stub via get-add (imdb_url + title only,
@@ -249,6 +255,8 @@ Depth 0: seed person (imdb_url, cascade_depth: 0, queue: false)
     │   │   │       (single queue row per URL, no duplicate scrape)
     │   │   └── top 5 credits sync-enriched inline (person at depth 0) —
     │   │       the seed returns with enriched films before the title cron runs
+    │   ├── add-credit-edges-from-person #13013 replay — sync-created
+    │   │   Film_TV nodes receive WORKED_ON edges immediately
     │   └── cascade-awards-from-person
     │       └── shared_with people → person stubs → queue_imdb_person at depth 1:
     │           ├── co-winner / co-nominee on the seed's award → T2
@@ -283,7 +291,7 @@ External calls by depth (Firecrawl scrapes \+ LLM extracts):
 
 ## Loop prevention (five layers)
 
-1. **Dedup gate in `get-add`:** `imdb_url` already in `imdb_person` / `film_tv` with `enriched_at` within 30 days → return existing, no scrape.
+1. **Dedup gate in `get-add`:** person side — `imdb_url` already in `imdb_person` with `enriched_at` within 30 days → return existing, no scrape. Title side — **any** existing enriched `film_tv` row dedups (sparse stubs fall through for queue repair / sync-enrich; `refresh: true` bypasses).
 2. **Queue upsert:** duplicate `imdb_url` in queue → `count++`, tier upgrade. Single row per URL.
 3. **Depth cap:** depth 2 scrape happens but no cascade. Depth 3 never queued.
 4. **Tier cap at depth ≥ 1:** only T1–T2 discoveries are queued at depth 2 (T3–T4 discarded).
@@ -305,8 +313,10 @@ External calls by depth (Firecrawl scrapes \+ LLM extracts):
 - **Top-N sync credits on person seeds (`sync_top_credits: 5`):** `cascade-credits-from-person` v1.3 sync-enriches the top 5 credits inline when the person is at `cascade_depth == 0`, while preserving the discovered title depth (`cascade_depth + 1`). Guarantees a seed returns with enriched films even before the title cron runs without reclassifying those titles as roots.
 - **Cron single-row tick pattern:** modeled on `process-person-queue` **#126** / `process-company-queue` **#127**. Lock-on-pick, `try_catch` around orchestrator, release lock on failure. Priority pick order: `priority_tier` asc, `cascade_depth` asc, `id` asc.
 - **Missing-stub guard:** if the queue row's `imdb_person_id` / `film_tv_id` is 0, write `log_crash` and `db.del` the queue row — prevents a bad row from monopolizing the lock forever.
-- **Symmetric credit-edge writers:** #13013 (person side) and #13015 (title side) write graph edges only when both endpoint UUIDs exist. #13013 also materializes pending `imdb_credit_join` rows for credit-derived `film_tv` stubs with `edge_created: false`, then flips them to true on a later resolved pass. No reconciler cron needed.
-- **Honorary awards have no `Film_TV` anchor:** `#2334 v1.5` handles `film_tv_id == null` by gating the `Film_TV` MERGE on `hasFilm` and swapping the `Film_TV_Award` MERGE key from `film_tv_imdb_url` → `person_uuid` so honoraries remain unique per-person.
+- **Symmetric credit-edge writers:** #13013 (person side) and #13015 (title side) write graph edges only when both endpoint UUIDs exist, stamping `uuid` \+ a description at write time (shared helper #13181) and mirroring resolved edges into `imdb_credit_join`. #13013 also materializes pending `imdb_credit_join` rows for credit-derived `film_tv` stubs with `edge_created: false`, then flips them to true on a later resolved pass. No reconciler cron needed.
+- **Award graph writes are deferred:** the award scrapers (#12887 / #12879) persist `film_tv_award` rows and log `award_graph_deferred`; `tool/backfill-award-edges-imdb` #13014 drives #2334 in bounded batches so high-award people can't time out on hundreds of inline graph writes.
+- **Honorary awards have no `Film_TV` anchor:** `#2334 v1.5` handles `film_tv_id == null` by gating the `Film_TV` MERGE on `hasFilm` and swapping the `Film_TV_Award` MERGE key from `film_tv_imdb_url` → `person_uuid` so honoraries remain unique per-person. Since v1.7, title-level rows with no linked person also materialize their award node \+ `HAS_AWARD` edge.
+- **`node_registry` registration:** #2320 and #2334 register stamped `Film_TV` / `Film_TV_Award` UUIDs in `node_registry` (2026-07-09) using linked table names — the live type column is spelled `entitiy_type`.
 
 ---
 
@@ -322,46 +332,3 @@ The existing person \+ company waterfall solves this for LinkedIn/PDL/Enrich Lay
 - From a seed **title**: enrich the title, pull ALL awards on it, ALL people on those awards, and its **key crew** (director, writer, cinematographer, lead producer) \+ top 3 cast. Write `WORKED_ON` edges for every cast/crew whose person is already in the graph.
 
 ---
-
-## Historical reference
-
-<Accordion title="April 2026 sandbox-found bugs (8 fixes, all closed by 2026-04-24)">
-  Eight bugs surfaced across the Mark Neveldine \+ Scorsese sandbox seeds. All landed in April:
-
-  - **Fix #1** — `#2334 v1.4`: JSON.stringify Cypher literals (apostrophe-in-description crash).
-  - **Fix #2** — `#12878 v1.1`: filter-chain hoisting (Xano parser bug on chained-parenthesized filters).
-  - **Fix #3** — `#12880 v1.3`: `{{` / `}}` escape preprocessing.
-  - **Fix #4** — `#12880 v1.4`: Phase 5 orphan repair after #12633 deletion. Built **#12887** as direct mirror of #12879.
-  - **Fix #5** — `#12887 v1.1c→v1.1h` \+ `#12879 v1.5→v1.6`: silent-empty LLM parse \+ token ceiling \+ prompt-schema slim \+ JSON salvage. Five ship rounds. Closed with 452 rows persisted on Scorsese.
-  - **Fix #6** — `#2334 v1.5`: honorary-award edge-writer crash on null `film_tv_id`. Unblocked 39/452 honoraries.
-  - **Fix #7** — `#10509 v1.2`: Phase-8 awards-scraper wiring. Closed the Phase-8 ⇄ #12880 Phase 5 asymmetry where main-pipeline IMDB entries skipped honoraries.
-  - **Fix #8** — `#2334 v1.6`: NULL\_UUID bulletproofing via retry \+ MATCH fallback. Closed the 0.22% transient FalkorDB gap (1/451 on prior run); Scorsese re-run at 470/470 = 100% coverage.
-  - **Fix #9** — `#10509 v2.4` \+ `#12887 v1.1m`: existing-master-person IMDb attach now reuses `cascade-credits-from-person(sync_top_credits: 5)` instead of queueing every credit as a stub, and explicit IMDb no-awards pages return cleanly without warning rows.
-
-  The full per-fix changelogs (with sandbox repro details, raw response previews, telemetry counters, etc.) are preserved in `git log -- docs/guides/enrichment/waterfall/imdb-waterfall.mdx`. Each fix's symptom \+ cause \+ remediation is recoverable from the commit history if needed for future audits.
-</Accordion>
-
-<Accordion title="Pre-waterfall function graph + loop risk (before 2026-04-22)">
-  The waterfall replaced a set of interconnected scrape functions whose loop prevention relied on three `!`-prefix-disabled `foreach` blocks — brittle because one accidental edit re-enabled infinite recursion.
-
-  | # | Function | Role (pre-waterfall) |
-  | --- | --- | --- |
-  | #10506 | `create-master-person-from-imdb` | Scrape person URL → create `imdb_person` \+ `master_person`. Tail-called `add-award-records-from-person` \+ `add-imdb-credits` |
-  | #10509 | `add-imdb-to-master-person` | Attach IMDB data to existing `master_person`. Current path delegates credit fanout to `cascade-credits-from-person(sync_top_credits: 5)` |
-  | #10507 | `add-title-imdb` | Scrape title → create `film_tv`. Had writer/director cascade (`!`-disabled) |
-  | #10515 | `add-title-imdb-restricted` | Same scrape path, no cascade — used as cascade terminator |
-  | #12633 | `add-award-records-from-person` | Scrape `{imdb_url}/awards/` → write `film_tv_award` rows, call full `add-title-imdb` per project |
-  | #12632 | `add-imdb-credits` | Walked `imdb_person.json.credits[]`, called full `add-title-imdb` per credit |
-
-  **The loop:**
-
-  ```text
-  person seed (#10506)
-    ├─ add-award-records-from-person (#12633) → add-title-imdb (#10507) per award project
-    │                                            └─ writer/director cascade → #10506 → ♾️
-    └─ add-imdb-credits (#12632) → add-title-imdb (#10507) per credit
-                                     └─ writer/director cascade → #10506 → ♾️
-  ```
-
-  The new waterfall replaces this with `get-add` gates, `cascade-*` helpers, and a depth cap — no more brittle `!`-prefix safety.
-</Accordion>

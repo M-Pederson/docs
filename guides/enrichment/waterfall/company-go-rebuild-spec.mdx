@@ -1,0 +1,1107 @@
+---
+title: "Company Go/AlloyDB Rebuild Spec"
+sidebarTitle: "Go Rebuild Spec"
+description: "Rebuild-grade implementation contract for porting the Company waterfall from frozen Xano workspace 3 into Go services on GCP, AlloyDB, and Orbiter Universe."
+---
+
+# Company Go/AlloyDB Rebuild Spec
+
+## 1. Executive Summary
+
+This page is the implementation contract for rebuilding the Company enrichment waterfall in Go on GCP, AlloyDB, and the standalone Orbiter Universe graph. It replaces the 2026-07-02 edition of this page (deleted 2026-07-06 to be rebuilt) and is extracted from:
+
+- Live Xano workspace 3 (branch `v1`) exports re-pulled **2026-07-09** for all 61 baseline Company functions plus the new shared helpers, under `/Users/markpederson/work/rebuild_specs/company/functions_live/` with a durable freeze manifest at `manifest.md`.
+- A machine diff of the 2026-07-02 exports against the 2026-07-09 exports (comment-stripping code-equivalence verifier): **25 functions unchanged, 36 functions with real code changes** landed between 2026-07-02 and 2026-07-09 01:17.
+- The Company waterfall docs ([overview](/guides/enrichment/waterfall/company-waterfall), [entry points](/guides/enrichment/waterfall/company-entry-points), [functions](/guides/enrichment/waterfall/company-functions), [tables](/guides/enrichment/waterfall/company-tables), [nodes](/guides/enrichment/waterfall/company-nodes), [edges](/guides/enrichment/waterfall/company-edges), [crons](/guides/enrichment/waterfall/company-crons), [parity QA smoke tests](/guides/enrichment/waterfall/company-parity-qa-smoke-tests)).
+- The Universe design docs that define the rebuild target: [Enrichment GCP Migration](/guides/open-work/orbiter-univers-standalone/enrichment-gcp-migration) (nine settled decisions), [Universe Lookup Tables](/guides/open-work/orbiter-univers-standalone/universe-lookup-tables) (the `universe.entity` backbone), [Projection Pattern](/guides/open-work/orbiter-univers-standalone/projection-pattern) (`company_display` + projection packages), and [Tables: Universe vs Orbiter Backend](/guides/open-work/orbiter-univers-standalone/tables-universe-vs-orbiter-backend).
+- Task #127 metadata re-verified 2026-07-09 via the Metadata API: `active: false`, 600s cadence, drain gated to `priority_tier <= 1`.
+
+The Go rebuild must preserve the live data contract: procedural dedup, whole-envelope payload storage, queue tier/depth semantics, graph node/edge shape, provider gates, LLM parse/repair behavior, and the non-recursive depth policy. Flow changes are allowed only after Mark approval (migration-plan decision #3, parity-first).
+
+<Note>
+**Frozen baseline confirmed — 2026-07-09.** Migration-plan Step 1 (Mark's hard freeze) is signed off. Live workspace 3 was re-verified against this page's exports after the sign-off: every Company function matches the 2026-07-09 pull at the executable-code level (one post-pull touch, #4587 `domain-extractor` at 06:36 UTC, was comment-only and machine-verified code-equivalent). The exports under `/Users/markpederson/work/rebuild_specs/company/functions_live/` are therefore the frozen reference this spec is extracted from. Per the freeze rules, any enrichment change from here on must be mirrored into this spec and explicitly re-baselined — the reference contract no longer drifts.
+</Note>
+
+Material contract changes since the deleted 2026-07-02 edition, all verified in live XanoScript:
+
+1. **Queue explicit-zero semantics reversed** — `upsert-enrich-company` #12855 v1.2 reads `priority_tier` via `first_notnull:4`: an explicit tier `0`/`1` is now stored, not coerced to 4. Re-upserts apply a count-to-tier escalation (drop 1 tier per 3 re-references, floor 0).
+2. **Entry gate returns a structured shell** — every #12558 branch now returns `company_created: true|false` plus a typed miss shell (2026-07-09), and two new pre-create guards (school-input guard, non-company guard) block bad creations.
+3. **Deal-fanout gate is depth-only** — the seed-marker chain (`is_vc` / `seeded_by_user` / source string) is gone from #12813; `effectiveCascadeDepth == 0` alone allows fanout, with per-deal protection moved into #12856 v1.9 company-origin containment.
+4. **Company_LLM funding fallback subsystem** (#12813 v1.8–v1.19) — LLM-captured funding materializes one provisional `Funding_Round` node + `RAISED` edge + `company_funding_round` row when Fundable has no deals.
+5. **Signal NFX URL discovery moved from Brave to Serper** (#2640 rewritten 2026-07-08; `$env.SERPER_DEV`).
+6. **Shared LLM edge descriptions** — `generate-edge-description` #13181 + `normalize-edge-description` #13180 now write descriptions on investor, RAISED, HAS_SUBDOMAIN, and work edges, with parser-diagnostic hard-stops.
+7. **`node_registry` (table #758, created 2026-07-09)** — graph writers register every created node UUID (column spelled `entitiy_type` — live typo).
+8. **School path rebuilt** — the `school` table is retired (#4689 writes disabled 2026-07-04); schools are `master_company` rows with `is_school = true`, full-enrich but skip Fundable/Signal/thesis and force `is_vc = false`.
+9. **Reverse music bridge** — orchestrator step 12.5 (`$env.reverse_music_bridge == "on"`, depth 0) detects music-label companies and enters them into the MusicBrainz pipeline (#13175).
+10. **Founders as company facts** — #12974 v1.20 emits structured `founders[]`; #12992 v4.21/v4.24 synthesizes founder people into the Exa C-suite loop; #2800 v2.x adds phantom-founder exclusion against Fundable structured `is_founder`.
+
+This spec does not claim parity is proven. Golden fixtures have not been captured or run; the [parity QA smoke tests](/guides/enrichment/waterfall/company-parity-qa-smoke-tests) page is a human checklist, not a harness.
+
+## 2. How to Use This Spec
+
+Use this page as the authoritative build contract for the Go port. The existing Company waterfall pages remain the canonical narrative reference and detailed source catalogs; they are not the implementation checklist — and several are stale against live Xano (section 21).
+
+Implement the shared Go foundations first, then the Company pipeline on top of them. Any proposed change to orchestration order, dedup keys, graph shape, queue semantics, provider request contracts, or historical bug/fix decisions needs Mark approval before implementation.
+
+When in doubt, preserve current live behavior unless this page explicitly marks a behavior as `Fix in Go` or `Xano artifact — do not reimplement`.
+
+## 3. Shared Go Foundations Expected
+
+Package names follow the migration plan's foundations-sprint table; the Company pipeline depends on these packages instead of rebuilding clients inline:
+
+| Package | Required for Company | Contract |
+| --- | --- | --- |
+| `internal/config` | Required | Env + runtime config. Note the dual config surface in Xano: `$env.*` secrets (openRouter, SERPER_DEV, exa, firecrawl, groq, scrapecreators, ENRICH_LAYER, radar_live_secret, LOGO_DEV) and **rows in the `environment_variables` table #272** (`kill_switch_company`, GCP backend URL via #12977, per-datasource). Go config must model both; see [env inventory](/guides/open-work/orbiter-univers-standalone/env-vars). |
+| `internal/provenance` | Required | Canonical source strings: `Base Company Enrich`, `Company_LLM`, `Fundable`, `Signal NFX`, `YC`, `Funding Rounds`, `User Input`, `ScrapeCreators Linkedin`, `Enrich Layer`, `Exa`. Source rides the record; person rows created from the C-suite loop carry the match source. |
+| `internal/datasource` | Required | Typed provider clients behind the shared fail-open rate limiter: OpenRouter, Serper (profile discovery + Signal NFX URL discovery), Exa, Firecrawl (v2 controls), Radar, BigQuery, GCP thesis service, ScrapeCreators, Enrich Layer. Brave Search is retired (2026-07-08) — do not build a client. |
+| `internal/llm` | Required | OpenRouter client, model registry, JSON extraction, code-fence stripping, retry/repair, `reasoning: {enabled: false}` support, structured parse-fallback shells, fixture replay. |
+| `internal/embeddings` | Required | Gemini `gemini-embedding-001` **1536-dim, L2-normalized** (decision #1; standard updated 2026-07-06 — was 3072). OpenAI 1536 `name_embedding` is legacy reference context; Universe writes Gemini 1536 as canonical. Vector helper must accept array and bracket-string forms. |
+| `internal/graph` | Required | Universe FalkorDB client: parameterized queries, standard MERGE envelope (`coalesce(created_at, timestamp())`, `updated_at`, `randomUUID()`, weight), null/empty property pruning, `'Label' IN labels(n)` convention, valid-vector gates before any `vecf32` splice. |
+| `internal/store` | Required | AlloyDB repositories over the `universe.*` backbone (section 12): entity/identifier/fact/payload writes, transactions, strong-key conflict handling, JSONB payload persistence. |
+| `internal/queue` | Required | Queue upsert with #12855 semantics (first_notnull tier, count escalation), worker leases, `FOR UPDATE SKIP LOCKED`, bounded retry, poison handling, DLQ. |
+| `internal/projections` | Required | `company_display` + `funding_round_display` projection-package writer per the [Projection Pattern](/guides/open-work/orbiter-univers-standalone/projection-pattern). |
+| `internal/fixtures` | Required | Recorded provider and LLM replay fixtures plus table/graph parity assertions. |
+
+Provider clients required before the Company pipeline can run: OpenRouter, Serper, Exa, Firecrawl, Radar, BigQuery, GCP thesis builder, FalkorDB, Gemini embeddings, ScrapeCreators, Enrich Layer, and the local Fundable mirror repositories.
+
+## 4. Freeze Manifest
+
+Durable manifest with the full 61-function export-vs-live table, per-function delta files, and subagent verification reports: `/Users/markpederson/work/rebuild_specs/company/manifest.md`.
+
+### Core source set
+
+| Role | Xano item | ID | Live state (2026-07-09 pull) | Go role |
+| --- | --- | --: | --- | --- |
+| Entry gate | `mvp/get-add/master-company-new` | 12558 | `updated_at 2026-07-09 01:17:17`; unversioned dated notes through 2026-07-09 (`company_created` shells) | Public get-or-create, dedup, guards, create, dispatch/queue. |
+| LLM stage | `mvp/enrich/new-company-enrichment` | 12974 | v1.21 (2026-07-08); `founders[]` since v1.20 | Web-grounded company research + Serper profile discovery. |
+| Apply LLM payload | `mvp/enrich/apply-company-llm-payload` | 12989 | 2026-07-08; domain repair + VC guard + about fill | Deterministic LLM-to-relational fanout. |
+| Orchestrator | `mvp/enrich/enrich-master-company` | 12992 | v4.24 (2026-07-08) | Fifteen-step gated worker (+ step 12.5 music bridge). |
+| Queue upsert | `mvp/queue/upsert-enrich-company` | 12855 | v1.2 (2026-07-03) — `first_notnull:4`, count escalation | Single sanctioned queue writer. |
+| Queue batch drain | `mvp/queue/process-enrichment-queue` | 12816 | v1.2 (2026-07-04) — DB-native filters | Operator drain for person/company queues. |
+| Scheduled drain | `process-company-queue` | Task 127 | `active: false`, 600s, drain gated `priority_tier <= 1` (updated 2026-07-03) | Cron reference; not auto-running live. |
+
+### Active function roster
+
+Baseline 61 functions (all re-exported and diffed 2026-07-09) plus the new shared helpers. Group membership follows the [functions page](/guides/enrichment/waterfall/company-functions):
+
+| Group | Function IDs |
+| --- | --- |
+| Domain and entry helpers | 4587, 12696, 12789 |
+| Gated pre-phase | 12991, 12990, 12978, 12911, 12988, 12997 |
+| YC subsystem | 12799, 12700, 4628, 4516, 10503, 12563 |
+| Fundable phase chain | 12809, 12810, 12813, 12703, 12856, 12701, 12702 |
+| Expertise and descriptions | 12746, 13142, 13141, 13143, 13144 |
+| About, tags, locations | 2545, 2538, 4517, 1924, 2451, 4653, 4528, 2000 |
+| Graph writers | 2602, 4659, 2800 |
+| Relational fanout | 2547, 2548, 2446, 2710, 2450, 2540, 281, 2806 |
+| Fundable mirror | 12698, 12689, 12690, 12691, 12692, 12794 |
+| Signal support | 2640, 4515 |
+| **New shared helpers (post-Jul-2)** | **13180 (normalize-edge-description), 13181 (generate-edge-description), 13183 (register-node-registry), 13175 (reverse bridge) + 13173/13174 (find/enter label)** |
+| Cross-pipeline callees on the company path | 2815 (send-cypher), 13125/13114/4676 (vector helpers), 13136 (check-openrouter), 2523 (remove-emojis), 12977 (GCP URL from table), 2541 (create-master-link), 13008/13010 (work/relationship edge-description writers), person-side: enrich_layer person-linkedin, replace-avatar, process-person-phase-5 |
+| Deprecated (historical only) | 4689 `mvp/enrich/add-school` — all writes disabled 2026-07-04; #4514 `company-profile_v2` (ScrapeCreators writer, tagged "maybe depreciated??", no caller in the waterfall set) |
+
+Functions with real code changes between the 2026-07-02 and 2026-07-09 exports (fixture-pin these versions): 281, 2446, 2540, 2545, 2602, 2640, 2800 (v2.12), 4515 (v1.6), 4516, 4517, 4528 (v1.5), 4628, 4653, 4659 (v1.10), 4689, 12558, 12690, 12700 (v3.5), 12701 (v1.17), 12702 (v1.17), 12746, 12789, 12813 (v1.19), 12816 (v1.2), 12855 (v1.2), 12856 (v1.10), 12974 (v1.21), 12988 (v1.2), 12989, 12991 (v1.4), 12992 (v4.24), 12997 (v2.5), 13141 (v1.6), 13142 (v1.4), 13143 (v1.1), 13144 (v1.1).
+
+### Tables touched
+
+| Area | Tables |
+| --- | --- |
+| Core company | `master_company` #142, `company_enrich_data` #485 (JSONB fields incl. `linkedin_profile`), `enrich_history_company` #404, `queue_enrich_company` #583 |
+| Financial/investor | `company_financial` #287 (incl. `rounds_added`, `funding_summary`), `investor_profile_company` #478, `investment_thesis` #709, **`company_funding_round` #201** (old table, Xano-tagged deprecated, revived 2026-07-06+ as the side-panel funding-round row) |
+| Graph bookkeeping | **`node_registry` #758** (created 2026-07-09; `node_uuid` + `entitiy_type` [sic]) |
+| Text/tags/taxonomy | `about_company` #366, `industry_join` #307, `industry` #192, `speciality_join` #456, `specialty` #455, `sub_domain_expertise` #654 (now dual-writes `domain_expertise_id`), `domain_expertise` #459 |
+| Identity | `master_link` #166, `master_address` #164, `master_email` #155, `master_phone` #151, `permalink_company` #431 |
+| Logs/config | `log_enrichment_company` #632, `log_crash` #542 (strict `phase` enum), `environment_variables` #272 |
+| Fundable mirror | `fundable_organizations` #666, `fundable_people` #667, `fundable_deals` #671, `fundable_organization_associations` #673, `fundable_institutional_investments` #678, `fundable_angel_investments` #679, related mirrors #668–681, #723, #626 |
+| Music bridge | `mb_label`, `music_reverse_probe` (read/written by #13175) |
+| Retired | `school` #300 (writes disabled 2026-07-04) |
+
+### External providers
+
+| Provider | Used by | Contract |
+| --- | --- | --- |
+| OpenRouter | 12974, 12990, 12746, 13141, 13143, 13181, 2545, 4517, 12700, 4628, 4516, 2540 | LLM calls with model-specific temperature, max tokens, timeout, and parse rules (section 11). |
+| Serper | 12974 (profile discovery), 2640 via 12991 (Signal NFX URL discovery since 2026-07-08) | `POST https://google.serper.dev/search`, `X-API-KEY: $env.SERPER_DEV`. |
+| Exa | 12988 | People search + optional contents expansion, 60s, no retry; strict seed-evidence gating since v1.2. |
+| Firecrawl | 4515 via 12991 and 4628 | v2 scrape with per-caller controls; soft-fail callers log empty error_message. |
+| GCP thesis service | 12978 (base URL via #12977 from `environment_variables` table) | `POST /v1/outcomes/investment-thesis/build`, 180s, one immediate retry. |
+| BigQuery | 12689, 12690 | Mirror ingestion substrate; not in the live synchronous company path. The forward plan is [Fundable changelog processing](/guides/open-work/orbiter-univers-standalone/fundable-changelog-processing) (plan only, nothing built). |
+| Radar | 2000 via 2451 | Forward geocoding before the location graph drain. |
+| ScrapeCreators | 4514 (writer of `company_enrich_data.linkedin_profile`; no live caller found in the waterfall set) | `GET https://api.scrapecreators.com/v1/linkedin/company`, `x-api-key: $env.scrapecreators`, 60s. Payload consumed live by 12989/12992/12813. |
+| Enrich Layer | via person-side helper from 12997 (founder/C-suite follow-up since v2.2) | `api/enrich_layer/person-linkedin`; profile stored in `person_enrich_data.enrich_layer_data`. |
+| logo.dev | 12558, 12989 | Logo URL string construction only; never fetched. Token currently hardcoded in #12989 (artifact — section 20). |
+| Brave Search | — | **Retired 2026-07-08.** #2640 keeps its `brave/` name but calls Serper. |
+
+### Prompt/model and graph source pages
+
+Use [Company system prompts](/guides/enrichment/company-pipeline/llm-system-prompts), [Company model summary](/guides/enrichment/company-pipeline/model-summary), [All models summary](/guides/enrichment/all-models-summary), [Company cyphers](/guides/cyphers/company-pipeline), and [Funding cyphers](/guides/cyphers/funding) as supporting references — but note both prompt/model pages are materially stale against live Xano (section 21); where they conflict with this page, the live exports win.
+
+## 5. Source Docs Read
+
+Primary:
+
+- [Enrichment GCP Migration](/guides/open-work/orbiter-univers-standalone/enrichment-gcp-migration)
+- [Universe Lookup Tables](/guides/open-work/orbiter-univers-standalone/universe-lookup-tables)
+- [Projection Pattern](/guides/open-work/orbiter-univers-standalone/projection-pattern)
+- [Tables: Universe vs Orbiter Backend](/guides/open-work/orbiter-univers-standalone/tables-universe-vs-orbiter-backend)
+- [Company Waterfall](/guides/enrichment/waterfall/company-waterfall) (including the 2026-07-09 QA-tightening warning)
+- [Company Waterfall Entry Points](/guides/enrichment/waterfall/company-entry-points)
+- [Company Waterfall Functions](/guides/enrichment/waterfall/company-functions)
+- [Company Waterfall Tables](/guides/enrichment/waterfall/company-tables)
+- [Company Nodes](/guides/enrichment/waterfall/company-nodes) · [Company Edges](/guides/enrichment/waterfall/company-edges)
+- [Company Waterfall Crons](/guides/enrichment/waterfall/company-crons)
+- [Company Parity QA Smoke Tests](/guides/enrichment/waterfall/company-parity-qa-smoke-tests)
+
+Supporting:
+
+- [Company system prompts](/guides/enrichment/company-pipeline/llm-system-prompts) · [Company model summary](/guides/enrichment/company-pipeline/model-summary)
+- [Company cyphers](/guides/cyphers/company-pipeline) · [Funding cyphers](/guides/cyphers/funding) · [Expertise cyphers](/guides/cyphers/expertise)
+- [Environment variables](/guides/open-work/orbiter-univers-standalone/env-vars) (and its duplicate `environmental-variables` page)
+- [Fundable changelog processing](/guides/open-work/orbiter-univers-standalone/fundable-changelog-processing)
+- [Ontology node types](/guides/ontology/nodes) · [Ontology edge types](/guides/ontology/edges) · [Edge weights](/guides/ontology/edge-weights)
+
+## 6. Entry Points and Public Contracts
+
+### `POST /internal/enrichment/company/get-add`
+
+Go equivalent of `mvp/get-add/master-company-new` #12558.
+
+Input (17-field contract unchanged; semantics updated where noted):
+
+| Name | Type | Required | Default | Xano default semantic | Go semantic |
+| --- | --- | --- | --- | --- | --- |
+| `domain` | string | No | `""` | Trimmed; URL-shaped values become null after #4587 | Trim before parse; bare host only becomes registrable domain. |
+| `profile_url` | string | No | `""` | Trimmed; `master_link` quick check; `/school/` URLs preserved (2026-07-04) | Normalize trailing slash, `//linkedin` to `//www.linkedin`; never rewrite `/school/` to `/company/`. |
+| `company_name` | string | No | `""` | Trimmed; placeholder guard input (blocklist expanded 2026-07-09) | Trim; hint only. |
+| `source` | string | No | `""` | `first_notempty` to `Base Company Enrich` on create | Canonical source string. |
+| `data_source_id` | int | No | `0` | Legacy, mostly ignored | Accept for compatibility; no new behavior. |
+| `is_vc` | bool | No | empty | Hint; VC status derived from evidence with consulting-suppression guards | Accept but derive. |
+| `is_school` | bool | No | empty | Escalate true only; triggers school-input guard + school LLM source-fact seeding | Preserve escalate-only + guard. |
+| `queue` | bool | No | empty | Truthy forces queue path | Explicit bool; default false. |
+| `hold_downstream` | bool | No | empty | `first_notnull:false`; explicit false survives | Suppress enrich and queue fanout when true. |
+| `return_fast` | bool | No | empty | `first_notnull:false`; skips sync LLM only | Async orchestrator still owns enrichment. |
+| `lookup_only` | bool | No | empty | Fan-out governor create block | Match-only; miss returns the miss shell. |
+| `allow_create` | bool | No | empty | `false` creates lookup-only; explicit `true` unlocks the controlled work-history queue exception | Default true unless caller explicitly false. |
+| `cascade_depth` | int | No | `0` | `first_notempty:0` at the gate | Preserve explicit zero. |
+| `priority_tier` | int | No | `0` | Queue writer #12855 v1.2 stores explicit 0/1 (`first_notnull:4`) | Explicit tier survives; missing tier defaults 4. |
+| `source_function` | string | No | `""` | Trace metadata + governor keys (see below) | Persist to queue; preserve exact string comparisons. |
+| `source_entity_id` | int | No | `0` | Trace metadata | Persist to queue. |
+| `source_entity_uuid` | string | No | `""` | Trace metadata | Persist to queue. |
+| `source_entity_type` | string | No | `""` | Trace metadata + Fundable exact-id gate (`fundable_organizations`) | Preserve exact comparisons. |
+| `seeded_by_user` | int | No | `0` | Raw write to company row | Nullable int; observability only (no longer gates deal fanout). |
+
+`source_function` values with load-bearing behavior at the gate:
+
+| Value | Behavior |
+| --- | --- |
+| `process-person-phase-3` | With `hold_downstream == false`, `queue == false`, depth 0: forces immediate async orchestrator dispatch (root current-company lane, 2026-07-04). |
+| `resolve-edges-work-history-queue` | With explicit `allow_create == true`, depth 1, tier >= 2: allowed to create/queue (controlled waterfall exception); otherwise depth leaves are lookup-only. |
+| `mvp/enrich/process-person-exa-profile` | Depth > 0 without explicit `allow_create`: lookup-only (exa-profile work-history leaf, 2026-07-05). |
+
+Return shape (contract since 2026-07-09 — every branch returns a shell; misses are typed, not null):
+
+```json
+{
+  "company_created": false,
+  "master_company_id": null,
+  "node_uuid": null,
+  "company_name": null,
+  "company_domain": null,
+  "permalink": null,
+  "linkedin_url": null
+}
+```
+
+Found/created branches return the same shape populated, with `company_created: true` only on a fresh create. The docs pages do not yet document this output contract; fixtures must pin it from live behavior.
+
+Pre-create guard order (all guards log a `log_crash` row with `qa_passed: true` and return the miss shell):
+
+1. Placeholder blocklist — generic role/placeholder names with no domain: `angel investor`, `investor`, `limited partner`, `general partner`, `venture partner`, `operating partner`, `board member`, `board observer`, `advisor`/`adviser`, `consultant`, `mentor`, `member`, `stealth startup`, `stealth company`, `confidential startup`, `confidential company`, `stealth startup community`, and friends.
+2. Kill switch — `environment_variables` table row `kill_switch_company` (not a `$env` var); active means local-lookup-only, no provider calls.
+3. School-input guard (2026-07-04) — lambda classifies school evidence (LinkedIn `/school/`, name terms, `.edu`/`.ac.` domains) vs company evidence; company-shaped school inputs are rejected before create.
+4. Fan-out governor (lookup-only resolution) — see `source_function` table above.
+5. Non-company guard (2026-07-05) — after LLM preflight, explicit `Company_LLM` personal-website / not-a-company classifications block creation unless strong org evidence exists (school, explicit VC, LinkedIn org URL, direct Fundable id, org-like name).
+
+### `POST /internal/enrichment/company/run`
+
+Go equivalent of `mvp/enrich/enrich-master-company` #12992.
+
+| Name | Type | Required | Default | Xano semantic | Go semantic |
+| --- | --- | --- | --- | --- | --- |
+| `master_company_id` | int | No | `0` | Missing-row guard; errors mostly logged | Required in Go API; validation error if 0. |
+| `cascade_depth` | int | No | `0` | Repaired upward against deepest queue row | Compute effective depth from input and queue state. |
+| `data_source_id` | int | No | `0` | Dead legacy | Accept only if compatibility needs it. |
+
+## 7. End-to-End Worked Example
+
+### Example: `resend.com` seed company
+
+Input:
+
+```json
+{
+  "domain": "resend.com",
+  "profile_url": "https://www.linkedin.com/company/resend",
+  "company_name": "Resend",
+  "source": "User Input",
+  "cascade_depth": 0,
+  "priority_tier": 1,
+  "queue": false,
+  "hold_downstream": false,
+  "return_fast": false
+}
+```
+
+Expected control flow:
+
+1. Entry gate passes the placeholder blocklist, normalizes the domain, resolves redirects, checks `profile_url` in `master_link`.
+2. Kill switch (table row) off; school-input guard not triggered (no school evidence); governor allows create (no depth-leaf source_function).
+3. LLM preflight #12974 runs (not `return_fast`): tier-1 `google/gemini-3.1-flash-lite` with `openrouter:web_search`, escalating to `anthropic/claude-sonnet-4.6` on parse/confidence failure. Envelope includes `founders[]` and is stored whole (never only `.data`).
+4. Non-company guard passes (real company). Post-LLM dedup checks discovered profiles/domains, plus name/legal-name dedup for fanout callers.
+5. Fundable lookup #12698 reads the local mirror; a miss stores the literal JSON string `"no_data"`.
+6. Fresh create writes `master_company` (with `source: "User Input"`), `company_enrich_data`, relational fanout via #12989, initial Company graph node via #2602 (CREATE + stamp-back, dual embeddings, summary/description/funding props), and `node_registry` registration (`entitiy_type: "master_company"` — via #2602 and again idempotently via the gate).
+7. Depth 0, not queue, not hold: async dispatch of #12992. No queue row.
+8. Orchestrator: 60s debounce, effective-depth repair, base history row, then the 15-step chain (section 8). At seed depth: Exa C-suite with strict seed evidence (v1.2), Company_LLM founder fallback if Exa misses verified founders, YC people, Fundable backfill, deal fanout (depth-only gate; here no Fundable org, so the Company_LLM funding fallback materializes a provisional round only if the LLM captured round evidence), specialties destructive rebuild, about writer + about-fallback, locations, node sync #4659, `is_vc` re-assert, reverse-music-bridge no-op (no music specialties), closeout stamps `master_company.last_enrich`.
+
+Expected key AlloyDB writes (Universe backbone mapping in section 12):
+
+| Table | Key | Important fields |
+| --- | --- | --- |
+| `universe.entity` + `universe.company` | strong identifier resolve-or-create | `entity_type='company'`, `graph_node_uuid`, `enrichment_state`, winners: name, domain, description |
+| `universe.entity_identifier` | `(kind, normalized_value)` | `(linkedin, linkedin.com/company/resend, strong)`, `(domain, resend.com, per section 16)` |
+| `universe.enrichment_payload` | `(entity, provider, request_hash)` | full `company_llm` envelope (with `founders[]`), `fundable = "no_data"` sentinel, later `exa_c_suite`, `yc_data`, `signal_nfx_*`, `linkedin_profile` |
+| history/run state | `(entity, source, created_at)` | `Base Company Enrich` lifecycle row, `Company_LLM`, `Fundable`, provider trace rows |
+| link/about/industry/specialty/address/email/phone facts | per-fact natural keys (section 12) | identity-gated profile links, about corpus, tags |
+
+Expected graph writes:
+
+| Node/Edge | Key | Required properties |
+| --- | --- | --- |
+| `Company` | CREATE once; `node_uuid` stamped back on the row; registry row | `uuid`, `master_company_id`, `name`, `company_domain`, `display_label`, `created_at`, `summary`, `description`, `linkedin_url`, funding props when present, `name_embedding` (gated), Gemini `embeddings` |
+| `SPECIALIZES_IN` | destructive rebuild per run | weight formula for matched nodes; fixed 10 for created; LLM edge description |
+| `Funding_Round` + `RAISED` | Fundable path: `uuid = fundable_deals.id`; LLM fallback path: random UUID, `provisional: true` | `:Entity` label, non-empty description, `RAISED` weight 10, deterministic edge uuid, generated edge description |
+| Work/founder edges | via #2800 after `master-person-from-exa` | `WORKS_AT` + typed edges with LLM descriptions (always on, v2.12), phantom-founder guard |
+| Location edges | address graph drain | `LOCATED_IN`, `IN_REGION`, `IN_COUNTRY`; location nodes carry `description`; registry rows |
+
+Queue/projection side effects:
+
+- No `queue_enrich_company` row for this seed input.
+- Depth-1 companies discovered later must queue through `upsert-enrich-company` (explicit tier survives, count escalation applies).
+- Projection: `company_display` row seeded at create, refreshed by a `company_projection.v1` package on orchestrator completion (section 15).
+
+Acceptance checks:
+
+- Re-running the same seed does not create a second canonical company row when dedup keys match, and returns `company_created: false`.
+- Re-running within 60 seconds does not run a second orchestrator pass.
+- The Company node is not created twice after `node_uuid` is set (row-gated; the Xano CREATE has a caller-side-uniqueness duplicate window — Go closes it, section 16).
+- Empty/null optional graph properties are absent, not present as nulls.
+- A duplicate queue request increments `count` and preserves best tier/depth; every third re-reference drops the tier by 1 (floor 0).
+- Explicit `priority_tier: 0` through the queue path is **stored as 0** (v1.2 contract — the old 0-to-4 coercion is gone).
+
+## 8. Function Contract Sheets
+
+### `mvp/get-add/master-company-new` #12558
+
+Role: synchronous entry gate and only sanctioned Company get-or-create path.
+
+Reads: `master_link`, `master_company` (URL/domain/name dedup), `company_enrich_data`, `environment_variables` (kill switch row), `fundable_organizations`, `log_enrichment_company`.
+
+Writes: `log_enrichment_company`, `log_crash` (guard SKIP rows, `qa_passed: true`), `enrich_history_company` (including re-pointing the `Company_LLM` history row at an existing company on preflight dedup, closing it `processing: false` — 2026-07-07), `master_company`, `company_enrich_data`, `company_financial`, identity/tag/about tables, `fundable_organizations` backlinks, initial Company graph node, `node_registry`.
+
+Calls: #4587, #12696, #12789, #12974, #12698, #12989, #2602, #13183, #12855, #12992, plus fanout helpers #2547, #2548, #2538, #2446, #2451, #281, #2523.
+
+Queue/dispatch decision:
+
+- `hold_downstream == true`: no queue, no orchestrator dispatch.
+- `cascade_depth == 0 && queue == false && hold_downstream == false`: async orchestrator dispatch. Also forced for `source_function == "process-person-phase-3"` under the same flags.
+- Otherwise: sync `upsert-enrich-company` #12855.
+
+Pseudo-code:
+
+```go
+func GetAddCompany(ctx context.Context, in CompanySeed) (CompanyShell, error) {
+    if placeholderCompany(in.CompanyName, in.ProfileURL) {
+        logSkip(ctx, "placeholder blocked")
+        return missShell(), nil
+    }
+    norm := normalizeCompanySeed(in) // domain extractor + resolver, /school/ preserved
+
+    if hit := findByProfileLink(ctx, norm.ProfileURL); hit != nil {
+        maybeQueueOrDispatch(ctx, hit.ID, in)
+        return foundShell(hit), nil
+    }
+    if killSwitchOn(ctx) || isLookupOnly(norm, in) { // governor: allow_create/lookup_only/depth-leaf sources
+        return localOnlyCompanyLookup(ctx, norm), nil // miss => missShell()
+    }
+    if in.IsSchool && !schoolInputGuard(norm).ShouldCreateSchool {
+        logSkip(ctx, "company-shaped school input")
+        return missShell(), nil
+    }
+
+    var llm CompanyLLMEnvelope
+    if !in.ReturnFast && hasIdentityHint(norm) {
+        llm = providers.CompanyResearch(ctx, norm) // #12974, founders[] included
+    }
+    if blocked := nonCompanyGuard(llm, norm, in); blocked.ShouldBlock {
+        logSkip(ctx, blocked.Reason) // personal website / not-a-company
+        return missShell(), nil
+    }
+    if hit := postLLMDedup(ctx, norm, llm); hit != nil { // profiles, domains, name/legal-name for fanout callers
+        relinkLLMHistory(ctx, hit.ID)
+        maybeQueueOrDispatch(ctx, hit.ID, in)
+        return foundShell(hit), nil
+    }
+    fundable := store.LookupFundableCompany(ctx, norm) // #12698 precedence chain
+    if hit := postFundableDedup(ctx, norm, fundable); hit != nil {
+        maybeQueueOrDispatch(ctx, hit.ID, in)
+        return foundShell(hit), nil
+    }
+
+    return store.WithTx(ctx, func(tx Tx) (CompanyShell, error) {
+        c := tx.CreateCompany(norm, llm, fundable) // source string rides the row
+        tx.CreateCompanyEnrichData(c.ID, llm, fundableOrNoData(fundable))
+        tx.ApplyCompanyLLMPayload(c.ID, "Company_LLM") // #12989
+        graph.CreateCompanyNode(ctx, c.ID)             // #2602: CREATE + stamp-back + registry
+        registry.RegisterOnce(ctx, c.NodeUUID, "master_company")
+        tx.ApplyFundableFanout(c.ID, fundable, in.HoldDownstream)
+        maybeQueueOrDispatch(ctx, c.ID, in)
+        projections.SeedCompanyDisplay(ctx, c.ID)
+        return createdShell(c), nil // company_created: true
+    })
+}
+```
+
+Go implementation notes:
+
+- Return the full shell shape on every branch — callers now key on `company_created`.
+- Transaction for row creation + relational fanout; graph writes are idempotent side effects with recovery/backfill.
+- Do not trust `is_vc` input; derive with the consulting/accelerator suppression rules (#12989/#12992 guards).
+
+Artifact decisions: serializer workarounds (`{}|set`, double-prefix URL lookup, dead `$modelUsed`) are not ported. The load-bearing smoke-test typo `seed-invetment-thesis-smoke-test` is preserved only if external callers still send it.
+
+Acceptance checks: placeholder/personal-website/company-shaped-school inputs return the miss shell and create no row/node; URL-shaped `domain` never becomes a bad domain; kill switch blocks creation with zero provider calls; lookup-only hit returns the found shell without queueing; fresh seed dispatches the orchestrator; depth-1 leaf queues; `/school/` profile URL survives normalization.
+
+### `mvp/enrich/new-company-enrichment` #12974 (v1.21)
+
+Role: pure-compute Company research envelope.
+
+Inputs: `company_name` (required in practice), `company_domain`, `linkedin_url`, `source_urls` (JSON array), `source_facts` (JSON object).
+
+Output envelope (whole thing is persisted):
+
+```json
+{
+  "data": {
+    "name": "Resend",
+    "legal_name": null,
+    "aliases": [],
+    "domain": "resend.com",
+    "alt_domains": [],
+    "company_type": "Private Company",
+    "profiles": [],
+    "founders": [
+      {"name": "Zeno Rocha", "title": "Founder", "linkedin_url": "https://www.linkedin.com/in/...", "aliases": [], "source_url": "https://..."}
+    ],
+    "is_school": false,
+    "funding": {"total_raised_usd": null, "last_round": null, "last_round_date": null, "investors": [], "acquired": {"is_acquired": false}},
+    "_meta": {"confidence": {"overall": 0.82}, "sources": [], "notes": []}
+  },
+  "model_used": "google/gemini-3.1-flash-lite",
+  "escalated": false,
+  "gemini_confidence": 0.82
+}
+```
+
+Contract notes (all live-verified):
+
+- `founders[]` (v1.20): verified founders/co-founders only — never rosters; `linkedin_url` only if a canonical `/in/` profile is verified, else null; aliases only when the source ties them to the founder.
+- Parse fallback (v1.19/v1.21): if BOTH model tiers return non-JSON, the function emits a structured low-confidence shell — `_parse_fallback: true`, `_meta.parse_fallback: true`, `confidence.overall: 0.05`, non-authoritative, `is_school` heuristic from URL/domain/name — instead of `data._error`. Downstream writers still get stable identity fields. **The old `data._error` claim is retired.**
+- LinkedIn `/school/` profiles are preserved as valid org profiles (v1.18); profile-root matching requires roots of 4+ chars and understands two-part public suffixes.
+- Escalation: tier-2 `anthropic/claude-sonnet-4.6` when tier-1 parse fails, confidence missing/non-numeric, or confidence below 0.7.
+- Serper profile discovery: batch of seven `site:` queries (LinkedIn, X/Twitter, Facebook, Instagram, YouTube, Crunchbase, Wellfound), 30s, silent `[]` on failure; merged profiles are identity-gated, at most one URL per platform.
+
+Acceptance checks: missing `_meta.confidence.overall` escalates; double-tier parse failure yields the `_parse_fallback` shell (not `_error`, not a crash); Serper failure never fails the stage; founders with unverifiable LinkedIn get `linkedin_url: null`.
+
+### `mvp/enrich/apply-company-llm-payload` #12989
+
+Role: deterministic mapping from `company_enrich_data.company_llm.data` into relational tables.
+
+Writes: `master_company` (preserve-existing scalar fills; now also fill-empty `about`/`about_500` from LLM summary/headline; official-domain repair — below), `company_financial` (preserve-existing per field; `funding_summary` string computed from LLM funding), `master_link`, `industry_join`, `speciality_join`, `about_company`, `master_address`, `master_email`, `master_phone`.
+
+New guards (2026-07-04..08, live-verified):
+
+- **VC-classification guard**: `is_vc` from LLM output is suppressed when consulting/coaching/methodology/professional-services language is present without hard fund identity (`venture capital`, `vc firm`, `venture fund`, `private equity`, `family office`, `angel fund`, `seed fund`, `investment firm`, `investment management`).
+- **Official-domain repair**: evidence-weighted candidates (`llm.domain` 4, `llm.website` 3, `fundable.domain`/`website` 3, `linkedin_profile.website` 2) with a blocked-root list (social/aggregator domains); the stored `company_domain` is replaced only on explicit-correction notes OR two or more distinct sources OR weight 5+; the old domain moves into `alternative_domains`; a logo.dev logo is re-pointed when safe (token currently hardcoded — section 20).
+
+Acceptance checks: existing non-empty `company_financial` fields are never clobbered by sparse LLM output; a consulting firm whose text says "venture building methodology" does not become a VC; domain repair with a single weak source is a no-op; `angel.co`/`wellfound.com` profiles pass the v1.8 regex.
+
+### `mvp/enrich/enrich-master-company` #12992 (v4.24)
+
+Role: fifteen-step gated orchestrator (plus half-steps).
+
+State machine:
+
+1. Debounce: `Base Company Enrich` history row within 60s → log QA pass, return.
+2. Add base history row (`processing: true`).
+3. Load company + deepest queue row; compute effective depth (max — queue only raises). School pre-step: `is_school && is_vc` → reset `is_vc` false.
+4. Suppress funding-round-sourced VCs at depth above 0.
+5. Guard missing `company_enrich_data`.
+6. Steps 1+2: LLM preflight when `company_llm.data` empty; persist whole envelope.
+7. Step 3: apply LLM payload only when the LLM just ran.
+8. Steps 4/4.5: Fundable re-lookup and VC classification repair — **skipped entirely for schools** (v4.7); accelerator/consulting suppression (v4.20).
+9. Step 5: Signal NFX when gated (never for schools).
+10. Step 6: investment thesis when gated (never for schools).
+11. Step 7: Exa C-suite — fetch-once envelope at any depth; **people expansion seed-depth only** with strict seed-company evidence (#12988 v1.2); Exa query prefers canonical Fundable/LinkedIn/legal names over domain-like seed input (v4.23); **Company_LLM founder fallback** (v4.21/v4.24): verified `founders[]` (or a tightly-parsed founder phrase / title-phrase people from Fundable/LinkedIn text — a title phrase is required) synthesized into the C-suite loop when Exa misses them; person source strings ride the match.
+12. Steps 8–11: YC, Fundable backfill, financial/backlink repair, deal fanout (depth-only gate — section 9) + Company_LLM funding fallback (#12813).
+13. Step 12: specialties destructive rebuild (#12746).
+14. Step 12.5: **reverse music bridge** — `$env.reverse_music_bridge == "on"` and effective depth 0 → `mb/reverse/detect-and-enter-label` #13175 (crash-logged, non-fatal).
+15. Step 13: about writer + industry classifier; **about-fallback** (v4.18): empty `about`/`about_500` filled from Company_LLM summary/headline → Fundable short_description → crunchbase_about → long_description → crunchbase_full_description → identity sentence (logged as FALLBACK).
+16. Step 14: location graph drain.
+17. Step 15: update Company node (#4659 — now also funding props + linkedin_url).
+18. Step 15.5: `is_vc` re-assert (school-guarded).
+19. Finalize base history row; **closeout stamps `master_company.last_enrich` + `updated_at`** (v4.22).
+
+Failure behavior: steps are isolated in try/catch; each failure appends `log_crash`, sets the crash flag, and continues. Inner per-person and avatar warnings do not set crash state. Go should make finalization robust and keep the SKIP/WARN/FALLBACK/SAVED log taxonomy queryable (section 17).
+
+Acceptance checks: duplicate run inside 60s writes only the duplicate marker; effective depth cannot be lowered by a stale direct call; depth-1 leaves save the Exa envelope but create no people; a school run makes zero Fundable/Signal/thesis calls and ends with `is_vc == false`; a failing step does not skip later isolated steps; successful closeout stamps `last_enrich`.
+
+### Queue contracts: #12855 (v1.2), #12816 (v1.2), Task #127
+
+`upsert-enrich-company` #12855 (v1.2, 2026-07-03):
+
+- Guard `master_company_id` null/0 → `skipped_no_id`, no write.
+- `cascade_depth|first_notempty:0`.
+- **`priority_tier|first_notnull:4`** — explicit 0/1 stored; only a missing tier defaults to 4.
+- Existing row: `count++`, merged tier = `min(existing, incoming)`, then **count escalation**: `deltaDrop = floor(count/3) - floor((count-1)/3)`; `bestTier = max(0, mergedTier - deltaDrop)` — one tier drop per 3 re-references, incremental, never compounds; `cascade_depth = min(existing, incoming)`.
+- Source metadata updates only on strict improvement (deeper→shallower depth, or equal depth with better tier); empty incoming fields never wipe existing metadata.
+- Insert: `processing=false`, `count=1`, effective depth/tier, source metadata.
+
+Task #127 `process-company-queue` (re-verified 2026-07-09):
+
+- `active = false` live; 600s cadence when enabled.
+- Picks one `queue_enrich_company` row where `processing == false` **and `priority_tier <= 1`** (drain gate added 2026-07-03 — investors enter at tier 1; non-investors escalate down via the count rule), sorted `priority_tier asc, cascade_depth asc, id asc`.
+- Sets `processing=true`, runs #12992 synchronously with the row's depth, deletes on success, logs + releases on failure. No kill-switch check, no retry counter, no DLQ. Its `log_crash` writes carry no `phase` value (the strict #542 enum broke the logger on `phase: "queue"` — fixed 2026-07-02).
+
+Operator #12816 (v1.2, 2026-07-04):
+
+- Person queue before company queue when `entity_type = both`; checks kill switches.
+- `max_tier`/`max_depth`/`min_count` (default 0) are **DB-side where filters** now; deterministic sort `priority_tier asc, cascade_depth asc, id asc`; caps to `max_items`.
+- Per-row failures log a WARN `log_crash` row (queue id, tier, depth, source_function) — stranded rows are visible.
+- `dry_run` remains read-only with response-only counters.
+
+Go worker contract: section 13.
+
+### Provider and phase functions
+
+| Function | Role | Go contract |
+| --- | --- | --- |
+| #12991 / #12990 / #2640 | Signal NFX | 30-day attempt debounce on `Signal NFX` history; URL discovery via **Serper** `site:signal.nfx.com/investors` query with name-token scoring (#2640, 2026-07-08); Firecrawl scrape (#4515); #12990 parses markdown to JSON via `$env.LLM_MODEL_JSON_PARSE`; persist raw + parsed; upsert investor profile; flip `is_vc`. Never runs for schools. |
+| #12978 / #12911 / #12977 | Investment thesis | Gather 36-month context with all-time fallback; POST to GCP (base URL from the `environment_variables` table via #12977); one immediate retry; firm-name mismatch writes a rejection sentinel. |
+| #12988 / #12997 | Exa C-suite | Fetch once, save envelope at any depth; seed-depth people expansion only; **strict seed evidence** (v1.2): exact domain, exact company LinkedIn, exact name, or legal-suffix compact variants — no prefix matches; #12997 v2.0–v2.5: company+first/last-name dedupe, ScrapeCreators employee-card reconciliation (canonical `/in/` URL + avatar, source `ScrapeCreators Linkedin`), immediate Enrich Layer follow-up (profile → `enrich_layer_data`, links with `suppress_downstream`, EL avatar), Unicode name normalization. |
+| #12799 / #12700 / #4628 | YC | YC detection and scrape; people seed-only; founder without LinkedIn dropped; #12700 v3.5 `toString(founded ?? 'null')` guard (null founded no longer aborts the §7 hub cypher); #4628 Firecrawl retry failure is crash-logged and falls through to the no-data guard. |
+| #12809 | Fundable backfill | Once-ever on `company_enrich_data.fundable` emptiness; `"no_data"` retires the phase. |
+| #12810 | Financial repair | Domain-only Fundable backlink + fill-empty/escalate-only financial repair. |
+| #12813 / #12703 / #12856 | Deal fanout | **Gate: `effectiveCascadeDepth == 0` only** (seed-marker chain retired; old fields logged for observability). 25 raised + 25 invested cap; per-deal cascade self-gates on staleness; #12856 v1.9 **company-origin containment**: when the seed company is itself the investor, portfolio rounds (raiser != origin company) are skipped with `processed_at` stamped; v1.10 scalarizes `fundable_deal_id` and caught errors. |
+| #12813 funding fallback (v1.8–v1.19) | Company_LLM funding fallback | Runs on **every** phase-7 invocation. Materializes one provisional round from LLM funding (+ `linkedin_profile.funding.lastRound` supplement) when: `company_financial` row exists AND round evidence exists (round/date/investors/size — a bare company total never counts) AND `rounds_added != true` AND no duplicate against `company_funding_round` (normalized round type + ±3-day date window) AND `node_uuid` set. Writes `Funding_Round {provisional: true, source: 'Company_LLM'}` + `RAISED` w10 + `company_funding_round` row + registry row + history row (`Funding Rounds`); investor `INVESTED_IN` w20 edges only for already-existing company nodes; **no queueing, non-recursive, LLM-free investor loop**. All three outcome paths set `rounds_added: true` (write, duplicate-skip, total-only-skip). |
+| #12701 / #12702 | Funding graph and investor edges | #12701 v1.17: `:Entity` on Funding_Round, always-non-empty description, RAISED description via #13181 (fail-closed), `edge_id` returned and stored, `company_funding_round` upsert, registry row, date-milliseconds hardening (epoch-millis → UTC ISO date in a lambda), id/field scalarization armor. #12702 v1.17: investor-firm enqueues at **priority_tier 1** (was 2); all six edge types get LLM descriptions with deterministic CASE fallbacks; investor node names repaired on match. |
+| #12746 / #13142 / #13141 / #13143 / #13144 | Expertise | Destructive `SPECIALIZES_IN` rebuild; KNN guard band 0.15/0.25 with LLM adjudication; **matched nodes now get parent attach too** (2026-07-09); new nodes registered in node_registry; #13142 v1.3–v1.4 idempotent parent repair + `domain_expertise_id` dual-write + HAS_SUBDOMAIN uuid/description; #13143/#13144 v1.1 lambda-built prompts + parser-diagnostic hard-stops. |
+| #2545 / #4517 | About/classifier | Kimi about writer, then GPT-4o industry/specialty classifier. |
+| #1924 / #4528 | Locations | Drain geocoded addresses into the graph, then mark `path_triples_added`; location nodes carry `description` (v1.3–v1.5), gated embedding splices, registry rows for country/region/city. |
+| #2602 / #4659 | Company graph node | Section 14. |
+| #13181 / #13180 / #13183 | Shared helpers | Section 11 (LLM) and 14 (registry). #13181 has NO internal try/catch — every caller must wrap it (they do). |
+| #13175 / #13173 / #13174 | Reverse music bridge | #13175: skip if `mb_label` bridged / probe cached / no node_uuid; graph traversal over `SPECIALIZES_IN`/`HAS_SUBDOMAIN` names; music-term match → `find-label` (confidence >= 0.5 + mbid) → `enter-label`; records `music_reverse_probe` status matched/review/no_match. No internal try/catch — #12992 wraps it. `no_match` probe caching noted "not yet wired" in the header. |
+
+## 9. Orchestration State Machine
+
+```text
+seed/request
+  -> get-add gate
+     -> placeholder/kill/school-guard/governor/non-company short-circuit  => miss shell (company_created: false)
+     -> LLM + Fundable sourcing
+     -> procedural dedup (link, domain, name, fundable)
+     -> row + node create (+ registry)  => created shell (company_created: true)
+     -> dispatch decision
+        -> depth-0 immediate async orchestrator (also forced for person-phase-3 root lane)
+        -> depth leaf queue upsert (explicit tier survives; count escalation)
+        -> hold_downstream no-op
+
+queue drain (tier <= 1) or async dispatch
+  -> 60s debounce
+  -> effective-depth repair (max of input, deepest queue row)
+  -> school pre-step (is_vc reset) + funding-round VC suppression
+  -> LLM/apply/Fundable/Signal/thesis/Exa(+founder fallback)/YC/backfill/financial/deals(+LLM funding fallback)
+  -> specialties -> music bridge (12.5) -> about(+fallback)/classifier -> locations -> node sync -> is_vc re-assert
+  -> history finalize + last_enrich stamp -> projection refresh
+```
+
+Depth gates (live 2026-07-09):
+
+| Gate | Seed (depth 0) | Depth above 0 |
+| --- | --- | --- |
+| Exa people expansion | Create/update people with strict seed evidence, work edges, async person enrichment | Save envelope only |
+| Company_LLM founder fallback | Synthesized into the C-suite loop | Off |
+| YC people | Founders T1, partner T2 into the person queue | Skip people |
+| Deal fanout | **Allowed by depth alone** (containment moved into #12856 v1.9) | Skip |
+| Company_LLM funding fallback | Runs (self-gated) | **Also runs** (self-gated; no depth gate) |
+| Investor edge set | Explicit seed 0 fires (`first_notnull` depth read in #12702) | Omitted depth fails closed to 1 |
+| Reverse music bridge | Runs when `$env.reverse_music_bridge == "on"` | Off |
+
+## 10. Provider Contracts
+
+### OpenRouter Company Research (#12974)
+
+```http
+POST https://openrouter.ai/api/v1/chat/completions
+Authorization: Bearer ${OPENROUTER_API_KEY}
+Content-Type: application/json
+```
+
+Tier 1 / tier 2:
+
+```json
+{
+  "model": "google/gemini-3.1-flash-lite | anthropic/claude-sonnet-4.6",
+  "temperature": 0,
+  "max_tokens": 8000,
+  "tools": [{ "type": "openrouter:web_search" }],
+  "provider": { "sort": "throughput", "allow_fallbacks": true, "data_collection": "deny" }
+}
+```
+
+Tier 2 uses temperature 0.2 and 240s (tier 1: 180s). No retry beyond the tier-2 escalation; double failure yields the structured `_parse_fallback` shell. Persist the raw envelope in JSONB.
+
+### Serper — profile discovery (#12974) and Signal NFX URL discovery (#2640, since 2026-07-08)
+
+```http
+POST https://google.serper.dev/search
+X-API-KEY: ${SERPER_DEV}
+Content-Type: application/json
+```
+
+- Profile discovery: batch of 7 `site:` platform queries, 30s, silent `[]` on failure.
+- Signal discovery: query `site:signal.nfx.com/investors <name> Investor Profile`, 30s; organic results scored by name-token match (full-name hit 8, per-token 2, position tiebreak); best canonical `signal.nfx.com/investors/...` URL returned or null. **Brave Search is retired on this path** — `#2640` keeps its `brave/` name as a naming fossil.
+
+### Exa C-suite Search (#12988, v1.2)
+
+```http
+POST https://api.exa.ai/search
+x-api-key: ${EXA_API_KEY}
+```
+
+Query "founders, co-founders, C-suite executives...", `category: people`, `numResults: 6`, contents with highlights + bio summary; optional `POST /contents` expansion. 60s, no retry. Zero-match envelope is saved and permanently satisfies the fetch-once gate. Match acceptance is strict (exact domain / exact company LinkedIn / exact name / legal-suffix compact); broad text snippets only count with structured workHistory seed evidence.
+
+### Firecrawl (#4515, v1.4–v1.6)
+
+Caller-tunable controls (zero/empty sentinels = missing): `timeout_ms` (default 60000), `request_timeout_seconds` (default 60), `proxy` (default `auto`), `only_main_content` (default true for Crunchbase URLs), `only_clean_content` (default false), `wait_for_ms` (default 1000 for Crunchbase, else 0), `store_in_cache` (default true). Request body adds `location: {country: "US", languages: ["en-US"]}`, `removeBase64Images: true`, `blockAds: true`. Retries: 4 attempts on non-200. Soft-fail callers get an **empty** `error_message` on optional-source misses (2026-07-06 — quiet the noise) with full `request_config` preserved in the log row's data.
+
+### Signal NFX flow (#12991)
+
+1. 30-day debounce on `enrich_history_company.source = "Signal NFX"` (failed attempts count).
+2. #2640 discovers the URL via Serper (above); no URL → close history as success/no-op.
+3. #4515 scrapes; tolerate `markdown = null`.
+4. #12990 parses markdown to JSON: model `$env.LLM_MODEL_JSON_PARSE` (docs resolve it to `google/gemini-3.1-flash-lite-preview`), temperature 0.1, 4000 max tokens, 60s; null on any failure (debounce suppresses retry).
+5. Persist raw + parsed; upsert investor profile; flip `is_vc = true`.
+
+### GCP Investment Thesis (#12978)
+
+```http
+POST ${GCP_BACKEND_URL}/v1/outcomes/investment-thesis/build
+Content-Type: application/json
+```
+
+`{"master_company_id": ..., "context": {...}, "data_source": "xano_company_enrichment"}`. 180s; exactly one immediate retry on non-200. Base URL comes from the `environment_variables` TABLE (per-datasource) via #12977 — not a `$env` var. No auth header in Xano; Go should use service-to-service auth with Mark's sign-off.
+
+### ScrapeCreators company profile (#4514 — producer status uncertain)
+
+```http
+GET https://api.scrapecreators.com/v1/linkedin/company?url=<linkedin_url>
+x-api-key: ${SCRAPECREATORS_KEY}
+```
+
+60s. Response minus `similarPages/posts/type/logo` is stored as `company_enrich_data.linkedin_profile` and cached to `linkedin_profile_company`; fields consumed live: `employees[]` (C-suite reconciliation), `funding.lastRound.{type,date,amount}` (funding fallback supplement), `website` (domain repair), `description`/`name`/`url`. **#4514 has no caller among the waterfall functions and is Xano-tagged "maybe depreciated??"** — the payload is real and consumed, the producer's trigger is unconfirmed (section 22).
+
+### Enrich Layer (via #12997 v2.2)
+
+Founder/C-suite LinkedIn URLs trigger `api/enrich_layer/person-linkedin` immediately; profile stored in `person_enrich_data.enrich_layer_data`; EL links written with `suppress_downstream: true`; EL profile pic preferred for `replace-avatar`.
+
+### Fundable Mirror and BigQuery
+
+Live enrichment reads the local mirror only. `fundable-lookup` #12698 precedence: exact `fundable_org_id` → domain → original domain → LinkedIn URL → Crunchbase URL; returns null or a single-row legacy-array shape. BigQuery ingestion (#12689/#12690) is a separate substrate with no identified live trigger; the forward design is the [Fundable changelog plan](/guides/open-work/orbiter-univers-standalone/fundable-changelog-processing) (plan only — proposed `fundable_change_log`/`fundable_sync_runs` tables and sync/process functions dispatching into #12856/#12701/#12702/#12703).
+
+## 11. LLM Contracts
+
+| Function | Model | Temp | Max tokens | Timeout | Parse behavior |
+| --- | --- | --: | --: | --: | --- |
+| #12974 tier 1 | `google/gemini-3.1-flash-lite` + web_search | 0 | 8000 | 180s | Extract JSON, normalize schema (incl. `founders[]`), escalate on bad/missing confidence. |
+| #12974 tier 2 | `anthropic/claude-sonnet-4.6` + web_search | 0.2 | 8000 | 240s | Replaces tier-1; double non-JSON → structured `_parse_fallback` shell (never `data._error`). |
+| #12990 Signal parse | `$env.LLM_MODEL_JSON_PARSE` | 0.1 | 4000 | 60s | Strip fences; parse object; null on failure. |
+| #12746 specialty blurb | `google/gemini-3.1-flash-lite` | 0.2 | — | 25s | Fallback to specialty name on decode failure. |
+| #12746 guard-band adjudication | `google/gemini-3.1-flash-lite` | 0 | — | 20s | `{"same": bool}`; decode failure creates a new node. |
+| #13141 parent domain | `google/gemini-3.1-flash-lite` | 0 | 2000 | 90s | Three attempts, fail-loud; prompt v1.6 (2026-07-08) routes industry-qualified leadership + business administration. |
+| #13143 edge description (specialties) | `deepseek/deepseek-v4-flash` | 0.3 | 300 | 120s | Prompt built in a lambda (v1.1, no template_engine); good-or-null; parser diagnostics rejected. |
+| **#13181 generate-edge-description** | `deepseek/deepseek-v4-flash`, `reasoning: {enabled: false}` | 0.2 | 220 | 90s | Single SYSTEM message; per-edge-label guidance; deterministic fallback per label (RAISED prefers `existing_description`); normalize → subject-name guard → object-name guard (skipped for RAISED) → normalize again. **No internal try/catch — callers wrap.** Not documented on the prompt/model pages. |
+| #2545 about | `moonshotai/kimi-k2.5` | 0.2 then 0.3 retry | 2000 | 60s each | Parse JSON, clamp lengths; failure logs and returns empty. |
+| #4517 industry classifier | `openai/gpt-4o` | 0 | 4000 | 60s | Shape failures degrade to `{industry: null, specialties: []}`. |
+| #12563 founder LinkedIn | direct Groq `groq/compound` | 0.2 | 1024 | 30s | Raw string; no validation; empty drops the founder. |
+
+All OpenRouter calls set `provider.data_collection = "deny"`. Do not duplicate long prompts in Go — store prompt fixtures and model configs in `internal/llm` and cross-link the prompt docs (noting their staleness, section 21). `normalize-edge-description` #13180 is LLM-free: Unicode/whitespace cleanup plus hard rejection of parser-diagnostic text (returns empty string on `Line N: Char N`, `unterminated string literal`, `template_engine`, `parser diagnostic`, `syntax error`).
+
+## 12. AlloyDB Target Schema
+
+The 2026-07-02 edition of this section proposed a direct Xano-to-Postgres port. That is superseded: the Universe backbone is now defined in [Universe Lookup Tables](/guides/open-work/orbiter-univers-standalone/universe-lookup-tables) (V1 draft — `universe.entity`, `entity_identifier`, `entity_fact`, `enrichment_payload`, typed detail tables, `merged_into` recovery). The Company pipeline plugs into that backbone; this section specifies the mapping and the Company-specific extensions.
+
+### Mapping: Xano tables → Universe backbone
+
+| Xano source | Universe target | Contract notes |
+| --- | --- | --- |
+| `master_company` #142 | `universe.entity` (`entity_type='company'`) + `universe.company` typed winners + `universe.entity_identifier` rows | Typed table is a rebuildable cache of chosen facts — never authored directly. `graph_node_uuid` on entity replaces `master_company.node_uuid`. `source` text is the provenance field (decision: do not recreate `data_source_id`/table 161). |
+| `company_enrich_data` #485 | `universe.enrichment_payload` (one row per provider response: `company_llm`, `fundable`, `exa_c_suite`, `yc_data`, `yc_partner_page`, `signal_nfx_scrape`, `signal_nfx_json`, `linkedin_profile`) | Preserve whole-envelope parity (never store only `.data`). Sentinels must survive: `fundable = "no_data"` (terminal), `yc_data = "no_data"` (retriable). Fetch-once/empty gates in section 16 key off these rows. |
+| `enrich_history_company` #404 | enrichment run/status rows + `universe.entity.enrichment_state`/`last_enriched_at` | Debounce surface (60s base-run, 30-day Signal) must stay queryable by `(entity, source, created_at)`. |
+| `queue_enrich_company` #583 | `universe` queue table (below) | #12855 v1.2 semantics preserved exactly. |
+| `company_financial` #287, `about_company`, links, industries, specialties, addresses, emails, phones | `universe.entity_fact` rows (per-source, confidence) distilled into `universe.company` winners + normalized fact sets | Preserve-existing writer precedence becomes distill rules: existing chosen winner is not displaced by a sparser/lower-confidence source. `rounds_added` and `funding_summary` remain state on the company financial fact-set. |
+| `company_funding_round` #201 | `universe.funding_round` detail rows (below) → `funding_round_display` projection | Revived-table caveat: Xano schema still references `data_source_id` (table 161) and has the `raised_at_valutaion_usd` typo — neither carries into Universe. |
+| `node_registry` #758 | **superseded** by `universe.entity.graph_node_uuid` + `graph_written_at` | Do not port the table or the `entitiy_type` typo; the write-once semantics live in the entity row. Non-entity nodes (locations, funding rounds) get registry semantics via their own detail rows' `graph_node_uuid`. |
+| `fundable_*` mirrors | `universe.fundable_organization` / `fundable_person` / `fundable_deal` source mirrors | Already specified in the backbone doc; keep `processed_at` and `funding_round_node_uuid` parity on sync. |
+| `log_crash` #542 / `log_enrichment_company` #632 | structured event logs (section 17) | Strict `phase` enum is a Xano artifact — Go uses open-vocabulary structured fields. |
+| `school` #300 | nothing | Retired 2026-07-04. Schools are company entities with `is_school = true` (label discriminator in `company_display`). |
+
+### Identifier kinds for companies
+
+| kind | strength | normalized_value | Source |
+| --- | --- | --- | --- |
+| `linkedin` | strong | `linkedin.com/company/<slug>` or `linkedin.com/school/<slug>` | seed input, LLM profiles (identity-gated), ScrapeCreators |
+| `fundable` | strong | fundable org id | mirror backlink |
+| `domain` | **decision pending (section 22)** — live Xano treats a canonical-domain match as a deterministic dedup hit; the backbone doc classifies domain as soft | registrable domain (public-suffix aware, per the live two-part-suffix rules) | seed, LLM (post domain-repair), Fundable |
+| `crunchbase` | strong | canonical crunchbase org URL | Fundable, LLM profiles |
+| `name` | soft | normalized lowercase name / legal name | seed, LLM — candidate lists only (the 2026-07-09 fanout name-dedup becomes a scored soft-key resolve) |
+
+Strong-key uniqueness is the partial unique index from the backbone doc; a strong-key collision is the merge trigger (`merged_into`), which replaces Xano's procedural "return the existing row" branches.
+
+### Company-specific extension tables (DDL sketches)
+
+`universe.company_queue` — source: `queue_enrich_company` #583.
+
+```sql
+CREATE TABLE universe.company_queue (
+  entity_id     UUID PRIMARY KEY REFERENCES universe.entity(id),
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ,
+  processing    BOOLEAN NOT NULL DEFAULT false,
+  count         INT NOT NULL DEFAULT 1,
+  cascade_depth INT NOT NULL DEFAULT 0,
+  priority_tier INT NOT NULL DEFAULT 4,
+  source_function TEXT,
+  source_entity_id BIGINT,
+  source_entity_uuid TEXT,
+  source_entity_type TEXT,
+  retry_count   INT NOT NULL DEFAULT 0,   -- Go addition
+  last_error    TEXT                      -- Go addition
+);
+CREATE INDEX company_queue_pick_idx
+  ON universe.company_queue (processing, priority_tier, cascade_depth, entity_id);
+```
+
+One logical row per company (Xano enforces this procedurally; the PK makes it intentional). Upsert must mimic #12855 v1.2 exactly (section 13).
+
+`universe.funding_round` — sources: `company_funding_round` #201 + `fundable_deals` materialization state.
+
+```sql
+CREATE TABLE universe.funding_round (
+  id                UUID PRIMARY KEY,
+  company_entity_id UUID NOT NULL REFERENCES universe.entity(id),
+  graph_node_uuid   TEXT UNIQUE,          -- Fundable path: fundable_deals.id; LLM path: generated
+  round_permalink   TEXT,
+  funding_type      TEXT,
+  money_raised      JSONB,                -- {value, currency, value_usd, citation}
+  announced_date    DATE,
+  num_investors     INT,
+  raised_edge_uuid  TEXT,
+  description       TEXT,
+  provisional       BOOLEAN NOT NULL DEFAULT false,  -- true only for Company_LLM fallback rounds
+  source            TEXT NOT NULL,        -- 'Fundable' | 'Company_LLM'
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at        TIMESTAMPTZ
+);
+CREATE INDEX funding_round_company_idx ON universe.funding_round (company_entity_id);
+```
+
+Dedup contract (from #12813 v1.14–v1.16): before inserting an LLM-fallback round, compare against existing rows by normalized round type (strip `and/funding/round`, alphanumeric-only) plus announced date within ±3 days; a same-company same-normalized-non-generic-round Fundable row is authoritative even when dates differ. A company-level `total_raised_usd` with no round evidence never materializes a round.
+
+`universe.enrichment_run` — sources: `enrich_history_company` #404 (+ crash-log correlation).
+
+```sql
+CREATE TABLE universe.enrichment_run (
+  id           UUID PRIMARY KEY,
+  entity_id    UUID NOT NULL REFERENCES universe.entity(id),
+  source       TEXT NOT NULL,            -- 'Base Company Enrich', 'Company_LLM', 'Fundable', 'Signal NFX', 'Funding Rounds', ...
+  processing   BOOLEAN NOT NULL DEFAULT false,
+  enrich_success BOOLEAN,
+  qa_passed    BOOLEAN,
+  note         TEXT,
+  data         JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at   TIMESTAMPTZ
+);
+CREATE INDEX enrichment_run_debounce_idx
+  ON universe.enrichment_run (entity_id, source, created_at DESC);
+```
+
+Carry the open QA follow-up (2026-07-09 waterfall warning): clean optional-source misses currently land as `enrich_success: false` and read as warnings — Go should distinguish terminal SKIP/no-op rows from failures (marked `Fix in Go`, section 20).
+
+### Investment thesis and investor profile
+
+`investment_thesis` #709 and `investor_profile_company` #478 carry over shape-compatible as typed detail/fact tables (the 2026-07-02 DDL sketches remain valid); note the Xano `exits = "null"` string quirk stays an artifact (nullable text in Go).
+
+Retention/backfill: greenfield Universe starts empty (decision #2) — no Xano rows are migrated; the Fundable mirrors are re-seeded from BigQuery and everything else arrives through the Go pipeline + the seed lists.
+
+## 13. Queue and Worker Contract
+
+### `universe.company_queue` worker
+
+Insert/upsert key: `entity_id` (one logical row per company).
+
+Upsert semantics (must mimic #12855 v1.2 exactly):
+
+```text
+incoming_tier  = priority_tier is null ? 4 : priority_tier      // first_notnull — explicit 0/1 survives
+incoming_depth = cascade_depth empty  ? 0 : cascade_depth       // first_notempty — 0 is also the fallback
+on conflict:
+  count       = count + 1
+  merged_tier = min(existing_tier, incoming_tier)
+  delta_drop  = floor(count/3) - floor((count-1)/3)              // 1 on every 3rd reference, else 0
+  priority_tier = max(0, merged_tier - delta_drop)
+  cascade_depth = min(existing_depth, incoming_depth)
+  source metadata: update only on strict improvement; empty incoming never wipes
+```
+
+Priority ordering and drain gate: `priority_tier asc, cascade_depth asc, id asc`, drain restricted to `priority_tier <= 1` (Task #127 contract, 2026-07-03 — investors enter at tier 1, everything else escalates toward it via the count rule).
+
+Locking SQL:
+
+```sql
+WITH picked AS (
+  SELECT entity_id
+  FROM universe.company_queue
+  WHERE processing = false AND priority_tier <= 1
+  ORDER BY priority_tier ASC, cascade_depth ASC, entity_id ASC
+  FOR UPDATE SKIP LOCKED
+  LIMIT 1
+)
+UPDATE universe.company_queue q
+SET processing = true, updated_at = now()
+FROM picked
+WHERE q.entity_id = picked.entity_id
+RETURNING q.*;
+```
+
+Processing boundary: the lock/update is its own short transaction; orchestration runs outside it; success deletes the row; failure releases it and increments `retry_count`; after configured max retries, move to DLQ (Go addition — Xano has neither and can poison-block).
+
+Cron state is part of the frozen contract: Task #127 ships `active: false` at 600s. The Go worker ships behind an equivalent off-by-default deployment flag until go-live.
+
+Explicit-zero behavior (changed vs the 2026-07-02 edition): `priority_tier: 0` is stored as 0 and is immediately drain-eligible. `cascade_depth: 0` remains 0.
+
+Acceptance checks: duplicate hit increments `count`; third re-reference drops tier by exactly 1 (floor 0, no compounding on later merges); better tier/depth improves the row; source metadata updates only on improvement; a tier-4 row never drains while the tier-gate is 1 (it must escalate first); workers cannot double-process a row.
+
+## 14. Graph Node and Edge Contract
+
+Graph writes target the standalone Universe FalkorDB graph through `internal/graph`: parameterized queries only, standard envelope (`coalesce(created_at, timestamp())`, `updated_at = timestamp()`, `randomUUID()` where a uuid is minted), null/empty properties omitted, `'Label' IN labels(n)` for label predicates, vector splices gated on a valid-vector check. Cypher sources for parity live on [Company cyphers](/guides/cyphers/company-pipeline), [Funding cyphers](/guides/cyphers/funding), and [Expertise cyphers](/guides/cyphers/expertise).
+
+### Company node
+
+Writer: #2602 create, #4659 sync. Labels: `:Entity:Company` plus create-time subtype `:School`, `:VC_Firm`, or `:Organization` (School wins over VC).
+
+Create semantics (parity notes, live-verified): Xano fires a **CREATE, not MERGE** — uniqueness is caller-side (row `node_uuid` gate) and a forced re-run mints a duplicate and re-stamps `node_uuid`, orphaning the old node. send-cypher runs in a 3-attempt retry; on success the node uuid is stamped back onto the company row and registered write-once in the registry. Go: keep row-gated creation but make the graph write idempotent (MERGE on uuid) so the duplicate window closes without changing observable success behavior.
+
+Properties (2026-07-04+ contract):
+
+- Identity: `uuid`, `master_company_id`, `name`/`company_name`, `company_domain`, `display_label`, `linkedin_url` (v1.10).
+- Text: `summary` (about → llm.summary → llm.headline) and `description` (about_500 → about → llm.summary → llm.headline → company_name) — written at CREATE since v1.9 (the docs' "no description at create" is stale).
+- Funding (when present, from Company_LLM/company_financial): `funding_total_raised_usd`, `funding_last_round`, `funding_last_round_date`, `funding_investors`, `funding_summary` — written at create (#2602 v2.0) and refreshed on sync (#4659 v1.9).
+- Optional LLM props null-omitted: `business_model`, product names/categories, `target_customers`, `is_acquired` only-when-true + `acquired_by`/`_date`/`_ticker`.
+- Embeddings: OpenAI 1536 `name_embedding` (legacy, gated on `$nameVecOk`) + Gemini 1536 `embeddings` — in Universe only Gemini 1536 L2-normalized is canonical (decision #1).
+- Label repair after create is NOT handled by #4659 — a subtype change post-create needs Mark-approved handling.
+
+### Node registry semantics
+
+Every created node registers write-once: company (#2602 + gate), country/region/city (#4528), sub_domain_expertise (#12746), funding_round (#12701/#12813 inline). In Go this is `universe.entity.graph_node_uuid` + `graph_written_at` (entities) and `graph_node_uuid` on detail rows (non-entity nodes) — do not port the `node_registry` table or its `entitiy_type` typo (section 20).
+
+### Funding_Round node and RAISED edge
+
+Writers: #12701 (Fundable path), #12813 (Company_LLM fallback path).
+
+| Aspect | Fundable path | Company_LLM fallback |
+| --- | --- | --- |
+| Node key | `uuid = fundable_deals.id` (MERGE) | generated UUID (MERGE on it) |
+| Labels | `:Entity:Funding_Round` (Entity added v1.10) | same, plus `provisional: true` |
+| Description | always non-empty: long → short → "org type" | materialized sentence (round, date, size, investors) |
+| `source` | Fundable | `Company_LLM` |
+| RAISED | weight 10, deterministic uuid `<companyNodeUuid>-<dealId>`, `created_at` coalesced, announced date property when present | weight 10, deterministic uuid `<companyNodeUuid>-<roundUuid>` |
+| Edge description | #13181 with full deal context, fail-closed to source/deterministic text | same, `existing_description` preferred |
+| Side-table | `company_funding_round` upsert by node_uuid, `edge_id` stored | same |
+| Idempotency | `fundable_deals.processed_at` set only when materialization returns a node uuid | `company_financial.rounds_added` set on write, duplicate-skip, and total-only-skip |
+
+### Investor edge set (#12702 v1.17)
+
+| Edge | Source | Target | Weight |
+| --- | --- | --- | --: |
+| `LEAD_INVESTED_IN` | `Company:VC_Firm` or `Person:Angel` | `Funding_Round` | 15 |
+| `INVESTED_IN` | `Company:VC_Firm` | `Funding_Round` | 20 |
+| `FOLLOW_ON_INVESTED_IN` | `Company:VC_Firm` | `Funding_Round` | 20 |
+| `INVESTED_IN` | `Person:Angel` | `Funding_Round` | 25 |
+| `INVESTMENT_PARTNER_IN` | `Person` | `Funding_Round` | 15 |
+| `INVESTMENT_PARTNER_AT` | `Person` | `Company:VC_Firm` | 20 |
+
+Rules: `cascade_depth` read via `first_notnull` — explicit seed 0 fires, omitted fails closed to 1; chronological processing drives follow-on detection; investor node names are repaired on match (name/company_name SET); every edge gets an LLM description with a deterministic CASE fallback; investor-firm enqueues enter the company queue at tier 1; type flips create additional typed edges — no silent deletion of old typed edges without a cleanup plan.
+
+### SPECIALIZES_IN and HAS_SUBDOMAIN (#12746, #13142)
+
+- Destructive rebuild: delete all existing `SPECIALIZES_IN` from the company each run, then re-create from current specialties.
+- Per specialty: blurb (LLM) → Gemini 1536 embed → KNN over `Entity.expert_embeddings`; distance below 0.15 auto-matches, 0.15–0.25 LLM-adjudicates, above 0.25 creates; exact-name guard rescues a stale vector index.
+- Matched edge weight `min(round(10 + match_score * 160), 50)`; created-node edge weight 10; edge descriptions via #13143/#13144 with parser-diagnostic hard-stops.
+- Parent attach runs for CREATED **and now MATCHED** subdomains (2026-07-09): existing relational FK → idempotent graph-edge repair without re-resolving; otherwise #13141 resolves, the graph edge is written, and `sub_domain_expertise.domain_expertise_id` is dual-written.
+- `HAS_SUBDOMAIN`: weight 100, edge `uuid` minted, LLM description with deterministic fallback (`<Domain> includes <subdomain>`), clears `parent_unresolved`/`parent_unresolved_at`; unresolved parent flags `parent_unresolved: true`.
+
+### Work, YC, and location edges
+
+| Edge family | Writer | Rules |
+| --- | --- | --- |
+| Work history | #2800 (v2.12) | `WORKS_AT` rank weight plus `FOUNDED`, `BOARD_MEMBER_OF`, `ADVISOR_TO`, `MEMBER_OF` by title classification. Work-history titles NEVER classify as `INVESTED_IN` (v2.5 — investment edges belong to the deal writers). Phantom-founder exclusion: title-only Founder claims drop when Fundable's structured `is_founder` associations exclude the person; explicit Co-Founder titles and Company_LLM founder-fallback rows survive; structured `is_founder` ORs in (Michael Dell case) with the person→Fundable bridge resolved on the fly. "Founder in Residence" and "Advisor to Founder" are not founders. Generic domainless role-companies (Angel Investor, Board Member, Stealth Startup, ...) receive no edges. LLM descriptions always run (`write_descriptions` input is ignored, v2.12) via #13008/#13010 with deterministic CASE fallbacks; `work_experience.edge_uuid` stores the relationship uuid. |
+| YC founding | #12700 (v3.5) | Multi-founder `contextFounded` hub with `FOUNDED` w5 and `WAS_FOUNDED` w1; single founder direct `FOUNDED` w5; `toString(founded ?? 'null')` guard keeps null founding years from aborting the hub cypher; §7 is delete-then-recreate idempotent. |
+| YC mentor | #12700 | `MENTOR` w14; duplicate risk if `valid_from` changes. |
+| Locations | #4528 (v1.5) | `LOCATED_IN` w70/w80, `IN_REGION` w25, `IN_COUNTRY` w50; location nodes carry `description`; embedding splices gated; registry rows for created nodes. |
+
+### Edge-description helper contract (Go)
+
+```go
+// generate-edge-description #13181 equivalent
+type EdgeDescriptionReq struct {
+    EdgeLabel, SubjectName, SubjectType, ObjectName, ObjectType string
+    Title, ExistingDescription, ContextJSON                     string
+}
+// Returns "" only after normalization rejects the text; callers always have a
+// deterministic fallback. Callers MUST wrap the LLM call (no internal recovery).
+// normalize #13180: NFKC + zero-width/NBSP strip + ellipsis/punct cleanup +
+// hard rejection of parser-diagnostic strings (returns "").
+```
+
+## 15. Projection Contract
+
+The read model is `company_display` (plus `funding_round_display`), per the [Projection Pattern](/guides/open-work/orbiter-univers-standalone/projection-pattern) and [Tables: Universe vs Orbiter Backend](/guides/open-work/orbiter-univers-standalone/tables-universe-vs-orbiter-backend). The 2026-07-02 edition's `company_card_snapshot` proposal is retired — that open question is answered by the design docs.
+
+Flow: Backend seeds `master_company` + a `company_display` row for the fast UI response (`enrichment_status: "seeded"` → `"enriching"`); Universe enrichment runs; on completion Universe publishes ONE versioned package; the Backend applier upserts display + side-panel facts idempotently.
+
+Package (schema `company_projection.v1` — canonical example in the projection-pattern doc):
+
+- Envelope: `schema_version`, `run_id`, `universe_company_uuid`, `source_updated_at`, `projection_generated_at`.
+- `display`: display_name, domain, logo_url, headline (tagline), summary, primary_location_label, industry_labels, employee_count_label, funding_stage, top_links, enrichment_status.
+- `side_panel_facts`: company_financial (funding_total, funding_stage, last_funding_date), primary_location, links, founders, funding_rounds, social_profiles.
+
+Field mapping (Universe → `company_display`):
+
+| Display field | Universe source | Refresh rule |
+| --- | --- | --- |
+| identity (display_name, domain, logo_url) | `universe.company` winners (post domain-repair) | Seed at create; refresh on package apply. |
+| headline / summary | tagline / about winners (incl. about-fallback) | After apply-LLM and after the about step. |
+| industry_labels / specialties | industry/specialty fact sets | After #12989 / #2545 / #12746 equivalents. |
+| funding_stage / employee_count_label | company_financial winners | After financial phases. |
+| top_links | identity-gated link facts | After link fanout. |
+| universe_node_uuid | `entity.graph_node_uuid` | After node create/backfill. |
+| enrichment_status | entity lifecycle | seeded → enriching → complete / partial / failed (worker states). |
+
+`side_panel_facts.founders` sources from the C-suite/founder person set (including Company_LLM fallback founders); `side_panel_facts.funding_rounds` sources from `universe.funding_round` — **decision needed on whether provisional Company_LLM rounds project** (section 22).
+
+Applier rules (from the design doc): validate schema_version; resolve/create App identity; upsert `company_display`; replace Universe-owned fact sections; conservative upsert for links/contacts; never touch App-owned dynamic sections; append a projection status row per `run_id` (idempotent re-apply).
+
+Acceptance checks: display row exists immediately after seed; completion package refreshes headline/summary/financial/tags/graph uuid without the App reading `universe.*`; re-applying the same `run_id` is a no-op; failure state visible via `enrichment_status`.
+
+## 16. Idempotency and Dedup Contract
+
+Company resolve order (live procedural behavior → Universe identifier model):
+
+1. Incoming/profile URL via `master_link` → strong `linkedin` (or platform) identifier hit.
+2. Resolved canonical domain → domain identifier (strength pending — section 22).
+3. Original pre-redirect domain → same.
+4. LLM alt domains vs existing canonical domains.
+5. LLM-discovered and Fundable-known profile URLs → strong identifiers.
+6. Fundable resolved domain/original domain/known URLs → `fundable` strong id + soft keys.
+7. Name/legal-name match (2026-07-09, fanout callers) → soft `name` key: candidate list, resolved by seed-company context — never an automatic merge in Universe.
+
+Universe mechanics: every lookup enters through `entity_identifier`; a strong-key insert collision IS the duplicate-detection event and triggers the merge flow (`merged_into`, identifier repoint with soft-key dedupe, fact repoint both directions, typed-table re-distill, graph node merge). This replaces Xano's procedural existing-row branches; observable behavior (return the canonical row) is unchanged.
+
+Queue idempotency: one logical row per company; upsert per section 13.
+
+Graph idempotency:
+
+- Company create is row/entity-gated (Xano CREATE has a duplicate window — Go closes it with MERGE-on-uuid while preserving the row gate).
+- Funding_Round and most edges are MERGE-keyed; RAISED/edge uuids are deterministic (`<companyUuid>-<dealId|roundUuid>`).
+- `SPECIALIZES_IN` is a destructive rebuild — fixtures assert the exact post-run edge set, not accumulation.
+- HAS_SUBDOMAIN repair is idempotent for matched subdomains (FK-first, no re-resolve).
+- Location drain marks addresses processed (`path_triples_added`) even when an endpoint MATCH no-ops — Go should make endpoint absence observable/retryable unless Mark wants exact no-op parity.
+- Registry/`graph_node_uuid` writes are write-once (skip on exists).
+
+Provider idempotency gates:
+
+- `company_llm.data` empty gates the LLM stage; the `_parse_fallback` shell counts as non-empty (no auto-retry — flag for fixtures).
+- `exa_c_suite` empty gates Exa; a zero-match envelope is non-empty and terminal.
+- `yc_data == "no_data"` retries next run; `fundable == "no_data"` is terminal.
+- `Signal NFX` 30-day history debounce, failures included.
+- Thesis rebuilds on no row, empty derived summary, or 30-day staleness.
+- Funding fallback: `company_financial.rounds_added` is terminal across write/duplicate/total-only outcomes; round dedup by normalized type + ±3-day window.
+- Deal cascade: `fundable_deals.processed_at`; containment SKIPs also stamp it.
+- Music bridge: `mb_label` presence and `music_reverse_probe` status rows (`no_match` caching noted "not yet wired" — treat probe rows as the gate).
+- Base-run 60s debounce on history.
+
+## 17. Error Handling and Observability
+
+Structured logs replace `log_crash`/`log_enrichment_company`: company entity id, function/step, severity, QA pass/fail, error, provider status, queue id, run id, fixture correlation id. Preserve the live note taxonomy — `SKIP:` (intentional gate, `qa_passed: true`), `WARN:` (non-fatal), `FALLBACK:` (degraded fill), `SAVED:` (fallback subsystem success), `CRASH:` — it is load-bearing for QA queries. The Xano `log_crash.phase` strict enum is an artifact (it broke the logger — 2026-07-02); Go uses open-vocabulary fields.
+
+Continuations: orchestrator steps continue after isolated failures and mark final success false. Provider sentinel payloads (`"no_data"`, zero-match envelopes, `_parse_fallback` shells) must stay distinguishable from true misses AND from failures. Graph writer failures leave retryable state (no `graph_node_uuid`, no `processed_at`, no `rounds_added`).
+
+Open QA follow-ups from the 2026-07-09 sandbox (waterfall-page warning; both `Fix in Go`, Mark-flagged):
+
+1. Clean optional-source misses land as `enrich_success: false` history rows and read as `PASS_WITH_WARNINGS` — Go should emit terminal SKIP/no-op run rows for optional misses so healthy runs report clean.
+2. When a later `Company_LLM` payload resolves to an existing company, additive fields (aliases, alternate domains, profile links, email/phone candidates) stay in payload rows without landing — Go should add conservative additive landing on existing-entity match paths without overwriting settled higher-confidence fields.
+
+Operational improvements allowed (documented as Go upgrades, not parity): queue retry counters + DLQ, stale-processing reapers, strong-key unique constraints with merge handling, provider replay mode, per-step tracing.
+
+## 18. Golden Fixture Plan
+
+The [parity QA smoke tests](/guides/enrichment/waterfall/company-parity-qa-smoke-tests) page contributes 11 pre-selected companies with prose ground truth (Vamos Watu, Resend, Dell, Deel, Apple, Knock, Primary Wave Music, Warner Bros.; stress: Windsurf, GoDigital, Frame.io) — convert its Notes into machine-checkable assertions; it defines no verdict semantics itself (those live in the waterfall warning box).
+
+| Fixture | Input | Frozen payloads | Key assertions |
+| --- | --- | --- | --- |
+| `company_resend_seed` | `resend.com`, `User Input`, depth 0 | #12974 (with founders[]), Serper, Exa, graph responses | Create + `company_created: true`, node props (summary/description/linkedin_url), no queue row, orchestrator runs, `last_enrich` stamped. |
+| `company_duplicate_domain` | same input twice | replay | Second run `company_created: false`, no duplicate row/node, 60s debounce. |
+| `company_return_fast` | `return_fast: true` | orchestrator LLM payload | Gate skips sync LLM; orchestrator fills `company_llm`. |
+| `company_depth1_leaf` | existing company, `queue: true`, depth 1, tier 1 | none | Queue upsert; worker enriches data but no Exa people/YC people/deals; Exa envelope saved. |
+| `company_priority_zero` | queue request `priority_tier: 0` | none | **Row stores tier 0** (v1.2 contract) and is drain-eligible. |
+| `company_count_escalation` | same company queued 3+ times at tier 3 | none | count=3 → tier drops to 2; count=6 → 1; floor 0; no compounding. |
+| `company_school_seed` | `.edu` domain or `/school/` URL | LLM payload | `is_school: true`, school guard passes real school, zero Fundable/Signal/thesis calls, final `is_vc: false`, `/school/` link preserved. |
+| `company_personal_website_block` | personal-site domain | LLM classifying not-a-company | Miss shell, SKIP log row, no row/node created. |
+| `company_fundable_vc` | Fundable VC org id | mirror, Serper Signal URL, Firecrawl, parse, thesis | Signal via Serper path, thesis gates, `is_vc` with consulting-suppression, investor profile. |
+| `company_deal_cascade` | seed VC with Fundable deals | deals/investors, graph | Funding_Round + RAISED + investor edges with LLM descriptions, tier-1 investor enqueues, co-investor queue rows. |
+| `company_investor_containment` | seed company that is itself an investor with portfolio deals | deals | Portfolio rounds (raiser != seed) skipped with `processed_at` stamped; own raised rounds materialize. |
+| `company_llm_funding_fallback` | company with LLM round evidence, no Fundable deals | #12974 funding + linkedin_profile.lastRound | Provisional Funding_Round + RAISED w10 + `company_funding_round` row + `rounds_added: true`; re-run is a no-op; company-total-only variant materializes nothing. |
+| `company_founder_fallback` | founders[] present, Exa misses them | #12974, Exa zero-relevant | Founder Person + FOUNDED edge created from LLM founder; phantom-founder guard keeps Fundable-excluded fakes out. |
+| `company_yc` | YC-backed company (incl. one with `founded: null`) | YC Firecrawl, LLM extracts | YC data, founder/partner queue tiers, founding hub built despite null year. |
+| `company_specialty_match` | company with known specialties | blurb, embedding/KNN, adjudication | Destructive rebuild, weight formula, matched-node parent attach, HAS_SUBDOMAIN description. |
+| `company_signal_parse_null` | Signal scrape with null parse | Serper/Firecrawl/parse-fail | 30-day debounce row suppresses retry; `signal_nfx_json` stays empty. |
+| `company_llm_parse_fallback` | both LLM tiers return non-JSON | tier1+tier2 raw text | `_parse_fallback` shell persisted; identity preserved; no `data._error`; downstream writers degrade cleanly. |
+| `company_music_label` | label-shaped company (e.g. Primary Wave) with bridge env on | graph traversal, find-label | Step 12.5 detects music specialty, enters MB pipeline or records probe status. |
+
+Every fixture must define: expected AlloyDB write-set (backbone rows), expected graph subgraph, queue side effects, projection package/row, exact-match vs semantic-tolerance fields (LLM prose is shape-asserted, not byte-asserted), and a re-run/idempotency assertion. Snapshot every provider and LLM request/response at capture time; pin to the frozen 2026-07-09 baseline (section 1).
+
+## 19. Acceptance Checks
+
+### Contract checks
+
+- Placeholder, personal-website, and company-shaped-school inputs return the typed miss shell (`company_created: false`) and write no row/node.
+- `resend.com` returns a populated shell with `company_domain = "resend.com"` and `company_created: true` exactly once.
+- Duplicate canonical domain or profile URL does not create a second canonical entity.
+- `return_fast: true` skips only the entry-gate LLM preflight.
+- `priority_tier: 0` is stored as 0; a missing tier defaults to 4; the third re-reference drops the stored tier by 1.
+- `cascade_depth: 0` survives the deal-cascade path and fires the investor edge set.
+- `source_function` lanes behave exactly: person-phase-3 forces immediate enrich; work-history-queue with `allow_create: true` at depth 1 tier 2+ creates; exa-profile leaves are lookup-only.
+
+### Provider replay checks
+
+- `company_resend_seed` replays produce identical normalized structs.
+- Tier-1 parse with missing confidence escalates; double failure produces the `_parse_fallback` shell.
+- Serper failure yields `[]` without failing the stage (both discovery paths).
+- Exa zero-match saves a non-empty envelope and blocks refetch; "Knock" does not match "Knock AI".
+- Firecrawl optional-source misses log with empty error_message and full request_config.
+
+### Graph checks
+
+- Re-run duplicates no MERGE-keyed nodes/edges; Company `created_at` stable, `updated_at` moves on sync.
+- Empty/null optional properties are absent.
+- Funding_Round materialization controls `processed_at`/`rounds_added`; provisional rounds carry `provisional: true` + `source: 'Company_LLM'`.
+- `SPECIALIZES_IN` rebuild leaves exactly the expected set; matched subdomains gain HAS_SUBDOMAIN parents idempotently.
+- Work edges: no INVESTED_IN from titles; phantom founders excluded; placeholder companies edge-free; every written edge has a non-empty description that is not a parser diagnostic.
+- Every created node has a registry/`graph_node_uuid` record.
+
+### Queue checks
+
+- Duplicate hits increment `count`; escalation math matches section 13; source metadata updates only on improvement.
+- Worker drains only `priority_tier <= 1`, locks one row, releases/DLQs per policy.
+- Cron-equivalent stays off by default in deployment config.
+
+### Projection checks
+
+- `company_display` row exists after seed; completion package refreshes display + side-panel facts; same `run_id` re-apply is a no-op; failure states visible in `enrichment_status`.
+
+## 20. Xano Artifact Decision Table
+
+| Behavior | Classification | Go decision |
+| --- | --- | --- |
+| `priority_tier` explicit 0/1 stored via `first_notnull:4` + count→tier escalation (v1.2) | Preserve for parity | Implement exactly; fixtures `company_priority_zero`, `company_count_escalation`. |
+| Old `first_notempty` 0→4 coercion | Xano artifact — do not reimplement | Fixed live 2026-07-03; the old parity row is void. |
+| `cascade_depth` repaired upward via deepest queue row; `first_notnull` seed-0 in #12702/#12856 | Preserve for parity | Explicit seed 0 fires the investor edge set. |
+| Deal fanout gate = depth 0 only (seed-marker chain removed) | Preserve for parity | Depth gate + #12856 containment; old marker fields log-only. |
+| Whole-envelope `company_llm`/`exa_c_suite`/`linkedin_profile` storage | Preserve for parity | Full JSONB payload rows. |
+| `"no_data"` sentinel asymmetry (fundable terminal, yc retriable) | Preserve for parity | Encode both. |
+| 60s orchestrator debounce; 30-day Signal/thesis windows | Preserve for parity | History/run-table backed. |
+| `_parse_fallback` shell blocks LLM re-run (non-empty gate) | Preserve for parity + Open question for Mark | Preserve; ask whether Go should add a retry window for fallback-shell rows. |
+| `node_registry` table + `entitiy_type` typo + inline vs helper writes | Xano artifact — do not reimplement | `entity.graph_node_uuid` + detail-row uuids carry the semantics; never port the typo. |
+| `company_funding_round.data_source_id` (table 161 ref) + `raised_at_valutaion_usd` typo | Xano artifact — do not reimplement | `universe.funding_round` uses `source` text and corrected field names. |
+| Hardcoded logo.dev token in #12989 | Xano artifact — do not reimplement | Token from config; behavior (safe logo re-point) preserved. |
+| `log_crash.phase` strict enum | Xano artifact — do not reimplement | Open-vocabulary structured fields. |
+| String-built `lambda_filter` in #12816 | Xano artifact (already fixed live v1.2) | Plain SQL predicates. |
+| Twig/string-spliced Cypher + lambda JSON.stringify encoding hops | Xano artifact — do not reimplement | Parameterized queries via `internal/graph`. |
+| CREATE-not-MERGE company node with caller-side uniqueness | Fix in Go | MERGE on uuid behind the row gate; observable behavior unchanged. |
+| No queue retry/DLQ; poison-block possible | Fix in Go | Bounded retries + DLQ; idempotent writes keep data parity. |
+| Optional-source misses land `enrich_success: false` (PASS_WITH_WARNINGS noise) | Fix in Go (Mark-flagged 2026-07-09) | Terminal SKIP/no-op run rows for optional misses. |
+| Additive LLM fields not landed on existing-company match | Fix in Go (Mark-flagged 2026-07-09) | Conservative additive landing; never overwrite settled winners. |
+| `write_descriptions` input accepted but ignored (#2800 v2.12) | Preserve for parity | Accept and ignore; descriptions always run. |
+| Location drain marks processed on endpoint no-op | Open question for Mark | Default: observable + retryable in Go. |
+| #12794 db.edit-UUID workaround; dead `$modelUsed`; empty-object set-chain serializer tricks | Xano artifact — do not reimplement | Inline repository updates. |
+| #12689 all-empty BigQuery query can mirror an arbitrary org | Fix in Go | Input guard. |
+| `mb/reverse` no_match probe caching "not yet wired" | Preserve for parity + note | Implement the probe-row gate as live; wire no_match caching only with Mark sign-off. |
+| Prompt/model docs drift | Docs stale | Source model configs from the live exports (section 11), not the prompt pages. |
+
+## 21. Docs-vs-Xano Gap Report
+
+### Docs match live Xano
+
+- Queue contract v1.2: `first_notnull:4` and the count→tier escalation are correctly documented (crons + functions pages), as is Task #127's `active: false` / tier-1 drain gate.
+- #12974 tier models, #2545 kimi-k2.5, #4517 gpt-4o, #12563 groq/compound, #12990 env-model resolution (functions page), #12702 v1.12+ repair, Serper-not-Brave on #2640 (legacy name flagged; no `brave_search_api` var documented anywhere).
+- Env-var inventory pages (audit 2026-07-08) match the live `$env.*` usage set, and correctly exclude `kill_switch_company`/GCP URL as `environment_variables`-TABLE rows.
+
+### Docs are stale
+
+- `llm-system-prompts` + `model-summary` document four legacy functions (#12591, #2814, #5326, #12593) absent from the live roster; model-summary covers ~6 of 13 live LLM calls and misattributes `LLM_MODEL_JSON_PARSE` to #2814; #2545's prompt entry contradicts itself (sonnet-4.5 header vs kimi curl); #12746's blurb has the old 0.45 threshold.
+- #12974 docs omit `founders[]` and the `_parse_fallback` contract (still describe `data._error`).
+- #12813's Company_LLM funding fallback is documented only on the funding-cyphers page; the functions card still says "no fundable org → silent no-op" and the waterfall/nodes/edges pages omit provisional rounds.
+- #2602's card describes the 2026-07-02 state: add-school still active at create (removed; #4689 retired 2026-07-04) and "no description property at create" (summary/description written since v1.9).
+- Reverse-bridge functions (#13175/#13173/#13174) have inventory rows but no step placement or gate conditions; #13180/#13181 have no documented model config anywhere; #13183 and `node_registry`/`company_funding_round` appear on no company docs page.
+- The entry-points/waterfall pages don't yet document the 2026-07-09 `company_created` return shells, the school/non-company guards, or the governor's controlled work-history lane.
+
+### Docs are accurate but not rebuild-grade
+
+- #12558's input contract is fully specified; its output contract exists only in live code (this page section 6 is the only written source).
+- The parity-QA page is a human checklist (no machine assertions, no verdict semantics — those live in the waterfall warning box).
+- `environmental-variables.mdx` and `env-vars.mdx` are byte-identical duplicates — pick one canonical page.
+- Provider request/response snapshots and the Fundable-seed BigQuery SQL are described, not fixture-pinned.
+
+### Xano behavior is uncertain and needs fixture/runtime confirmation
+
+- The trigger for #4514 (`linkedin_profile` producer) — no caller in the waterfall set; tagged "maybe depreciated??" while its payload is consumed live.
+- The production trigger for #12689 BigQuery mirror ingestion.
+- Exact product-caller dependence on specific #12558 shell fields beyond `company_created`/ids.
+- Whether any external caller still sends the `seed-invetment-thesis-smoke-test` typo.
+- Live values of `reverse_music_bridge` and `LLM_MODEL_JSON_PARSE` (the Metadata API exposes no workspace env-var route; values are unverifiable read-only — confirm with Mark and record them here).
+- Whether #4659 label repair gaps ever matter in practice (subtype changes post-create).
+
+## 22. Open Questions for Mark
+
+1. **Domain identifier strength**: live Xano dedups deterministically on canonical domain; the Universe backbone classifies `domain` as a soft key. Recommendation: treat registrable company domain as strong (partial-unique) with the #12989 domain-repair rules as the correction path — confirm, or keep soft + scored resolve?
+2. Should **provisional Company_LLM funding rounds** project into `funding_round_display` (badged provisional), or stay Universe-internal until Fundable confirms them?
+3. The two 2026-07-09 QA follow-ups (terminal SKIP rows for optional misses; additive landing on existing-company match): implement in Go from day one, or after parity is proven against current behavior?
+4. `_parse_fallback` shells permanently satisfy the `company_llm` non-empty gate (no retry). Keep exact parity, or give fallback shells a retry window in Go?
+5. Should Go preserve Xano's location-drain no-op marking (`path_triples_added` even when the graph write no-ops), or make it observable/retryable (recommended)?
+6. `reverse_music_bridge`: what should the Go default be at cutover (env-gated off like today, or on once the Music pipeline is live), and should company→label detection wire the `no_match` probe caching the live header says is missing?
+7. #4514 / `linkedin_profile`: is ScrapeCreators company-profile capture part of the frozen reference the Go port must reproduce (and if so, what triggers it), or is the payload consume-only-if-present?
+8. #12689 BigQuery mirror ingestion + the [Fundable changelog plan](/guides/open-work/orbiter-univers-standalone/fundable-changelog-processing): in-scope for the Company pipeline dev, or a separate Fundable-ingestion service (recommended)?
+9. Investor-firm enqueues now enter at tier 1 (drain-eligible immediately once crons flip on). Intended steady-state, or should Go gate investor fanout behind a separate go-live flag?
+
+(Resolved 2026-07-09: the former question 10 — whether the 2026-07-09 01:17 state was settled — closed when Mark signed off the hard freeze; the six sandbox-QA functions from that night are inside the frozen reference.)

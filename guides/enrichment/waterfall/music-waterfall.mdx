@@ -9,20 +9,22 @@ Queue-driven MusicBrainz enrichment with a tiered cascade, depth cap, loop preve
 It mirrors the [IMDB Waterfall](/guides/enrichment/waterfall/imdb-waterfall) — queue tables, depth-capped cascade, priority tiers, upsert dedup — with two structural differences: MusicBrainz is a **structured JSON API** (no HTML scrape, no LLM extraction in the structural path), and it enforces a **hard 1 request/second global limit**, which becomes the central design constraint.
 
 <Note>
-  **Status: BUILT and live-audited (2026-07-01), forward path only.** The 16 tables (#736–#751) and the forward function layer are live in Xano workspace 3 (OrbiterV2), branch `v1`, tagged `musicbrainz` — the full inventory with ID ranges is on [Music Waterfall Functions](/guides/enrichment/waterfall/music-functions). **We designed first, then built** — all six open design questions were resolved 2026-06-11 (see [Resolved design decisions](#resolved-design-decisions-2026-06-11)); node/edge specs were derived from real API responses (Nirvana / _Nevermind_ / Sub Pop / Reading Festival 1992). The unified drain cron (Task 180) and person-resolution cron (Task 182) ship **INACTIVE** — pausing/leaving them off is the manual kill.
+  **Last reviewed & updated: 2026-07-09** — audited against live XanoScript (workspace 3 `OrbiterV2`, branch `v1`).
 </Note>
+
+The tables and the forward function layer are live in Xano workspace 3 (OrbiterV2), branch `v1`, tagged `musicbrainz` — the full inventory is on [Music Waterfall Functions](/guides/enrichment/waterfall/music-functions). **We designed first, then built** — all six open design questions were resolved before build (see [Resolved design decisions](#resolved-design-decisions-2026-06-11)); node/edge specs were derived from real API responses (Nirvana / _Nevermind_ / Sub Pop / Reading Festival 1992). The unified drain cron (Task 180) and person-resolution cron (Task 182) are **INACTIVE** — pausing/leaving them off is the manual kill.
 
 <CardGroup cols={2}>
   <Card title="Music Waterfall Entry Points" icon="play" href="/guides/enrichment/waterfall/music-entry-points">
-    The functions that can start the waterfall — the six per-entity get-add gates and the operator seed endpoints that feed them.
+    The functions that can start the waterfall — the six per-entity get-add gates, the pipeline-wired reverse bridge (triggered by the person, company, and IMDB waterfalls on music-expertise signals), and the operator seed endpoints.
   </Card>
 
   <Card title="Music Waterfall Functions" icon="diagram-project" href="/guides/enrichment/waterfall/music-functions">
-    Every function and operator tool — the rate-limit foundation, queue upserts, node writers, orchestrators, the unified drain, LLM descriptions, person-resolution, and label-owner resolution.
+    Every function and operator tool — the rate-limit foundation, queue upserts, node writers, orchestrators, the unified drain, LLM descriptions, person-resolution, label-owner resolution, and the reverse bridge.
   </Card>
 
   <Card title="Music Waterfall Tables" icon="table" href="/guides/enrichment/waterfall/music-tables">
-    The 16 Xano tables \+ queues — 6 MusicBrainz queues, 8 source-of-truth tables, the `mb_rate_limit` singleton, and the person-resolution queue, with field-by-field schemas and conventions.
+    The Xano tables \+ queues — 6 MusicBrainz queues, 8 source-of-truth tables, the `mb_rate_limit` singleton, the person-resolution queue, and the bridge-adjacent tables (expertise map, reverse probe, node registry), with field-by-field schemas.
   </Card>
 
   <Card title="Music Nodes" icon="circle-nodes" href="/guides/enrichment/waterfall/music-nodes">
@@ -34,17 +36,17 @@ It mirrors the [IMDB Waterfall](/guides/enrichment/waterfall/imdb-waterfall) —
   </Card>
 
   <Card title="Music Waterfall Crons" icon="clock-rotate-left" href="/guides/enrichment/waterfall/music-crons">
-    The four scheduled tasks — unified queue drain (180), edge-description safety net (181), person-resolution drain (182), and the vector-index health check (183).
+    The five scheduled tasks — unified queue drain (180), edge-description safety net (181), person-resolution drain (182), the vector-index health check (183), and the temporary live image sweep (184).
   </Card>
 </CardGroup>
 
 <Warning>
-  **Live Xano audit callouts (2026-07-01, fixes published).**
+  **Standing live-state callouts.**
 
-  - **`SAME_AS` identity weight is fixed-forward.** Lower weight = stronger, `0` is disallowed, and identity uses the floor **`1`**. Live #13091 and #13121 write `SAME_AS.weight = 1` for the label→Company and Music\_Artist→master-person bridges.
+  - **`SAME_AS` identity weight is fixed-forward.** Lower weight = stronger, `0` is disallowed, and identity uses the floor **`1`**. Live #13091, #13121, and the reverse-bridge writers (#13170 / #13172) write `SAME_AS.weight = 1` for the label→Company and Music\_Artist→master-person bridges.
   - **Three documented edge types are allowlisted but unwired:** `COLLABORATED_WITH`, `SUPPORTING_MUSICIAN_FOR`, and `TRIBUTE_TO` have no live writer. They remain design/deferred entries until a writer lands.
   - **Generated node descriptions cover only three node types:** `Recording`, `Music_Group`, and `Music_Artist`. The other music node types get dual vectors from `name + disambiguation`; forward writers stamp `description = null` / `description_generated_at = null` semantically on create.
-  - **Edge description envelope is fixed-forward.** Forward edge writers stamp `description = null` / `description_generated_at = null` on create; the describers later fill GOOD-or-null descriptions.
+  - **Edge description envelope is fixed-forward.** Forward edge writers stamp `description = null` / `description_generated_at = null` on create; every orchestrator then describes its pending edges in-band via #13158, with the sandbox safety-net cron (#181) as async fallback.
   - **Recording credit edges are type-aware.** `PLAYED_ON` / `PRODUCED` / `ENGINEERED` can originate from `Music_Group` as well as `Person:Music_Artist` (#13100 splits by the MusicBrainz `artist.type`).
   - **Remaining forward-path gap:** `FROM_AREA` geography edges are graph-derived outside the audited ingest path while sweeps are excluded.
 </Warning>
@@ -192,13 +194,18 @@ Identical to IMDB — hard cap at depth 2.
 
 ### Cascade filter — artist seed
 
+Since #13094 v1.8 (2026-07-09) the artist cascade is **signal-scored with inline anchors**: children are ranked by MusicBrainz search score \+ rating \+ vote volume \+ tags \+ date/title quality, a small top slice is **enriched inline** at root/depth-safe time, and the rest queue with graded tiers.
+
 ```text
-from artist lookup + browse:
+from artist lookup + browse (signal-scored):
     member of band (each)                          → T1 (artist)
-    release-group type=Album (cap 20 by date)      → T2 (release-group)
-    recording main-credit (cap 50, as returned)    → T2 (recording)
+    release-groups: top 20 kept —
+        top 3 enriched inline · next 5 → T1 · rest → T2   (release-group)
+    recordings: top 50 kept —
+        top 2 enriched inline · next 13 → T1 · rest → T2  (recording)
+    events (depth-0 seeds only, recency-sorted):
+        top 2 enriched inline · next 3 → T2 · rest → T3   (event)
     collaborator / supporting musician             → deferred to v2
-    event main performer (depth-0 seeds only)      → T3 (event)
     # depth ≥ 1: keep only T1–T2
 ```
 
@@ -243,7 +250,7 @@ Full schemas, indexes, and conventions: [Music Waterfall Tables](/guides/enrichm
     For each `member of band` rel → `MEMBER_OF` edge (instruments/dates/original) \+ queue the member artist at **T1**.
   </Step>
   <Step title="Cascade (browse, throttled, paginated)">
-    Queue children per the [artist cascade filter](#cascade-filter--artist-seed) above, each via `get-add` at `depth+1`. Depth-0 person artists also enqueue [person-resolution](/guides/enrichment/waterfall/music-functions#person-resolution) and fetch a serper avatar inline.
+    Score \+ queue children per the [artist cascade filter](#cascade-filter--artist-seed) above, each via `get-add` at `depth+1` — the top-scored slice (3 release-groups / 2 recordings / 2 events) is **enriched inline** at root/depth-safe time (v1.8). Depth-0 person artists also enqueue [person-resolution](/guides/enrichment/waterfall/music-functions#person-resolution) and fetch a serper avatar inline.
   </Step>
   <Step title="Mark success">
     `enriched_at = now`, `enrich_success = true`, `cascade_depth = 0`.
@@ -276,10 +283,12 @@ Depth 0: seed artist (mbid)
 │       where the finalizer applies
 ├── Membership: each "member of band" rel
 │   → MEMBER_OF edge (instruments/dates/original) + member artist queued at T1
-├── Cascade fanout (browse, throttled, paginated; each child via get-add at depth+1)
-│   ├── release-group type=Album (cap 20 by date)    → T2 (queue_mb_release_group)
-│   ├── recording main-credit (cap 50, as returned)  → T2 (queue_mb_recording)
-│   ├── event main performer (depth-0 seeds only)    → T3 (queue_mb_event)
+├── Cascade fanout (browse, throttled, paginated; signal-scored, v1.8;
+│   each child via get-add at depth+1)
+│   ├── release-groups top 20: top 3 INLINE · next 5 T1 · rest T2
+│   ├── recordings top 50:     top 2 INLINE · next 13 T1 · rest T2
+│   ├── events (depth-0 seeds only, recency-sorted):
+│   │                          top 2 INLINE · next 3 T2 · rest T3
 │   └── collaborator / supporting musician           → deferred to v2, not queued
 ├── Depth-0 person artists only
 │   ├── enqueue person-resolution → SAME_AS (weight 1) bridge to canonical
@@ -359,12 +368,3 @@ The open questions from the original design, each resolved before build:
 ## Deviations from the design
 
 What was built differs from the design in a handful of audited ways — cascade helpers inlined into orchestrators, the 60 s × 10-batch cron cadence, per-entity caps, deferred collaborators, and the `FROM_AREA` gap. The authoritative table is [Music Waterfall Functions → Deviations & deferrals](/guides/enrichment/waterfall/music-functions#deviations--deferrals).
-
-## Build history
-
-<Accordion title="Build order (2026-06-11 → 2026-07-01)">
-  1. **2026-06-11** — Tables (#736–#750), `mb/rate-limit/acquire` (13079) \+ `mb/api/request` (13080); kill switch skipped by design.
-  2. **2026-06-12** — Artist path (gate 13088, orchestrator 13094, node writer 13092, `MEMBER_OF`) proven end-to-end on Nirvana in the sandbox; cascading inlined per orchestrator; unified drain (13102) \+ Task 180 (shipped inactive); Recording \+ Work path (13100, 13101); Label \+ Release path (13091, 13099) with inline `Place` materialization; edge-description trio (13095–13097); Event path (13106, 13105, drain rank-3 wiring, `seed/event` 8649) smoke-tested on Reading Festival 1992.
-  3. **2026-06-12 → 2026-06-15** — Forward media \+ descriptions/vectors: cover art (13104, 13108), group images (13107, 13109), person avatars (13119–13120), generated descriptions for `Recording` / `Music_Group` / `Music_Artist` (13112 \+ finalizer 13117, `deepseek/deepseek-v4-flash`); dual OpenAI \+ Gemini vectors.
-  4. **2026-06-14 → 2026-07-01** — Forward bridges and graph hardening: person-resolution (#13118–#13123, queue #751, Task 182), release-scoped `ON_RECORD_LABEL` (#13131 via #13099), label-owner `OWNED_BY` \+ `ACQUIRED_BY` (#13132–#13134), `SAME_AS.weight = 1`, semantic-null description envelopes, forward vectors for Event / inline Place. Remaining forward gap: `FROM_AREA`.
-</Accordion>

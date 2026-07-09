@@ -11,7 +11,11 @@ Most core entries on this page are generated from the live `util.template_engine
 - For generated core sections, the **actual MERGE/CREATE Cypher snippet** that writes the edge — copied verbatim from the function (Twig templating preserved, so you can see exactly which properties are conditional).
 - The **edge pattern**, **weight** (lower = more important), and the **inputs** the writer reads.
 
-**Weight convention:** Lower numbers indicate stronger / more important relationships. IMDB film/TV edges use a 0.0–1.0 scale; all other edges use an integer 5–100 scale.
+**Weight convention:** Lower numbers indicate stronger / more important relationships. Every edge uses the integer 1–100 scale (identity bridges at 1, hub damping at 100) — the IMDB film/TV edges' old sub-1 weights were raised to 30–40 by the §3.6 audit (2026-05-31); never write sub-1 weights.
+
+<Note>
+  **Last reviewed & updated: 2026-07-09** — patterns, weights, and the quoted Cypher below re-extracted from the live XanoScript writers (workspace 3, branch `v1`).
+</Note>
 
 ---
 
@@ -25,9 +29,9 @@ Edges connecting people to companies through employment and professional roles.
 mvp/edges/create-work-edges — #2800
 ```
 
-Single Cypher writes all six work-edge types in one pass via per-edge `FOREACH (CASE WHEN ...)` guards. Reads grouped `work_experience` rows joined by `master_person_id` + `master_company_id`. Every edge gets a stable `uuid = coalesce(r.uuid, randomUUID())` so re-runs are idempotent.
+**v2.12 (2026-07-08).** Single Cypher MERGEs Person \+ Company stubs, then writes the work-edge types in one pass via per-edge `FOREACH (CASE WHEN ...)` guards. Reads grouped `work_experience` rows joined by `master_person_id` + `master_company_id`. Every edge gets a stable `uuid = coalesce(r.uuid, randomUUID())`, `created_at` (coalesce) + `updated_at`, and a deterministic fallback `description`; the LLM description writers always run inline after graph creation (the `write_descriptions` input is retained but ignored since v2.12).
 
-**Inputs:** grouped work-experience records via `$var.cypher` (a lambda-built map containing `person_uuid`, `company_uuid`, `is_founder`, `founder_title`, `is_board_member`, `is_advisor`, `is_investor`, `is_member`, `is_works_at`, `works_at_weight`, `works_at_seniority`, plus per-edge `valid_from` / `valid_to` / `title` / `description`).
+**Inputs:** grouped work-experience records via `$var.cypher` (a lambda-built map containing `person_uuid`, `company_uuid`, `is_founder`, `founder_title`, `is_board_member`, `is_advisor`, `is_investor`, `is_member`, `is_works_at`, `works_at_weight`, `works_at_seniority`, plus per-edge `valid_from` / `valid_to` / `title` / `description`). The v2.x classifier: founder evidence ORs in Fundable structured `is_founder` and Company_LLM founder rows (with a phantom-founder guard against title-only fakes), advisory/board/member titles are excluded from `WORKS_AT`, generic placeholder companies get no edges, and **`isInvestor` is hardcoded `false` (v2.5)** — see `INVESTED_IN` below.
 
 </Card>
 
@@ -44,18 +48,20 @@ A person founded or co-founded a company.
 ```cypher
 FOREACH (x IN CASE WHEN g.is_founder = true THEN [1] ELSE [] END |
   MERGE (p)-[r:FOUNDED]->(c)
-  SET r.title = g.founder_title,
+  SET r.created_at = coalesce(r.created_at, timestamp()),
+      r.updated_at = timestamp(),
+      r.title = g.founder_title,
       r.weight = 5,
       r.description = CASE
         WHEN toLower(g.founder_title) CONTAINS 'co-founder'
           OR toLower(g.founder_title) CONTAINS 'cofounder'
         THEN CASE
-          WHEN g.founder_start_year IS NOT NULL
+          WHEN g.founder_start_year IS NOT NULL AND toString(g.founder_start_year) <> ''
           THEN p.name + ' co-founded ' + c.name + ' in ' + toString(g.founder_start_year) + '.'
           ELSE p.name + ' is the Co-Founder of ' + c.name + '.'
         END
         ELSE CASE
-          WHEN g.founder_start_year IS NOT NULL
+          WHEN g.founder_start_year IS NOT NULL AND toString(g.founder_start_year) <> ''
           THEN p.name + ' founded ' + c.name + ' in ' + toString(g.founder_start_year) + '.'
           ELSE p.name + ' is the Founder of ' + c.name + '.'
         END
@@ -89,7 +95,14 @@ Standard employment relationship. Weight varies by seniority level (computed ups
 ```cypher
 FOREACH (x IN CASE WHEN g.is_works_at = true THEN [1] ELSE [] END |
   MERGE (p)-[r:WORKS_AT]->(c)
-  SET r.title = g.works_at_title,
+  SET r.created_at = coalesce(r.created_at, timestamp()),
+      r.updated_at = timestamp(),
+      r.title = g.works_at_title,
+      r.description = CASE
+        WHEN r.description IS NOT NULL AND toString(r.description) <> '' THEN r.description
+        WHEN g.works_at_title IS NOT NULL AND toString(g.works_at_title) <> '' THEN p.name + ' works at ' + c.name + ' as ' + g.works_at_title + '.'
+        ELSE p.name + ' works at ' + c.name + '.'
+      END,
       r.weight = g.works_at_weight,
       r.seniority_level = g.works_at_seniority,
       r.valid_from = g.valid_from,
@@ -124,9 +137,14 @@ Person serves on a company's board.
 ```cypher
 FOREACH (x IN CASE WHEN g.is_board_member = true THEN [1] ELSE [] END |
   MERGE (p)-[r:BOARD_MEMBER_OF]->(c)
-  SET r.title = g.board_title,
+  SET r.created_at = coalesce(r.created_at, timestamp()),
+      r.updated_at = timestamp(),
+      r.title = g.board_title,
       r.weight = 8,
-      r.description = g.board_description,
+      r.description = CASE
+        WHEN g.board_description IS NOT NULL AND toString(g.board_description) <> '' THEN g.board_description
+        ELSE p.name + ' is a board member of ' + c.name + '.'
+      END,
       r.valid_from = g.board_valid_from,
       r.valid_to = g.board_valid_to,
       r.uuid = coalesce(r.uuid, randomUUID())
@@ -148,9 +166,14 @@ Person serves as a formal advisor.
 ```cypher
 FOREACH (x IN CASE WHEN g.is_advisor = true THEN [1] ELSE [] END |
   MERGE (p)-[r:ADVISOR_TO]->(c)
-  SET r.title = g.advisor_title,
+  SET r.created_at = coalesce(r.created_at, timestamp()),
+      r.updated_at = timestamp(),
+      r.title = g.advisor_title,
       r.weight = 12,
-      r.description = g.advisor_description,
+      r.description = CASE
+        WHEN g.advisor_description IS NOT NULL AND toString(g.advisor_description) <> '' THEN g.advisor_description
+        ELSE p.name + ' advises ' + c.name + '.'
+      END,
       r.valid_from = g.advisor_valid_from,
       r.valid_to = g.advisor_valid_to,
       r.uuid = coalesce(r.uuid, randomUUID())
@@ -161,20 +184,28 @@ FOREACH (x IN CASE WHEN g.is_advisor = true THEN [1] ELSE [] END |
 
 ### INVESTED_IN (Person → Company)
 
-Person invested in a company outside of any formal funding round (the funding-round variant lives in the [Funding](#funding) section).
+Two variants exist on this pattern:
+
+- **Work-derived (w15, #2800) — dead branch since v2.5 (2026-07-05):** the `FOREACH (… g.is_investor …)` block below is still in the work-edge Cypher, but the classifier hardcodes `isInvestor: false`, so work-history titles never fire it ("Angel Investor at Acme" is a work-history relationship now). Legacy w15 edges linger in the graph.
+- **Angel portfolio, direct (w25, `process-person-phase-9` #12830, 2026-07-02 D-series) — live:** per `fundable_angel_investments` row, phase 9 MERGEs `(Person:Angel)-[r:INVESTED_IN {weight: 25}]->(Company)` against the canonical `master_company_node_uuid` (ON CREATE stamps a self-healing Company stub), with an LLM-or-deterministic description. Default-on for depth-0 angels (`allow_investor_network_cascade|first_notnull:true`); no `Funding_Round` is materialized on this path. The round-scoped variants live in the [Funding](#funding) section.
 
 | | |
 |---|---|
 | **Pattern** | `(Person)-[INVESTED_IN]->(Company)` |
-| **Weight** | **15** |
-| **Writer** | `mvp/edges/create-work-edges` (#2800) |
+| **Weight** | **15** (work-derived, defunct) · **25** (direct angel portfolio) |
+| **Writers** | `mvp/edges/create-work-edges` (#2800 — dead branch) · `mvp/enrich/process-person-phase-9` (#12830 — live) |
 
 ```cypher
 FOREACH (x IN CASE WHEN g.is_investor = true THEN [1] ELSE [] END |
   MERGE (p)-[r:INVESTED_IN]->(c)
-  SET r.title = g.investor_title,
+  SET r.created_at = coalesce(r.created_at, timestamp()),
+      r.updated_at = timestamp(),
+      r.title = g.investor_title,
       r.weight = 15,
-      r.description = g.investor_description,
+      r.description = CASE
+        WHEN g.investor_description IS NOT NULL AND toString(g.investor_description) <> '' THEN g.investor_description
+        ELSE p.name + ' is an investor in ' + c.name + '.'
+      END,
       r.valid_from = g.investor_valid_from,
       r.valid_to = g.investor_valid_to,
       r.uuid = coalesce(r.uuid, randomUUID())
@@ -196,9 +227,14 @@ Person is a member of an organization (e.g. club, society) but not via employmen
 ```cypher
 FOREACH (x IN CASE WHEN g.is_member = true THEN [1] ELSE [] END |
   MERGE (p)-[r:MEMBER_OF]->(c)
-  SET r.title = g.member_title,
+  SET r.created_at = coalesce(r.created_at, timestamp()),
+      r.updated_at = timestamp(),
+      r.title = g.member_title,
       r.weight = 20,
-      r.description = g.member_description,
+      r.description = CASE
+        WHEN g.member_description IS NOT NULL AND toString(g.member_description) <> '' THEN g.member_description
+        ELSE p.name + ' is a member of ' + c.name + '.'
+      END,
       r.valid_from = g.member_valid_from,
       r.valid_to = g.member_valid_to,
       r.uuid = coalesce(r.uuid, randomUUID())
@@ -215,7 +251,7 @@ FOREACH (x IN CASE WHEN g.is_member = true THEN [1] ELSE [] END |
 mvp/yc/process-yc-people — #12700
 ```
 
-**v3.1 (2026-05-13, Twig Cypher).** Y Combinator partner → batch founder mentorship edges. The function processes every YC batch member of a freshly-enriched master_company. When a `yc_partner` is set on the company's YC record, the partner is `MERGE`'d as a `MENTOR` of every founder created by the same function. Also referenced from the user-facing Known mentorship flow for declared mentorships.
+**v3.5 (2026-07-02, Twig Cypher).** Y Combinator partner → batch founder mentorship edges. The function processes every YC batch member of a freshly-enriched master_company. When a `yc_partner` is set on the company's YC record, the partner is `MERGE`'d as a `MENTOR` of every founder created by the same function (the multi-founder branch routes `FOUNDED` w5 through the `Entity:contextFounded` hub \+ `WAS_FOUNDED` w1 — accepted by design). Also referenced from the user-facing Known mentorship flow for declared mentorships.
 
 </Card>
 
@@ -271,7 +307,7 @@ ON MATCH SET
 mvp/edges/create-education-edges — #1898
 ```
 
-**v1.1 (FalkorDB-compat).** Resolves `education_experience` rows into a Person→School `ATTENDED` edge, then derives `ATTENDED_TOGETHER` and `STUDIED_UNDER` from overlapping `ATTENDED` / `TAUGHT_AT` patterns in the graph. Called from `mvp/resolve/resolve-edges-education` (#12560) after `master_company_id` resolution.
+**v1.2 (FalkorDB-safe; hardened 2026-07-04/07).** Resolves `education_experience` rows into a Person→School `ATTENDED` edge, then derives `ATTENDED_TOGETHER` and `STUDIED_UNDER` from overlapping `ATTENDED` / `TAUGHT_AT` patterns in the graph. Dynamic strings are JSON-encoded, every merged edge is guaranteed `uuid` / `description` / `source: "education_experience"`, duplicate same-name-school `ATTENDED` edges are cleaned up, and the writer runs idempotently over **all** resolved rows so descriptions self-repair. Called from `mvp/resolve/resolve-edges-education` (#12560 v1.13) after `master_company_id` resolution.
 
 </Card>
 
@@ -286,32 +322,49 @@ Person attended a school.
 | **Writer** | `mvp/edges/create-education-edges` (#1898) |
 
 ```cypher
-MATCH (person {uuid: $personUuid})
-MATCH (school {uuid: $schoolUuid})
+MATCH (person {uuid: {{$var.cyEducationStrings.personUuid}}})
+MATCH (school {uuid: {{$var.cyEducationStrings.schoolUuid}}})
 MERGE (person)-[r:ATTENDED]->(school)
-ON CREATE SET r.uuid = randomUUID()
 
 WITH person, r, school,
-     $descrip AS descripStr,
-     $fieldOfStudy AS fieldOfStudyStr,
-     $degree AS degreeStr,
-     $activities AS activitiesStr,
-     $validFrom AS validFromStr,
-     $validTo AS validToStr
+     {{$var.cyEducationStrings.description}} AS descripStr,
+     {{$var.cyEducationStrings.field}} AS fieldOfStudyStr,
+     {{$var.cyEducationStrings.degree}} AS degreeStr,
+     {{$var.cyEducationStrings.activities}} AS activitiesStr,
+     {{$var.cyEducationStrings.validFrom}} AS validFromStr,
+     {{$var.cyEducationStrings.validTo}} AS validToStr,
+     {{$var.cyEducationStrings.sourceSchoolName}} AS sourceSchoolName
 
-FOREACH (x IN CASE WHEN descripStr <> "" THEN [1] ELSE [] END | SET r.description = descripStr)
+SET r.description = CASE
+      WHEN descripStr <> "" THEN descripStr
+      ELSE coalesce(person.name, "This person") + " attended " + coalesce(school.name, sourceSchoolName) END
+FOREACH (x IN CASE WHEN descripStr <> "" THEN [1] ELSE [] END |
+  SET r.description_generated_at = timestamp()
+)
 FOREACH (x IN CASE WHEN fieldOfStudyStr <> "" THEN [1] ELSE [] END | SET r.field_of_study = fieldOfStudyStr)
 FOREACH (x IN CASE WHEN degreeStr <> "" THEN [1] ELSE [] END | SET r.degree = degreeStr)
 FOREACH (x IN CASE WHEN activitiesStr <> "" THEN [1] ELSE [] END | SET r.activities_societies = activitiesStr)
 FOREACH (x IN CASE WHEN validFromStr <> "" THEN [1] ELSE [] END | SET r.valid_from = validFromStr)
-FOREACH (x IN CASE WHEN validToStr <> "" AND toInteger(substring(validToStr, 0, 4)) <= $currentYear THEN [1] ELSE [] END | SET r.valid_to = validToStr)
+FOREACH (x IN CASE WHEN validToStr <> "" AND toInteger(substring(validToStr, 0, 4)) <= {{$var.currentYear}} THEN [1] ELSE [] END | SET r.valid_to = validToStr)
 
-SET r.weight = 40
+SET r.uuid = coalesce(r.uuid, randomUUID()),
+    r.created_at = coalesce(r.created_at, timestamp()),
+    r.updated_at = timestamp(),
+    r.source = "education_experience",
+    r.weight = 40
+
+WITH person, r, school, sourceSchoolName
+OPTIONAL MATCH (person)-[duplicateAttended:ATTENDED]->(duplicateSchool)
+WHERE duplicateSchool <> school
+  AND toLower(coalesce(duplicateSchool.name, "")) = toLower(coalesce(sourceSchoolName, ""))
+DELETE duplicateAttended
 ```
 
 | Property | Description |
 |----------|-------------|
 | `degree` / `field_of_study` / `activities_societies` | Optional, all `FOREACH`-gated so an empty string never overwrites a previous value |
+| `description` | Always present — generated text, or the deterministic "X attended Y" fallback |
+| `source` | Always `"education_experience"` |
 | `valid_to` | Gated to `toInteger(substring(...,0,4)) <= currentYear` — drops future end-dates that LinkedIn sometimes emits |
 | `weight` | Always `40` |
 
@@ -324,7 +377,7 @@ Two people who attended the same school with overlapping date ranges. Derived in
 | | |
 |---|---|
 | **Pattern** | `(Person)-[ATTENDED_TOGETHER]-(Person)` (undirected) |
-| **Weight** | **35 / 50 / 70** (same major / same field / overlap only) |
+| **Weight** | **35 / 70** (same `field_of_study` / overlap only) |
 | **Writer** | `mvp/edges/create-education-edges` (#1898) — derived after ATTENDED |
 
 ```cypher
@@ -338,37 +391,37 @@ WHERE person <> peer
 FOREACH (x IN CASE WHEN peer IS NOT NULL THEN [1] ELSE [] END |
   MERGE (person)-[at:ATTENDED_TOGETHER]-(peer)
   ON CREATE SET at.uuid = randomUUID()
-  SET at.school = school.name,
+  SET at.created_at = coalesce(at.created_at, timestamp()),
+      at.updated_at = timestamp(),
+      at.school = schoolName,
       at.overlap_start = CASE WHEN myAttended.valid_from > theirAttended.valid_from THEN myAttended.valid_from ELSE theirAttended.valid_from END,
       at.overlap_end = CASE WHEN myAttended.valid_to < theirAttended.valid_to THEN myAttended.valid_to ELSE theirAttended.valid_to END,
+      at.valid_from = CASE WHEN myAttended.valid_from > theirAttended.valid_from THEN myAttended.valid_from ELSE theirAttended.valid_from END,
+      at.valid_to = CASE WHEN myAttended.valid_to < theirAttended.valid_to THEN myAttended.valid_to ELSE theirAttended.valid_to END,
       at.same_degree = CASE WHEN myAttended.degree IS NOT NULL AND theirAttended.degree IS NOT NULL AND myAttended.degree = theirAttended.degree THEN true ELSE false END,
-      at.same_major = CASE WHEN myAttended.major IS NOT NULL AND theirAttended.major IS NOT NULL AND myAttended.major = theirAttended.major THEN true ELSE false END,
-      at.same_field = CASE WHEN myAttended.field IS NOT NULL AND theirAttended.field IS NOT NULL AND myAttended.field = theirAttended.field THEN true ELSE false END,
+      at.same_major = CASE WHEN myAttended.field_of_study IS NOT NULL AND theirAttended.field_of_study IS NOT NULL AND myAttended.field_of_study = theirAttended.field_of_study THEN true ELSE false END,
+      at.same_field = CASE WHEN myAttended.field_of_study IS NOT NULL AND theirAttended.field_of_study IS NOT NULL AND myAttended.field_of_study = theirAttended.field_of_study THEN true ELSE false END,
       at.relationship_strength = CASE
-        WHEN myAttended.major IS NOT NULL AND theirAttended.major IS NOT NULL AND myAttended.major = theirAttended.major THEN 3
-        WHEN myAttended.field IS NOT NULL AND theirAttended.field IS NOT NULL AND myAttended.field = theirAttended.field THEN 2
+        WHEN myAttended.field_of_study IS NOT NULL AND theirAttended.field_of_study IS NOT NULL AND myAttended.field_of_study = theirAttended.field_of_study THEN 3
         ELSE 1 END,
       at.weight = CASE
-        WHEN myAttended.major IS NOT NULL AND theirAttended.major IS NOT NULL AND myAttended.major = theirAttended.major THEN 35
-        WHEN myAttended.field IS NOT NULL AND theirAttended.field IS NOT NULL AND myAttended.field = theirAttended.field THEN 50
+        WHEN myAttended.field_of_study IS NOT NULL AND theirAttended.field_of_study IS NOT NULL AND myAttended.field_of_study = theirAttended.field_of_study THEN 35
         ELSE 70 END,
       at.context = CASE
-        WHEN myAttended.major IS NOT NULL AND theirAttended.major IS NOT NULL AND myAttended.major = theirAttended.major
-        THEN "Same major (" + myAttended.major + ")"
-        WHEN myAttended.field IS NOT NULL AND theirAttended.field IS NOT NULL AND myAttended.field = theirAttended.field
-        THEN "Same field (" + toString(myAttended.field) + ")"
-        ELSE "Overlapped at " + school.name END,
-      at.description = person.name + " and " + peer.name + " studied together at " + school.name
+        WHEN myAttended.field_of_study IS NOT NULL AND theirAttended.field_of_study IS NOT NULL AND myAttended.field_of_study = theirAttended.field_of_study
+        THEN "Same field (" + toString(myAttended.field_of_study) + ")"
+        ELSE "Overlapped at " + schoolName END,
+      at.description = person.name + " and " + peer.name + " studied together at " + schoolName
 )
 ```
 
 | Property | Description |
 |----------|-------------|
-| `school` / `overlap_start` / `overlap_end` | Where + when the overlap occurred |
-| `same_degree` / `same_major` / `same_field` | Booleans for granularity of shared experience |
-| `relationship_strength` | `3` (same major), `2` (same field), `1` (overlap only) |
-| `weight` | `35` / `50` / `70` matching strength |
-| `context` | Auto-generated label (e.g. "Same major (Computer Science)") |
+| `school` / `overlap_start` / `overlap_end` / `valid_from` / `valid_to` | Where + when the overlap occurred |
+| `same_degree` / `same_major` / `same_field` | Booleans — `same_major` and `same_field` are both computed from `field_of_study` in the live Cypher |
+| `relationship_strength` | `3` (same field of study), `1` (overlap only) — **the old middle tier is gone** |
+| `weight` | `35` (same field) / `70` (overlap only) |
+| `context` | Auto-generated label (e.g. "Same field (Computer Science)") |
 
 ---
 
@@ -388,17 +441,20 @@ WHERE myAttended.valid_from IS NOT NULL AND myAttended.valid_to IS NOT NULL
   AND taught.valid_from IS NOT NULL AND taught.valid_to IS NOT NULL
   AND myAttended.valid_from <= taught.valid_to
   AND myAttended.valid_to >= taught.valid_from
-  AND (myAttended.field IS NULL OR taught.department IS NULL OR myAttended.field = taught.department)
+  AND (myAttended.field_of_study IS NULL OR taught.department IS NULL
+       OR myAttended.field_of_study = taught.department)
 
 FOREACH (x IN CASE WHEN instructor IS NOT NULL THEN [1] ELSE [] END |
   MERGE (person)-[su:STUDIED_UNDER]->(instructor)
   ON CREATE SET su.uuid = randomUUID()
-  SET su.school = school.name,
+  SET su.created_at = coalesce(su.created_at, timestamp()),
+      su.updated_at = timestamp(),
+      su.school = schoolName,
       su.department = taught.department,
       su.overlap_start = CASE WHEN myAttended.valid_from > taught.valid_from THEN myAttended.valid_from ELSE taught.valid_from END,
       su.overlap_end = CASE WHEN myAttended.valid_to < taught.valid_to THEN myAttended.valid_to ELSE taught.valid_to END,
       su.weight = 10,
-      su.description = person.name + " studied under " + instructor.name + " at " + school.name
+      su.description = person.name + " studied under " + instructor.name + " at " + schoolName
 )
 ```
 
@@ -412,7 +468,7 @@ FOREACH (x IN CASE WHEN instructor IS NOT NULL THEN [1] ELSE [] END |
 mvp/resolve/resolve-edges-certifications — #12578
 ```
 
-**v1 (canonical writer).** Per certification: vector-search → match or `MERGE` a `Certification` node → link `HAS_CERTIFICATION` to person → optionally `GRANTED_BY` and `CERTIFIED_BY` to the issuing company. Series 6/7/63 weight is `15`, all other certs are `20`. Also wired into the QA path via `qa/resolve-edges-certifications` (#12719) and the older mirror at `mvp/certifications/resolve-certifications` (#4572).
+**v2.6 (2026-07-07, canonical writer).** Per certification: `MERGE` a `Certification` node → link `HAS_CERTIFICATION` to person → optionally `GRANTED_BY` and `CERTIFIED_BY` to the issuing company. Series-cert weight is `15`, all other certs are `20`; every node and edge stamps `created_at` (coalesce) \+ `updated_at`, and all three edges carry LLM-or-fallback descriptions (normalized before write since v2.6). Also wired into the QA path via `qa/resolve-edges-certifications` (#12719) and the older mirror at `mvp/certifications/resolve-certifications` (#4572).
 
 </Card>
 
@@ -427,31 +483,38 @@ Person holds a professional certification.
 | **Writer** | `mvp/resolve/resolve-edges-certifications` (#12578) |
 
 ```cypher
-MERGE (certification:Entity:Certification {name: $certName})
+MERGE (certification:Entity:Certification {name: "{{$var.certName}}"})
 SET certification += {
-  issue_date: $issueDate,
-  description: $description,
-  issued_by: $orgName,
-  uuid: CASE WHEN certification.uuid IS NULL THEN randomUUID() ELSE certification.uuid END
+{% if $var.item.issue_date %}issue_date: "{{$var.item.issue_date}}",{% endif %}
+{% if $var.certDescription %}description: "{{$var.certDescription}}",{% endif %}
+{% if $var.orgName %}issued_by: "{{$var.orgName}}",{% endif %}
+  uuid: CASE WHEN certification.uuid IS NULL THEN randomUUID() ELSE certification.uuid END,
+  created_at: coalesce(certification.created_at, timestamp()),
+  updated_at: timestamp()
 }
-SET certification.name_embedding = vecf32($embeddingArray)
+SET certification.name_embedding = vecf32({{$var.embeddingArray}})
 
 WITH certification
-MATCH (person:Person {uuid: $personUuid})
+MATCH (person:Person {uuid: "{{$var.masterPerson.node_uuid}}"})
 MERGE (person)-[has_cert:HAS_CERTIFICATION]->(certification)
 SET has_cert += {
   uuid: CASE WHEN has_cert.uuid IS NULL THEN randomUUID() ELSE has_cert.uuid END,
-  weight: $certName starts with 'Series' ? 15 : 20,
-  valid_from: $issueDate,
-  description: $description
+  created_at: coalesce(has_cert.created_at, timestamp()),
+  updated_at: timestamp(),
+  weight: {% if $var.certName starts with 'Series' %}15{% else %}20{% endif %}
+{% if $var.item.issue_date %},valid_from: "{{$var.item.issue_date}}"{% endif %}
+,description: CASE
+  WHEN {{$var.cyHasCertEdgeDescription}} <> "" THEN {{$var.cyHasCertEdgeDescription}}
+  ELSE certification.description
+END
 }
 ```
 
 | Property | Description |
 |----------|-------------|
 | `valid_from` | Issue date (currency derived from `valid_to IS NULL`) |
-| `description` | Cert description |
-| `weight` | `15` for FINRA Series certs, `20` for everything else |
+| `description` | Normalized LLM edge description, falling back to the certification's own description |
+| `weight` | `15` for `Series …` certs, `20` for everything else |
 
 ---
 
@@ -466,13 +529,20 @@ Certification was granted by a specific organization.
 | **Writer** | `mvp/resolve/resolve-edges-certifications` (#12578) |
 
 ```cypher
-MATCH (organization:Company {uuid: $masterCompanyNodeUuid})
-SET organization:Organization
+MATCH (organization:Company {uuid: "{{$var.masterCompany.node_uuid}}"})
+SET organization:Organization,
+    organization.updated_at = timestamp()
 
 MERGE (certification)-[granted:GRANTED_BY]->(organization)
 SET granted += {
   uuid: CASE WHEN granted.uuid IS NULL THEN randomUUID() ELSE granted.uuid END,
-  weight: 10
+  created_at: coalesce(granted.created_at, timestamp()),
+  updated_at: timestamp(),
+  weight: 10,
+  description: CASE
+    WHEN {{$var.cyGrantedByEdgeDescription}} <> "" THEN {{$var.cyGrantedByEdgeDescription}}
+    ELSE certification.name + ' was granted by ' + organization.name + '.'
+  END
 }
 ```
 
@@ -491,21 +561,39 @@ Direct Person→Organization shortcut for certification queries. Avoids the two-
 | **Writer** | `mvp/resolve/resolve-edges-certifications` (#12578) |
 
 ```cypher
-MERGE (person)-[certified:CERTIFIED_BY {cert_type: $certName}]->(organization)
+MERGE (person)-[certified:CERTIFIED_BY {cert_type: "{{$var.certName}}"}]->(organization)
 ON CREATE SET
   certified.uuid = randomUUID(),
   certified.weight = 25,
   certified.certification_count = 1,
-  certified.certifications = [$certName],
-  certified.first_certified = $issueDate
+  certified.certifications = ["{{$var.certName}}"],
+  certified.first_certified = "{{$var.item.issue_date}}"
+ON MATCH SET
+  certified.weight = 25,
+  certified.certification_count = certified.certification_count + 1,
+  certified.certifications = CASE
+    WHEN NOT "{{$var.certName}}" IN certified.certifications
+    THEN certified.certifications + "{{$var.certName}}"
+    ELSE certified.certifications
+  END,
+  certified.most_recent = CASE
+    WHEN "{{$var.item.issue_date}}" > coalesce(certified.most_recent, "")
+    THEN "{{$var.item.issue_date}}" ELSE certified.most_recent
+  END
+SET certified.created_at = coalesce(certified.created_at, timestamp()),
+    certified.updated_at = timestamp(),
+    certified.description = CASE
+      WHEN {{$var.cyCertifiedByEdgeDescription}} <> "" THEN {{$var.cyCertifiedByEdgeDescription}}
+      ELSE person.name + ' was certified by ' + organization.name + ' for ' + certification.name + '.'
+    END
 ```
 
 | Property | Description |
 |----------|-------------|
 | `cert_type` | Part of MERGE key — separate edge per cert type |
 | `certification_count` | Bumped on re-merge |
-| `certifications` | Array of cert names |
-| `first_certified` | Earliest issue date observed |
+| `certifications` | Array of cert names (deduped on re-merge) |
+| `first_certified` / `most_recent` | Earliest issue date on create · latest issue date maintained on re-merge |
 
 ---
 
@@ -517,7 +605,7 @@ ON CREATE SET
 mvp/resolve/resolve-edges-honor — #4574
 ```
 
-**v1 (production).** Creates a fresh `Honor` node per honor row, attaches it to the person via `RECEIVED_HONOR`, and (when an issuer node is resolved) connects the honor to the issuing organization via `ISSUED_BY`. Mirror at `qa/resolve-edges-honor` (#12715) emits identical Cypher with safer pre-conditions (no company creation).
+**v4 (2026-06-23, production).** Creates a fresh `Honor` node per honor row (with timestamps), attaches it to the person via `RECEIVED_HONOR`, and (when an issuer node is resolved) connects the honor to the issuing organization via `ISSUED_BY` — both edges stamp timestamps and carry LLM-or-fallback descriptions. Mirror at `qa/resolve-edges-honor` (#12715) emits identical Cypher with safer pre-conditions (no company creation).
 
 </Card>
 
@@ -532,25 +620,32 @@ Person received an honor / award.
 | **Writer** | `mvp/resolve/resolve-edges-honor` (#4574) |
 
 ```cypher
-MATCH (p:Person {uuid: $personNodeUUID})
+MATCH (p:Person {uuid: {{ $var.personNodeUUID | json_encode | raw }}})
 CREATE (h:Honor {
   uuid: randomUUID(),
-  title: $honorTitle
-  {% if $honorDescription %}, description: $honorDescription {% endif %}
-  {% if $honorIssueYear %}, issued_on_year: $honorIssueYear {% endif %}
-  {% if $honorIssueMonth %}, issued_on_month: $honorIssueMonth {% endif %}
-  {% if $honorIssueDay %}, issued_on_day: $honorIssueDay {% endif %}
-  {% if $honorIssuerName %}, issuer_name: $honorIssuerName {% endif %}
+  created_at: timestamp(),
+  updated_at: timestamp(),
+  title: {{ $var.honorTitle | json_encode | raw }}
+  {% if $var.honorDescription is not null %}, description: {{ $var.honorDescription | json_encode | raw }}{% endif %}
+  {% if $var.honorIssueYear is not null %}, issued_on_year: {{ $var.honorIssueYear }}{% endif %}
+  {% if $var.honorIssueMonth is not null %}, issued_on_month: {{ $var.honorIssueMonth }}{% endif %}
+  {% if $var.honorIssueDay is not null %}, issued_on_day: {{ $var.honorIssueDay }}{% endif %}
+  {% if $var.honorIssuerName is not null %}, issuer_name: {{ $var.honorIssuerName | json_encode | raw }}{% endif %}
 })
-CREATE (p)-[r:RECEIVED_HONOR {weight: 20, uuid: randomUUID()}]->(h)
+CREATE (p)-[r:RECEIVED_HONOR {weight: 20, uuid: randomUUID(), created_at: timestamp(), updated_at: timestamp()}]->(h)
+SET r.description = CASE
+      WHEN {{$var.cyReceivedHonorDescription}} <> "" THEN {{$var.cyReceivedHonorDescription}}
+      ELSE p.name + ' received ' + h.title + '.'
+    END
 ```
 
 | Property | Description |
 |----------|-------------|
 | `uuid` | Edge identifier |
+| `description` | LLM-or-fallback sentence (`description_generated_at` stamped when LLM text landed) |
 | `weight` | Always `20` |
 
-The Honor node carries `title`, `description`, `issued_on_year/month/day`, `issuer_name`.
+The Honor node carries `title`, `description`, `issued_on_year/month/day`, `issuer_name`, and timestamps.
 
 ---
 
@@ -566,9 +661,13 @@ The honor was issued by a specific organization.
 
 ```cypher
 WITH h, r
-OPTIONAL MATCH (o:Organization {uuid: $issuerNodeUUID})
+OPTIONAL MATCH (o:Organization {uuid: {{ $var.issuerNodeUUID | json_encode | raw }}})
 FOREACH (_ IN CASE WHEN o IS NOT NULL THEN [1] ELSE [] END |
-  CREATE (h)-[:ISSUED_BY {weight: 25, uuid: randomUUID()}]->(o)
+  CREATE (h)-[issued:ISSUED_BY {weight: 25, uuid: randomUUID(), created_at: timestamp(), updated_at: timestamp()}]->(o)
+  SET issued.description = CASE
+        WHEN {{$var.cyIssuedByDescription}} <> "" THEN {{$var.cyIssuedByDescription}}
+        ELSE h.title + ' was issued by ' + o.name + '.'
+      END
 )
 ```
 
@@ -582,7 +681,7 @@ FOREACH (_ IN CASE WHEN o IS NOT NULL THEN [1] ELSE [] END |
 mvp/resolve/resolve-edges-projects-publications — #12579
 ```
 
-Two Cypher blocks: one for `Project` nodes + `CONTRIBUTED_TO` edges (weight scales with recency), one for `Work:Publication` nodes + `AUTHORED` + optional `PUBLISHED_BY` edges. Both `CREATE`-only writers — re-runs make new node UUIDs per row, so the resolver only runs against rows whose `node_uuid` is still null.
+**v8 (2026-07-07).** Two Cypher blocks: one for `Entity:Work:Project` nodes + `CONTRIBUTED_TO` edges (weight scales with recency), one for `Entity:Work:Publication` nodes + `AUTHORED` + optional `PUBLISHED_BY` edges. Since v6 (2026-07-04) the resolver processes existing project rows (repair instead of self-skip) and stamps `display_label`s \+ descriptions on nodes and edges; publication re-run protection still lives in the relational rows.
 
 </Card>
 
@@ -592,14 +691,14 @@ Person contributed to a project (work product).
 
 | | |
 |---|---|
-| **Pattern** | `(Person)-[CONTRIBUTED_TO]->(Project)` |
+| **Pattern** | `(Person)-[CONTRIBUTED_TO]->(Work:Project)` |
 | **Weight** | **dynamic: 40 / 35 / 30 / 25 / 20 / 15** by project recency |
 | **Writer** | `mvp/resolve/resolve-edges-projects-publications` (#12579) |
 
 ```cypher
 WITH
-  CASE WHEN $endYear = "" THEN null ELSE toInteger($endYear) END AS end_year,
-  $currentYear AS current_year
+  CASE WHEN "{{$var.project.end_year}}" = "" THEN null ELSE toInteger("{{$var.project.end_year}}") END AS end_year,
+  {{current_year}} AS current_year
 WITH end_year, current_year,
   CASE
     WHEN end_year IS NULL OR end_year >= current_year THEN 40
@@ -611,17 +710,26 @@ WITH end_year, current_year,
   END AS weight,
   CASE WHEN end_year IS NULL OR end_year >= current_year THEN true ELSE false END AS is_current
 
-MATCH (p:Person {uuid: $personUuid})
-CREATE (proj:Project {uuid: randomUUID()})
-SET proj.title = $title, proj.description = $description,
-    proj.start_day = $startDay, proj.start_month = $startMonth, proj.start_year = $startYear,
-    proj.end_day = $endDay, proj.end_month = $endMonth, proj.end_year = $endYear
+MATCH (p:Person {uuid: "{{$var.project.person.node_uuid}}"})
+CREATE (proj:Entity:Work:Project {uuid: randomUUID(), created_at: timestamp(), updated_at: timestamp()})
+SET proj.display_label = "Project",
+    proj.name = "{{$var.project.title}}", proj.title = "{{$var.project.title}}",
+    proj.description = "{{$var.project.description}}",
+    proj.start_day = …, proj.start_month = …, proj.start_year = …,
+    proj.end_day = …, proj.end_month = …, proj.end_year = …
 
 CREATE (p)-[r:CONTRIBUTED_TO {
   uuid: randomUUID(),
   weight: weight,
-  is_current: is_current
+  is_current: is_current,
+  created_at: timestamp(),
+  updated_at: timestamp()
 }]->(proj)
+SET r.description = CASE
+  WHEN {{$var.cyProjectEdgeDescription}} <> "" THEN {{$var.cyProjectEdgeDescription}}
+  WHEN proj.title IS NOT NULL THEN p.name + ' contributed to ' + proj.title + '.'
+  ELSE p.name + ' contributed to a project.'
+END
 ```
 
 | Recency | Weight |
@@ -647,8 +755,8 @@ Person authored a publication-shaped work.
 
 ```cypher
 WITH
-  CASE WHEN $pubYear = "" THEN null ELSE toInteger($pubYear) END AS pub_year,
-  $currentYear AS current_year
+  CASE WHEN "{{$var.publication.published_on_year}}" = "" THEN null ELSE toInteger("{{$var.publication.published_on_year}}") END AS pub_year,
+  {{current_year}} AS current_year
 WITH pub_year, current_year,
   CASE
     WHEN pub_year IS NULL OR pub_year >= current_year THEN 25
@@ -657,12 +765,18 @@ WITH pub_year, current_year,
     ELSE 15
   END AS authored_weight
 
-MATCH (p:Person {uuid: $personUuid})
-CREATE (pub:Entity:Work:Publication {uuid: randomUUID()})
-SET pub.name = $name, pub.publisher = $publisher, pub.publication_url = $url,
-    pub.published_on_day = $day, pub.published_on_month = $month, pub.published_on_year = $year
+MATCH (p:Person {uuid: "{{$var.masterPerson.node_uuid}}"})
+CREATE (pub:Entity:Work:Publication {uuid: randomUUID(), created_at: timestamp(), updated_at: timestamp()})
+SET pub.display_label = "Publication",
+    pub.name = …, pub.description = …, pub.publisher = …, pub.publication_url = …,
+    pub.published_on_day = …, pub.published_on_month = …, pub.published_on_year = …
 
-CREATE (p)-[r1:AUTHORED {uuid: randomUUID(), weight: authored_weight}]->(pub)
+CREATE (p)-[r1:AUTHORED {uuid: randomUUID(), weight: authored_weight, created_at: timestamp(), updated_at: timestamp()}]->(pub)
+SET r1.description = CASE
+  WHEN {{$var.cyAuthoredEdgeDescription}} <> "" THEN {{$var.cyAuthoredEdgeDescription}}
+  WHEN pub.name IS NOT NULL THEN p.name + ' authored ' + pub.name + '.'
+  ELSE p.name + ' authored a publication.'
+END
 ```
 
 ---
@@ -679,11 +793,20 @@ Publication-shaped work was published by a specific company.
 
 ```cypher
 WITH pub, r1
-OPTIONAL MATCH (c:Company {uuid: $companyUuid})
-WHERE $companyUuid <> ""
+OPTIONAL MATCH (c:Company {uuid: "{{$var.publication.company.node_uuid}}"})
+WHERE "{{$var.publication.company.node_uuid}}" <> ""
 
 FOREACH (_ IN CASE WHEN c IS NOT NULL THEN [1] ELSE [] END |
-  CREATE (pub)-[:PUBLISHED_BY {uuid: randomUUID(), weight: 20}]->(c)
+  CREATE (pub)-[:PUBLISHED_BY {
+    uuid: randomUUID(),
+    weight: 20,
+    description: CASE
+      WHEN {{$var.cyPublishedByEdgeDescription}} <> "" THEN {{$var.cyPublishedByEdgeDescription}}
+      ELSE pub.name + ' was published by ' + c.name + '.'
+    END,
+    created_at: timestamp(),
+    updated_at: timestamp()
+  }]->(c)
 )
 ```
 
@@ -710,22 +833,27 @@ mvp/resolve/resolve-edges-volunteering — #4575
 | **Writer** | `mvp/resolve/resolve-edges-volunteering` (#4575) |
 
 ```cypher
-MERGE (org:Organization:Company {name: $volCoName})
-ON CREATE SET org.uuid = randomUUID(), org.createdAt = timestamp()
+MERGE (org:Organization:Company {name: "{{$var.volCoName}}"})
+ON CREATE SET
+  org.uuid = randomUUID(),
+  org.created_at = timestamp(),
+  org.updated_at = timestamp()
+ON MATCH SET
+  org.updated_at = timestamp()
 
 WITH org
-MATCH (p:Person {uuid: $personUUID})
+MATCH (p:Person {uuid: "{{$var.personUUID}}"})
 
 CREATE (p)-[va:VOLUNTEERED_AT {
   uuid: randomUUID(),
-  title: $volTitle,
-  weight: ($volEndYear ? 50 : 38),
-  startMonth: $volStartMonth,
-  startYear: $volStartYear,
-  endMonth: $volEndMonth,
-  endYear: $volEndYear,
-  isCurrent: ($volEndYear ? false : true),
-  createdAt: timestamp()
+  title: "{{ $var.volTitle }}",
+  weight: {% if $var.volEndYear %}50{% else %}38{% endif %},
+  startMonth: {% if $var.volStartMonth %}{{ $var.volStartMonth }}{% else %}null{% endif %},
+  startYear: {% if $var.volStartYear %}{{ $var.volStartYear }}{% else %}null{% endif %},
+  endMonth: {% if $var.volEndMonth %}{{ $var.volEndMonth }}{% else %}null{% endif %},
+  endYear: {% if $var.volEndYear %}{{ $var.volEndYear }}{% else %}null{% endif %},
+  isCurrent: {% if $var.volEndYear %}false{% else %}true{% endif %},
+  created_at: timestamp(), updated_at: timestamp()
 }]->(org)
 ```
 
@@ -745,7 +873,7 @@ CREATE (p)-[va:VOLUNTEERED_AT {
 mvp/node/primary-location-nodes-edges_v2— #4690
 ```
 
-Single function that resolves Country → Region → City nodes (with embeddings + LLM-generated descriptions for missing rows), then writes the three-hop location chain to FalkorDB. Three branches depending on which of `city`, `region`, `country` are present; full Cypher below is the city + region + country branch.
+**v1.5 (2026-07-04).** Single function that resolves Country → Region → City nodes (with embeddings + descriptions — the location nodes write a canonical `description` since v1.3–v1.5), then writes the location chain to FalkorDB. Four branches depending on which of `city`, `region`, `country` resolved (city+region+country / city+country / region+country / country-only at LOCATED_IN w80); every edge stamps `created_at` (coalesce) + `updated_at`. The snippets below are from the city + region + country branch.
 
 </Card>
 
@@ -760,16 +888,17 @@ Person is located in a city.
 | **Writer** | `mvp/node/primary-location-nodes-edges_v2` (#4690) — company side: `mvp/node/location-nodes-edges-company` (#4528) |
 
 ```cypher
-MATCH (person:Entity {uuid: $personUuid})
-MATCH (city:Entity {uuid: $cityUuid})
+MATCH (person:Entity {uuid: "{{$var.masterPerson.node_uuid}}"})
+MATCH (city:Entity {uuid: "{{$var.cityRecord.node_uuid}}"})
 
 MERGE (person)-[relates1:LOCATED_IN]->(city)
-ON CREATE SET
-  relates1.uuid = randomUuid(),
-  relates1.description = person.name + ' is located in ' + city.name,
-  relates1.weight = 70,
-  relates1.name = "LOCATED_IN",
-  relates1.valid_from = $currentMonth
+  ON CREATE SET
+    relates1.uuid = randomUuid(),
+    relates1.description = person.name + ' is located in ' + city.name,
+    relates1.weight = 70,
+    relates1.name = "LOCATED_IN",
+    relates1.valid_from = "{{'now'|date('Y-m')}}"
+  SET relates1.created_at = coalesce(relates1.created_at, timestamp()), relates1.updated_at = timestamp()
 ```
 
 ---
@@ -785,15 +914,16 @@ City sits in a region (state/province).
 | **Writer** | `mvp/node/primary-location-nodes-edges_v2` (#4690) |
 
 ```cypher
-MATCH (city:Entity {uuid: $cityUuid})
-MATCH (region:Entity {uuid: $regionUuid})
+MATCH (city:Entity {uuid: "{{$var.cityRecord.node_uuid}}"})
+MATCH (region:Entity {uuid: "{{$var.regionRecord.node_uuid}}"})
 
 MERGE (city)-[relates2:IN_REGION]->(region)
-ON CREATE SET
-  relates2.uuid = randomUuid(),
-  relates2.fact = city.name + ' is a city located in ' + region.name,
-  relates2.weight = 25,
-  relates2.name = "IN_REGION"
+  ON CREATE SET
+    relates2.uuid = randomUuid(),
+    relates2.description = city.name + ' is a city located in ' + region.name,
+    relates2.weight = 25,
+    relates2.name = "IN_REGION"
+  SET relates2.created_at = coalesce(relates2.created_at, timestamp()), relates2.updated_at = timestamp()
 ```
 
 ---
@@ -809,21 +939,22 @@ Region sits in a country.
 | **Writer** | `mvp/node/primary-location-nodes-edges_v2` (#4690) |
 
 ```cypher
-MATCH (region:Entity {uuid: $regionUuid})
-MATCH (country:Entity {uuid: $countryUuid})
+MATCH (region:Entity {uuid: "{{$var.regionRecord.node_uuid}}"})
+MATCH (country:Entity {uuid: "{{$var.countryRecord.node_uuid}}"})
 
 MERGE (region)-[relates3:IN_COUNTRY]->(country)
-ON CREATE SET
-  relates3.uuid = randomUuid(),
-  relates3.fact = CASE
-    WHEN country.name = 'United States'
-      THEN region.name + ' is a state located in the United States'
-    WHEN country.name ENDS WITH 's'
-      THEN region.name + ' is a region located in the ' + country.name
-    ELSE region.name + ' is a region located in ' + country.name
-  END,
-  relates3.weight = 50,
-  relates3.name = "IN_COUNTRY"
+  ON CREATE SET
+    relates3.uuid = randomUuid(),
+    relates3.description = CASE
+      WHEN country.name = 'United States'
+        THEN region.name + ' is a state located in the United States'
+      WHEN country.name ENDS WITH 's'
+        THEN region.name + ' is a region located in the ' + country.name
+      ELSE region.name + ' is a region located in ' + country.name
+    END,
+    relates3.weight = 50,
+    relates3.name = "IN_COUNTRY"
+  SET relates3.created_at = coalesce(relates3.created_at, timestamp()), relates3.updated_at = timestamp()
 ```
 
 ---
@@ -836,7 +967,7 @@ ON CREATE SET
 mvp/edge/add-node-edge-imdb-award — #2334
 ```
 
-**v1.6 (2026-04-24).** Writes Film_TV + Film_TV_Award nodes, plus four edges: `HAS_AWARD`, `WORKED_ON` (award context), `WON_AWARD`, `NOMINATED_FOR`. Split into Query A (always — node MERGEs + HAS_AWARD) and Query B (only when `hasPerson` AND Query A returned a uuid — Person edges). v1.5 added honorary handling (`hasFilm = false` → Award node keyed on `person_uuid` instead of `film_tv_imdb_url`). v1.6 added a three-tier bulletproof chain (MERGE → retry → MATCH-only fallback) so empty-RETURN edge cases don't leave `node_uuid` null.
+**v1.12 (2026-07-09).** Writes Film_TV + Film_TV_Award nodes, plus four edges: `HAS_AWARD`, `WORKED_ON` (award context), `WON_AWARD`, `NOMINATED_FOR` — §3.6 weights (40/30/30/35). Split into Query A (always — node MERGEs + HAS_AWARD) and Query B (only when `hasPerson` AND Query A returned a uuid — Person edges). v1.5 added honorary handling (`hasFilm = false` → Award node keyed on `person_uuid` instead of `film_tv_imdb_url`); v1.6 added a three-tier bulletproof chain (MERGE → retry → MATCH-only fallback) so empty-RETURN edge cases don't leave `node_uuid` null; the v1.7–v1.12 wave (2026-07-08/09) supports title-level award rows with no linked person, stamps award-node display metadata (`name`, `title`, `display_label`, `source`) and edge `uuid`/`updated_at`, writes the Film_TV graph uuid back to `film_tv.node_uuid`, uses deterministic (non-LLM) descriptions on this hot path, and registers created node uuids in `node_registry`.
 
 </Card>
 
@@ -858,70 +989,77 @@ Person worked on a film/TV title (cast/crew credit, or via an award row).
 | | |
 |---|---|
 | **Pattern** | `(Person)-[WORKED_ON]->(Film_TV)` |
-| **Weight** | **0.5** |
-| **Writers** | `add-credit-edges-from-person` (#13013), `add-credit-edges-from-title` (#13015), `add-node-edge-imdb-award` (#2334) |
+| **Weight** | **30** *(§3.6 — was 0.5 pre-audit)* |
+| **Writers** | `add-credit-edges-from-person` (#13013 v1.5), `add-credit-edges-from-title` (#13015 v1.5), `add-node-edge-imdb-award` (#2334) |
 
 ```cypher
--- v1.0 (#13013) — person-side UNWIND writer (lambda-built)
-MATCH (p:Person {uuid: $personUuid})
-UNWIND $credits AS credit
+-- #13013 — person-side UNWIND writer (lambda-built)
+MATCH (p:Person {uuid: <personUuid>})
+UNWIND <credits> AS credit
 MATCH (f:Film_TV {uuid: credit.film_uuid})
 MERGE (p)-[w:WORKED_ON]->(f)
 ON CREATE SET
-  w.created_at = $now,
+  w.uuid = randomUUID(),
+  w.created_at = <now>,
+  w.updated_at = <now>,
+  w.description = credit.description,
+  w.description_generated_at = <now>,
   w.role = credit.role,
   w.year = credit.year,
-  w.weight = 0.5,
+  w.weight = 30,
   w.source = 'imdb.com'
 ON MATCH SET
-  w.updated_at = $now,
+  w.updated_at = <now>,
+  w.description = credit.description,
+  w.description_generated_at = <now>,
   w.role = credit.role,
+  w.year = credit.year,
   w.source = 'imdb.com'
 RETURN count(w) AS edges_written
 ```
 
 ```cypher
--- v1.0 (#13015) — title-side UNWIND mirror
-MATCH (f:Film_TV {uuid: $filmUuid})
-UNWIND $crew AS crew
+-- #13015 — title-side UNWIND mirror (same envelope, crew.person_uuid side)
+MATCH (f:Film_TV {uuid: <filmUuid>})
+UNWIND <crew> AS crew
 MATCH (p:Person {uuid: crew.person_uuid})
 MERGE (p)-[w:WORKED_ON]->(f)
 ON CREATE SET
-  w.created_at = $now,
-  w.role = crew.role,
-  w.weight = 0.5,
-  w.source = 'imdb.com'
+  w.uuid = randomUUID(), w.created_at = <now>, w.updated_at = <now>,
+  w.description = crew.description, w.description_generated_at = <now>,
+  w.role = crew.role, w.weight = 30, w.source = 'imdb.com'
 ON MATCH SET
-  w.updated_at = $now,
-  w.role = crew.role,
-  w.source = 'imdb.com'
+  w.updated_at = <now>, w.description = crew.description,
+  w.description_generated_at = <now>, w.role = crew.role, w.source = 'imdb.com'
 RETURN count(w) AS edges_written
 ```
 
 ```cypher
--- v1.5 (#2334 Query B) — award-context writer, hasFilm-gated
-MATCH (p:Person { uuid: $personUuid })
-MATCH (f:Film_TV { imdb_url: $imdbUrl })
-MATCH (a:Film_TV_Award { uuid: $extractedUuid })
-
+-- #2334 Query B — award-context writer, hasFilm-gated
 MERGE (p)-[w:WORKED_ON]->(f)
 ON CREATE SET
-  w.created_at = $now,
-  w.valid_from = $validFrom,
-  w.weight = 0.5,
-  w.source = $source
+  w.uuid = randomUUID(),
+  w.created_at = {{ $var.lit.now }},
+  w.updated_at = {{ $var.lit.now }},
+  w.valid_from = {{ $var.lit.validFrom }},
+  w.weight = 30,
+  w.description = {{ $var.lit.workedOnDescription }},
+  w.description_generated_at = {{ $var.lit.now }},
+  w.source = {{ $var.lit.source }}
 ON MATCH SET
-  w.updated_at = $now,
-  w.weight = 0.5,
-  w.source = $source
+  w.uuid = coalesce(w.uuid, randomUUID()),
+  w.updated_at = {{ $var.lit.now }},
+  w.weight = 30,
+  w.source = {{ $var.lit.source }}
 ```
 
 | Property | Description |
 |----------|-------------|
 | `role` | Job role on the credit (director, writer, cinematographer, producer, executive producer, cast). Role precedence on conflict: `directors > writers > cinematographers > producers > cast` (first match wins per MERGE key). Award-context writer doesn't set `role` |
 | `year` | Year of the credit (when present in `imdb_person.json.credits[]`) |
+| `description` / `description_generated_at` | LLM-or-deterministic credit sentence, stamped by the credit writers since v1.1 (2026-07-08) |
 | `source` | Always `'imdb.com'` for credit writers; the award writer uses the source passed into `#2334` |
-| `weight` | Always `0.5` |
+| `weight` | Always `30` |
 
 ---
 
@@ -932,51 +1070,67 @@ A film/TV title has an award.
 | | |
 |---|---|
 | **Pattern** | `(Film_TV)-[HAS_AWARD]->(Film_TV_Award)` |
-| **Weight** | **0.5** |
+| **Weight** | **40** *(§3.6 — was 0.5 pre-audit)* |
 | **Writer** | `mvp/edge/add-node-edge-imdb-award` (#2334) — Query A, only when `hasFilm = true` |
 
 ```cypher
--- v1.5 Query A — gated on hasFilm
-MERGE (f:Film_TV { imdb_url: $imdbUrl })
-ON CREATE SET ...      -- (title, type, description, year, rating, etc.)
+-- Query A — gated on hasFilm (JSON-quoted literals)
+MERGE (f:Film_TV { imdb_url: {{ $var.lit.imdbUrl }} })
+ON CREATE SET
+  f.uuid = randomUUID(), f.created_at = {{ $var.lit.now }}, f.updated_at = {{ $var.lit.now }},
+  f.display_label = 'Film_TV', f.title = …, f.type = …, f.description = …, f.year = …, f.source = …
+ON MATCH SET
+  f.uuid = coalesce(f.uuid, randomUUID()), f.updated_at = {{ $var.lit.now }}, f.title = …, f.source = …
 SET f:Movie / :TV_Series / :TV_Movie / :TV_Mini_Series / :Short_Film / :Documentary / :TV_Special
 WITH f
 
 MERGE (a:Film_TV_Award {
-  year: $awardYearInt,
-  award_type: $awardType,
-  award_description: $awardDescription,
-  film_tv_imdb_url: $projectImdbUrl
+  year: {{ $var.lit.awardYearInt }},
+  award_type: {{ $var.lit.awardType }},
+  award_description: {{ $var.lit.awardDescription }},
+  film_tv_imdb_url: {{ $var.lit.projectImdbUrl }}   // person_uuid instead when hasFilm = false
 })
 ON CREATE SET
   a.uuid = randomUUID(),
-  a.created_at = $now,
+  a.created_at = {{ $var.lit.now }},
+  a.updated_at = {{ $var.lit.now }},
+  a.name = {{ $var.lit.awardNodeName }},
+  a.title = {{ $var.lit.awardNodeTitle }},
   a.display_label = 'Film_TV_Award',
-  a.description = $awardText,
-  a.nominee_or_winner = $nomineeOrWinner,
-  a.project_title = $projectTitle,
-  a.name_embedding = vecf32($awardEmbeddingArray)
-ON MATCH SET ...
+  a.description = {{ $var.lit.awardText }},
+  a.nominee_or_winner = {{ $var.lit.nomineeOrWinner }},
+  a.source = {{ $var.lit.source }},
+  a.project_title = {{ $var.lit.projectTitle }},
+  a.name_embedding = vecf32({{ $var.awardEmbeddingArray }})
+ON MATCH SET …   // same display metadata refreshed (v1.8)
 
 SET a:Winner / :Nominee
 
 MERGE (f)-[h:HAS_AWARD]->(a)
 ON CREATE SET
-  h.created_at = $now,
-  h.valid_from = $validFrom,
-  h.weight = 0.5,
-  h.source = $source
+  h.uuid = randomUUID(),
+  h.created_at = {{ $var.lit.now }},
+  h.updated_at = {{ $var.lit.now }},
+  h.valid_from = {{ $var.lit.validFrom }},
+  h.weight = 40,
+  h.description = {{ $var.lit.hasAwardDescription }},
+  h.description_generated_at = {{ $var.lit.now }},
+  h.source = {{ $var.lit.source }}
 ON MATCH SET
-  h.updated_at = $now,
-  h.weight = 0.5,
-  h.source = $source
+  h.uuid = coalesce(h.uuid, randomUUID()),
+  h.updated_at = {{ $var.lit.now }},
+  h.weight = 40,
+  h.description = {{ $var.lit.hasAwardDescription }},
+  h.description_generated_at = {{ $var.lit.now }},
+  h.source = {{ $var.lit.source }}
 ```
 
 | Property | Description |
 |----------|-------------|
 | `valid_from` | Award year |
+| `description` | Deterministic award sentence (LLM generation removed from this hot path in v1.11) |
 | `source` | Source of the award row (typically `'imdb.com'`) |
-| `weight` | Always `0.5` |
+| `weight` | Always `40` |
 
 For **honorary awards** (`hasFilm = false`), the Film_TV node + HAS_AWARD edge are skipped entirely and the Award node's MERGE key swaps `film_tv_imdb_url` → `person_uuid` to keep per-person uniqueness.
 
@@ -989,23 +1143,26 @@ Person won an award. Always created when the award row has `nominee_or_winner = 
 | | |
 |---|---|
 | **Pattern** | `(Person)-[WON_AWARD]->(Film_TV_Award)` |
-| **Weight** | **0.3** |
+| **Weight** | **30** *(§3.6 — was 0.3 pre-audit)* |
 | **Writer** | `mvp/edge/add-node-edge-imdb-award` (#2334) — Query B, when `isWinner` |
 
 ```cypher
 MERGE (p)-[r:WON_AWARD]->(a)
 ON CREATE SET
-  r.created_at = $now,
-  r.valid_from = $validFrom,
-  r.valid_to = $validTo,
-  r.weight = 0.3,
-  r.description = $edgeDescription,
-  r.source = $source
+  r.uuid = randomUUID(),
+  r.created_at = {{ $var.lit.now }},
+  r.updated_at = {{ $var.lit.now }},
+  r.valid_from = {{ $var.lit.validFrom }},
+  r.valid_to = {{ $var.lit.validTo }},
+  r.weight = 30,
+  r.description = {{ $var.lit.edgeDescription }},
+  r.source = {{ $var.lit.source }}
 ON MATCH SET
-  r.updated_at = $now,
-  r.weight = 0.3,
-  r.description = $edgeDescription,
-  r.source = $source
+  r.uuid = coalesce(r.uuid, randomUUID()),
+  r.updated_at = {{ $var.lit.now }},
+  r.weight = 30,
+  r.description = {{ $var.lit.edgeDescription }},
+  r.source = {{ $var.lit.source }}
 ```
 
 ---
@@ -1017,23 +1174,26 @@ Person was nominated for an award (no win).
 | | |
 |---|---|
 | **Pattern** | `(Person)-[NOMINATED_FOR]->(Film_TV_Award)` |
-| **Weight** | **0.7** |
+| **Weight** | **35** *(§3.6 — was 0.7 pre-audit)* |
 | **Writer** | `mvp/edge/add-node-edge-imdb-award` (#2334) — Query B, when not `isWinner` |
 
 ```cypher
 MERGE (p)-[r:NOMINATED_FOR]->(a)
 ON CREATE SET
-  r.created_at = $now,
-  r.valid_from = $validFrom,
-  r.valid_to = $validTo,
-  r.weight = 0.7,
-  r.description = $edgeDescription,
-  r.source = $source
+  r.uuid = randomUUID(),
+  r.created_at = {{ $var.lit.now }},
+  r.updated_at = {{ $var.lit.now }},
+  r.valid_from = {{ $var.lit.validFrom }},
+  r.valid_to = {{ $var.lit.validTo }},
+  r.weight = 35,
+  r.description = {{ $var.lit.edgeDescription }},
+  r.source = {{ $var.lit.source }}
 ON MATCH SET
-  r.updated_at = $now,
-  r.weight = 0.7,
-  r.description = $edgeDescription,
-  r.source = $source
+  r.uuid = coalesce(r.uuid, randomUUID()),
+  r.updated_at = {{ $var.lit.now }},
+  r.weight = 35,
+  r.description = {{ $var.lit.edgeDescription }},
+  r.source = {{ $var.lit.source }}
 ```
 
 ---
@@ -1047,7 +1207,7 @@ mvp/expertise/resolve-person-expertise-v2 — #12926
 mvp/expertise/upsert-person-has-expertise — #12925
 ```
 
-**v5 / v2 chain (2026-05-17).** Person-side: LLM identifies domains of expertise via `mvp/expertise/llm-identify-person-expertise` (#12666), which calls #12926 for each. #12926 vector-searches against existing `Entity:SubDomainExpertise` / `Entity:DomainExpertise` nodes, creates a new node if no match, and `MERGE`s the `HAS_EXPERTISE` edge with persisted `r.weight`. Successful graph MERGE triggers #12925 to dual-write into `person_has_expertise` (Xano table 711). Companies use a parallel path: `mvp/expertise/resolve-company-specialties` (#12746) writes `SPECIALIZES_IN`. The hierarchical `HAS_SUBDOMAIN` edge is written by the relational sync (#12663), forward-path parent attach (#13142), and taxonomy seeder (#13161); all three now stamp the full edge metadata envelope.
+**Locked-spec chain (#12926 v2.8, 2026-07-08 / #12925 v1.2).** Person-side: LLM identifies domains of expertise via `mvp/expertise/llm-identify-person-expertise` (#12666 — which first deletes the person's existing `HAS_EXPERTISE` edges **and** their `person_has_expertise` mirror rows), then calls #12926 per signal. #12926 vector-searches `expert_embeddings` against existing `Entity:SubDomainExpertise` / `Entity:DomainExpertise` nodes (3-way guard band \< 0.15 / 0.15–0.25 / \> 0.25), creates a new node only on a guard-band miss, and `MERGE`s the `HAS_EXPERTISE` edge with persisted `r.weight` — stamping the full metadata envelope (`uuid`, timestamps, `source`) since v2.8. Successful graph MERGE triggers #12925 to dual-write into `person_has_expertise` (Xano table 711). Companies use a parallel path: `mvp/expertise/resolve-company-specialties` (#12746 v1.8) writes `SPECIALIZES_IN`. The hierarchical `HAS_SUBDOMAIN` edge is written by the relational sync (#12663), forward-path parent attach (#13142), and taxonomy seeder (#13161); all three stamp the full edge metadata envelope.
 
 </Card>
 
@@ -1058,57 +1218,69 @@ Person has expertise in a domain or sub-domain.
 | | |
 |---|---|
 | **Pattern** | `(Person)-[HAS_EXPERTISE]->(DomainExpertise \| SubDomainExpertise)` |
-| **Weight** | **dynamic** — `min(round(10 + match_score*80), 50)` (10 best, 50 worst, integer) |
-| **Writer** | `mvp/expertise/resolve-person-expertise-v2` (#12926) |
+| **Weight** | **dynamic** — matched: `min(round(10 + match_score × 160), 50)` (10 best, 50 worst, integer); created-node edges: fixed **10** |
+| **Writer** | `mvp/expertise/resolve-person-expertise-v2` (#12926 v2.8) |
 
 ```cypher
--- v5 — v2 adds r.weight
-MATCH (p:Entity:Person {uuid: $personNodeUuid})
-MATCH (e:Entity {uuid: $bestUuid})
+-- matched branch (v2.8 — full metadata envelope; the created branch mirrors it with match_type: "created")
+MATCH (p:Entity:Person {uuid: "{{$input.person_node_uuid}}"})
+MATCH (e:Entity {uuid: "{{$var.bestUuid}}"})
 MERGE (p)-[r:HAS_EXPERTISE]->(e)
 ON CREATE SET
-  r.confidence = $confidence,
-  r.evidence = $cleanEvidence,
-  r.identified_as = $cleanArea,
-  r.signal_type = $signalType,
-  r.depth = $depth,
-  r.recency = $recency,
-  r.match_score = $bestScore,
-  r.weight = $edgeWeight,
+  r.uuid = randomUUID(),
+  r.created_at = timestamp(),
+  r.updated_at = timestamp(),
+  r.source = "llm_identify_person_expertise",
+  r.confidence = {{$var.item.confidence}},
+  r.evidence = "{{$var.cleanEvidence}}",
+  r.identified_as = "{{$var.cleanArea}}",
+  r.signal_type = "{{$var.item.signal_type}}",
+  r.depth = "{{$var.item.depth}}",
+  r.recency = "{{$var.item.recency}}",
+  r.match_score = {{$var.safeBestScore}},
+  r.weight = {{$var.edgeWeight}},
+  r.expertise_strength = {{$var.expertiseStrength}},
   r.match_type = "matched"
 ON MATCH SET
-  r.evidence = r.evidence + " | " + $cleanEvidence,
-  r.identified_as = r.identified_as + " | " + $cleanArea,
-  r.signal_type = r.signal_type + " | " + $signalType,
-  r.confidence = CASE WHEN $confidence > r.confidence THEN $confidence ELSE r.confidence END,
+  r.uuid = coalesce(r.uuid, randomUUID()),
+  r.created_at = coalesce(r.created_at, timestamp()),
+  r.updated_at = timestamp(),
+  r.source = coalesce(r.source, "llm_identify_person_expertise"),
+  r.evidence = r.evidence + " | " + "{{$var.cleanEvidence}}",
+  r.identified_as = r.identified_as + " | " + "{{$var.cleanArea}}",
+  r.signal_type = r.signal_type + " | " + "{{$var.item.signal_type}}",
+  r.confidence = CASE WHEN {{$var.item.confidence}} > r.confidence THEN {{$var.item.confidence}} ELSE r.confidence END,
   r.depth = CASE
-    WHEN r.depth = "creator" OR $depth = "creator" THEN "creator"
-    WHEN r.depth = "expert" OR $depth = "expert" THEN "expert"
-    WHEN r.depth = "practitioner" OR $depth = "practitioner" THEN "practitioner"
+    WHEN r.depth = "creator" OR "{{$var.item.depth}}" = "creator" THEN "creator"
+    WHEN r.depth = "expert" OR "{{$var.item.depth}}" = "expert" THEN "expert"
+    WHEN r.depth = "practitioner" OR "{{$var.item.depth}}" = "practitioner" THEN "practitioner"
     ELSE "familiar"
   END,
   r.recency = CASE
-    WHEN r.recency = "current" OR $recency = "current" THEN "current"
-    WHEN r.recency = "recent" OR $recency = "recent" THEN "recent"
+    WHEN r.recency = "current" OR "{{$var.item.recency}}" = "current" THEN "current"
+    WHEN r.recency = "recent" OR "{{$var.item.recency}}" = "recent" THEN "recent"
     ELSE "historical"
   END,
-  r.match_score = CASE WHEN $bestScore < r.match_score THEN $bestScore ELSE r.match_score END,
-  r.weight = CASE WHEN $edgeWeight < r.weight THEN $edgeWeight ELSE r.weight END
+  r.match_score = CASE WHEN {{$var.safeBestScore}} < r.match_score THEN {{$var.safeBestScore}} ELSE r.match_score END,
+  r.weight = CASE WHEN {{$var.edgeWeight}} < r.weight THEN {{$var.edgeWeight}} ELSE r.weight END,
+  r.expertise_strength = CASE WHEN {{$var.expertiseStrength}} > r.expertise_strength THEN {{$var.expertiseStrength}} ELSE r.expertise_strength END
 ```
 
 | Property | Description |
 |----------|-------------|
+| `uuid` / `created_at` / `updated_at` / `source` | Metadata envelope stamped at MERGE time (v2.8); `source` is `"llm_identify_person_expertise"` |
 | `confidence` | LLM-output 0–1 |
 | `evidence` | LLM-extracted snippet justifying the expertise (concatenated with ` \| ` on re-merge) |
 | `identified_as` | The raw text the LLM identified (e.g. "agentic AI infra") — concatenated |
 | `signal_type` | Source signal (e.g. `bio`, `headline`, `social_post`) — concatenated |
 | `depth` | Promotion ladder: `familiar < practitioner < expert < creator` — only ever escalates |
 | `recency` | Promotion ladder: `historical < recent < current` — only ever escalates |
-| `match_score` | Vector-match distance — only ever decreases (better) |
+| `match_score` | Vector-match distance — only ever decreases (better); exact-name matches carry `0` |
 | `match_type` | `matched` or `created` |
-| `weight` | Only ever decreases (better) |
-| `description` | LLM-written sentence (15–30 words) describing this person's expertise in this domain — generated by `enrich/write-expertise-edge-description-to-graph` (#13020), written inline after each MERGE and backfilled by task #176 |
-| `description_generated_at` | ISO-8601 timestamp when `description` was last written; used as the idempotency guard to skip already-described edges |
+| `weight` | Only ever decreases (better) — created edges start at the strongest value, flat `10` |
+| `expertise_strength` | Separate **0–100, higher = stronger** signal (depth \+ recency \+ duration × confidence) — decoupled from the path weight; only ever increases |
+| `description` | LLM-written sentence (15–30 words) describing this person's expertise in this domain — written inline by `write-expertise-edge-description-to-graph` (#13020 v2.3) after each MERGE; catch-up drain is `backfill-has-expertise-descriptions-v2` #13046 via inactive Task #177 (Task #176 was deleted) |
+| `description_generated_at` | Timestamp when `description` was last written; used as the idempotency guard to skip already-described edges |
 
 When no SubDomain node matches the vector search, the function creates a new one via `CREATE (s:Entity:SubDomainExpertise {...})` and writes to `sub_domain_expertise` (Xano table) for dual-storage.
 
@@ -1157,23 +1329,40 @@ Hierarchical parent→child link between expertise nodes.
 | **Writers** | `mvp/node/sync-domain-expertise-nodes` (#12663), `mvp/expertise/attach-subdomain-parent` (#13142), `mvp/expertise/seed-expertise-graph-batch` (#13161) |
 
 ```cypher
-MATCH (d:Entity:DomainExpertise {uuid: $parentDomainUuid})
-MATCH (s:Entity:SubDomainExpertise {uuid: $subNodeUuid})
+-- #13142 (forward-path attach) — also clears the parent_unresolved review flag
+MATCH (d:Entity:DomainExpertise {uuid: "{{$var.domainUuidForEdge}}"})
+MATCH (s:Entity:SubDomainExpertise {uuid: "{{$input.sub_node_uuid}}"})
 MERGE (d)-[r:HAS_SUBDOMAIN]->(s)
 ON CREATE SET
   r.uuid = randomUUID(),
   r.created_at = timestamp(),
   r.updated_at = timestamp(),
   r.weight = 100,
-  r.description = coalesce(d.name, 'Domain') + ' includes ' + coalesce(s.name, 'subdomain'),
-  r.description_generated_at = timestamp()
+  r.description = CASE
+    WHEN {{$var.cyHasSubdomainDescription}} <> "" THEN {{$var.cyHasSubdomainDescription}}
+    ELSE coalesce(d.name, 'Domain') + ' includes ' + coalesce(s.name, 'subdomain')
+  END,
+  r.description_generated_at = CASE
+    WHEN {{$var.cyHasSubdomainDescription}} <> "" THEN timestamp()
+    ELSE r.description_generated_at
+  END
 ON MATCH SET
   r.uuid = coalesce(r.uuid, randomUUID()),
   r.created_at = coalesce(r.created_at, timestamp()),
   r.updated_at = timestamp(),
   r.weight = coalesce(r.weight, 100),
-  r.description = coalesce(r.description, coalesce(d.name, 'Domain') + ' includes ' + coalesce(s.name, 'subdomain')),
-  r.description_generated_at = coalesce(r.description_generated_at, timestamp())
+  r.description = CASE
+    WHEN {{$var.cyHasSubdomainDescription}} <> "" THEN {{$var.cyHasSubdomainDescription}}
+    ELSE coalesce(r.description, coalesce(d.name, 'Domain') + ' includes ' + coalesce(s.name, 'subdomain'))
+  END,
+  r.description_generated_at = CASE
+    WHEN {{$var.cyHasSubdomainDescription}} <> "" THEN timestamp()
+    ELSE r.description_generated_at
+  END
+SET
+  s.parent_unresolved = NULL,
+  s.parent_unresolved_at = NULL,
+  s.updated_at = timestamp()
 RETURN d.uuid AS domain_uuid
 ```
 
@@ -1201,7 +1390,7 @@ mvp/fundable/resolve-investors-edges   — #12702
 mvp/investor/cascade-deal-participants — #12856
 ```
 
-#12701 materializes the `Funding_Round` node from `fundable_deals` + writes the company-side `RAISED` edge. #12702 walks every institutional investor + angel on the deal and writes investor-side edges (`LEAD_INVESTED_IN`, `INVESTED_IN`, `FOLLOW_ON_INVESTED_IN`, `INVESTMENT_PARTNER_IN`, `INVESTMENT_PARTNER_AT`). #12856 (v1.6, 2026-07-02) is the single source of truth that orchestrates both — called from `add-all-fundable-deals` (#12703 v2.1, target side) and `process-person-phase-9` (investor side). **Repaired v1.12 (2026-07-02, sandbox-verified):** #12702 reads `cascade_depth` as a nullable input via `first_notnull`, so seed-deal runs write the full investor edge set below; from v1.11 (2026-06-23) until the fix a `first_notempty` depth coercion made the writer self-skip on every invocation — deals processed in that window carry `Funding_Round` \+ `RAISED` only. See [Company Edges](/guides/enrichment/waterfall/company-edges).
+#12701 (v1.17, 2026-07-09) materializes the `Funding_Round` node from `fundable_deals` (adding the `:Entity` base label since v1.10) + writes the company-side `RAISED` edge. #12702 (v1.17, 2026-07-07) walks every institutional investor + angel on the deal and writes investor-side edges (`LEAD_INVESTED_IN`, `INVESTED_IN`, `FOLLOW_ON_INVESTED_IN`, `INVESTMENT_PARTNER_IN`, `INVESTMENT_PARTNER_AT`) — every edge stamping timestamps \+ a description, and the participant node names repaired from Fundable source names. #12856 (v1.10, 2026-07-07) is the single source of truth that orchestrates both — called from `add-all-fundable-deals` (#12703 v2.3, **company side only**; the person phase 9 writes direct angel portfolio edges instead since the 2026-07-02 D-series). Deals processed in the 2026-06-23 → 07-02 depth-coercion outage carry `Funding_Round` \+ `RAISED` only (accepted as historical). See [Company Edges](/guides/enrichment/waterfall/company-edges).
 
 </Card>
 
@@ -1216,13 +1405,19 @@ Company raised a funding round.
 | **Writer** | `mvp/funding/add-fundable-deal-node` (#12701) |
 
 ```cypher
-MATCH (c:Company {uuid: $companyNodeUuid})
-MATCH (fr:Funding_Round {uuid: $dealId})
+MATCH (c:Company {uuid: '{{$var.organizationMasterCompanyNodeUuid}}'})
+MATCH (fr:Funding_Round {uuid: '{{$var.dealId}}'})
 MERGE (c)-[raised:RAISED]->(fr)
-SET raised.weight = 10
-  {% if $formattedDate %}, raised.announced_date = $formattedDate {% endif %}
-  {% if $organizationName %}, raised.company_name = $organizationName {% endif %}
-  {% if $shortDescription %}, raised.short_description = $shortDescription {% endif %}
+SET raised.created_at = coalesce(raised.created_at, {% if $var.announcedMillis is not empty %}{{$var.announcedMillis}}{% else %}timestamp(){% endif %}),
+    raised.updated_at = timestamp(),
+    raised.uuid = coalesce(raised.uuid, '{{$var.organizationMasterCompanyNodeUuid}}-{{$var.dealId}}'),
+    raised.weight = 10
+  {% if $var.cyAnnouncedDate is not null %}, raised.announced_date = {{$var.cyAnnouncedDate}}{% endif %}
+  {% if $var.cyCompanyName is not null %}, raised.company_name = {{$var.cyCompanyName}}{% endif %}
+  , raised.description = CASE
+      WHEN {{$var.cyRaisedEdgeDescription}} <> "" THEN {{$var.cyRaisedEdgeDescription}}
+      {% if $var.cyShortDescription is not null %}ELSE {{$var.cyShortDescription}}{% else %}ELSE raised.description{% endif %}
+    END
 ```
 
 ---
@@ -1238,29 +1433,42 @@ Investor (VC firm or angel) led the round.
 | **Writer** | `mvp/fundable/resolve-investors-edges` (#12702) |
 
 ```cypher
--- VC firm lead-investor branch
-MATCH (vc:Company {uuid: $investorNodeUuid})
-SET vc:VC_Firm
+-- VC firm lead-investor branch (v1.16 — JSON-encoded description vars, node-name repair)
+MATCH (vc:Company {uuid: '{{$var.investorNodeUuid}}'})
+SET vc:VC_Firm,
+    vc.updated_at = timestamp(),
+    vc.name = {{ $var.safeInvestorOrgName | json_encode | raw }},
+    vc.company_name = {{ $var.safeInvestorOrgName | json_encode | raw }}
 WITH vc
-MATCH (fr:Funding_Round {uuid: $fundingRoundUuid})
+MATCH (fr:Funding_Round {uuid: '{{$var.deal.funding_round_node_uuid}}'})
 MERGE (vc)-[r:LEAD_INVESTED_IN]->(fr)
-SET r.uuid = $investorNodeUuid + '-' + $fundingRoundUuid,
-    r.name = NULL,
-    r.description = $investorOrgName + ' led the ' + $fundedCoName + ' ' + $financingType + ' funding round.',
+SET r.created_at = coalesce(r.created_at, timestamp()),
+    r.updated_at = timestamp(),
+    r.uuid = '{{$var.investorNodeUuid}}-{{$var.deal.funding_round_node_uuid}}',
+    r.description = CASE
+      WHEN {{ $var.leadInstitutionalDescription | json_encode | raw }} <> "" THEN {{ $var.leadInstitutionalDescription | json_encode | raw }}
+      ELSE '{{$var.safeInvestorOrgName}} led the {{$var.safeFundedCoName}} {{$var.safeFinancingType}} funding round.'
+    END,
     r.is_lead_investor = true,
     r.weight = 15
 ```
 
 ```cypher
 -- Angel lead-investor branch
-MATCH (p:Person {uuid: $angelNodeUuid})
-SET p:Angel
+MATCH (p:Person {uuid: '{{$var.angelNodeUuid}}'})
+SET p:Angel,
+    p.name = {{ $var.safeAngelName | json_encode | raw }},
+    p.updated_at = timestamp()
 WITH p
-MATCH (fr:Funding_Round {uuid: $fundingRoundUuid})
+MATCH (fr:Funding_Round {uuid: '{{$var.deal.funding_round_node_uuid}}'})
 MERGE (p)-[r:LEAD_INVESTED_IN]->(fr)
-SET r.uuid = $angelNodeUuid + '-' + $fundingRoundUuid,
-    r.name = NULL,
-    r.description = $angelName + ' led the ' + $fundedCoName + ' ' + $financingType + ' funding round as an angel investor.',
+SET r.created_at = coalesce(r.created_at, timestamp()),
+    r.updated_at = timestamp(),
+    r.uuid = '{{$var.angelNodeUuid}}-{{$var.deal.funding_round_node_uuid}}',
+    r.description = CASE
+      WHEN {{ $var.leadAngelDescription | json_encode | raw }} <> "" THEN {{ $var.leadAngelDescription | json_encode | raw }}
+      ELSE '{{$var.safeAngelName}} led the {{$var.safeFundedCoName}} {{$var.safeFinancingType}} funding round as an angel investor.'
+    END,
     r.is_lead_investor = true,
     r.weight = 15
 ```
@@ -1281,23 +1489,29 @@ Investor participated in the round as a non-lead.
 
 ```cypher
 -- VC firm non-lead branch — only fires when no earlier round exists; else creates FOLLOW_ON_INVESTED_IN
-MATCH (vc:Company {uuid: $investorNodeUuid})
-SET vc:VC_Firm
+MATCH (vc:Company {uuid: '{{$var.investorNodeUuid}}'})
+SET vc:VC_Firm, vc.updated_at = timestamp(),
+    vc.name = {{ $var.safeInvestorOrgName | json_encode | raw }},
+    vc.company_name = {{ $var.safeInvestorOrgName | json_encode | raw }}
 WITH vc
-MATCH (fr:Funding_Round {uuid: $fundingRoundUuid})
+MATCH (fr:Funding_Round {uuid: '{{$var.deal.funding_round_node_uuid}}'})
 With vc, fr
-MATCH (fundedCompany:Company {uuid: $fundedCompanyUuid})
+MATCH (fundedCompany:Company {uuid: '{{$var.fundedCompanyOrg.master_company_node_uuid}}'})
 OPTIONAL MATCH (fundedCompany)-[:RAISED]->(earlierRound:Funding_Round)
   <-[earlierInvestment]-(vc)
-WHERE earlierRound.announced_date < $formattedDate
+WHERE earlierRound.announced_date < '{{$var.formattedDate}}'
   AND type(earlierInvestment) IN ['LEAD_INVESTED_IN', 'INVESTED_IN', 'FOLLOW_ON_INVESTED_IN']
 WITH vc, fr, COUNT(earlierRound) > 0 AS hasEarlierInvestment
 
 FOREACH (_ IN CASE WHEN NOT hasEarlierInvestment THEN [1] ELSE [] END |
   MERGE (vc)-[r:INVESTED_IN]->(fr)
-  SET r.uuid = $investorNodeUuid + '-' + $fundingRoundUuid,
-      r.name = NULL,
-      r.description = $investorOrgName + ' invested in the ' + $fundedCoName + ' ' + $financingType + ' funding round.',
+  SET r.created_at = coalesce(r.created_at, timestamp()),
+      r.updated_at = timestamp(),
+      r.uuid = '{{$var.investorNodeUuid}}-{{$var.deal.funding_round_node_uuid}}',
+      r.description = CASE
+        WHEN {{ $var.institutionalDescription | json_encode | raw }} <> "" THEN {{ $var.institutionalDescription | json_encode | raw }}
+        ELSE '{{$var.safeInvestorOrgName}} invested in the {{$var.safeFundedCoName}} {{$var.safeFinancingType}} funding round.'
+      END,
       r.is_lead_investor = false,
       r.weight = 20
 )
@@ -1305,19 +1519,25 @@ FOREACH (_ IN CASE WHEN NOT hasEarlierInvestment THEN [1] ELSE [] END |
 
 ```cypher
 -- Angel non-lead branch — flat (no follow-on detection on the angel path)
-MATCH (p:Person {uuid: $angelNodeUuid})
-SET p:Angel
+MATCH (p:Person {uuid: '{{$var.angelNodeUuid}}'})
+SET p:Angel,
+    p.name = {{ $var.safeAngelName | json_encode | raw }},
+    p.updated_at = timestamp()
 With p
-MATCH (fr:Funding_Round {uuid: $fundingRoundUuid})
+MATCH (fr:Funding_Round {uuid: '{{$var.deal.funding_round_node_uuid}}'})
 MERGE (p)-[inv:INVESTED_IN]->(fr)
-SET inv.uuid = $angelNodeUuid + '-' + $fundingRoundUuid,
-    inv.name = NULL,
-    inv.description = $angelName + ' invested in the ' + $fundedCoName + ' ' + $financingType + ' funding round as an angel investor.',
+SET inv.created_at = coalesce(inv.created_at, timestamp()),
+    inv.updated_at = timestamp(),
+    inv.uuid = '{{$var.angelNodeUuid}}-{{$var.deal.funding_round_node_uuid}}',
+    inv.description = CASE
+      WHEN {{ $var.angelInvestmentDescription | json_encode | raw }} <> "" THEN {{ $var.angelInvestmentDescription | json_encode | raw }}
+      ELSE '{{$var.safeAngelName}} invested in the {{$var.safeFundedCoName}} {{$var.safeFinancingType}} funding round as an angel investor.'
+    END,
     inv.is_lead_investor = false,
     inv.weight = 25
 ```
 
-The Person → Company variant (out-of-band investments not tied to a funding round) lives in [Work Relationships](#invested_in-person-company) above and is written by `#2800` with weight **15**.
+The Person → Company variants (not tied to a funding round) live in [Work Relationships](#invested_in-person-company) above: the #2800 w15 work-derived branch is defunct since v2.5, and the live path is phase 9's direct angel portfolio edge at **w25** (#12830).
 
 ---
 
@@ -1334,9 +1554,13 @@ VC firm made a follow-on investment in a company they had previously invested in
 ```cypher
 FOREACH (_ IN CASE WHEN hasEarlierInvestment THEN [1] ELSE [] END |
   MERGE (vc)-[r:FOLLOW_ON_INVESTED_IN]->(fr)
-  SET r.uuid = $investorNodeUuid + '-' + $fundingRoundUuid,
-      r.name = NULL,
-      r.description = $investorOrgName + ' made a follow-on investment in the ' + $fundedCoName + ' ' + $financingType + ' funding round.',
+  SET r.created_at = coalesce(r.created_at, timestamp()),
+      r.updated_at = timestamp(),
+      r.uuid = '{{$var.investorNodeUuid}}-{{$var.deal.funding_round_node_uuid}}',
+      r.description = CASE
+        WHEN {{ $var.followOnInstitutionalDescription | json_encode | raw }} <> "" THEN {{ $var.followOnInstitutionalDescription | json_encode | raw }}
+        ELSE '{{$var.safeInvestorOrgName}} made a follow-on investment in the {{$var.safeFundedCoName}} {{$var.safeFinancingType}} funding round.'
+      END,
       r.is_lead_investor = false,
       r.weight = 20
 )
@@ -1357,13 +1581,21 @@ A VC partner (Person) represented their VC firm in a specific round.
 | **Writer** | `mvp/fundable/resolve-investors-edges` (#12702) — fires when `fundable_institutional_investments_person` row resolves a partner |
 
 ```cypher
-MATCH (p:Person {uuid: $partnerNodeUuid})
-MATCH (fr:Funding_Round {uuid: $fundingRoundUuid})
-MATCH (vc:Company {uuid: $investorNodeUuid})
+MATCH (p:Person {uuid: '{{$var.partnerNodeUuid}}'})
+SET p.name = {{ $var.safePartnerName | json_encode | raw }},
+    p.updated_at = timestamp()
+WITH p
+MATCH (fr:Funding_Round {uuid: '{{$var.deal.funding_round_node_uuid}}'})
+MATCH (vc:Company {uuid: '{{$var.investorNodeUuid}}'})
 
 MERGE (p)-[dr:INVESTMENT_PARTNER_IN]->(fr)
-SET dr.uuid = $partnerNodeUuid + '-' + $fundingRoundUuid,
-    dr.description = $partnerName + ' was an investment partner in the ' + $fundedCoName + ' ' + $financingType + ' funding round, representing ' + $investorOrgName + '.',
+SET dr.created_at = coalesce(dr.created_at, timestamp()),
+    dr.updated_at = timestamp(),
+    dr.uuid = '{{$var.partnerNodeUuid}}-{{$var.deal.funding_round_node_uuid}}',
+    dr.description = CASE
+      WHEN {{ $var.partnerInDescription | json_encode | raw }} <> "" THEN {{ $var.partnerInDescription | json_encode | raw }}
+      ELSE '{{$var.safePartnerName}} was an investment partner in the {{$var.safeFundedCoName}} {{$var.safeFinancingType}} funding round, representing {{$var.safeInvestorOrgName}}.'
+    END,
     dr.weight = 15
 ```
 
@@ -1381,8 +1613,13 @@ A VC partner (Person) has a direct partnership relationship with the VC firm —
 
 ```cypher
 MERGE (p)-[dv:INVESTMENT_PARTNER_AT]->(vc)
-SET dv.uuid = $partnerNodeUuid + '-' + $investorNodeUuid + '-deal_partner',
-    dv.description = $partnerName + ' represented ' + $investorOrgName + ' as an investment partner in the ' + $fundedCoName + ' ' + $financingType + ' funding round.',
+SET dv.created_at = coalesce(dv.created_at, timestamp()),
+    dv.updated_at = timestamp(),
+    dv.uuid = '{{$var.partnerNodeUuid}}-{{$var.investorNodeUuid}}-deal_partner',
+    dv.description = CASE
+      WHEN {{ $var.partnerAtDescription | json_encode | raw }} <> "" THEN {{ $var.partnerAtDescription | json_encode | raw }}
+      ELSE '{{$var.safePartnerName}} represented {{$var.safeInvestorOrgName}} as an investment partner in the {{$var.safeFundedCoName}} {{$var.safeFinancingType}} funding round.'
+    END,
     dv.weight = 20
 ```
 
@@ -1607,22 +1844,11 @@ mb/tool/backfill-music-edge-descriptions — #13097
 
 ## Weight Reference
 
-Quick scan of all edge weights, sorted strongest → weakest within each scale.
-
-### IMDB scale (0.0–1.0, lower = stronger)
+Quick scan of all edge weights, sorted strongest → weakest. One integer scale (1–100, lower = stronger) — the film/TV edges' old sub-1 values were raised by the §3.6 audit.
 
 | Edge | Weight |
 |------|-------:|
-| `WON_AWARD` | **0.3** |
-| `WORKED_ON` (credit + award contexts) | **0.5** |
-| `HAS_AWARD` | **0.5** |
-| `NOMINATED_FOR` | **0.7** |
-
-### Integer scale (5–100, lower = stronger)
-
-| Edge | Weight |
-|------|-------:|
-| `SAME_AS` (music label→company) | **1** |
+| `SAME_AS` (music label→company · music artist→person) | **1** |
 | `FOUNDED` | **5** |
 | `MEMBER_OF` (music current) | **5** |
 | `BOARD_MEMBER_OF` | **8** |
@@ -1640,7 +1866,7 @@ Quick scan of all edge weights, sorted strongest → weakest within each scale.
 | `MENTOR` | **14** |
 | `AUTHORED` | 15-25 (recency-tiered) |
 | `CONTRIBUTED_TO` | 15-40 (recency-tiered) |
-| `INVESTED_IN` (person→company) | **15** |
+| `INVESTED_IN` (person→company, work-derived — defunct #2800 branch) | **15** |
 | `INVESTMENT_PARTNER_IN` | **15** |
 | `LEAD_INVESTED_IN` | **15** |
 | `COLLABORATED_WITH` | **15** |
@@ -1658,26 +1884,32 @@ Quick scan of all edge weights, sorted strongest → weakest within each scale.
 | `MEMBER_OF` | **20** |
 | `PLAYED_ON` | **20** |
 | `ENGINEERED` | **22** |
-| `HAS_EXPERTISE` | 10-50 (dynamic — `min(round(10 + match_score×80), 50)`) |
+| `HAS_EXPERTISE` | 10-50 (dynamic — matched `min(round(10 + match_score×160), 50)`; created-node edges fixed **10**) |
 | `SPECIALIZES_IN` | 10-50 (dynamic — matched `min(round(10 + match_score×160), 50)`; created-node edges fixed **10**) |
 | `IN_REGION` | **25** |
 | `INVESTED_IN` (Angel→funding round) | **25** |
+| `INVESTED_IN` (Angel→company, direct portfolio — #12830) | **25** |
 | `CERTIFIED_BY` | **25** |
 | `ISSUED_BY` | **25** |
+| `WON_AWARD` | **30** *(§3.6 — was 0.3)* |
+| `WORKED_ON` (credit \+ award contexts) | **30** *(§3.6 — was 0.5)* |
 | `RECORDING_OF` | **30** |
 | `RELEASE_OF` | **30** |
 | `HELD_AT` | **30** |
 | `HEADLINED` | **35** |
 | `RECORDED_AT` | **35** |
-| `ATTENDED_TOGETHER` | 35 / 50 / 70 (same major / field / overlap) |
+| `NOMINATED_FOR` | **35** *(§3.6 — was 0.7)* |
+| `ATTENDED_TOGETHER` | 35 / 70 (same field / overlap only) |
 | `VOLUNTEERED_AT` | 38 (current) / 50 (past) |
 | `ATTENDED` | **40** |
+| `HAS_AWARD` | **40** *(§3.6 — was 0.5)* |
 | `TRIBUTE_TO` | **40** |
 | `APPEARS_ON` | **45** |
 | `PERFORMED_AT` | **45** |
 | `IN_COUNTRY` | **50** |
 | `RELEASED_ON` | **50** |
 | `ON_RECORD_LABEL` | **55** |
+| `REGISTERED_FOR` | **65** (live-event registration, LSI path #12864) |
 | `FROM_AREA` | **70** |
 | `LOCATED_IN` | **70** to City / Region / State; **80** direct-to-Country *(§3.6)* |
 | `HAS_SUBDOMAIN` | **100** *(§3.6 hub damping)* |

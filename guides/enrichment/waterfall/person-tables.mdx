@@ -9,7 +9,11 @@ The Xano storage layer for the [Person Waterfall](/guides/enrichment/waterfall/p
 2. **One JSON column per provider.** `person_enrich_data` predates the later "raw payload in a field named `json`" convention — every provider gets its own named JSON column, and the phase functions gate on per-column emptiness.
 3. **Almost nothing is DB-unique.** Outside primary keys there is exactly **one** unique index among the waterfall-owned tables — `person_has_expertise (master_person_id, expertise_node_uuid)`; the Fundable BigQuery mirrors carry their own loader-side unique slug indexes (`linkedin_person_id` / `crunchbase_person_id` on #667). Everything else is procedural dedup: query-before-write inside sanctioned writers. A rebuild must reproduce the exact code-level dedup keys documented below; concurrent writers CAN race duplicates today (which is why the person merge tooling exists).
 
-Function behavior lives on [Person Waterfall Functions](/guides/enrichment/waterfall/person-functions); graph writes on [Nodes](/guides/enrichment/waterfall/person-nodes) and [Edges](/guides/enrichment/waterfall/person-edges); the queue's (inactive) drain on [Crons](/guides/enrichment/waterfall/person-crons). Schemas verified against live workspace 3 (branch v1), audit date 2026-07-02.
+Function behavior lives on [Person Waterfall Functions](/guides/enrichment/waterfall/person-functions); graph writes on [Nodes](/guides/enrichment/waterfall/person-nodes) and [Edges](/guides/enrichment/waterfall/person-edges); the queue's (inactive) drain on [Crons](/guides/enrichment/waterfall/person-crons).
+
+<Note>
+  **Last reviewed & updated: 2026-07-09** — schemas and indexes re-verified against live workspace 3 (branch `v1`) via the Metadata API.
+</Note>
 
 ## Table inventory
 
@@ -71,9 +75,7 @@ Function behavior lives on [Person Waterfall Functions](/guides/enrichment/water
 <Note>
   **`log_crash` is shared infrastructure, not person-specific.** Person-relevant `phase` enum values: `phase-0` through `phase-12` — one per orchestrator phase, written by the per-phase `try_catch` wrappers in `enrich-master-person` #13040 v3.23 (exception: phase 4b — `phase-4b` is not in the enum, so its crash rows omit the `phase` field and are found by `function_name` instead) — plus `webhook_post_process` (the deep-research webhook #8303 v1.1 fan-out). `phase` is a **strict enum — values outside the list fail at runtime.** The entry gate #13039 omits `phase` entirely; its step identity lives in `note` \+ `function_name`.
 
-  **Fixed on the person side too (2026-07-02):** cron **Task #126**'s catch block no longer writes `log_crash` with the out-of-enum `phase: "queue"`. Pre-fix, a queue-item crash would make the crash logger itself throw, swallowing the crash row _and_ skipping the `processing: false` release that follows it (wedging the queue row). The company twin Task #127 was repaired the same day. The broken path never fired in practice: the task ships `active = false`, and its manual "Run Now" drains had not hit a queue-item crash before the fix landed.
-
-  **Since 2026-06-30 `log_crash` is also the canonical kill-switch audit trail:** #13039 v1.13 removed the `kill_switch_blocked_people` side-write — blocked-person events land here and nowhere else.
+  **`log_crash` is also the canonical kill-switch audit trail** (since 2026-06-30): #13039 removed the `kill_switch_blocked_people` side-write — blocked-person events land here and nowhere else.
 </Note>
 
 ---
@@ -93,11 +95,12 @@ The person tables predate the conventions the [IMDB tables](/guides/enrichment/w
 - **Unique-key policy:** exactly one unique index among the waterfall-owned tables — `person_has_expertise (master_person_id, expertise_node_uuid)` (the Fundable mirrors #667 etc. have loader-side unique slugs). Queue idempotency, person dedup, contact dedup: all procedural.
 - **Default index** otherwise: `btree(created_at desc)` on nearly every table. Well-indexed exceptions: `master_link` (btrees on **both** FK sides), `master_avatar` (`master_person_id`), `master_email` (search index on `email_address`, `full_name`), `person_has_expertise` (five btrees \+ the unique pair).
 
-**The three index gaps** — the headline parity notes for a rebuilt store, all verified live 2026-07-02:
+**The four index gaps** — the headline parity notes for a rebuilt store, all verified live:
 
 1. **`master_person` #139 has no index on `linkedin_url` or `node_uuid`** — despite `linkedin_url` being a dedup-lookup key at multiple sites (the #13039 v1.6 pre-API dedup, the #13038 tier-4 fallback, #12997's normalized-LinkedIn dedup) and `node_uuid` being the graph bridge. Every one of those lookups is a sequential scan today.
 2. **`person_enrich_data` #500 has no index on `master_person_id`** — PK \+ `created_at` only, so every phase read of the payload stash scans.
 3. **`queue_enrich_person` #582 has no `unique(master_person_id)`** — queue idempotency lives entirely in `upsert-enrich-person` #12854. There is also no worker-pickup index (no IMDB-style composite `btree(processing, priority_tier, cascade_depth)`); every drain pick is a scan.
+4. **`education_experience` #230 has no `master_person_id` btree** — unlike its sibling `work_experience` #147, which has one; every education-resolver read scans (PK \+ `created_at desc` only).
 
 One more parity aside: `enrich_history_person` #160 lacks the `master_person_id` btree its company twin (`enrich_history_company` #404) has — the orchestrator's debounce query scans.
 
@@ -132,15 +135,15 @@ Every producer routes through #12854 (v1.1, 2026-06-03) — raw `db.add queue_en
 - **No row:** insert with `processing: false`, `count: 1`, the caller's depth/tier/`source_*` metadata.
 - Because there is no unique constraint, two concurrent upserts can still race a duplicate row — the get-then-write inside #12854 is the only guard.
 
-### Who writes here (post-containment)
+### Who writes here (controlled waterfall)
 
-The 2026-06-23 containment sweep removed **all** company enqueueing from person runs — person enrichment no longer writes `queue_enrich_company` at all. The full story is on the [overview](/guides/enrichment/waterfall/person-waterfall); the queue-facing consequence is that `queue_enrich_person` rows now come from a short producer list:
+Under the 2026-07-04/05 controlled-waterfall policy person runs write **`queue_enrich_company`** again — but only as depth-1 leaves (past employers via `resolve-edges-work` #12562, sparse non-primary Exa employers via #13031); schools and the selected current company **full-enrich inline instead of queueing**. The full story is on the [overview](/guides/enrichment/waterfall/person-waterfall). `queue_enrich_person` rows come from a short producer list:
 
 | Producer | What it queues | Depth / tier |
 | --- | --- | --- |
 | `master-person-new` #13039 | Any call with `queue: true` or `cascade_depth > 0` (existing **and** new people) upserts instead of direct-dispatching | Caller-specified |
-| `resolve-investors-edges` #12702 (opt-in deal cascade) | Co-angels \+ VC partners on a seed person's deals — **only** when phase 9 ran with `allow_investor_network_cascade: true` at depth 0 | Depth 1, tier 1 |
-| Company-waterfall seed-only people fanout | YC founders / partner, Fundable investor partners discovered by a **seed company** run | Depth 1, tiers 1–2 |
+| `resolve-investors-edges` #12702 (company-side deal cascade) | Co-angels \+ VC partners on a deal — driven by the company waterfall's deal walker (#12703 → #12856); the person phase 9 now writes direct portfolio edges instead of cascading | Depth 1, tier 1 |
+| Company-waterfall seed-only people fanout | YC founders / partner, Fundable investor partners discovered by a **seed company** run | Depth 1, tier 1 |
 | Seed / backfill tasks | Task #155 `seed-fundable-people` (via #12853) · Task #156 `backfill-empty-pdl-people` · Task #179 divergent-LP seeding — all routed through #12854 | Depth 0, tier 1 |
 
 Deliberately **not** here: company-seed Exa C-suite people (direct-dispatched into #13040 with `current_company_only: true`), music-resolved people (minted synchronously via #13039 by #13121), and film & TV people (their own `queue_imdb_person` #706).
@@ -154,15 +157,15 @@ flowchart TD
     B -->|no| D["Insert: processing false, count 1"]
     C --> E["Row waits — automatic drain is OFF live"]
     D --> E
-    E --> F["Task #126 tick (600s): pick 1 row<br/>priority_tier asc, cascade_depth asc, id asc"]
+    E --> F["Task #126 tick (600s): pick 1 row<br/>WHERE processing = false AND priority_tier ≤ 1<br/>sorted priority_tier, cascade_depth, id"]
     F --> G["Lock: processing = true"]
     G --> H["enrich-master-person #13040<br/>{master_person_id, deep_research, cascade_depth}"]
     H -->|success| I["Delete row"]
-    H -->|crash| J["Release: processing = false + log_crash<br/>⚠️ phase: 'queue' — not in the enum, logger itself throws"]
+    H -->|crash| J["Release: processing = false + log_crash"]
 ```
 
 <Warning>
-  **Nothing drains this queue automatically today.** The only scheduled drain, cron **Task #126 `process-person-queue`**, ships `active = false` (verified live 2026-07-02; freq 600s, datasource live). When active it processes **one row per tick** (max 6 people/hour), sorted `priority_tier asc, cascade_depth asc, id asc`, locking `processing = true`, dispatching `{master_person_id, deep_research, cascade_depth}` into #13040, and deleting the row only after success. Its failure path was repaired on 2026-07-02 — the catch no longer writes `log_crash` with the out-of-enum `phase: "queue"` (same fix as company Task #127). Full task card: [Person Waterfall Crons](/guides/enrichment/waterfall/person-crons).
+  **Nothing drains this queue automatically today.** The only scheduled drain, cron **Task #126 `process-person-queue`**, ships `active = false` (freq 600s, datasource live). When active it processes **one `priority_tier <= 1` row per tick** (max 6 people/hour — the 2026-07-03 tier gate leaves lower-priority rows to tier escalation or the operator drain), sorted `priority_tier asc, cascade_depth asc, id asc`, locking `processing = true`, dispatching `{master_person_id, deep_research, cascade_depth}` into #13040, and deleting the row only after success. Full task card: [Person Waterfall Crons](/guides/enrichment/waterfall/person-crons).
 </Warning>
 
 - **Operator batch drain** — `process-enrichment-queue` #12816 (v1.1, 2026-06-03) serves **both** the person and company queues: kill-switch checks first, candidate pick by `priority_tier asc`, `max_tier` / `max_depth` / `min_count` filters, then the same lock → sync orchestrator → delete pattern, routed through the gated orchestrators so depth policy applies to queued leaves. The full calling contract (incl. the `min_count: 0` null-break trap) is on [Company Waterfall Tables](/guides/enrichment/waterfall/company-tables) — linked, not duplicated. In practice this endpoint plus "Run Now" on #126 are how the person queue is drained today.
@@ -246,7 +249,7 @@ Per-person raw-payload stash — every provider response lands here as untouched
 
 | Column | Best-known provenance |
 | --- | --- |
-| `exa_search` | Exa search-lane stash (separate from the cascade's `exa` match object) |
+| `exa_search` | Exa search-lane stash (separate from the cascade's `exa` match object) — since 2026-07-06 also carries `fiber_email`, the audited Exa Fiber fallback attempt (#13039 v1.15) |
 | `scrapecreator_person` | ScrapeCreators LinkedIn person scrape — dispatched from `create-master-link`'s LinkedIn branch |
 | `fundable` | Fundable person payload stash from the Fundable match path |
 | `linkedin_profile` | Legacy LinkedIn payload — still **read** by phase 2's location cascade (`enrich_layer_data.location_str` → `linkedin_profile.location` → PDL) |
@@ -266,7 +269,7 @@ The cascade stashes are written at exactly two places in #13039, and the split m
 
 ### FullEnrich lifecycle
 
-`full_enrich` is asynchronous by design: #13039 dispatches `full-enrich-reverse-email-lookup` #13036 (v1.4 — `custom` carries `person_enrich_data_id`, `data_source`, `current_company_only`, `cascade_depth`; `name` encodes `ped__{id}__{data_source}__{email}`), and webhook `webhook/contact-finished` #8594 (v1.9) writes back. Per item, #8594 refuses empty `custom.data_source` (v1.8 emergency guard), sets the datasource, edits `full_enrich`, then **waits for `enrich_history_person.processing = false`** (30s grace / 30-min deadline, v1.7) before calling `process-full-enrich` #13049 — which applies the payload and re-dispatches #13040 with `force_run: true`. Response counters: `{matched_ped, processed, wait_timeouts, skipped, refused_no_data_source}`. _(The old docs' `email_enrich_fallback` branch and `matched_eef` counter were dropped in #8594 v1.6 — no table by that name exists in workspace 3.)_
+`full_enrich` is asynchronous by design: #13039 dispatches `full-enrich-reverse-email-lookup` #13036 (v1.4 — `custom` carries `person_enrich_data_id`, `data_source`, `current_company_only`, `cascade_depth`; `name` encodes `ped__{id}__{data_source}__{email}`), and webhook `webhook/contact-finished` #8594 (v1.9) writes back. Per item, #8594 refuses empty `custom.data_source` (v1.8 emergency guard), sets the datasource, edits `full_enrich`, then **waits for `enrich_history_person.processing = false`** (30s grace / 30-min deadline, v1.7) before calling `process-full-enrich` #13049 (v1.10) — which applies the payload and re-dispatches #13040 with `force_run: true`. Response counters: `{matched_ped, processed, wait_timeouts, skipped, refused_no_data_source}`.
 
 ---
 
@@ -320,7 +323,7 @@ The four contact tables share the dual-FK shape (`master_person_id` \+ `master_c
 
 | Table | ID | Live writer | Code dedup key | Notes |
 | --- | :-: | --- | --- | --- |
-| `master_link` | #166 | `create-master-link` #2541 (v1.3) | Normalized `link_url` | The best-indexed table in the family (btrees on both FKs). See below for scraper fan-out |
+| `master_link` | #166 | `create-master-link` #2541 (v1.8) | **Lowercased** normalized `link_url`, scoped per owner (v1.7/v1.8 — the same URL can attach to a Person and separately to a Company) | The best-indexed table in the family (btrees on both FKs). See below for scraper fan-out |
 | `master_email` | #155 | `add-person-email` #2784 (v1.2) | `email_address` (lowercased by the input validator) per person | `email_type` enum default `work`; `orbiter_verified` written only for **user-supplied** input emails — PDL-discovered emails always stay `false`. Search index on (`email_address`, `full_name`) |
 | `master_phone` | #151 | `add-person-phone` #2783 (v1.1) | The **LLM-formatted** E.164 `phone_number` (via `llm-phone-format` #2540), not the raw input | `phone_type` enum default `mobile`; `connected_only` default **true**, required; carries the name fields #13038's name-aware match reads |
 | `master_avatar` | #227 | `replace-avatar` #237 (v4.2) · `create-placeholder-avatar` #1832 (v1.3) | #1832 dedups by `original_source_url` | See below. btree on `master_person_id` — no `updated_at` column |
@@ -329,7 +332,7 @@ The four contact tables share the dual-FK shape (`master_person_id` \+ `master_c
 
 Columns: `id`, `created_at`, `updated_at`, both FKs, `service` / `service_label` / `icon_url`, `link_url`, `profile` (bool), `data_source_id` (legacy), `created_by_user_id`, `source`. **Indexes:** PK · btree `created_at desc` · btree `master_company_id` · btree `master_person_id`.
 
-`create-master-link` #2541 normalizes and dedups the URL, then its per-domain branches **launch async scraper enrichment**: LinkedIn (→ ScrapeCreators \+ sets `master_person.linkedin_url`), Twitter/X (→ `scrape-twitter-person` #2106 v1.10), Crunchbase, YouTube, Facebook, IMDB. Since **v1.3 (2026-06-22)** a `suppress_downstream` input guards **all 9** async dispatch sites, and #13039 v1.10 passes it whenever `hold_downstream` is set or `cascade_depth > 0` — scraper fan-out is suppressed on contained paths. _(The old note that "table-level triggers fire anyway under `hold_downstream`" is obsolete.)_
+`create-master-link` #2541 normalizes, lowercases, and dedups the URL per owner, then its per-domain branches **launch async scraper enrichment**: LinkedIn (→ ScrapeCreators \+ sets `master_person.linkedin_url`), Twitter/X (→ `scrape-twitter-person` #2106 v1.11), Crunchbase, YouTube, Facebook, IMDB (person `imdb.com/name` links dispatch `add-imdb-to-master-person` #10509 synchronously since v1.5). Since **v1.3 (2026-06-22)** a `suppress_downstream` input guards **all 9** async dispatch sites, and #13039 v1.10 passes it whenever `hold_downstream` is set or `cascade_depth > 0` — scraper fan-out is suppressed on contained paths.
 
 Source attribution: EL links are written **first**, so `"Enrich Layer"` wins when a URL appears in multiple sources (dedup is by normalized URL); PDL profile URLs write `"People Data Labs"`; Fundable profile URLs (LinkedIn / Crunchbase / X / Tracxn / CB Insights / PitchBook) write `"Fundable"`; caller-supplied URLs keep `$input.source`.
 
@@ -345,7 +348,7 @@ Source attribution: EL links are written **first**, so `"Enrich Layer"` wins whe
 | `is_placeholder` | bool, **default true** | ⚠️ Real avatars must explicitly write `false` — port the inverted default |
 | `source` | text | Text attribution (`"UI Avatars"`, `"Enrich Layer"`, `"LinkedIn"`, …) |
 
-- **`replace-avatar` #237 (v4.2)** — priority-based replacement: a candidate only displaces the current `main` when its source ranks higher. Priority order **LinkedIn \> Signal NFX \> PDL \> Twitter \> …** (originally keyed on legacy `data_source` ids 11 / 64 / 91 / 7; **v4.2 dropped the int input — attribution is text-source-only now**).
+- **`replace-avatar` #237 (v4.12, 2026-07-08)** — priority-based replacement: a candidate only displaces the current `main` when its source ranks higher. Live text-source priority order: **Signal NFX \> LinkedIn / ScrapeCreators LinkedIn \> Serper \> Fundable / other \> Twitter** (v4.2 dropped the legacy `data_source` int input — attribution is text-source-only). The v4.9–v4.12 wave blocks provider placeholder images, LinkedIn cover/background banners, and LinkedIn company logos from becoming main person avatars, and makes duplicate-URL source attribution priority-aware.
 - **`create-placeholder-avatar` #1832 (v1.3, 2026-05-25)** — UI Avatars initials image → webp → GCS → `master_avatar` insert with `source: "UI Avatars"` per the #237 v3\+ text scheme. _(The body carries an unversioned inline "v1.4" comment; the header stops at v1.3.)_
 - **`find-avatar` #12846 (v1.3)** — Serper.dev image search, called from `add-person-node` #2601 **before** the placeholder fallback; #2601 v2.0 made the whole avatar step best-effort (try/catch, non-blocking). The temp avatar backfill (Task #161 → #12886) walks `master_person` with a `backfill_cursor` #708 cursor through the same #12846 → #237 chain.
 
@@ -380,7 +383,7 @@ Shared person/company thesis table — exactly one FK side is real per row, and 
 
 ### Fundable inputs
 
-The phase-9 deal cascade reads two mirror tables directly: `fundable_people` #667 (unique `linkedin_person_id` \+ `crunchbase_person_id` slugs; `master_person_id` backlink written by `link-fundable-person` #12793 and the seed task #155) and `fundable_angel_investments` #679 (angel person→deal join, btrees on `person_id` / `deal_id`, no unique pair) — each row routed through `cascade-deal-participants` #12856 (v1.6, 2026-07-02 — the `first_notnull` depth-guard repair) **only** under the opt-in gate (`allow_investor_network_cascade: true` AND depth 0). Full mirror-family schemas: [Company Waterfall Tables → Fundable mirror family](/guides/enrichment/waterfall/company-tables#fundable-mirror-family).
+Phase 9 reads two mirror tables directly: `fundable_people` #667 (unique `linkedin_person_id` \+ `crunchbase_person_id` slugs; `master_person_id` backlink written by `link-fundable-person` #12793 and the seed task #155) and `fundable_angel_investments` #679 (angel person→deal join, btrees on `person_id` / `deal_id`, no unique pair). Since the 2026-07-02 D-series rework each angel-investment row becomes a **direct `(Person)-[:INVESTED_IN w25]->(Company)` edge** (default-on for depth-0 angels; `allow_investor_network_cascade: false` suppresses) — the full deal cascade `cascade-deal-participants` #12856 runs from the **company side** only. Full mirror-family schemas: [Company Waterfall Tables → Fundable mirror family](/guides/enrichment/waterfall/company-tables#fundable-mirror-family).
 
 ---
 
@@ -410,7 +413,7 @@ Relational projection of `HAS_EXPERTISE` graph edges — one row per `(master_pe
 
 **Indexes:** primary `id` · btrees on `master_person_id`, `person_node_uuid`, `domain_expertise_id`, `sub_domain_expertise_id`, `expertise_node_uuid` · **unique (`master_person_id`, `expertise_node_uuid`)**.
 
-**Writer:** `upsert-person-has-expertise` #12925 (v1.2, 2026-07-02 — fixed the two-arg `|concat` mis-render, added the dedupe guards), called by `resolve-person-expertise-v2` #12926 (v2.4) after every `HAS_EXPERTISE` MERGE. Also written by the music credit-expertise emitter path (#13160 → #12926), which the unique pair keeps idempotent.
+**Writer:** `upsert-person-has-expertise` #12925 (v1.2, 2026-07-02 — fixed the two-arg `|concat` mis-render, added the dedupe guards), called by `resolve-person-expertise-v2` #12926 (v2.8) after every `HAS_EXPERTISE` MERGE. Also written by the music credit-expertise emitter path (#13160 → #12926), which the unique pair keeps idempotent. Since 2026-07-06, `llm-identify-person-expertise` #12666 **clears the person's rows here** alongside its `HAS_EXPERTISE` edge delete on every re-resolution, so the table mirrors the current graph edge set.
 
 <Warning>
   **Stale weight comment — do not propagate.** The live `weight` column description (and #12925's input doc) still reads `min(round(10 + score*80), 50)`. The **live formula** in resolver #12926 v2.4 is `min(round(10 + score × 160), 50)` for matched edges and a flat **10** for created ones; `expertise_strength` (0–100, depth\+recency\+duration) is a separate edge property, not this weight. Canonical detail: [Person Edges](/guides/enrichment/waterfall/person-edges).
@@ -462,11 +465,11 @@ Tables the person waterfall writes or feeds that are canonically documented else
 
 ### `work_experience` (#147)
 
-Work rows from every provider — the input `resolve-edges-work` #12562 and `choose-best-current-role` #12621 read. Written by phase 3 (PDL), `process-enrich-layer` #12615, phase 4b #13031 (Exa), and `process-full-enrich` #13049 (deduped on write). Notable columns: `company_name` / `company_domain` / `company_linkedin_url` (the resolution keys), **text-typed** `start_day/month/year` \+ `end_day/month/year` (do not parse as ints blindly), `current` (bool), `edge_uuid` (graph writeback from `create-work-edges` #2800 — v1.8 made a null `edge_uuid` retryable), `triples_created_at`, dual provenance, and two self-documented deprecations (`main` — "depreciated??", `linkedin_company_id` — "depreciated!!"). btree on `master_person_id`.
+Work rows from every provider — the input `resolve-edges-work` #12562 and `choose-best-current-role` #12621 read. Written by phase 3 (PDL), `process-enrich-layer` #12615, phase 4b #13031 (Exa — routed through `add-position-record` #12608 since v1.7 so mixed-source duplicates update instead of multiplying), and `process-full-enrich` #13049 (deduped on write). Notable columns: `company_name` / `company_domain` / `company_linkedin_url` (the resolution keys), **text-typed** `start_day/month/year` \+ `end_day/month/year` (do not parse as ints blindly), `current` (bool), `edge_uuid` (graph writeback from `create-work-edges` #2800 — a null `edge_uuid` is retryable, and #12562 v1.13 copies the canonical edge uuid onto duplicate source rows), `triples_created_at`, dual provenance, and two self-documented deprecations (`main` — "depreciated??", `linkedin_company_id` — "depreciated!!"). btree on `master_person_id`.
 
 ### `education_experience` (#230)
 
-Education rows — the `resolve-edges-education` #12560 input. `school_name` / `linkedin_url` / `school_domain` resolution keys, **list-typed** `field_of_study` / `degree_name` / `activities_societies`, int-typed `start/end_month/year` (unlike #147's text dates), `edge_uuid` writeback, `master_company_id` set once the school resolves. btree on `master_person_id`.
+Education rows — the `resolve-edges-education` #12560 input (also written by phase 4b #13031 v1.12, which materializes Exa `educationHistory` here). `school_name` / `linkedin_url` / `school_domain` resolution keys, **list-typed** `field_of_study` / `degree_name` / `activities_societies`, int-typed `start/end_month/year` (unlike #147's text dates), `edge_uuid` writeback, `master_company_id` set once the school resolves. **No `master_person_id` btree** (index gap #4) — PK \+ `created_at desc` only.
 
 ### `about_person` (#365)
 

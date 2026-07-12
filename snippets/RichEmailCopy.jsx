@@ -14,7 +14,7 @@ export const RichEmailCopy = ({ text }) => {
   const normalized = normalize(text);
   const boldLines = new Set([
     "Recent highlights",
-    "When Can I Get Access?",
+    "When Can You Get Access?",
     "Fundraising Status & Strategy",
     "Here is the illustrative paper value for each of you individually:",
     "For both of you combined:",

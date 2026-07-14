@@ -21,15 +21,44 @@ export const RichEmailCopy = ({ text }) => {
   ]);
 
   const renderInline = (line, paragraphIndex, lineIndex) =>
-    line.split(/(https?:\/\/[^\s)]+)/g).filter(Boolean).map((part, partIndex) =>
-      part.startsWith("http://") || part.startsWith("https://") ? (
-        <a key={`${paragraphIndex}-${lineIndex}-${partIndex}`} href={part}>
-          {part}
-        </a>
-      ) : (
-        <span key={`${paragraphIndex}-${lineIndex}-${partIndex}`}>{part}</span>
-      )
-    );
+    line
+      .split(/(\[[^\]]+\]\(https?:\/\/[^\s)]+\)|https?:\/\/[^\s)]+)/g)
+      .filter(Boolean)
+      .map((part, partIndex) => {
+        const markdownLink = part.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/);
+
+        if (markdownLink) {
+          return (
+            <a key={`${paragraphIndex}-${lineIndex}-${partIndex}`} href={markdownLink[2]}>
+              {markdownLink[1]}
+            </a>
+          );
+        }
+
+        return part.startsWith("http://") || part.startsWith("https://") ? (
+          <a key={`${paragraphIndex}-${lineIndex}-${partIndex}`} href={part}>
+            {part}
+          </a>
+        ) : (
+          <span key={`${paragraphIndex}-${lineIndex}-${partIndex}`}>{part}</span>
+        );
+      });
+
+  const renderLine = (line, paragraphIndex, lineIndex) => {
+    const namedListItem = line.match(/^- ([^(]+?)(?= \()/);
+
+    if (namedListItem) {
+      return (
+        <>
+          <span>- </span>
+          <strong style={{ fontWeight: 700 }}>{namedListItem[1]}</strong>
+          {renderInline(line.slice(namedListItem[0].length), paragraphIndex, lineIndex)}
+        </>
+      );
+    }
+
+    return renderInline(line, paragraphIndex, lineIndex);
+  };
 
   const paragraphs = normalized.split(/\n\s*\n/);
 
@@ -133,9 +162,9 @@ export const RichEmailCopy = ({ text }) => {
                 {lines.map((line, lineIndex) => (
                   <span key={lineIndex}>
                     {lineIndex === 0 && shouldBoldFirstLine ? (
-                      <strong style={{ fontWeight: 700 }}>{renderInline(line, paragraphIndex, lineIndex)}</strong>
+                      <strong style={{ fontWeight: 700 }}>{renderLine(line, paragraphIndex, lineIndex)}</strong>
                     ) : (
-                      renderInline(line, paragraphIndex, lineIndex)
+                      renderLine(line, paragraphIndex, lineIndex)
                     )}
                     {lineIndex < lines.length - 1 ? <br /> : null}
                   </span>

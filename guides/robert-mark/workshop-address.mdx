@@ -120,32 +120,41 @@ Normalization for tiers 2–3: lowercase, trim, collapse whitespace, strip punct
 
 **Uniqueness:** composite unique index on `(master_person_id, master_company_id, natural_key)` — two people at the same address must remain legal. The null-vs-`0` FK defaults must be coalesced consistently (today `master_person_id` defaults to `0` but `master_company_id` to null) so blank owners actually collide.
 
-### Writer inventory — what must change
+### Field name — keep `natural_key`? (open, recommendation: keep)
 
-| Writer | ID | Current dedupe | Change |
+- **Keep `natural_key` (recommended):** it is the locked column name in the [Universe ↔ Backend sync design](/guides/open-work/backend-refactor-tables) across all four facet tables (`master_email` / `master_phone` / `master_link` / `master_address`) — the generic upsert machinery keys on `(node_uuid, natural_key)`, and one uniform name is what makes the apply endpoint generic. It's also the standard DB term for a domain-derived key (vs the surrogate `id`).
+- **`canonical_address`:** self-describing on this table, but per-table naming breaks the generic sync apply, and "canonical" already means something else on `master_link` (canonical URL normalization).
+- **`dedupe_key` / `identity_key`:** clearer intent for app developers — viable only as a uniform rename across all four facet tables in the sync design, not an address-only name.
+
+### Writer inventory — enrichment waterfalls only
+
+<Note>
+**Scope narrowed (2026-07-15):** only `master_address` writers reachable from the enrichment waterfalls are in scope. User-facing app paths (`create-person-address-join` 4654, `create-company-address-join` 4653, `POST /master-addresses` API 3110, `PUT /master-addresses/{id}` API 3112) and the merge orchestrators keep their current behavior — later phase.
+</Note>
+
+Verified against live XanoScript (2026-07-15): **every enrichment write to `master_address` funnels through one choke point — `mvp/address/add-company-address` (2451)**. And the person waterfall never writes `master_address` at all: `mvp/address/add-person-primary-location` (2766) geocodes via Radar and writes graph location nodes / `primary_location` via `mvp/node/primary-location-nodes-edges_v2` — so this change is **company-pipeline-only**.
+
+| Writer | ID | Path into master\_address | Change |
 | --- | --- | --- | --- |
-| `mvp/address/build-address-natural-key` | **new** | — | Single helper that computes the key; every writer calls it |
-| `mvp/address/add-company-address` | 2451 | city + state per company | Compute key from Radar components; upsert on it; recompute in the update branch |
-| `mvp/address/bulk-add-company-address` | 2452 | inherits 2451 | None directly (inherits) |
-| `mvp/address/create-person-address-join` | 4654 | raw `formatted_address` per person | Compute key (Radar components when geocode succeeds, `fmt:` tier otherwise); upsert |
-| `mvp/address/create-company-address-join` | 4653 | same shape as 4654 | Same change |
-| `mvp/enrich/apply-company-llm-payload` | 12989 | HQ + other locations via 2451 | None directly (inherits) |
-| `mvp/enrich/process-company-phase-5` | 12809 | Fundable address backfill via 2451 | None directly (inherits) |
-| `POST /master-addresses` | API 3110 (group 353) | delegates to join helpers | None directly (inherits) |
-| `PUT /master-addresses/{master_address_id}` | API 3112 | edits components directly, **no dedupe** | Recompute `natural_key` after edit; on unique violation, merge into the existing row instead of saving |
-| `merge/person-v2` / `merge/company-v2` | 12945 / 12956 | merge-time address dedup (own logic) | Switch the compare to `natural_key` |
+| `mvp/address/build-address-natural-key` | **new** | called by 2451 | Create — single implementation of the key |
+| `mvp/address/add-company-address` | 2451 | **the sink** — Radar geocode, then dedupe on `(company, city, state_region)` | **The only edit** — compute key from Radar components, upsert on it, recompute in the update branch |
+| `mvp/address/bulk-add-company-address` | 2452 | foreach → 2451 | None (inherits) |
+| `mvp/enrich/apply-company-llm-payload` | 12989 | Company\_LLM HQ + other locations → 2451 | None (inherits) |
+| `mvp/enrich/process-company-phase-5` | 12809 | Fundable HQ string → 2451 (`source: "Fundable"`) | None (inherits) |
+
+Implementation surface for this pass: **one new helper + one function edit.**
 
 ### Backfill & rollout order
 
 1. **Add columns** `natural_key` (text) + optional `place_id` (text) — via the Xano UI, *not* the MCP full-schema replace (drops `trim` validators) and never `xano workspace push`.
-2. **Ship the helper** and wire all writers to compute-on-write. No constraint yet — old and new rows coexist.
+2. **Ship the helper** and wire 2451 to compute-on-write. No constraint yet — old and new rows coexist.
 3. **Backfill** existing rows in batches (rows with geocoded components → `cmp:` tier; rest → `fmt:` tier). Row volume: TBD, measure before running.
 4. **Collision report** — group by `(owner, natural_key)`; merge duplicates keep-oldest and repoint `my_person_address_join` (310), `my_company_address_join` (314), `my_address_notes` (293).
-5. **Create the unique index** only after the collision report is clean — index creation fails on existing dupes.
-6. **Flip writers to upsert semantics** (early-return paths still bump counters, per the queue upsert convention).
+5. **DB unique index: deferred.** With user-facing writers out of scope, a table-wide unique constraint would make `PUT /master-addresses/{id}` (3112) and the join helpers fail on violation. This pass runs `natural_key` as an **application-level upsert key inside 2451** plus a recurring collision report; the DB constraint lands when the app writers are updated in the later phase.
 
 ### Open questions
 
+- Field name: keep `natural_key` (recommended, see above) or rename uniformly across the four facet tables?
 - Keep `unit` in the key? (Recommend yes — two units in one building are distinct addresses.)
 - Countries without postal codes and PO boxes — does the component normalization need per-country rules, or is best-effort fine at current data quality?
 - Backfill geocoding for never-geocoded rows (costs Radar calls per row) or accept `fmt:` keys until a row is next touched?
@@ -156,6 +165,7 @@ Normalization for tiers 2–3: lowercase, trim, collapse whitespace, strip punct
 **Decisions (workshop only — no Xano changes made yet):**
 
 1. **2026-07-15 — `master_address.longitude` / `latitude` → `decimal`.** Align with `primary_location`. Open follow-ups: inventory the functions that write these columns as strings; decide whether to go further to `geo_point` (single field, unlocks spatial indexes and radius / nearest-neighbor queries).
-2. **2026-07-15 — `natural_key` dedupe column: scoped, pending sign-off.** See the scope section above — tiered normalized key, composite unique index, 6-step rollout. Also resolves the sync-design open question (place_id vs component hash → component hash now, `pid:` tier reserved).
+2. **2026-07-15 — `natural_key` dedupe column: scoped, pending sign-off.** See the scope section above — tiered normalized key, composite unique index, staged rollout. Also resolves the sync-design open question (place_id vs component hash → component hash now, `pid:` tier reserved).
+3. **2026-07-15 — scope narrowed to enrichment-waterfall writers.** Only the company waterfall writes `master_address` (all through `add-company-address` 2451; the person waterfall writes `primary_location` instead). User-facing app paths and merge orchestrators deferred; DB unique constraint deferred with them — `natural_key` runs as an application-level upsert key in 2451 for this pass. Field name kept as `natural_key` pending sign-off (recommendation: keep, for sync-design uniformity).
 
 _Further proposed changes, decisions, and open questions to be added as the workshop continues._

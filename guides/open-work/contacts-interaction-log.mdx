@@ -59,6 +59,7 @@ CREATE TABLE contacts_interaction_log (
 
   -- app-feature counts (PLACEHOLDERS — features not yet deployed; stay 0)
   total_in_app_chat_threads INTEGER NOT NULL DEFAULT 0,
+  chat_interactions         INTEGER NOT NULL DEFAULT 0,
   total_leverage_loops      INTEGER NOT NULL DEFAULT 0,
   total_leverage_loop_assists INTEGER NOT NULL DEFAULT 0,
 
@@ -97,7 +98,8 @@ CREATE INDEX idx_cil_user_last_opened  ON contacts_interaction_log (user_id, las
 | `distinct_meeting_series` | Count of unique series masters + one-off events — "how many separate times did we decide to meet." A weekly standing 1:1 counts once here, ~50/yr in `total_meetings`. The better relationship-strength signal. |
 | `opened` | Times the user opened this contact in the side panel. **App-incremented**, not recomputable — there is no raw open-event log. |
 | `last_opened_at` | Timestamp of the most recent side-panel open. |
-| `total_in_app_chat_threads` | **Placeholder.** In-app (user↔contact) chat threads. The chat feature is not yet deployed — see [placeholder columns](#placeholder-columns--features-not-yet-deployed). |
+| `total_in_app_chat_threads` | **Placeholder.** Distinct in-app chat threads (Stream channels) the user and contact share. Feature not yet deployed — integration design in [In-app chat source](#in-app-chat-getstream--planned-source). |
+| `chat_interactions` | **Placeholder.** Total messages **posted by the contact** in shared in-app chat threads — their engagement toward the user, not the user's own posts. |
 | `total_leverage_loops` | **Placeholder.** Generic one-click leverage loops involving this contact. The user-facing feature is not yet implemented. |
 | `total_leverage_loop_assists` | **Placeholder.** Purpose-specific leverage loops — created to help with something specific, as opposed to the one-click generic loop counted above. |
 | `linkedin_connected_on` | LinkedIn connection date, from the LinkedIn import (`linkedin_csv.connected_on` 259 / `linkedin_connection_join.date_connected` 258). Domain time. |
@@ -111,9 +113,9 @@ Subset invariants (assert in tests, and after every backfill): `total_meetings_a
 ### Placeholder columns — features not yet deployed
 
 <Note>
-`total_in_app_chat_threads`, `total_leverage_loops`, and `total_leverage_loop_assists` are **schema placeholders**. They count app features that have not shipped yet — the columns are reserved now so adding them later doesn't need a migration, and they stay `0` until the features deploy.
+`total_in_app_chat_threads`, `chat_interactions`, `total_leverage_loops`, and `total_leverage_loop_assists` are **schema placeholders**. They count app features that have not shipped yet — the columns are reserved now so adding them later doesn't need a migration, and they stay `0` until the features deploy.
 
-- **`total_in_app_chat_threads`** — threads in the upcoming in-app (user↔contact) chat. No source table exists yet; this is *not* the copilot chat (`conversations` 636 / `copilot_chat_messages` 637).
+- **`total_in_app_chat_threads`** / **`chat_interactions`** — the upcoming in-app (user↔contact) chat, built on GetStream. This is *not* the copilot chat (`conversations` 636 / `copilot_chat_messages` 637). The source design is committed — see [In-app chat source](#in-app-chat-getstream--planned-source) — it just waits on the feature.
 - **`total_leverage_loops`** — the generic **one-click** leverage loop a user fires for a contact.
 - **`total_leverage_loop_assists`** — leverage loops created to **help with something specific**, as opposed to the generic one-click loop. Loops and assists are disjoint counts, not a subset.
 
@@ -256,6 +258,38 @@ Each change must land in **both ingest paths** — the webhook handlers *and* th
 |---|---|---|
 | `calendar_event_activity` (598) | `is_recurring` bool | Recurring counts already work via the `events.master_event_id` (221 → 222) join; carrying the flag on 598 just saves the join in the cron's hot path. |
 
+## In-app chat (GetStream) — planned source
+
+In-app user↔contact messaging will run on [Stream Chat](https://getstream.io/chat/docs/). The counting pattern is identical to email: Stream is the transport, but the cron **never calls the Stream API** — a webhook-fed activity table is the source of truth, exactly like the Nylas rule above.
+
+### New activity table: `chat_activity`
+
+Mirror of `email_activity`, fed by Stream webhooks:
+
+| Column | From the Stream event |
+|---|---|
+| `user_id`, `my_person_id` | Resolved from the Stream user ids of the channel members (provision Stream users with Orbiter `user.id` as the Stream user id so this mapping is a lookup, not an inference). |
+| `channel_cid` | `cid` — Stream's channel identifier; the thread key. Use Stream **distinct channels** for 1:1 DMs so the same pair always maps to the same `cid`. |
+| `message_id` | `message.id` — idempotency key for webhook retries (unique index). |
+| `direction` enum `sent \| received` | `message.user` vs the channel counterpart — same direction convention as the email table. |
+| `message_ts` | `message.created_at`. |
+
+Subscribe to `message.new` (and `message.deleted` if deleted messages should un-count). The webhook payload carries the message, sender, `cid`, and the channel member list — members are truncated at 50, which is irrelevant for 1:1 DMs but means group-channel support later should read membership from our own channel record, not the event payload.
+
+### Counting rules (cron, local SQL over `chat_activity`)
+
+- `total_in_app_chat_threads` = `COUNT(DISTINCT channel_cid)` for the pair.
+- `chat_interactions` = count of rows with `direction = 'received'` — messages the **contact** posted. Deliberately one-directional: it measures their engagement toward the user. If a `to`/`from` split like email ever matters, add columns; don't redefine this one.
+- Chat timestamps feed `first_known_interaction` and any future `last_direct_interaction` the same as email and calendar.
+
+### What Stream gives us (verified against their docs)
+
+- **Webhooks** with per-event selection, HMAC `X-Signature` verification, and full message + sender + channel context on `message.new` — everything the ingest handler needs.
+- **Distinct channels** — stable 1:1 channel identity without managing our own channel ids.
+- **Export Channels API** — async job (`task_id` polling) with `messages_since` / `messages_until`, up to 25 channels per request. This is the one-time historical backfill path **only if** webhooks weren't enabled from day one. Enable the webhook before the chat feature launches and no backfill ever exists — the export API stays unused.
+
+The Stream event payload should also land raw in a log table (the `nylas_message_read_logs` pattern) for replay/debugging.
+
 ## Retirement note
 
 Once this table is populated and the side panel reads from it, the legacy rollup columns on `contacts` (128) — `total_email_activity`, `total_remote_events`, `total_irl_events` — become retirement candidates. Same rule as the Known [pending retirements](/guides/known/index#pending-retirements): confirm a 30-day window of zero readers before dropping. Do not remove them in the build pass.
@@ -268,4 +302,4 @@ Once this table is populated and the side panel reads from it, the legacy rollup
 | Rolling windows (`emails_last_90d` etc.) | Not in v1 | If the side panel ever shows "active recently" — the Known docs' [time-bucketing rationale](/guides/known/scope/counts#why-time-bucketed) applies here identically |
 | `opened` durability | Increment-only, unrecoverable | Add an open-event log if the count starts driving anything that matters |
 | Historical `orbiter_connected_at` backfill | Best-effort | When the `contacts.connected_at` column lands |
-| Placeholder columns (`total_in_app_chat_threads`, `total_leverage_loops`, `total_leverage_loop_assists`) | Reserved in schema, always 0, no writer | When in-app chat / leverage loops ship — define source, counting rule, and writer per column |
+| Placeholder columns (`total_in_app_chat_threads`, `chat_interactions`, `total_leverage_loops`, `total_leverage_loop_assists`) | Reserved in schema, always 0, no writer | Chat pair: source design committed (GetStream → `chat_activity`), waits on the chat feature — enable the Stream webhook **before launch** so no backfill is ever needed. Loop pair: define source + rules when the feature ships |

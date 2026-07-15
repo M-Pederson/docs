@@ -25,9 +25,13 @@ This page is a working document to decide whether the address tables and their s
 
 ## master\_address — schema (table 164)
 
-<Check>
-**Applied 2026-07-15:** `master_address.longitude` and `latitude` are now `decimal`, matching `primary_location`. Writers pass Radar's numeric values straight through, so no function edits were needed. Known side effect of the schema replace: the `trim` validators were dropped from every text column on this table (documented Xano MCP behavior) — write-time auto-trim is gone until restored via the UI; the `natural_key` helper will normalize at write time regardless.
-</Check>
+<Warning>
+**`natural_key` and `place_id` need to be ADDED to `master_address`.** Shown in the table below as proposed rows — they do not exist in Xano yet. Add them **via the Xano UI** (the MCP full-schema replace strips `trim` validators; `xano workspace push` wipes data-source records).
+</Warning>
+
+<Warning>
+**`longitude` and `latitude` must be type `decimal`** (matching `primary_location`) — text storage accepts junk silently and blocks the proximity-fallback coordinate math. Status: applied on branch `v1` 2026-07-15 and verified by schema read; if your table view still shows `text`, check which branch/datasource you're viewing. Writers pass Radar's numeric values straight through, so no function edits were needed. Side effect of the applied schema replace: `trim` validators were dropped from every text column on this table — restore via the UI if needed; the `natural_key` helper normalizes at write time regardless.
+</Warning>
 
 | Column | Type | Nullable | Default | Notes |
 | --- | --- | --- | --- | --- |
@@ -57,6 +61,8 @@ This page is a working document to decide whether the address tables and their s
 | `path_triples_added` | bool | no | — | Graph-sync flag |
 | `created_by_user_id` | int → `user` (125) | yes | `0` |  |
 | `source` | text | yes | — |  |
+| `natural_key` | text | yes | — | 🆕 **PROPOSED — to be added.** Tier-prefixed dedupe key (see scope section) |
+| `place_id` | text | yes | — | 🆕 **PROPOSED — to be added.** Geocoder place id, empty until a `pid:`-capable geocoder — reserved by the sync design |
 
 **Indexes:** primary (`id`) · btree (`created_at` desc)
 
@@ -166,13 +172,11 @@ Dedupe alone doesn't stop junk rows: live example on `master_address` today — 
 
 **Proximity fallback for the consistency check.** Neighborhood-vs-city naming breaks strict slot matching: "Venice, Los Angeles, CA" may geocode to city = Los Angeles while "842 Flower Ave, Venice, CA 90291" geocodes to city = Venice — slots disagree, yet it's the same place. When a coarse **city-level** row fails the slot comparison, fall back to coordinates: treat it as consistent if its lat/long is within ~15 km of the finer address (both rows already carry Radar coordinates). Street-level rows never use the fallback — two different street addresses are different addresses regardless of distance.
 
-**Backfill addition:** the collision report gains a completeness sweep — for each owner, delete coarse rows that are consistent (slots or proximity) with a more complete surviving row, repointing any joins first.
-
 ### Live validation cases (from master\_address, 2026-07-15)
 
 | Rows | Owner | Data | Handled by |
 | --- | --- | --- | --- |
-| 1 vs 2 | neural frames (140→id 1/2) | `"DE"` vs `"Donaustraße 44, 12043 Berlin, DE"` | **Completeness floor** — "DE" is rejected at write; backfill sweep deletes the existing row |
+| 1 vs 2 | neural frames (140→id 1/2) | `"DE"` vs `"Donaustraße 44, 12043 Berlin, DE"` | **Completeness floor** — "DE" is rejected at write |
 | 153 vs 154 | Warner Bros. Discovery (#140) | `"New York, NY US"` vs `"New York City, NY US"` | **Dedupe** — Radar canonicalizes both to city = New York → identical `cmp:` key → second write is a no-op |
 | 176 vs 177 | supersogood (#174) | `"Venice, Los Angeles, CA US"` vs `"842 Flower Ave, Venice, CA 90291 US"` | **Upgrade + proximity fallback** — strict slots may disagree (LA vs Venice as city), coordinates agree → coarse row upgraded in place |
 
@@ -202,20 +206,13 @@ Verified against live XanoScript (2026-07-15): **every enrichment write to `mast
 
 Implementation surface for this pass: **one new helper + one function edit.**
 
-### Backfill & rollout order
-
-1. **Add columns** `natural_key` (text) + optional `place_id` (text) — via the Xano UI, *not* the MCP full-schema replace (drops `trim` validators) and never `xano workspace push`.
-2. **Ship the helper** and wire 2451 to compute-on-write. No constraint yet — old and new rows coexist.
-3. **Backfill** existing rows in batches (rows with geocoded components → `cmp:` tier; rest → `fmt:` tier). Row volume: TBD, measure before running.
-4. **Collision report** — group by `(owner, natural_key)`; merge duplicates keep-oldest and repoint `my_person_address_join` (310), `my_company_address_join` (314), `my_address_notes` (293).
-5. **DB unique index: deferred.** With user-facing writers out of scope, a table-wide unique constraint would make `PUT /master-addresses/{id}` (3112) and the join helpers fail on violation. This pass runs `natural_key` as an **application-level upsert key inside 2451** plus a recurring collision report; the DB constraint lands when the app writers are updated in the later phase.
+**DB unique index: deferred.** With user-facing writers out of scope, a table-wide unique constraint would make `PUT /master-addresses/{id}` (3112) and the join helpers fail on violation. This pass runs `natural_key` as an **application-level upsert key inside 2451** plus a recurring collision report; the DB constraint lands when the app writers are updated in the later phase.
 
 ### Open questions
 
 - Field name: keep `natural_key` (recommended, see above) or rename uniformly across the four facet tables?
 - Keep `unit` in the key? (Recommend yes — two units in one building are distinct addresses.)
 - PO boxes — normalize as `street="po box", number=N`, or leave to the `fmt:` tier? (Countries without postal codes are now handled by spec rule 6 — empty slots degrade gracefully.)
-- Backfill geocoding for never-geocoded rows (costs Radar calls per row) or accept `fmt:` keys until a row is next touched?
 - Does this land before or with the Universe sync's `ALTER TABLE` for the other three sync columns (`content_hash`, `source_run_id`, `locked`)?
 
 ## Deployment — step by step
@@ -241,13 +238,9 @@ Ordered runbook to take the scoped `master_address` work live. Nothing below has
 
 7. **Run the three live validation cases** in the STAGING data source: neural frames "DE" (floor rejects), WBD "New York City" (dedupe no-ops), supersogood Venice/LA (upgrade fires via proximity). Then re-run a normal company enrich end-to-end (Fundable 12809 + LLM payload 12989 paths) and confirm keys land.
 
-### No backfill
-
-**Skipped by decision (2026-07-15):** the data is still being wiped and re-generated during testing, so there is no legacy data to key, merge, or sweep — the rules apply to fresh writes only. If this ships after a data set we keep, revisit: key computation for existing rows → collision merge (repoint joins 310 / 314 / 293) → completeness sweep, in that order.
-
 ### Phase 4 — monitor
 
-8. **Recurring collision report** (weekly task or QA-agent check) — with no DB constraint yet, this is the safety net; also watch the floor-rejection log for sources that suddenly produce junk. Bonus of the no-backfill world: once the app writers are updated (later phase), the unique index can be created immediately — there's no legacy dedupe pass gating it.
+8. **Recurring collision report** (weekly task or QA-agent check) — with no DB constraint yet, this is the safety net; also watch the floor-rejection log for sources that suddenly produce junk. Once the app writers are updated (later phase), the unique index can be created immediately.
 
 ### Later phase — explicitly not in this deployment
 
@@ -263,9 +256,9 @@ Ordered runbook to take the scoped `master_address` work live. Nothing below has
 1. ✅ **2026-07-15 — `master_address.longitude` / `latitude` → `decimal`. APPLIED in Xano** (the only change applied so far; everything else remains workshop-only). Writer inventory confirmed no function edits needed; `geo_point` remains a future consideration.
 2. **2026-07-15 — `natural_key` dedupe column: scoped, pending sign-off.** See the scope section above — tiered normalized key, composite unique index, staged rollout. Also resolves the sync-design open question (place_id vs component hash → component hash now, `pid:` tier reserved).
 3. **2026-07-15 — scope narrowed to enrichment-waterfall writers.** Only the company waterfall writes `master_address` (all through `add-company-address` 2451; the person waterfall writes `primary_location` instead). User-facing app paths and merge orchestrators deferred; DB unique constraint deferred with them — `natural_key` runs as an application-level upsert key in 2451 for this pass. Field name kept as `natural_key` pending sign-off (recommendation: keep, for sync-design uniformity).
-4. **2026-07-15 — completeness floor + upgrade rule added to the 2451 scope.** Country-only/region-only geocodes are rejected at write; a more complete address of the *same* place upgrades the existing row in place (id + joins preserved); a less complete one is ignored. Backfill gains a completeness sweep. Motivated by live data: `neural frames` rows 1 ("DE") vs 2 (full Berlin address).
+4. **2026-07-15 — completeness floor + upgrade rule added to the 2451 scope.** Country-only/region-only geocodes are rejected at write; a more complete address of the *same* place upgrades the existing row in place (id + joins preserved); a less complete one is ignored. Motivated by live data: `neural frames` rows 1 ("DE") vs 2 (full Berlin address).
 5. **2026-07-15 — `primary_location` gets no `natural_key` column.** Its FK triple `(city_id, region_id, country_id)` already is the natural key and the matching logic is live in 4690 (verified). Instead: fix the city-lookup same-country `OR` bug and add a unique index on the triple — see the callout in the primary\_location schema section.
 6. **2026-07-15 — coarse granularity is valid for `primary_location`.** Country-only ("Australia") and city-level ("Sydney, Australia") rows are both legitimate — no completeness floor there (that's a `master_address`-only rule). Null slots in the triple must dedupe consistently.
-7. **2026-07-15 — no backfill.** Data is still being wiped and re-generated during testing; all rules apply to fresh writes only. Deployment runbook trimmed accordingly (backfill phase removed, unique index unblocked once app writers are updated).
+7. **2026-07-15 — rules apply to fresh writes only.** Data is still being wiped and re-generated during testing, so there is no legacy data to migrate; the unique index is unblocked as soon as the app writers are updated.
 
 _Further proposed changes, decisions, and open questions to be added as the workshop continues._

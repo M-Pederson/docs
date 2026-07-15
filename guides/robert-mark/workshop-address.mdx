@@ -89,10 +89,73 @@ A few asymmetries between the two tables worth discussing:
 - **`updated_at`** exists on `master_address` but not on `primary_location`.
 - **No uniqueness constraints** on either table beyond the primary key — nothing prevents duplicate addresses or locations for the same entity.
 
+## Proposed: `natural_key` on master\_address — scope
+
+<Note>
+**Workshop scope only — no Xano changes made.** This section scopes the canonical-address dedupe key. It reuses the `natural_key` column already planned for `master_address` in the [Universe ↔ Backend sync design](/guides/open-work/backend-refactor-tables) (upsert key `(node_uuid, natural_key)`, one of the four sync columns), so we get one dedupe concept, not two.
+</Note>
+
+### Why — today's dedupe is broken in both directions
+
+The two live writer paths use different, conflicting keys (verified against live XanoScript, 2026-07-15):
+
+- `mvp/address/add-company-address` (2451) dedupes on **`(master_company_id, city, state_region)`** — massively **over-dedupes**: one row per company per city. A second office in the same city is silently swallowed (or overwrites the first via the update branch when `address_line_1` is empty).
+- `mvp/address/create-person-address-join` (4654) dedupes on **exact raw `(master_person_id, formatted_address)`** — **under-dedupes**: "123 Main St" and "123 Main Street" both insert, since one string is user-typed and the other geocoder-formatted.
+
+A computed `natural_key` with a unique index replaces both with one correct rule.
+
+### Key definition
+
+`natural_key` is a **computed, tier-prefixed normalized string** (not the raw `formatted_address`):
+
+| Tier | Prefix | Value | When |
+| --- | --- | --- | --- |
+| 1 | `pid:` | geocoder place id | **Not available today** — Radar forward geocoding returns no durable place id (the retired `archive/details/add-address` 228 took a Google `place_id` input). Keep the optional `place_id` column from the sync design for a future geocoder upgrade. |
+| 2 | `cmp:` | `country_code\|region_code\|city\|postal_code\|street\|number\|unit` | Row has geocoded components (the normal Radar path) |
+| 3 | `fmt:` | normalized `formatted_address` string | Row was never geocoded (user-typed only) |
+
+Normalization for tiers 2–3: lowercase, trim, collapse whitespace, strip punctuation and diacritics, null/missing component → empty string. Tier prefixes prevent cross-tier false collisions.
+
+**Recommendation:** store the readable pipe-joined string, not a sha256 of it — deterministic either way, but debuggable when a merge goes wrong. Hash only if key length becomes a problem.
+
+**Uniqueness:** composite unique index on `(master_person_id, master_company_id, natural_key)` — two people at the same address must remain legal. The null-vs-`0` FK defaults must be coalesced consistently (today `master_person_id` defaults to `0` but `master_company_id` to null) so blank owners actually collide.
+
+### Writer inventory — what must change
+
+| Writer | ID | Current dedupe | Change |
+| --- | --- | --- | --- |
+| `mvp/address/build-address-natural-key` | **new** | — | Single helper that computes the key; every writer calls it |
+| `mvp/address/add-company-address` | 2451 | city + state per company | Compute key from Radar components; upsert on it; recompute in the update branch |
+| `mvp/address/bulk-add-company-address` | 2452 | inherits 2451 | None directly (inherits) |
+| `mvp/address/create-person-address-join` | 4654 | raw `formatted_address` per person | Compute key (Radar components when geocode succeeds, `fmt:` tier otherwise); upsert |
+| `mvp/address/create-company-address-join` | 4653 | same shape as 4654 | Same change |
+| `mvp/enrich/apply-company-llm-payload` | 12989 | HQ + other locations via 2451 | None directly (inherits) |
+| `mvp/enrich/process-company-phase-5` | 12809 | Fundable address backfill via 2451 | None directly (inherits) |
+| `POST /master-addresses` | API 3110 (group 353) | delegates to join helpers | None directly (inherits) |
+| `PUT /master-addresses/{master_address_id}` | API 3112 | edits components directly, **no dedupe** | Recompute `natural_key` after edit; on unique violation, merge into the existing row instead of saving |
+| `merge/person-v2` / `merge/company-v2` | 12945 / 12956 | merge-time address dedup (own logic) | Switch the compare to `natural_key` |
+
+### Backfill & rollout order
+
+1. **Add columns** `natural_key` (text) + optional `place_id` (text) — via the Xano UI, *not* the MCP full-schema replace (drops `trim` validators) and never `xano workspace push`.
+2. **Ship the helper** and wire all writers to compute-on-write. No constraint yet — old and new rows coexist.
+3. **Backfill** existing rows in batches (rows with geocoded components → `cmp:` tier; rest → `fmt:` tier). Row volume: TBD, measure before running.
+4. **Collision report** — group by `(owner, natural_key)`; merge duplicates keep-oldest and repoint `my_person_address_join` (310), `my_company_address_join` (314), `my_address_notes` (293).
+5. **Create the unique index** only after the collision report is clean — index creation fails on existing dupes.
+6. **Flip writers to upsert semantics** (early-return paths still bump counters, per the queue upsert convention).
+
+### Open questions
+
+- Keep `unit` in the key? (Recommend yes — two units in one building are distinct addresses.)
+- Countries without postal codes and PO boxes — does the component normalization need per-country rules, or is best-effort fine at current data quality?
+- Backfill geocoding for never-geocoded rows (costs Radar calls per row) or accept `fmt:` keys until a row is next touched?
+- Does this land before or with the Universe sync's `ALTER TABLE` for the other three sync columns (`content_hash`, `source_run_id`, `locked`)?
+
 ## Workshop notes
 
 **Decisions (workshop only — no Xano changes made yet):**
 
 1. **2026-07-15 — `master_address.longitude` / `latitude` → `decimal`.** Align with `primary_location`. Open follow-ups: inventory the functions that write these columns as strings; decide whether to go further to `geo_point` (single field, unlocks spatial indexes and radius / nearest-neighbor queries).
+2. **2026-07-15 — `natural_key` dedupe column: scoped, pending sign-off.** See the scope section above — tiered normalized key, composite unique index, 6-step rollout. Also resolves the sync-design open question (place_id vs component hash → component hash now, `pid:` tier reserved).
 
 _Further proposed changes, decisions, and open questions to be added as the workshop continues._

@@ -1,0 +1,409 @@
+---
+title: "Contacts Interaction Log"
+description: "Per-contact interaction rollups (email, calendar, LinkedIn, engagement) — AlloyDB table spec, nightly recompute cron, and Go build plan."
+---
+
+`contacts_interaction_log` is a per-contact rollup table that answers, cheaply and at read time: *how much have I actually interacted with this person, through which channels, and for how long have I known them?* It feeds the contact side panel and any downstream relationship-strength signals.
+
+It is the app-side, **user-perspective** cousin of the [Known](/guides/known/index) `KNOWS` edge: `KNOWS` is a symmetric person↔person edge in FalkorDB; this table is *my* interaction stats with *my* contact. Naming and update conventions follow the Known model ([interaction counts](/guides/known/scope/counts), [KNOWS edge fields](/guides/known/schema-design/edges)) so the two stay mentally interchangeable.
+
+<Info>
+**Home: AlloyDB.** The table lives only in AlloyDB (Universe / App backend). The side panel reads it through the App backend, not Xano. `user_id` and `contacts_id` are *logical* foreign keys mirroring Xano row ids — there are no cross-system FK constraints to enforce them.
+</Info>
+
+<Warning>
+**The cron never calls the Nylas API.** Historical log-parse loads every past email into `email_activity` and every past calendar event into `calendar_event_activity` + `events`, and the webhook handlers keep those tables current. They are mirrored into AlloyDB with the same shape as the Xano workspace 3 tables, so the nightly job reads them with local SQL. If a classification rule needs a field those tables don't carry, the fix is to [change the activity tables](#required-changes-to-the-activity-tables) — never to fetch from Nylas at cron time.
+</Warning>
+
+## Tables
+
+Three product tables plus the job-state row, all in AlloyDB. `contacts_interaction_log` is the read model the side panel hits. `contacts_interaction_monthly` is the history primitive — every temporal signal (averages, last-month, momentum) derives from it. `chat_activity` ships with the in-app chat feature.
+
+### `contacts_interaction_log`
+
+One row per `contacts` row (Xano table 128). `contacts` is already unique per `(user_id, master_person_id)`, so `contacts_id` alone identifies the pair and is the **upsert key** (`UNIQUE`). `user_id` is denormalized alongside it as the query path for per-user scans. Upsert-only: never a second row for the same `contacts_id`. Any Known-side or graph consumer that wants these rollups keyed by person joins through `contacts` to reach `master_person_id`.
+
+```sql
+CREATE TABLE contacts_interaction_log (
+  id                        BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  created_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  user_id                   BIGINT NOT NULL,  -- logical FK → Xano user.id (125)
+  contacts_id               BIGINT NOT NULL,  -- logical FK → Xano contacts.id (128)
+
+  -- email counts (cron-owned)
+  total_emails              INTEGER NOT NULL DEFAULT 0,
+  to_emails                 INTEGER NOT NULL DEFAULT 0,
+  from_emails               INTEGER NOT NULL DEFAULT 0,
+
+  -- calendar counts (cron-owned)
+  total_meetings            INTEGER NOT NULL DEFAULT 0,
+  total_meetings_attended   INTEGER NOT NULL DEFAULT 0,
+  total_irl_meetings        INTEGER NOT NULL DEFAULT 0,
+  total_remote_meetings     INTEGER NOT NULL DEFAULT 0,
+  total_recurring_meetings  INTEGER NOT NULL DEFAULT 0,
+  distinct_meeting_series   INTEGER NOT NULL DEFAULT 0,
+
+  -- engagement (app-owned; cron never writes these)
+  opened                    INTEGER NOT NULL DEFAULT 0,
+  last_opened_at            TIMESTAMPTZ,
+
+  -- app-feature counts (PLACEHOLDERS — features not yet deployed; stay 0)
+  total_in_app_chat_threads INTEGER NOT NULL DEFAULT 0,
+  chat_interactions         INTEGER NOT NULL DEFAULT 0,
+  total_leverage_loops      INTEGER NOT NULL DEFAULT 0,
+  total_leverage_loop_assists INTEGER NOT NULL DEFAULT 0,
+
+  -- connection anchors (cron-owned)
+  linkedin_connected_on     DATE,
+  orbiter_connected_at      TIMESTAMPTZ,
+  first_known_interaction   TIMESTAMPTZ,
+
+  -- derived month ints (cron-owned)
+  months_connected_linkedin INTEGER,
+  months_connected_orbiter  INTEGER,
+  months_known              INTEGER,
+
+  -- temporal rollups (cron-owned; derived from contacts_interaction_monthly,
+  -- complete calendar months only)
+  average_monthly_emails            NUMERIC(6,2),
+  average_monthly_meetings          NUMERIC(6,2),
+  average_monthly_chat_interactions NUMERIC(6,2),
+  last_month_emails                 INTEGER,
+  last_month_meetings               INTEGER,
+  last_month_chat_interactions      INTEGER,
+  momentum                          TEXT CHECK (momentum IN
+    ('new','rising','steady','cooling','dormant','reignited')),
+
+  -- bookkeeping
+  last_counts_updated_at    TIMESTAMPTZ,
+
+  CONSTRAINT contacts_interaction_log_contacts_id_key UNIQUE (contacts_id)
+);
+
+CREATE INDEX idx_cil_user_id           ON contacts_interaction_log (user_id);
+CREATE INDEX idx_cil_user_last_opened  ON contacts_interaction_log (user_id, last_opened_at DESC);
+```
+
+### `contacts_interaction_monthly`
+
+The history primitive: one row per contact per calendar month with any activity. The cron rewrites a contact's full bucket set from raw activity history on every recompute (delete + insert, one transaction) — buckets are data, the `average_monthly_*` / `last_month_*` / `momentum` columns above are just views over them. Buckets also power side-panel sparklines and any future signal (z-scores, seasonality, gap analysis) without a migration.
+
+```sql
+CREATE TABLE contacts_interaction_monthly (
+  id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  user_id      BIGINT NOT NULL,   -- logical FK → Xano user.id (125)
+  contacts_id  BIGINT NOT NULL,   -- logical FK → Xano contacts.id (128)
+  month        DATE NOT NULL,     -- first day of the month (UTC)
+
+  emails_to         INTEGER NOT NULL DEFAULT 0,
+  emails_from       INTEGER NOT NULL DEFAULT 0,
+  meetings          INTEGER NOT NULL DEFAULT 0,  -- non-cancelled events starting in this month
+  chat_interactions INTEGER NOT NULL DEFAULT 0,  -- stays 0 until in-app chat ships
+
+  CONSTRAINT contacts_interaction_monthly_pair_month_key UNIQUE (contacts_id, month)
+);
+
+CREATE INDEX idx_cim_user_month ON contacts_interaction_monthly (user_id, month);
+```
+
+Bucketing is by **domain time** (`date_trunc('month', activity_timestamp)` for email, event start for meetings), consistent with the domain-time principle below. Months with zero activity get no row — readers treat missing as zero.
+
+### `chat_activity` (created when in-app chat ships)
+
+Webhook-fed mirror of `email_activity` for the GetStream in-app chat — see [In-app chat source](#in-app-chat-getstream--planned-source) for the event mapping. The migration ships with the chat feature, not now.
+
+```sql
+CREATE TABLE chat_activity (
+  id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  user_id       BIGINT NOT NULL,   -- logical FK → Xano user.id (125)
+  my_person_id  BIGINT NOT NULL,   -- logical FK → Xano contacts.id (128)
+  channel_cid   TEXT NOT NULL,     -- Stream channel identifier (thread key)
+  message_id    TEXT NOT NULL,     -- Stream message id (webhook idempotency)
+  direction     TEXT NOT NULL CHECK (direction IN ('sent','received')),
+  message_ts    TIMESTAMPTZ NOT NULL,
+
+  CONSTRAINT chat_activity_message_id_key UNIQUE (message_id)
+);
+
+CREATE INDEX idx_chat_activity_person_ts ON chat_activity (my_person_id, message_ts);
+```
+
+### `cron_state`
+
+One row per job — the high-water mark the delta pass reads and the run bookkeeping.
+
+```sql
+CREATE TABLE cron_state (
+  job_name         TEXT PRIMARY KEY,
+  high_water_mark  TIMESTAMPTZ,
+  last_run_at      TIMESTAMPTZ,
+  last_run_status  TEXT
+);
+```
+
+## Design principles
+
+1. **Recompute, don't increment.** Every cron-owned count is recomputed from raw activity logs on each pass — never `count = count + delta`. Simpler, self-healing, no drift. (Same rule as the Known counts crons.)
+2. **Anchors are stored, months are derived.** `months_*` integers tick on their own; the anchor timestamps are the source of truth and the cron re-derives the ints. Never write a `months_*` value without its anchor.
+3. **Domain time, not ingest time.** `first_known_interaction` backdates to when the interaction *happened* (a LinkedIn connection from 2019 imported in 2026 counts as 2019). This mirrors the Known model's `evidence_occurred_at` vs `first_seen_at` split.
+4. **Activity tables only, Nylas never.** The nightly job reads Orbiter's own activity tables in AlloyDB. Anything it needs from a Nylas event must be captured into those tables by the two ingest paths (webhook handlers + historical log-parse) — see [required changes](#required-changes-to-the-activity-tables) below.
+5. **Two writers, disjoint columns.** The nightly cron owns the counts, anchors, months, and temporal rollups. The App backend owns `opened` / `last_opened_at`. Neither ever writes the other's columns.
+6. **History in buckets, aggregates as views.** Anything temporal is derived from `contacts_interaction_monthly`, never stored as its own maintained aggregate. New temporal signals mean a new query over the buckets, not a new cron-maintained column.
+
+## Column semantics
+
+| Column | Meaning |
+|---|---|
+| `total_emails` | All messages exchanged with the contact. Invariant: `= to_emails + from_emails`. Broadcast/cc-only messages **count** (decided); `email_activity.participant_count` is available if a later scoring pass wants to discount them. |
+| `to_emails` | User → contact. Contact appears as a recipient (to or cc) on a message the user sent. |
+| `from_emails` | Contact → user. Contact is the sender. |
+| `total_meetings` | All non-cancelled calendar events where user and contact are both participants. Includes future events ("meetings on the books"). |
+| `total_meetings_attended` | Subset of `total_meetings`: the event has ended **and** the contact's RSVP was `yes` (or the contact was the organizer). `maybe` / `noreply` stay in `total_meetings` only. RSVP is a declared-attendance proxy — the best signal the calendar gives. |
+| `total_irl_meetings` | Subset: physical `location` set, not URL-shaped, no conferencing block. |
+| `total_remote_meetings` | Subset: conferencing details present (Zoom / Meet / Teams URL), or the location is URL-shaped. |
+| `total_recurring_meetings` | Subset: instances belonging to a recurring series (event carries a recurrence rule, or points at a series master). |
+| `distinct_meeting_series` | Count of unique series masters + one-off events — "how many separate times did we decide to meet." A weekly standing 1:1 counts once here, ~50/yr in `total_meetings`. The better relationship-strength signal. |
+| `opened` | Times the user opened this contact in the side panel. **App-incremented**, not recomputable — there is no raw open-event log. |
+| `last_opened_at` | Timestamp of the most recent side-panel open. |
+| `total_in_app_chat_threads` | **Placeholder.** Distinct in-app chat threads (Stream channels) the user and contact share. Feature not yet deployed — integration design in [In-app chat source](#in-app-chat-getstream--planned-source). |
+| `chat_interactions` | **Placeholder.** Total messages **posted by the contact** in shared in-app chat threads — their engagement toward the user, not the user's own posts. |
+| `total_leverage_loops` | **Placeholder.** Generic one-click leverage loops involving this contact. The user-facing feature is not yet implemented. |
+| `total_leverage_loop_assists` | **Placeholder.** Purpose-specific leverage loops — created to help with something specific, as opposed to the one-click generic loop counted above. |
+| `linkedin_connected_on` | LinkedIn connection date, from the LinkedIn import (`linkedin_csv.connected_on` 259 / `linkedin_connection_join.date_connected` 258). Domain time. |
+| `orbiter_connected_at` | When `contacts.status_connected` first became `connected` — a real mutual connection on Orbiter (decided: **not** contact-record age). |
+| `first_known_interaction` | `min(` first `email_activity` timestamp, first past calendar event start, `linkedin_connected_on` `)`. Domain time — so `months_known >= months_connected_linkedin` always holds. App-side analog of the KNOWS `known_since` derivation. |
+| `months_connected_linkedin` / `months_connected_orbiter` / `months_known` | Full calendar months elapsed since the corresponding anchor. `NULL` when the anchor is `NULL`. |
+| `average_monthly_emails` / `average_monthly_meetings` / `average_monthly_chat_interactions` | Mean per complete calendar month over the trailing **12 complete months** (fewer for younger contacts — whatever complete months exist). Derived from the monthly buckets; `NULL` until at least one complete month exists. |
+| `last_month_emails` / `last_month_meetings` / `last_month_chat_interactions` | Counts in the last **complete** calendar month. Never the current month — it's always partial and would always read "below average" mid-month. |
+| `momentum` | `new \| rising \| steady \| cooling \| dormant \| reignited` — the side panel's temperature word for the relationship. Rules in [Temporal awareness](#temporal-awareness). |
+| `last_counts_updated_at` | Stamped by the cron on every recompute of a row. Doubles as the freshness signal. |
+
+Subset invariants (assert in tests, and after every backfill): `total_meetings_attended <= total_meetings`; `total_irl_meetings + total_remote_meetings <= total_meetings` (events with neither location nor conferencing land in neither subtype — it is **not** an equality); `total_recurring_meetings <= total_meetings`.
+
+### Placeholder columns — features not yet deployed
+
+<Note>
+`total_in_app_chat_threads`, `chat_interactions`, `total_leverage_loops`, and `total_leverage_loop_assists` are **schema placeholders**. They count app features that have not shipped yet — the columns are reserved now so adding them later doesn't need a migration, and they stay `0` until the features deploy.
+
+- **`total_in_app_chat_threads`** / **`chat_interactions`** — the upcoming in-app (user↔contact) chat, built on GetStream. This is *not* the copilot chat (`conversations` 636 / `copilot_chat_messages` 637). The source design is committed — see [In-app chat source](#in-app-chat-getstream--planned-source) — it just waits on the feature.
+- **`total_leverage_loops`** — the generic **one-click** leverage loop a user fires for a contact.
+- **`total_leverage_loop_assists`** — leverage loops created to **help with something specific**, as opposed to the generic one-click loop. Loops and assists are disjoint counts, not a subset.
+
+When each feature ships: define its source table, counting rule, and writer (nightly cron vs app-incremented), then update this page and the cron. Until then the nightly cron must **not** include these columns in its `DO UPDATE SET` list — same rule as the `opened` columns, so whichever writer they get later can't be clobbered retroactively.
+</Note>
+
+### Calendar classification rules
+
+Applied per event, using data captured from Nylas at ingest time:
+
+- **Excluded entirely:** `status == "cancelled"`; all-day busy blocks with no participants beyond the user.
+- **Remote:** the Nylas `conferencing` object is present (`conferencing.provider` / `details.url`), or `location` matches a URL pattern.
+- **IRL:** `location` is set, is not URL-shaped, and there is no conferencing block.
+- **Recurring:** the event carries a `recurrence` RRULE array (series master) or a `master_event_id` (expanded instance). Neither → one-off.
+- **Attended:** event end is in the past and the contact's `participants[].status == "yes"`, or the contact is the organizer.
+- Subtype counts follow `total_meetings` (i.e. they include future non-cancelled events), so a scheduled future Zoom shows up as remote immediately. Switching subtypes to attended-only is a one-line change in the cron if product prefers it — flag at build time.
+
+## Temporal awareness
+
+Lifetime totals can't tell "active relationship" from "was active in 2018" — the same argument the Known docs make for [time-bucketed counts](/guides/known/scope/counts#why-time-bucketed). Here the answer is the `contacts_interaction_monthly` buckets table plus three derived views on the main row: the trailing average, the last complete month, and one `momentum` word.
+
+**Why buckets and not more aggregate columns:** buckets keep every door open. Any future temporal signal — z-scores, EWMA baselines, seasonality, gap analysis, day-level windows at month grain — is a query over buckets added in an afternoon. Aggregate columns computed without history would require re-scanning the activity tables to reconstruct what buckets preserve for free. Storage is trivial: at most one small row per contact-month with activity.
+
+### Momentum rules
+
+Computed over **combined** interactions per complete month (`emails_to + emails_from + meetings + chat_interactions`). First match wins:
+
+| Order | Value | Rule |
+|---|---|---|
+| 1 | `new` | `months_known < 3` — the baseline is noise; don't compute a ratio |
+| 2 | `reignited` | last complete month > 0 after **6+ consecutive zero months** immediately before it |
+| 3 | `dormant` | last 6 complete months all zero (and interaction history exists) |
+| 4 | `rising` | last-month total ≥ **1.5×** the trailing average (average > 0) |
+| 5 | `cooling` | last-month total ≤ **0.5×** the trailing average (average ≥ 1, so near-zero baselines don't flap) |
+| 6 | `steady` | everything else |
+
+The `1.5× / 0.5× / 6-month / 3-month` values are initial guesses, listed in [open items](#open-items) for tuning against real data — the same convention as the Known scoring coefficients. `reignited` outranks everything but `new` because it's the signal a user actually acts on, and the one no flat average can express.
+
+Chat columns participate in all of this automatically once `chat_activity` starts filling buckets; until then they contribute zeros.
+
+**Deliberately not stored:** z-scores, EWMA, reciprocity drift, day-granularity windows. All derivable from buckets later if the product wants them; none earn a cron-maintained column today (design principle 6).
+
+## Update model
+
+### Writer 1 — App backend (`opened`)
+
+The side-panel open endpoint does a single upsert; this is the only increment-style write in the table:
+
+```sql
+INSERT INTO contacts_interaction_log (user_id, contacts_id, opened, last_opened_at)
+VALUES ($1, $2, 1, now())
+ON CONFLICT (contacts_id) DO UPDATE
+SET opened = contacts_interaction_log.opened + 1,
+    last_opened_at = now(),
+    updated_at = now();
+```
+
+If losing open counts ever matters, add a lightweight open-event log and move `opened` to the recount pattern. Not needed for v1.
+
+### Writer 2 — nightly cron (everything else)
+
+See the next section. Its upsert must list **only cron-owned columns** in the `DO UPDATE SET` clause so it can never clobber `opened` / `last_opened_at`.
+
+## CRON
+
+**Job:** `universe/crons/recompute_contacts_interaction_log` — a Go binary deployed as a Cloud Run Job, triggered by Cloud Scheduler at **02:00 UTC nightly**.
+
+**Data sources — activity tables in AlloyDB, nothing else.** The job never calls the Nylas API. Historical log-parse has already loaded all past emails and calendar events into these tables, and webhooks keep them current; they exist in AlloyDB with the same shape as the Xano workspace 3 tables (table ids below are the Xano references). Every read is local SQL:
+
+| Rollup fields | Source | Notes |
+|---|---|---|
+| `to_emails`, `from_emails`, `total_emails` | `email_activity` (Xano 597) | Keyed by `my_person_id` → `contacts.id`. Direction from the activity's direction signal — today inferred from `activity_type_id` / `card_descriptor`; an explicit `direction` column is a required change below. |
+| All six meeting counts | `calendar_event_activity` (Xano 598) + `events` (221) | 598 rows keyed by `my_person_id`; recurrence via `events.master_event_id` (222). Location / conferencing / RSVP fields are required changes below. |
+| `linkedin_connected_on` | `linkedin_connection_join` (258) / `linkedin_csv` (259) | Domain-time connection date. |
+| `orbiter_connected_at` | `contacts.status_connected` transition | Needs a transition timestamp — required change below. |
+| `first_known_interaction` | min across the three sources above | |
+
+**Pass structure:**
+
+1. **Delta detection.** Find `contacts_id`s with activity newer than the job's high-water mark (max `created_at` / `activity_timestamp` processed last run, persisted in a one-row `cron_state` table in AlloyDB). Only those rows get a full count recompute — the Known counts-cron differential pattern.
+2. **Count + bucket recompute** for touched contacts: pull their full activity history, classify, aggregate. Lifetime counts upsert into `contacts_interaction_log`; the contact's **entire monthly bucket set** is rewritten in `contacts_interaction_monthly` (delete + insert, one transaction). Recompute from scratch per contact — no incremental arithmetic.
+3. **Months pass** for **all** rows (not just touched ones — months tick with the calendar, not with activity). Pure SQL, one statement, derived from stored anchors:
+
+```sql
+UPDATE contacts_interaction_log
+SET months_connected_linkedin = months_between(linkedin_connected_on, CURRENT_DATE),
+    months_connected_orbiter  = months_between(orbiter_connected_at::date, CURRENT_DATE),
+    months_known              = months_between(first_known_interaction::date, CURRENT_DATE),
+    updated_at = now();
+```
+
+where `months_between` is full-calendar-month arithmetic: `(y2 - y1) * 12 + (m2 - m1) - CASE WHEN d2 < d1 THEN 1 ELSE 0 END`, null-safe.
+
+4. **Temporal pass** for **all** rows (last-month and averages shift at every month boundary, not just on activity): recompute `average_monthly_*` (trailing 12 complete months), `last_month_*` (last complete month), and `momentum` from `contacts_interaction_monthly` — pure SQL over the buckets, complete months only, per the [momentum rules](#momentum-rules).
+5. **Stamp** `last_counts_updated_at = now()` on every row touched in pass 2; advance the high-water mark only after a fully successful run.
+
+**Concurrency:** take a Postgres advisory lock (`pg_try_advisory_lock`) at job start; exit cleanly if a previous run is still holding it. Cloud Scheduler retries are then harmless.
+
+**Backfill mode:** the same binary with a `--backfill` flag ignores the high-water mark and recomputes every contact. Run it once after the table ships, and after any classification-rule change.
+
+## Go build plan
+
+Target: the Universe standalone Go codebase (see [Orbiter Universe Standalone](/guides/open-work/orbiter-univers-standalone)). All access via `pgx` against AlloyDB — the activity tables are already there, so the job has no HTTP dependencies at all.
+
+<Steps>
+  <Step title="Migrations — create the tables">
+    Create the [Tables](#tables) as migrations (whatever tool the Universe repo standardizes on — golang-migrate or equivalent): `contacts_interaction_log`, `contacts_interaction_monthly`, and `cron_state` now. `chat_activity`'s migration ships with the chat feature, not in this pass.
+  </Step>
+  <Step title="Activity readers — plain SQL">
+    An `ActivitySource` interface (`EmailsSince(watermark)`, `CalendarEventsSince(watermark)`, `LinkedInConnections(userID)`, `ContactsByID(...)`) backed by a single `PostgresActivityReader`: keyset-paginated SQL over `email_activity`, `calendar_event_activity` + `events`, `linkedin_connection_join`, and `contacts` in AlloyDB (`WHERE created_at > $watermark ORDER BY created_at, id LIMIT 500`). The interface exists for testability (fake source in unit tests), not for a second backend — there is deliberately no Nylas or Xano HTTP implementation.
+  </Step>
+  <Step title="Classifiers as pure functions">
+    `ClassifyEmailDirection(activity) → to|from`, `ClassifyMeeting(event) → {cancelled, remote, irl, recurring, attended}`, `MonthsBetween(anchor, today) → int`. No I/O — table-driven unit tests for every rule in [calendar classification](#calendar-classification-rules), including the URL-shaped-location edge cases and the `maybe`/`noreply` RSVP handling.
+  </Step>
+  <Step title="Aggregator">
+    Group classified activity by `contacts_id` into one rollup struct per contact **plus a per-month bucket map** (`date_trunc('month')` of each activity's domain timestamp). `distinct_meeting_series` = count of distinct series-master ids + count of one-offs. Compute `first_known_interaction` here as the min across modalities.
+  </Step>
+  <Step title="Writer — column-scoped upsert">
+    Two writes per touched contact, one transaction. First the buckets: `DELETE FROM contacts_interaction_monthly WHERE contacts_id = $1` then bulk `INSERT` of the recomputed months. Then the main-row batch upsert (~500 rows/statement):
+
+    ```sql
+    INSERT INTO contacts_interaction_log (user_id, contacts_id, total_emails, ..., last_counts_updated_at)
+    VALUES (...)
+    ON CONFLICT (contacts_id) DO UPDATE SET
+      total_emails = EXCLUDED.total_emails,
+      -- ... every cron-owned column, and ONLY cron-owned columns ...
+      last_counts_updated_at = EXCLUDED.last_counts_updated_at,
+      updated_at = now();
+    ```
+
+    `opened` and `last_opened_at` must never appear in the `SET` list.
+  </Step>
+  <Step title="Job wrapper — lock, watermark, months pass">
+    `main()` sequence: acquire advisory lock → load watermark → delta detect → count + bucket recompute → months-pass SQL → temporal-pass SQL → advance watermark → release lock. `--backfill` flag skips the watermark. Structured logs: contacts touched, rows upserted, bucket rows rewritten, per-modality totals, duration. Exit non-zero on any partial failure so Cloud Run marks the execution failed.
+  </Step>
+  <Step title="Deploy — Cloud Run Job + Scheduler">
+    Cloud Run Job in the same project/region as AlloyDB (connect via the AlloyDB Auth Proxy sidecar or direct VPC). Cloud Scheduler trigger at 02:00 UTC daily. Env: `ALLOYDB_DSN` — that's the only external dependency. Alert on job failure (Cloud Monitoring on execution status).
+  </Step>
+  <Step title="Verify">
+    Run `--backfill` against staging, then assert the invariants over the whole table: `total_emails = to_emails + from_emails`; `attended <= total_meetings`; `irl + remote <= total_meetings`; `recurring <= total_meetings`; every non-null `months_*` has a non-null anchor; `months_known >= months_connected_linkedin` wherever both are set. **Buckets must reconcile with lifetime counts**: per contact, `SUM(emails_to + emails_from)` over `contacts_interaction_monthly` = `total_emails`, and `SUM(meetings)` = `total_meetings` (both count from the same raw data, so any gap is a bucketing bug). `momentum` must be non-null wherever a bucket row exists. Spot-check a handful of contacts against their raw activity rows. Re-run the job immediately: a second pass over unchanged data must produce zero value changes (idempotency check).
+  </Step>
+</Steps>
+
+## Required changes to the activity tables
+
+<Warning>
+**These changes block the cron.** The classifiers below cannot run on the activity tables as they exist today (schemas referenced from Xano workspace 3 — the AlloyDB mirrors share the same shape). Every field listed is already present in the Nylas payloads that the ingest paths process; the fix is to persist them, never to fetch from Nylas at cron time.
+
+Each change must land in **both ingest paths** — the webhook handlers *and* the historical log-parse backfill — plus a **one-time backfill** of rows ingested before the columns existed (that one-time backfill is the only place Nylas may be called, and it runs once, not nightly).
+</Warning>
+
+### Blocking — the classifiers need these
+
+| Table | Add | Why |
+|---|---|---|
+| `email_activity` (597) | `direction` enum `sent \| received` | The `to_emails` / `from_emails` split. Today direction is inferred from `activity_type_id` / `card_descriptor` ("from Emery Wells") — brittle string logic in the counting path. One explicit column at ingest ends that. |
+| `calendar_event_activity` (598) | `event_start`, `event_end` timestamps | Only `activity_timestamp` exists; "has the event ended" (attended logic) needs the real end time. |
+| `calendar_event_activity` (598) | `event_status` enum `confirmed \| cancelled` | The exclusion rule. Cancellation currently lives in a freeform `status` text. |
+| `calendar_event_activity` (598) | `location` text, `conferencing_provider` text (null = none) | The IRL/remote split. Provider string doubles as a display fact ("met on Zoom 12×"). |
+| `calendar_event_activity` (598) | `contact_rsvp_status` enum `yes \| no \| maybe \| noreply`, `organizer_is_contact` bool | The attended rule. From Nylas `participants[].status` at ingest; update on RSVP-change webhooks. |
+| `contacts` (128) | `connected_at` timestamp | `status_connected` has no transition timestamp today, so `orbiter_connected_at` is unrecoverable for historical connections. Stamp it whenever status becomes `connected`; backfill best-effort from audit data or `updated_at`. **The longer this waits, the more connections lose their anchor permanently.** |
+
+### Optional — convenience, not blocking
+
+| Table | Add | Why |
+|---|---|---|
+| `calendar_event_activity` (598) | `is_recurring` bool | Recurring counts already work via the `events.master_event_id` (221 → 222) join; carrying the flag on 598 just saves the join in the cron's hot path. |
+
+## In-app chat (GetStream) — planned source
+
+In-app user↔contact messaging will run on [Stream Chat](https://getstream.io/chat/docs/). The counting pattern is identical to email: Stream is the transport, but the cron **never calls the Stream API** — a webhook-fed activity table is the source of truth, exactly like the Nylas rule above.
+
+### New activity table: `chat_activity`
+
+Mirror of `email_activity`, fed by Stream webhooks (DDL in [Tables](#tables)). Event-to-column mapping:
+
+| Column | From the Stream event |
+|---|---|
+| `user_id`, `my_person_id` | Resolved from the Stream user ids of the channel members (provision Stream users with Orbiter `user.id` as the Stream user id so this mapping is a lookup, not an inference). |
+| `channel_cid` | `cid` — Stream's channel identifier; the thread key. Use Stream **distinct channels** for 1:1 DMs so the same pair always maps to the same `cid`. |
+| `message_id` | `message.id` — idempotency key for webhook retries (unique index). |
+| `direction` enum `sent \| received` | `message.user` vs the channel counterpart — same direction convention as the email table. |
+| `message_ts` | `message.created_at`. |
+
+Subscribe to `message.new` (and `message.deleted` if deleted messages should un-count). The webhook payload carries the message, sender, `cid`, and the channel member list — members are truncated at 50, which is irrelevant for 1:1 DMs but means group-channel support later should read membership from our own channel record, not the event payload.
+
+### Counting rules (cron, local SQL over `chat_activity`)
+
+- `total_in_app_chat_threads` = `COUNT(DISTINCT channel_cid)` for the pair.
+- `chat_interactions` = count of rows with `direction = 'received'` — messages the **contact** posted. Deliberately one-directional: it measures their engagement toward the user. If a `to`/`from` split like email ever matters, add columns; don't redefine this one.
+- Chat timestamps feed `first_known_interaction` and any future `last_direct_interaction` the same as email and calendar.
+
+### What Stream gives us (verified against their docs)
+
+- **Webhooks** with per-event selection, HMAC `X-Signature` verification, and full message + sender + channel context on `message.new` — everything the ingest handler needs.
+- **Distinct channels** — stable 1:1 channel identity without managing our own channel ids.
+- **Export Channels API** — async job (`task_id` polling) with `messages_since` / `messages_until`, up to 25 channels per request. This is the one-time historical backfill path **only if** webhooks weren't enabled from day one. Enable the webhook before the chat feature launches and no backfill ever exists — the export API stays unused.
+
+The Stream event payload should also land raw in a log table (the `nylas_message_read_logs` pattern) for replay/debugging.
+
+## Retirement note
+
+Once this table is populated and the side panel reads from it, the legacy rollup columns on `contacts` (128) — `total_email_activity`, `total_remote_events`, `total_irl_events` — become retirement candidates. Same rule as the Known [pending retirements](/guides/known/index#pending-retirements): confirm a 30-day window of zero readers before dropping. Do not remove them in the build pass.
+
+## Open items
+
+| Item | Default in this spec | Revisit when |
+|---|---|---|
+| Subtype meeting counts include future events | Yes (they follow `total_meetings`) | Product review of the side panel — switch to attended-only is one line in the cron |
+| Day-granularity rolling windows (`emails_last_90d` etc.) | Not stored — the monthly buckets answer "active recently" at month grain | Only if a UI needs sharper-than-month windows; they'd derive from the activity tables, not from new columns |
+| `momentum` thresholds (`1.5×` rising, `0.5×` cooling, 6-month dormancy, 3-month `new`) | Initial guesses | Tune against real data after the first production runs — same convention as the Known scoring coefficients |
+| `opened` durability | Increment-only, unrecoverable | Add an open-event log if the count starts driving anything that matters |
+| Historical `orbiter_connected_at` backfill | Best-effort | When the `contacts.connected_at` column lands |
+| Placeholder columns (`total_in_app_chat_threads`, `chat_interactions`, `total_leverage_loops`, `total_leverage_loop_assists`) | Reserved in schema, always 0, no writer | Chat pair: source design committed (GetStream → `chat_activity`), waits on the chat feature — enable the Stream webhook **before launch** so no backfill is ever needed. Loop pair: define source + rules when the feature ships |

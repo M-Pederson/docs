@@ -15,21 +15,13 @@ It is the app-side, **user-perspective** cousin of the [Known](/guides/known/ind
 **The cron never calls the Nylas API.** Historical log-parse loads every past email into `email_activity` and every past calendar event into `calendar_event_activity` + `events`, and the webhook handlers keep those tables current. They are mirrored into AlloyDB with the same shape as the Xano workspace 3 tables, so the nightly job reads them with local SQL. If a classification rule needs a field those tables don't carry, the fix is to [change the activity tables](#required-changes-to-the-activity-tables) — never to fetch from Nylas at cron time.
 </Warning>
 
-## Design principles
+## Tables
 
-1. **Recompute, don't increment.** Every cron-owned count is recomputed from raw activity logs on each pass — never `count = count + delta`. Simpler, self-healing, no drift. (Same rule as the Known counts crons.)
-2. **Anchors are stored, months are derived.** `months_*` integers tick on their own; the anchor timestamps are the source of truth and the cron re-derives the ints. Never write a `months_*` value without its anchor.
-3. **Domain time, not ingest time.** `first_known_interaction` backdates to when the interaction *happened* (a LinkedIn connection from 2019 imported in 2026 counts as 2019). This mirrors the Known model's `evidence_occurred_at` vs `first_seen_at` split.
-4. **Activity tables only, Nylas never.** The nightly job reads Orbiter's own activity tables in AlloyDB. Anything it needs from a Nylas event must be captured into those tables by the two ingest paths (webhook handlers + historical log-parse) — see [required changes](#required-changes-to-the-activity-tables) below.
-5. **Two writers, disjoint columns.** The nightly cron owns the counts, anchors, and months. The App backend owns `opened` / `last_opened_at`. Neither ever writes the other's columns.
+Three product tables plus the job-state row, all in AlloyDB. `contacts_interaction_log` is the read model the side panel hits. `contacts_interaction_monthly` is the history primitive — every temporal signal (averages, last-month, momentum) derives from it. `chat_activity` ships with the in-app chat feature.
 
-## Grain and keying
+### `contacts_interaction_log`
 
-One row per `contacts` row (Xano table 128). `contacts` is already unique per `(user_id, master_person_id)`, so `contacts_id` alone identifies the pair and is the **upsert key** (`UNIQUE`). `user_id` is denormalized alongside it as the query path for per-user scans.
-
-Upsert-only: never a second row for the same `contacts_id`. Any Known-side or graph consumer that wants these rollups keyed by person joins through `contacts` to reach `master_person_id`.
-
-## Table spec (DDL)
+One row per `contacts` row (Xano table 128). `contacts` is already unique per `(user_id, master_person_id)`, so `contacts_id` alone identifies the pair and is the **upsert key** (`UNIQUE`). `user_id` is denormalized alongside it as the query path for per-user scans. Upsert-only: never a second row for the same `contacts_id`. Any Known-side or graph consumer that wants these rollups keyed by person joins through `contacts` to reach `master_person_id`.
 
 ```sql
 CREATE TABLE contacts_interaction_log (
@@ -73,6 +65,17 @@ CREATE TABLE contacts_interaction_log (
   months_connected_orbiter  INTEGER,
   months_known              INTEGER,
 
+  -- temporal rollups (cron-owned; derived from contacts_interaction_monthly,
+  -- complete calendar months only)
+  average_monthly_emails            NUMERIC(6,2),
+  average_monthly_meetings          NUMERIC(6,2),
+  average_monthly_chat_interactions NUMERIC(6,2),
+  last_month_emails                 INTEGER,
+  last_month_meetings               INTEGER,
+  last_month_chat_interactions      INTEGER,
+  momentum                          TEXT CHECK (momentum IN
+    ('new','rising','steady','cooling','dormant','reignited')),
+
   -- bookkeeping
   last_counts_updated_at    TIMESTAMPTZ,
 
@@ -83,7 +86,78 @@ CREATE INDEX idx_cil_user_id           ON contacts_interaction_log (user_id);
 CREATE INDEX idx_cil_user_last_opened  ON contacts_interaction_log (user_id, last_opened_at DESC);
 ```
 
-### Column semantics
+### `contacts_interaction_monthly`
+
+The history primitive: one row per contact per calendar month with any activity. The cron rewrites a contact's full bucket set from raw activity history on every recompute (delete + insert, one transaction) — buckets are data, the `average_monthly_*` / `last_month_*` / `momentum` columns above are just views over them. Buckets also power side-panel sparklines and any future signal (z-scores, seasonality, gap analysis) without a migration.
+
+```sql
+CREATE TABLE contacts_interaction_monthly (
+  id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  user_id      BIGINT NOT NULL,   -- logical FK → Xano user.id (125)
+  contacts_id  BIGINT NOT NULL,   -- logical FK → Xano contacts.id (128)
+  month        DATE NOT NULL,     -- first day of the month (UTC)
+
+  emails_to         INTEGER NOT NULL DEFAULT 0,
+  emails_from       INTEGER NOT NULL DEFAULT 0,
+  meetings          INTEGER NOT NULL DEFAULT 0,  -- non-cancelled events starting in this month
+  chat_interactions INTEGER NOT NULL DEFAULT 0,  -- stays 0 until in-app chat ships
+
+  CONSTRAINT contacts_interaction_monthly_pair_month_key UNIQUE (contacts_id, month)
+);
+
+CREATE INDEX idx_cim_user_month ON contacts_interaction_monthly (user_id, month);
+```
+
+Bucketing is by **domain time** (`date_trunc('month', activity_timestamp)` for email, event start for meetings), consistent with the domain-time principle below. Months with zero activity get no row — readers treat missing as zero.
+
+### `chat_activity` (created when in-app chat ships)
+
+Webhook-fed mirror of `email_activity` for the GetStream in-app chat — see [In-app chat source](#in-app-chat-getstream--planned-source) for the event mapping. The migration ships with the chat feature, not now.
+
+```sql
+CREATE TABLE chat_activity (
+  id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  user_id       BIGINT NOT NULL,   -- logical FK → Xano user.id (125)
+  my_person_id  BIGINT NOT NULL,   -- logical FK → Xano contacts.id (128)
+  channel_cid   TEXT NOT NULL,     -- Stream channel identifier (thread key)
+  message_id    TEXT NOT NULL,     -- Stream message id (webhook idempotency)
+  direction     TEXT NOT NULL CHECK (direction IN ('sent','received')),
+  message_ts    TIMESTAMPTZ NOT NULL,
+
+  CONSTRAINT chat_activity_message_id_key UNIQUE (message_id)
+);
+
+CREATE INDEX idx_chat_activity_person_ts ON chat_activity (my_person_id, message_ts);
+```
+
+### `cron_state`
+
+One row per job — the high-water mark the delta pass reads and the run bookkeeping.
+
+```sql
+CREATE TABLE cron_state (
+  job_name         TEXT PRIMARY KEY,
+  high_water_mark  TIMESTAMPTZ,
+  last_run_at      TIMESTAMPTZ,
+  last_run_status  TEXT
+);
+```
+
+## Design principles
+
+1. **Recompute, don't increment.** Every cron-owned count is recomputed from raw activity logs on each pass — never `count = count + delta`. Simpler, self-healing, no drift. (Same rule as the Known counts crons.)
+2. **Anchors are stored, months are derived.** `months_*` integers tick on their own; the anchor timestamps are the source of truth and the cron re-derives the ints. Never write a `months_*` value without its anchor.
+3. **Domain time, not ingest time.** `first_known_interaction` backdates to when the interaction *happened* (a LinkedIn connection from 2019 imported in 2026 counts as 2019). This mirrors the Known model's `evidence_occurred_at` vs `first_seen_at` split.
+4. **Activity tables only, Nylas never.** The nightly job reads Orbiter's own activity tables in AlloyDB. Anything it needs from a Nylas event must be captured into those tables by the two ingest paths (webhook handlers + historical log-parse) — see [required changes](#required-changes-to-the-activity-tables) below.
+5. **Two writers, disjoint columns.** The nightly cron owns the counts, anchors, months, and temporal rollups. The App backend owns `opened` / `last_opened_at`. Neither ever writes the other's columns.
+6. **History in buckets, aggregates as views.** Anything temporal is derived from `contacts_interaction_monthly`, never stored as its own maintained aggregate. New temporal signals mean a new query over the buckets, not a new cron-maintained column.
+
+## Column semantics
 
 | Column | Meaning |
 |---|---|
@@ -106,6 +180,9 @@ CREATE INDEX idx_cil_user_last_opened  ON contacts_interaction_log (user_id, las
 | `orbiter_connected_at` | When `contacts.status_connected` first became `connected` — a real mutual connection on Orbiter (decided: **not** contact-record age). |
 | `first_known_interaction` | `min(` first `email_activity` timestamp, first past calendar event start, `linkedin_connected_on` `)`. Domain time — so `months_known >= months_connected_linkedin` always holds. App-side analog of the KNOWS `known_since` derivation. |
 | `months_connected_linkedin` / `months_connected_orbiter` / `months_known` | Full calendar months elapsed since the corresponding anchor. `NULL` when the anchor is `NULL`. |
+| `average_monthly_emails` / `average_monthly_meetings` / `average_monthly_chat_interactions` | Mean per complete calendar month over the trailing **12 complete months** (fewer for younger contacts — whatever complete months exist). Derived from the monthly buckets; `NULL` until at least one complete month exists. |
+| `last_month_emails` / `last_month_meetings` / `last_month_chat_interactions` | Counts in the last **complete** calendar month. Never the current month — it's always partial and would always read "below average" mid-month. |
+| `momentum` | `new \| rising \| steady \| cooling \| dormant \| reignited` — the side panel's temperature word for the relationship. Rules in [Temporal awareness](#temporal-awareness). |
 | `last_counts_updated_at` | Stamped by the cron on every recompute of a row. Doubles as the freshness signal. |
 
 Subset invariants (assert in tests, and after every backfill): `total_meetings_attended <= total_meetings`; `total_irl_meetings + total_remote_meetings <= total_meetings` (events with neither location nor conferencing land in neither subtype — it is **not** an equality); `total_recurring_meetings <= total_meetings`.
@@ -132,6 +209,31 @@ Applied per event, using data captured from Nylas at ingest time:
 - **Recurring:** the event carries a `recurrence` RRULE array (series master) or a `master_event_id` (expanded instance). Neither → one-off.
 - **Attended:** event end is in the past and the contact's `participants[].status == "yes"`, or the contact is the organizer.
 - Subtype counts follow `total_meetings` (i.e. they include future non-cancelled events), so a scheduled future Zoom shows up as remote immediately. Switching subtypes to attended-only is a one-line change in the cron if product prefers it — flag at build time.
+
+## Temporal awareness
+
+Lifetime totals can't tell "active relationship" from "was active in 2018" — the same argument the Known docs make for [time-bucketed counts](/guides/known/scope/counts#why-time-bucketed). Here the answer is the `contacts_interaction_monthly` buckets table plus three derived views on the main row: the trailing average, the last complete month, and one `momentum` word.
+
+**Why buckets and not more aggregate columns:** buckets keep every door open. Any future temporal signal — z-scores, EWMA baselines, seasonality, gap analysis, day-level windows at month grain — is a query over buckets added in an afternoon. Aggregate columns computed without history would require re-scanning the activity tables to reconstruct what buckets preserve for free. Storage is trivial: at most one small row per contact-month with activity.
+
+### Momentum rules
+
+Computed over **combined** interactions per complete month (`emails_to + emails_from + meetings + chat_interactions`). First match wins:
+
+| Order | Value | Rule |
+|---|---|---|
+| 1 | `new` | `months_known < 3` — the baseline is noise; don't compute a ratio |
+| 2 | `reignited` | last complete month > 0 after **6+ consecutive zero months** immediately before it |
+| 3 | `dormant` | last 6 complete months all zero (and interaction history exists) |
+| 4 | `rising` | last-month total ≥ **1.5×** the trailing average (average > 0) |
+| 5 | `cooling` | last-month total ≤ **0.5×** the trailing average (average ≥ 1, so near-zero baselines don't flap) |
+| 6 | `steady` | everything else |
+
+The `1.5× / 0.5× / 6-month / 3-month` values are initial guesses, listed in [open items](#open-items) for tuning against real data — the same convention as the Known scoring coefficients. `reignited` outranks everything but `new` because it's the signal a user actually acts on, and the one no flat average can express.
+
+Chat columns participate in all of this automatically once `chat_activity` starts filling buckets; until then they contribute zeros.
+
+**Deliberately not stored:** z-scores, EWMA, reciprocity drift, day-granularity windows. All derivable from buckets later if the product wants them; none earn a cron-maintained column today (design principle 6).
 
 ## Update model
 
@@ -171,7 +273,7 @@ See the next section. Its upsert must list **only cron-owned columns** in the `D
 **Pass structure:**
 
 1. **Delta detection.** Find `contacts_id`s with activity newer than the job's high-water mark (max `created_at` / `activity_timestamp` processed last run, persisted in a one-row `cron_state` table in AlloyDB). Only those rows get a full count recompute — the Known counts-cron differential pattern.
-2. **Count recompute** for touched contacts: pull their full activity history, classify, aggregate, batch-upsert. Recompute from scratch per contact — no incremental arithmetic.
+2. **Count + bucket recompute** for touched contacts: pull their full activity history, classify, aggregate. Lifetime counts upsert into `contacts_interaction_log`; the contact's **entire monthly bucket set** is rewritten in `contacts_interaction_monthly` (delete + insert, one transaction). Recompute from scratch per contact — no incremental arithmetic.
 3. **Months pass** for **all** rows (not just touched ones — months tick with the calendar, not with activity). Pure SQL, one statement, derived from stored anchors:
 
 ```sql
@@ -184,7 +286,8 @@ SET months_connected_linkedin = months_between(linkedin_connected_on, CURRENT_DA
 
 where `months_between` is full-calendar-month arithmetic: `(y2 - y1) * 12 + (m2 - m1) - CASE WHEN d2 < d1 THEN 1 ELSE 0 END`, null-safe.
 
-4. **Stamp** `last_counts_updated_at = now()` on every row touched in pass 2; advance the high-water mark only after a fully successful run.
+4. **Temporal pass** for **all** rows (last-month and averages shift at every month boundary, not just on activity): recompute `average_monthly_*` (trailing 12 complete months), `last_month_*` (last complete month), and `momentum` from `contacts_interaction_monthly` — pure SQL over the buckets, complete months only, per the [momentum rules](#momentum-rules).
+5. **Stamp** `last_counts_updated_at = now()` on every row touched in pass 2; advance the high-water mark only after a fully successful run.
 
 **Concurrency:** take a Postgres advisory lock (`pg_try_advisory_lock`) at job start; exit cleanly if a previous run is still holding it. Cloud Scheduler retries are then harmless.
 
@@ -195,8 +298,8 @@ where `months_between` is full-calendar-month arithmetic: `(y2 - y1) * 12 + (m2 
 Target: the Universe standalone Go codebase (see [Orbiter Universe Standalone](/guides/open-work/orbiter-univers-standalone)). All access via `pgx` against AlloyDB — the activity tables are already there, so the job has no HTTP dependencies at all.
 
 <Steps>
-  <Step title="Migration — create the table">
-    Add the DDL above as a migration (whatever tool the Universe repo standardizes on — golang-migrate or equivalent). Include the two indexes and the `cron_state` watermark table (`job_name TEXT PRIMARY KEY, high_water_mark TIMESTAMPTZ, last_run_at TIMESTAMPTZ, last_run_status TEXT`).
+  <Step title="Migrations — create the tables">
+    Create the [Tables](#tables) as migrations (whatever tool the Universe repo standardizes on — golang-migrate or equivalent): `contacts_interaction_log`, `contacts_interaction_monthly`, and `cron_state` now. `chat_activity`'s migration ships with the chat feature, not in this pass.
   </Step>
   <Step title="Activity readers — plain SQL">
     An `ActivitySource` interface (`EmailsSince(watermark)`, `CalendarEventsSince(watermark)`, `LinkedInConnections(userID)`, `ContactsByID(...)`) backed by a single `PostgresActivityReader`: keyset-paginated SQL over `email_activity`, `calendar_event_activity` + `events`, `linkedin_connection_join`, and `contacts` in AlloyDB (`WHERE created_at > $watermark ORDER BY created_at, id LIMIT 500`). The interface exists for testability (fake source in unit tests), not for a second backend — there is deliberately no Nylas or Xano HTTP implementation.
@@ -205,10 +308,10 @@ Target: the Universe standalone Go codebase (see [Orbiter Universe Standalone](/
     `ClassifyEmailDirection(activity) → to|from`, `ClassifyMeeting(event) → {cancelled, remote, irl, recurring, attended}`, `MonthsBetween(anchor, today) → int`. No I/O — table-driven unit tests for every rule in [calendar classification](#calendar-classification-rules), including the URL-shaped-location edge cases and the `maybe`/`noreply` RSVP handling.
   </Step>
   <Step title="Aggregator">
-    Group classified activity by `contacts_id` into one rollup struct per contact. `distinct_meeting_series` = count of distinct series-master ids + count of one-offs. Compute `first_known_interaction` here as the min across modalities.
+    Group classified activity by `contacts_id` into one rollup struct per contact **plus a per-month bucket map** (`date_trunc('month')` of each activity's domain timestamp). `distinct_meeting_series` = count of distinct series-master ids + count of one-offs. Compute `first_known_interaction` here as the min across modalities.
   </Step>
   <Step title="Writer — column-scoped upsert">
-    Batch upsert (~500 rows/statement):
+    Two writes per touched contact, one transaction. First the buckets: `DELETE FROM contacts_interaction_monthly WHERE contacts_id = $1` then bulk `INSERT` of the recomputed months. Then the main-row batch upsert (~500 rows/statement):
 
     ```sql
     INSERT INTO contacts_interaction_log (user_id, contacts_id, total_emails, ..., last_counts_updated_at)
@@ -223,13 +326,13 @@ Target: the Universe standalone Go codebase (see [Orbiter Universe Standalone](/
     `opened` and `last_opened_at` must never appear in the `SET` list.
   </Step>
   <Step title="Job wrapper — lock, watermark, months pass">
-    `main()` sequence: acquire advisory lock → load watermark → delta detect → recompute + upsert → months-pass SQL → advance watermark → release lock. `--backfill` flag skips the watermark. Structured logs: contacts touched, rows upserted, per-modality totals, duration. Exit non-zero on any partial failure so Cloud Run marks the execution failed.
+    `main()` sequence: acquire advisory lock → load watermark → delta detect → count + bucket recompute → months-pass SQL → temporal-pass SQL → advance watermark → release lock. `--backfill` flag skips the watermark. Structured logs: contacts touched, rows upserted, bucket rows rewritten, per-modality totals, duration. Exit non-zero on any partial failure so Cloud Run marks the execution failed.
   </Step>
   <Step title="Deploy — Cloud Run Job + Scheduler">
     Cloud Run Job in the same project/region as AlloyDB (connect via the AlloyDB Auth Proxy sidecar or direct VPC). Cloud Scheduler trigger at 02:00 UTC daily. Env: `ALLOYDB_DSN` — that's the only external dependency. Alert on job failure (Cloud Monitoring on execution status).
   </Step>
   <Step title="Verify">
-    Run `--backfill` against staging, then assert the invariants over the whole table: `total_emails = to_emails + from_emails`; `attended <= total_meetings`; `irl + remote <= total_meetings`; `recurring <= total_meetings`; every non-null `months_*` has a non-null anchor; `months_known >= months_connected_linkedin` wherever both are set. Spot-check a handful of contacts against their raw activity rows. Re-run the job immediately: a second pass over unchanged data must produce zero value changes (idempotency check).
+    Run `--backfill` against staging, then assert the invariants over the whole table: `total_emails = to_emails + from_emails`; `attended <= total_meetings`; `irl + remote <= total_meetings`; `recurring <= total_meetings`; every non-null `months_*` has a non-null anchor; `months_known >= months_connected_linkedin` wherever both are set. **Buckets must reconcile with lifetime counts**: per contact, `SUM(emails_to + emails_from)` over `contacts_interaction_monthly` = `total_emails`, and `SUM(meetings)` = `total_meetings` (both count from the same raw data, so any gap is a bucketing bug). `momentum` must be non-null wherever a bucket row exists. Spot-check a handful of contacts against their raw activity rows. Re-run the job immediately: a second pass over unchanged data must produce zero value changes (idempotency check).
   </Step>
 </Steps>
 
@@ -264,7 +367,7 @@ In-app user↔contact messaging will run on [Stream Chat](https://getstream.io/c
 
 ### New activity table: `chat_activity`
 
-Mirror of `email_activity`, fed by Stream webhooks:
+Mirror of `email_activity`, fed by Stream webhooks (DDL in [Tables](#tables)). Event-to-column mapping:
 
 | Column | From the Stream event |
 |---|---|
@@ -299,7 +402,8 @@ Once this table is populated and the side panel reads from it, the legacy rollup
 | Item | Default in this spec | Revisit when |
 |---|---|---|
 | Subtype meeting counts include future events | Yes (they follow `total_meetings`) | Product review of the side panel — switch to attended-only is one line in the cron |
-| Rolling windows (`emails_last_90d` etc.) | Not in v1 | If the side panel ever shows "active recently" — the Known docs' [time-bucketing rationale](/guides/known/scope/counts#why-time-bucketed) applies here identically |
+| Day-granularity rolling windows (`emails_last_90d` etc.) | Not stored — the monthly buckets answer "active recently" at month grain | Only if a UI needs sharper-than-month windows; they'd derive from the activity tables, not from new columns |
+| `momentum` thresholds (`1.5×` rising, `0.5×` cooling, 6-month dormancy, 3-month `new`) | Initial guesses | Tune against real data after the first production runs — same convention as the Known scoring coefficients |
 | `opened` durability | Increment-only, unrecoverable | Add an open-event log if the count starts driving anything that matters |
 | Historical `orbiter_connected_at` backfill | Best-effort | When the `contacts.connected_at` column lands |
 | Placeholder columns (`total_in_app_chat_threads`, `chat_interactions`, `total_leverage_loops`, `total_leverage_loop_assists`) | Reserved in schema, always 0, no writer | Chat pair: source design committed (GetStream → `chat_activity`), waits on the chat feature — enable the Stream webhook **before launch** so no backfill is ever needed. Loop pair: define source + rules when the feature ships |

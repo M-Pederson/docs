@@ -1,0 +1,235 @@
+---
+title: "Contacts Interaction Log"
+description: "Per-contact interaction rollups (email, calendar, LinkedIn, engagement) — AlloyDB table spec, nightly recompute cron, and Go build plan."
+---
+
+`contacts_interaction_log` is a per-contact rollup table that answers, cheaply and at read time: *how much have I actually interacted with this person, through which channels, and for how long have I known them?* It feeds the contact side panel and any downstream relationship-strength signals.
+
+It is the app-side, **user-perspective** cousin of the [Known](/guides/known/index) `KNOWS` edge: `KNOWS` is a symmetric person↔person edge in FalkorDB; this table is *my* interaction stats with *my* contact. Naming and update conventions follow the Known model ([interaction counts](/guides/known/scope/counts), [KNOWS edge fields](/guides/known/schema-design/edges)) so the two stay mentally interchangeable.
+
+<Info>
+**Home: AlloyDB.** The table lives only in AlloyDB (Universe / App backend). The side panel reads it through the App backend, not Xano. `user_id` and `contacts_id` are *logical* foreign keys mirroring Xano row ids — there are no cross-system FK constraints to enforce them.
+</Info>
+
+## Design principles
+
+1. **Recompute, don't increment.** Every cron-owned count is recomputed from raw activity logs on each pass — never `count = count + delta`. Simpler, self-healing, no drift. (Same rule as the Known counts crons.)
+2. **Anchors are stored, months are derived.** `months_*` integers tick on their own; the anchor timestamps are the source of truth and the cron re-derives the ints. Never write a `months_*` value without its anchor.
+3. **Domain time, not ingest time.** `first_known_interaction` backdates to when the interaction *happened* (a LinkedIn connection from 2019 imported in 2026 counts as 2019). This mirrors the Known model's `evidence_occurred_at` vs `first_seen_at` split.
+4. **Activity tables first, Nylas never (at cron time).** The nightly job reads Orbiter's own activity tables. Anything it needs from a Nylas event must be captured at webhook-ingest time into the activity tables — see [gaps](#suggested-additions-to-the-activity-tables) below.
+5. **Two writers, disjoint columns.** The nightly cron owns the counts, anchors, and months. The App backend owns `opened` / `last_opened_at`. Neither ever writes the other's columns.
+
+## Grain and keying
+
+One row per `contacts` row (Xano table 128). `contacts` is already unique per `(user_id, master_person_id)`, so `contacts_id` alone identifies the pair and is the **upsert key** (`UNIQUE`). `user_id` is denormalized alongside it as the query path for per-user scans.
+
+Upsert-only: never a second row for the same `contacts_id`. Any Known-side or graph consumer that wants these rollups keyed by person joins through `contacts` to reach `master_person_id`.
+
+## Table spec (DDL)
+
+```sql
+CREATE TABLE contacts_interaction_log (
+  id                        BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  created_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  user_id                   BIGINT NOT NULL,  -- logical FK → Xano user.id (125)
+  contacts_id               BIGINT NOT NULL,  -- logical FK → Xano contacts.id (128)
+
+  -- email counts (cron-owned)
+  total_emails              INTEGER NOT NULL DEFAULT 0,
+  to_emails                 INTEGER NOT NULL DEFAULT 0,
+  from_emails               INTEGER NOT NULL DEFAULT 0,
+
+  -- calendar counts (cron-owned)
+  total_meetings            INTEGER NOT NULL DEFAULT 0,
+  total_meetings_attended   INTEGER NOT NULL DEFAULT 0,
+  total_irl_meetings        INTEGER NOT NULL DEFAULT 0,
+  total_remote_meetings     INTEGER NOT NULL DEFAULT 0,
+  total_recurring_meetings  INTEGER NOT NULL DEFAULT 0,
+  distinct_meeting_series   INTEGER NOT NULL DEFAULT 0,
+
+  -- engagement (app-owned; cron never writes these)
+  opened                    INTEGER NOT NULL DEFAULT 0,
+  last_opened_at            TIMESTAMPTZ,
+
+  -- connection anchors (cron-owned)
+  linkedin_connected_on     DATE,
+  orbiter_connected_at      TIMESTAMPTZ,
+  first_known_interaction   TIMESTAMPTZ,
+
+  -- derived month ints (cron-owned)
+  months_connected_linkedin INTEGER,
+  months_connected_orbiter  INTEGER,
+  months_known              INTEGER,
+
+  -- bookkeeping
+  last_counts_updated_at    TIMESTAMPTZ,
+
+  CONSTRAINT contacts_interaction_log_contacts_id_key UNIQUE (contacts_id)
+);
+
+CREATE INDEX idx_cil_user_id           ON contacts_interaction_log (user_id);
+CREATE INDEX idx_cil_user_last_opened  ON contacts_interaction_log (user_id, last_opened_at DESC);
+```
+
+### Column semantics
+
+| Column | Meaning |
+|---|---|
+| `total_emails` | All messages exchanged with the contact. Invariant: `= to_emails + from_emails`. Broadcast/cc-only messages **count** (decided); `email_activity.participant_count` is available if a later scoring pass wants to discount them. |
+| `to_emails` | User → contact. Contact appears as a recipient (to or cc) on a message the user sent. |
+| `from_emails` | Contact → user. Contact is the sender. |
+| `total_meetings` | All non-cancelled calendar events where user and contact are both participants. Includes future events ("meetings on the books"). |
+| `total_meetings_attended` | Subset of `total_meetings`: the event has ended **and** the contact's RSVP was `yes` (or the contact was the organizer). `maybe` / `noreply` stay in `total_meetings` only. RSVP is a declared-attendance proxy — the best signal the calendar gives. |
+| `total_irl_meetings` | Subset: physical `location` set, not URL-shaped, no conferencing block. |
+| `total_remote_meetings` | Subset: conferencing details present (Zoom / Meet / Teams URL), or the location is URL-shaped. |
+| `total_recurring_meetings` | Subset: instances belonging to a recurring series (event carries a recurrence rule, or points at a series master). |
+| `distinct_meeting_series` | Count of unique series masters + one-off events — "how many separate times did we decide to meet." A weekly standing 1:1 counts once here, ~50/yr in `total_meetings`. The better relationship-strength signal. |
+| `opened` | Times the user opened this contact in the side panel. **App-incremented**, not recomputable — there is no raw open-event log. |
+| `last_opened_at` | Timestamp of the most recent side-panel open. |
+| `linkedin_connected_on` | LinkedIn connection date, from the LinkedIn import (`linkedin_csv.connected_on` 259 / `linkedin_connection_join.date_connected` 258). Domain time. |
+| `orbiter_connected_at` | When `contacts.status_connected` first became `connected` — a real mutual connection on Orbiter (decided: **not** contact-record age). |
+| `first_known_interaction` | `min(` first `email_activity` timestamp, first past calendar event start, `linkedin_connected_on` `)`. Domain time — so `months_known >= months_connected_linkedin` always holds. App-side analog of the KNOWS `known_since` derivation. |
+| `months_connected_linkedin` / `months_connected_orbiter` / `months_known` | Full calendar months elapsed since the corresponding anchor. `NULL` when the anchor is `NULL`. |
+| `last_counts_updated_at` | Stamped by the cron on every recompute of a row. Doubles as the freshness signal. |
+
+Subset invariants (assert in tests, and after every backfill): `total_meetings_attended <= total_meetings`; `total_irl_meetings + total_remote_meetings <= total_meetings` (events with neither location nor conferencing land in neither subtype — it is **not** an equality); `total_recurring_meetings <= total_meetings`.
+
+### Calendar classification rules
+
+Applied per event, using data captured from Nylas at ingest time:
+
+- **Excluded entirely:** `status == "cancelled"`; all-day busy blocks with no participants beyond the user.
+- **Remote:** the Nylas `conferencing` object is present (`conferencing.provider` / `details.url`), or `location` matches a URL pattern.
+- **IRL:** `location` is set, is not URL-shaped, and there is no conferencing block.
+- **Recurring:** the event carries a `recurrence` RRULE array (series master) or a `master_event_id` (expanded instance). Neither → one-off.
+- **Attended:** event end is in the past and the contact's `participants[].status == "yes"`, or the contact is the organizer.
+- Subtype counts follow `total_meetings` (i.e. they include future non-cancelled events), so a scheduled future Zoom shows up as remote immediately. Switching subtypes to attended-only is a one-line change in the cron if product prefers it — flag at build time.
+
+## Update model
+
+### Writer 1 — App backend (`opened`)
+
+The side-panel open endpoint does a single upsert; this is the only increment-style write in the table:
+
+```sql
+INSERT INTO contacts_interaction_log (user_id, contacts_id, opened, last_opened_at)
+VALUES ($1, $2, 1, now())
+ON CONFLICT (contacts_id) DO UPDATE
+SET opened = contacts_interaction_log.opened + 1,
+    last_opened_at = now(),
+    updated_at = now();
+```
+
+If losing open counts ever matters, add a lightweight open-event log and move `opened` to the recount pattern. Not needed for v1.
+
+### Writer 2 — nightly cron (everything else)
+
+See the next section. Its upsert must list **only cron-owned columns** in the `DO UPDATE SET` clause so it can never clobber `opened` / `last_opened_at`.
+
+## CRON
+
+**Job:** `universe/crons/recompute_contacts_interaction_log` — a Go binary deployed as a Cloud Run Job, triggered by Cloud Scheduler at **02:00 UTC nightly**.
+
+**Data sources — Orbiter activity tables only.** The job never calls Nylas. Everything it classifies must already be sitting in our own tables, captured at webhook-ingest time:
+
+| Rollup fields | Source | Notes |
+|---|---|---|
+| `to_emails`, `from_emails`, `total_emails` | `email_activity` (Xano 597) | Keyed by `my_person_id` → `contacts.id`. Direction from the activity's direction signal — today inferred from `activity_type_id` / `card_descriptor`; an explicit `direction` column is proposed below. |
+| All six meeting counts | `calendar_event_activity` (Xano 598) + `events` (221) | 598 rows keyed by `my_person_id`; recurrence via `events.master_event_id` (222). Location / conferencing / RSVP fields are proposed additions below. |
+| `linkedin_connected_on` | `linkedin_connection_join` (258) / `linkedin_csv` (259) | Domain-time connection date. |
+| `orbiter_connected_at` | `contacts.status_connected` transition | Needs a transition timestamp — proposed addition below. |
+| `first_known_interaction` | min across the three sources above | |
+
+**Pass structure:**
+
+1. **Delta detection.** Find `contacts_id`s with activity newer than the job's high-water mark (max `created_at` / `activity_timestamp` processed last run, persisted in a one-row `cron_state` table in AlloyDB). Only those rows get a full count recompute — the Known counts-cron differential pattern.
+2. **Count recompute** for touched contacts: pull their full activity history, classify, aggregate, batch-upsert. Recompute from scratch per contact — no incremental arithmetic.
+3. **Months pass** for **all** rows (not just touched ones — months tick with the calendar, not with activity). Pure SQL, one statement, derived from stored anchors:
+
+```sql
+UPDATE contacts_interaction_log
+SET months_connected_linkedin = months_between(linkedin_connected_on, CURRENT_DATE),
+    months_connected_orbiter  = months_between(orbiter_connected_at::date, CURRENT_DATE),
+    months_known              = months_between(first_known_interaction::date, CURRENT_DATE),
+    updated_at = now();
+```
+
+where `months_between` is full-calendar-month arithmetic: `(y2 - y1) * 12 + (m2 - m1) - CASE WHEN d2 < d1 THEN 1 ELSE 0 END`, null-safe.
+
+4. **Stamp** `last_counts_updated_at = now()` on every row touched in pass 2; advance the high-water mark only after a fully successful run.
+
+**Concurrency:** take a Postgres advisory lock (`pg_try_advisory_lock`) at job start; exit cleanly if a previous run is still holding it. Cloud Scheduler retries are then harmless.
+
+**Backfill mode:** the same binary with a `--backfill` flag ignores the high-water mark and recomputes every contact. Run it once after the table ships, and after any classification-rule change.
+
+## Go build plan
+
+Target: the Universe standalone Go codebase (see [Orbiter Universe Standalone](/guides/open-work/orbiter-univers-standalone)). AlloyDB access via `pgx`; Xano reads via HTTP until the activity tables themselves migrate to AlloyDB.
+
+<Steps>
+  <Step title="Migration — create the table">
+    Add the DDL above as a migration (whatever tool the Universe repo standardizes on — golang-migrate or equivalent). Include the two indexes and the `cron_state` watermark table (`job_name TEXT PRIMARY KEY, high_water_mark TIMESTAMPTZ, last_run_at TIMESTAMPTZ, last_run_status TEXT`).
+  </Step>
+  <Step title="Activity readers behind an interface">
+    Define an `ActivitySource` interface (`EmailsSince(watermark)`, `CalendarEventsSince(watermark)`, `LinkedInConnections(userID)`, `ContactsByID(...)`) with a v1 `XanoActivityReader` implementation: paged HTTP reads against dedicated internal Xano endpoints (new small API group, keyed reads with `created_at > watermark`, page size ~500, `X-Data-Source` / `X-Branch` headers from env). Do **not** read the Xano Metadata API in the production path. When activity ingestion moves to AlloyDB, swap in a `PostgresActivityReader` without touching the rest of the job.
+  </Step>
+  <Step title="Classifiers as pure functions">
+    `ClassifyEmailDirection(activity) → to|from`, `ClassifyMeeting(event) → {cancelled, remote, irl, recurring, attended}`, `MonthsBetween(anchor, today) → int`. No I/O — table-driven unit tests for every rule in [calendar classification](#calendar-classification-rules), including the URL-shaped-location edge cases and the `maybe`/`noreply` RSVP handling.
+  </Step>
+  <Step title="Aggregator">
+    Group classified activity by `contacts_id` into one rollup struct per contact. `distinct_meeting_series` = count of distinct series-master ids + count of one-offs. Compute `first_known_interaction` here as the min across modalities.
+  </Step>
+  <Step title="Writer — column-scoped upsert">
+    Batch upsert (~500 rows/statement):
+
+    ```sql
+    INSERT INTO contacts_interaction_log (user_id, contacts_id, total_emails, ..., last_counts_updated_at)
+    VALUES (...)
+    ON CONFLICT (contacts_id) DO UPDATE SET
+      total_emails = EXCLUDED.total_emails,
+      -- ... every cron-owned column, and ONLY cron-owned columns ...
+      last_counts_updated_at = EXCLUDED.last_counts_updated_at,
+      updated_at = now();
+    ```
+
+    `opened` and `last_opened_at` must never appear in the `SET` list.
+  </Step>
+  <Step title="Job wrapper — lock, watermark, months pass">
+    `main()` sequence: acquire advisory lock → load watermark → delta detect → recompute + upsert → months-pass SQL → advance watermark → release lock. `--backfill` flag skips the watermark. Structured logs: contacts touched, rows upserted, per-modality totals, duration. Exit non-zero on any partial failure so Cloud Run marks the execution failed.
+  </Step>
+  <Step title="Deploy — Cloud Run Job + Scheduler">
+    Cloud Run Job in the same project/region as AlloyDB (connect via the AlloyDB Auth Proxy sidecar or direct VPC). Cloud Scheduler trigger at 02:00 UTC daily. Env: `ALLOYDB_DSN`, `XANO_BASE_URL`, `XANO_API_KEY`, `XANO_BRANCH`, `XANO_DATA_SOURCE`. Alert on job failure (Cloud Monitoring on execution status).
+  </Step>
+  <Step title="Verify">
+    Run `--backfill` against staging, then assert the invariants over the whole table: `total_emails = to_emails + from_emails`; `attended <= total_meetings`; `irl + remote <= total_meetings`; `recurring <= total_meetings`; every non-null `months_*` has a non-null anchor; `months_known >= months_connected_linkedin` wherever both are set. Spot-check a handful of contacts against their raw activity rows. Re-run the job immediately: a second pass over unchanged data must produce zero value changes (idempotency check).
+  </Step>
+</Steps>
+
+## Suggested additions to the activity tables
+
+These are the fields the classifiers need that the activity tables don't reliably carry today. All of them are already present in the Nylas webhook payloads that log-parse processes — capturing them **at ingest** is what lets the nightly job avoid Nylas entirely. Proposals, pending approval:
+
+| Table | Add | Why |
+|---|---|---|
+| `email_activity` (597) | `direction` enum `sent \| received` | Today direction is inferred from `activity_type_id` / `card_descriptor` ("from Emery Wells") — brittle string logic in the counting path. One explicit column at ingest ends that. |
+| `calendar_event_activity` (598) | `event_start`, `event_end` timestamps | Only `activity_timestamp` exists; "has the event ended" (attended logic) needs the real end time. |
+| `calendar_event_activity` (598) | `event_status` enum `confirmed \| cancelled` | Cancellation currently lives in a freeform `status` text; the exclusion rule needs it typed. |
+| `calendar_event_activity` (598) | `location` text, `conferencing_provider` text (null = none) | The IRL/remote split. Provider string doubles as a display fact ("met on Zoom 12×"). |
+| `calendar_event_activity` (598) | `is_recurring` bool (or rely on `events.master_event_id` join) | Recurring counts without re-fetching the event object. Carrying the flag on 598 saves the join. |
+| `calendar_event_activity` (598) | `contact_rsvp_status` enum `yes \| no \| maybe \| noreply`, `organizer_is_contact` bool | The attended rule. Nylas `participants[].status` at ingest time; update on RSVP-change webhooks. |
+| `contacts` (128) | `connected_at` timestamp | `status_connected` has no transition timestamp today, so `orbiter_connected_at` is unrecoverable for historical connections. Stamp it whenever status becomes `connected`; backfill best-effort from audit data or `updated_at`. |
+
+## Retirement note
+
+Once this table is populated and the side panel reads from it, the legacy rollup columns on `contacts` (128) — `total_email_activity`, `total_remote_events`, `total_irl_events` — become retirement candidates. Same rule as the Known [pending retirements](/guides/known/index#pending-retirements): confirm a 30-day window of zero readers before dropping. Do not remove them in the build pass.
+
+## Open items
+
+| Item | Default in this spec | Revisit when |
+|---|---|---|
+| Subtype meeting counts include future events | Yes (they follow `total_meetings`) | Product review of the side panel — switch to attended-only is one line in the cron |
+| Rolling windows (`emails_last_90d` etc.) | Not in v1 | If the side panel ever shows "active recently" — the Known docs' [time-bucketing rationale](/guides/known/scope/counts#why-time-bucketed) applies here identically |
+| `opened` durability | Increment-only, unrecoverable | Add an open-event log if the count starts driving anything that matters |
+| Historical `orbiter_connected_at` backfill | Best-effort | When the `contacts.connected_at` column lands |

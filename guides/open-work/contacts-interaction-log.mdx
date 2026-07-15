@@ -11,12 +11,16 @@ It is the app-side, **user-perspective** cousin of the [Known](/guides/known/ind
 **Home: AlloyDB.** The table lives only in AlloyDB (Universe / App backend). The side panel reads it through the App backend, not Xano. `user_id` and `contacts_id` are *logical* foreign keys mirroring Xano row ids — there are no cross-system FK constraints to enforce them.
 </Info>
 
+<Warning>
+**The cron never calls the Nylas API.** Historical log-parse loads every past email into `email_activity` and every past calendar event into `calendar_event_activity` + `events`, and the webhook handlers keep those tables current. They are mirrored into AlloyDB with the same shape as the Xano workspace 3 tables, so the nightly job reads them with local SQL. If a classification rule needs a field those tables don't carry, the fix is to [change the activity tables](#required-changes-to-the-activity-tables) — never to fetch from Nylas at cron time.
+</Warning>
+
 ## Design principles
 
 1. **Recompute, don't increment.** Every cron-owned count is recomputed from raw activity logs on each pass — never `count = count + delta`. Simpler, self-healing, no drift. (Same rule as the Known counts crons.)
 2. **Anchors are stored, months are derived.** `months_*` integers tick on their own; the anchor timestamps are the source of truth and the cron re-derives the ints. Never write a `months_*` value without its anchor.
 3. **Domain time, not ingest time.** `first_known_interaction` backdates to when the interaction *happened* (a LinkedIn connection from 2019 imported in 2026 counts as 2019). This mirrors the Known model's `evidence_occurred_at` vs `first_seen_at` split.
-4. **Activity tables first, Nylas never (at cron time).** The nightly job reads Orbiter's own activity tables. Anything it needs from a Nylas event must be captured at webhook-ingest time into the activity tables — see [gaps](#suggested-additions-to-the-activity-tables) below.
+4. **Activity tables only, Nylas never.** The nightly job reads Orbiter's own activity tables in AlloyDB. Anything it needs from a Nylas event must be captured into those tables by the two ingest paths (webhook handlers + historical log-parse) — see [required changes](#required-changes-to-the-activity-tables) below.
 5. **Two writers, disjoint columns.** The nightly cron owns the counts, anchors, and months. The App backend owns `opened` / `last_opened_at`. Neither ever writes the other's columns.
 
 ## Grain and keying
@@ -132,14 +136,14 @@ See the next section. Its upsert must list **only cron-owned columns** in the `D
 
 **Job:** `universe/crons/recompute_contacts_interaction_log` — a Go binary deployed as a Cloud Run Job, triggered by Cloud Scheduler at **02:00 UTC nightly**.
 
-**Data sources — Orbiter activity tables only.** The job never calls Nylas. Everything it classifies must already be sitting in our own tables, captured at webhook-ingest time:
+**Data sources — activity tables in AlloyDB, nothing else.** The job never calls the Nylas API. Historical log-parse has already loaded all past emails and calendar events into these tables, and webhooks keep them current; they exist in AlloyDB with the same shape as the Xano workspace 3 tables (table ids below are the Xano references). Every read is local SQL:
 
 | Rollup fields | Source | Notes |
 |---|---|---|
-| `to_emails`, `from_emails`, `total_emails` | `email_activity` (Xano 597) | Keyed by `my_person_id` → `contacts.id`. Direction from the activity's direction signal — today inferred from `activity_type_id` / `card_descriptor`; an explicit `direction` column is proposed below. |
-| All six meeting counts | `calendar_event_activity` (Xano 598) + `events` (221) | 598 rows keyed by `my_person_id`; recurrence via `events.master_event_id` (222). Location / conferencing / RSVP fields are proposed additions below. |
+| `to_emails`, `from_emails`, `total_emails` | `email_activity` (Xano 597) | Keyed by `my_person_id` → `contacts.id`. Direction from the activity's direction signal — today inferred from `activity_type_id` / `card_descriptor`; an explicit `direction` column is a required change below. |
+| All six meeting counts | `calendar_event_activity` (Xano 598) + `events` (221) | 598 rows keyed by `my_person_id`; recurrence via `events.master_event_id` (222). Location / conferencing / RSVP fields are required changes below. |
 | `linkedin_connected_on` | `linkedin_connection_join` (258) / `linkedin_csv` (259) | Domain-time connection date. |
-| `orbiter_connected_at` | `contacts.status_connected` transition | Needs a transition timestamp — proposed addition below. |
+| `orbiter_connected_at` | `contacts.status_connected` transition | Needs a transition timestamp — required change below. |
 | `first_known_interaction` | min across the three sources above | |
 
 **Pass structure:**
@@ -166,14 +170,14 @@ where `months_between` is full-calendar-month arithmetic: `(y2 - y1) * 12 + (m2 
 
 ## Go build plan
 
-Target: the Universe standalone Go codebase (see [Orbiter Universe Standalone](/guides/open-work/orbiter-univers-standalone)). AlloyDB access via `pgx`; Xano reads via HTTP until the activity tables themselves migrate to AlloyDB.
+Target: the Universe standalone Go codebase (see [Orbiter Universe Standalone](/guides/open-work/orbiter-univers-standalone)). All access via `pgx` against AlloyDB — the activity tables are already there, so the job has no HTTP dependencies at all.
 
 <Steps>
   <Step title="Migration — create the table">
     Add the DDL above as a migration (whatever tool the Universe repo standardizes on — golang-migrate or equivalent). Include the two indexes and the `cron_state` watermark table (`job_name TEXT PRIMARY KEY, high_water_mark TIMESTAMPTZ, last_run_at TIMESTAMPTZ, last_run_status TEXT`).
   </Step>
-  <Step title="Activity readers behind an interface">
-    Define an `ActivitySource` interface (`EmailsSince(watermark)`, `CalendarEventsSince(watermark)`, `LinkedInConnections(userID)`, `ContactsByID(...)`) with a v1 `XanoActivityReader` implementation: paged HTTP reads against dedicated internal Xano endpoints (new small API group, keyed reads with `created_at > watermark`, page size ~500, `X-Data-Source` / `X-Branch` headers from env). Do **not** read the Xano Metadata API in the production path. When activity ingestion moves to AlloyDB, swap in a `PostgresActivityReader` without touching the rest of the job.
+  <Step title="Activity readers — plain SQL">
+    An `ActivitySource` interface (`EmailsSince(watermark)`, `CalendarEventsSince(watermark)`, `LinkedInConnections(userID)`, `ContactsByID(...)`) backed by a single `PostgresActivityReader`: keyset-paginated SQL over `email_activity`, `calendar_event_activity` + `events`, `linkedin_connection_join`, and `contacts` in AlloyDB (`WHERE created_at > $watermark ORDER BY created_at, id LIMIT 500`). The interface exists for testability (fake source in unit tests), not for a second backend — there is deliberately no Nylas or Xano HTTP implementation.
   </Step>
   <Step title="Classifiers as pure functions">
     `ClassifyEmailDirection(activity) → to|from`, `ClassifyMeeting(event) → {cancelled, remote, irl, recurring, attended}`, `MonthsBetween(anchor, today) → int`. No I/O — table-driven unit tests for every rule in [calendar classification](#calendar-classification-rules), including the URL-shaped-location edge cases and the `maybe`/`noreply` RSVP handling.
@@ -200,26 +204,37 @@ Target: the Universe standalone Go codebase (see [Orbiter Universe Standalone](/
     `main()` sequence: acquire advisory lock → load watermark → delta detect → recompute + upsert → months-pass SQL → advance watermark → release lock. `--backfill` flag skips the watermark. Structured logs: contacts touched, rows upserted, per-modality totals, duration. Exit non-zero on any partial failure so Cloud Run marks the execution failed.
   </Step>
   <Step title="Deploy — Cloud Run Job + Scheduler">
-    Cloud Run Job in the same project/region as AlloyDB (connect via the AlloyDB Auth Proxy sidecar or direct VPC). Cloud Scheduler trigger at 02:00 UTC daily. Env: `ALLOYDB_DSN`, `XANO_BASE_URL`, `XANO_API_KEY`, `XANO_BRANCH`, `XANO_DATA_SOURCE`. Alert on job failure (Cloud Monitoring on execution status).
+    Cloud Run Job in the same project/region as AlloyDB (connect via the AlloyDB Auth Proxy sidecar or direct VPC). Cloud Scheduler trigger at 02:00 UTC daily. Env: `ALLOYDB_DSN` — that's the only external dependency. Alert on job failure (Cloud Monitoring on execution status).
   </Step>
   <Step title="Verify">
     Run `--backfill` against staging, then assert the invariants over the whole table: `total_emails = to_emails + from_emails`; `attended <= total_meetings`; `irl + remote <= total_meetings`; `recurring <= total_meetings`; every non-null `months_*` has a non-null anchor; `months_known >= months_connected_linkedin` wherever both are set. Spot-check a handful of contacts against their raw activity rows. Re-run the job immediately: a second pass over unchanged data must produce zero value changes (idempotency check).
   </Step>
 </Steps>
 
-## Suggested additions to the activity tables
+## Required changes to the activity tables
 
-These are the fields the classifiers need that the activity tables don't reliably carry today. All of them are already present in the Nylas webhook payloads that log-parse processes — capturing them **at ingest** is what lets the nightly job avoid Nylas entirely. Proposals, pending approval:
+<Warning>
+**These changes block the cron.** The classifiers below cannot run on the activity tables as they exist today (schemas referenced from Xano workspace 3 — the AlloyDB mirrors share the same shape). Every field listed is already present in the Nylas payloads that the ingest paths process; the fix is to persist them, never to fetch from Nylas at cron time.
+
+Each change must land in **both ingest paths** — the webhook handlers *and* the historical log-parse backfill — plus a **one-time backfill** of rows ingested before the columns existed (that one-time backfill is the only place Nylas may be called, and it runs once, not nightly).
+</Warning>
+
+### Blocking — the classifiers need these
 
 | Table | Add | Why |
 |---|---|---|
-| `email_activity` (597) | `direction` enum `sent \| received` | Today direction is inferred from `activity_type_id` / `card_descriptor` ("from Emery Wells") — brittle string logic in the counting path. One explicit column at ingest ends that. |
+| `email_activity` (597) | `direction` enum `sent \| received` | The `to_emails` / `from_emails` split. Today direction is inferred from `activity_type_id` / `card_descriptor` ("from Emery Wells") — brittle string logic in the counting path. One explicit column at ingest ends that. |
 | `calendar_event_activity` (598) | `event_start`, `event_end` timestamps | Only `activity_timestamp` exists; "has the event ended" (attended logic) needs the real end time. |
-| `calendar_event_activity` (598) | `event_status` enum `confirmed \| cancelled` | Cancellation currently lives in a freeform `status` text; the exclusion rule needs it typed. |
+| `calendar_event_activity` (598) | `event_status` enum `confirmed \| cancelled` | The exclusion rule. Cancellation currently lives in a freeform `status` text. |
 | `calendar_event_activity` (598) | `location` text, `conferencing_provider` text (null = none) | The IRL/remote split. Provider string doubles as a display fact ("met on Zoom 12×"). |
-| `calendar_event_activity` (598) | `is_recurring` bool (or rely on `events.master_event_id` join) | Recurring counts without re-fetching the event object. Carrying the flag on 598 saves the join. |
-| `calendar_event_activity` (598) | `contact_rsvp_status` enum `yes \| no \| maybe \| noreply`, `organizer_is_contact` bool | The attended rule. Nylas `participants[].status` at ingest time; update on RSVP-change webhooks. |
-| `contacts` (128) | `connected_at` timestamp | `status_connected` has no transition timestamp today, so `orbiter_connected_at` is unrecoverable for historical connections. Stamp it whenever status becomes `connected`; backfill best-effort from audit data or `updated_at`. |
+| `calendar_event_activity` (598) | `contact_rsvp_status` enum `yes \| no \| maybe \| noreply`, `organizer_is_contact` bool | The attended rule. From Nylas `participants[].status` at ingest; update on RSVP-change webhooks. |
+| `contacts` (128) | `connected_at` timestamp | `status_connected` has no transition timestamp today, so `orbiter_connected_at` is unrecoverable for historical connections. Stamp it whenever status becomes `connected`; backfill best-effort from audit data or `updated_at`. **The longer this waits, the more connections lose their anchor permanently.** |
+
+### Optional — convenience, not blocking
+
+| Table | Add | Why |
+|---|---|---|
+| `calendar_event_activity` (598) | `is_recurring` bool | Recurring counts already work via the `events.master_event_id` (221 → 222) join; carrying the flag on 598 just saves the join in the cron's hot path. |
 
 ## Retirement note
 

@@ -216,6 +216,48 @@ Implementation surface for this pass: **one new helper + one function edit.**
 - Backfill geocoding for never-geocoded rows (costs Radar calls per row) or accept `fmt:` keys until a row is next touched?
 - Does this land before or with the Universe sync's `ALTER TABLE` for the other three sync columns (`content_hash`, `source_run_id`, `locked`)?
 
+## Deployment — step by step
+
+Ordered runbook to take the scoped `master_address` work live. Nothing below has been started; each step gates the next.
+
+### Phase 0 — prep (no writes)
+
+1. **Measure the backfill**: row count on `master_address` (164), split by geocoded (has components) vs ungeocoded, and per-owner duplicate estimate from a dry-run of the key computation.
+2. **Save rollbacks**: export the current XanoScript of `add-company-address` (2451) to a rollback `.xs` file — `xano function edit` publishes live, there is no draft.
+3. **Confirm the field name** (`natural_key`, recommended) and sign off the spec sections above — key tiers, normalization v2, completeness policy, proximity fallback.
+
+### Phase 1 — schema
+
+4. **Add columns** `natural_key` (text) and `place_id` (text, empty for now) to `master_address` **via the Xano UI** — not the MCP full-schema replace (strips `trim` validators from every text column) and never `xano workspace push` (wipes data-source records).
+
+### Phase 2 — code (callee before caller)
+
+5. **Create `mvp/address/build-address-natural-key`** first — inputs: the Radar component set + a raw-string fallback; output: the tier-prefixed key. Pure function, no DB writes.
+6. **Verify the helper** against the worked-examples table (NY / Kenya / China / London / Singapore) and the `fmt:` fallback before touching any caller.
+7. **Edit `add-company-address` (2451)** — single edit that lands all four behaviors: compute `natural_key` on write; replace the `(city, state_region)` dedupe with a key lookup; completeness floor (reject city-less geocodes, log the skip); upgrade-in-place with proximity fallback + downgrade guard. Pin the Radar response language in the same pass.
+8. **Re-fetch the stored XanoScript** and confirm the `function.run "mvp/address/build-address-natural-key"` target stored non-empty (known serializer trap even when the callee exists).
+
+### Phase 3 — validate before backfill
+
+9. **Run the three live validation cases** in the STAGING data source: neural frames "DE" (floor rejects), WBD "New York City" (dedupe no-ops), supersogood Venice/LA (upgrade fires via proximity). Then re-run a normal company enrich end-to-end (Fundable 12809 + LLM payload 12989 paths) and confirm keys land.
+
+### Phase 4 — backfill (live, batched)
+
+10. **Compute keys for existing rows** in batches — `cmp:` tier where components exist, `fmt:` otherwise. No deletes in this pass.
+11. **Collision report** — group by `(owner, natural_key)`; merge duplicates keep-oldest, repointing `my_person_address_join` (310), `my_company_address_join` (314), `my_address_notes` (293) before deleting.
+12. **Completeness sweep** — per owner, delete coarse rows consistent (slots or proximity) with a fuller surviving row, joins repointed first.
+
+### Phase 5 — monitor
+
+13. **Recurring collision report** (weekly task or QA-agent check) — with no DB constraint yet, this is the safety net; also watch the floor-rejection log for sources that suddenly produce junk.
+
+### Later phase — explicitly not in this deployment
+
+- User-facing writers (4654 / 4653 / `POST`+`PUT /master-addresses`) and merge-orchestrator compares.
+- **DB unique index** on `(master_person_id, master_company_id, natural_key)` — only after the app writers are updated.
+- The other three sync columns (`content_hash`, `source_run_id`, `locked`) — Universe sync work-package.
+- `primary_location` fixes (independent, can ship any time): patch the city-lookup `OR` predicate in 4690, then unique index on `(city_id, region_id, country_id)` after a collision check.
+
 ## Workshop notes
 
 **Decisions (workshop only — no Xano changes made yet):**

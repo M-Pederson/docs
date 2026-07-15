@@ -123,9 +123,34 @@ A computed `natural_key` with a unique index replaces both with one correct rule
 | 2 | `cmp:` | `country_code\|region_code\|city\|postal_code\|street\|number\|unit` | Row has geocoded components (the normal Radar path) |
 | 3 | `fmt:` | normalized `formatted_address` string | Row was never geocoded (user-typed only) |
 
-Normalization for tiers 2–3: lowercase, trim, collapse whitespace, strip punctuation and diacritics, null/missing component → empty string. Tier prefixes prevent cross-tier false collisions.
-
 **Recommendation:** store the readable pipe-joined string, not a sha256 of it — deterministic either way, but debuggable when a merge goes wrong. Hash only if key length becomes a problem.
+
+### Normalization spec (global) — v2
+
+What makes the key work globally is that the **geocoder is the canonicalizer** (Radar expands "Str." → "Street", resolves ambiguous city names into components) and that **pipe positions are fixed** — a missing component leaves an empty slot and never shifts the others, so sparse address formats degrade gracefully instead of breaking.
+
+Rules for tiers 2–3 (`cmp:` / `fmt:`):
+
+1. **Fixed field order** `country_code|region_code|city|postal_code|street|number|unit`; missing component → empty string, position preserved.
+2. **Lowercase everything;** trim; collapse internal whitespace to a single space in `street` / `city`.
+3. **Strip punctuation and diacritics** (Unicode NFKD, drop combining marks) — applies to Latin scripts; CJK and other non-Latin scripts pass through intact (see rule 4).
+4. **Pin the Radar response language** (query with `language=en`) so components always come back in one script. Without this, the same Beijing address geocoded from English input vs `中关村大街1号` returns different-script components → two keys for one building.
+5. **`postal_code`: strip ALL whitespace**, keep alphanumerics only — UK postcodes ("SW1A 2AA") are written inconsistently with/without the internal space.
+6. **No-postal-code countries** (and no-street-number regions): slots stay empty; the key degrades to street- or city-level granularity, which is acceptable because uniqueness is scoped per owner.
+7. **`fmt:` tier gets rules 2–3 and 5 only** — no abbreviation expansion (that's the geocoder's job). A `fmt:` key never matches a `cmp:` key for the same address; convergence happens only when the row is geocoded.
+
+### Worked examples
+
+| Address | natural\_key |
+| --- | --- |
+| 133 West 22nd Str. New York, NY 10011 | `cmp:us\|ny\|new york\|10011\|west 22nd street\|133\|` |
+| Same string, never geocoded | `fmt:133 west 22nd str new york ny 10011` |
+| Kenyatta Avenue, Nairobi 00100, Kenya | `cmp:ke\|30\|nairobi\|00100\|kenyatta avenue\|\|` |
+| 1 Zhongguancun Street, Haidian, Beijing 100080 | `cmp:cn\|bj\|beijing\|100080\|zhongguancun street\|1\|` |
+| 10 Downing Street, London SW1A 2AA | `cmp:gb\|eng\|london\|sw1a2aa\|downing street\|10\|` |
+| 10 Bayfront Avenue, Singapore 018956 | `cmp:sg\|\|singapore\|018956\|bayfront avenue\|10\|` |
+
+Notes: the US example shows the geocoder fixing "Str."; Kenya shows sparse-slot degradation (no number/unit); Singapore shows a city-state with a legitimately empty region slot (postal code alone is building-precise there); London shows the space-stripped postcode.
 
 **Uniqueness:** composite unique index on `(master_person_id, master_company_id, natural_key)` — two people at the same address must remain legal. The null-vs-`0` FK defaults must be coalesced consistently (today `master_person_id` defaults to `0` but `master_company_id` to null) so blank owners actually collide.
 
@@ -165,7 +190,7 @@ Implementation surface for this pass: **one new helper + one function edit.**
 
 - Field name: keep `natural_key` (recommended, see above) or rename uniformly across the four facet tables?
 - Keep `unit` in the key? (Recommend yes — two units in one building are distinct addresses.)
-- Countries without postal codes and PO boxes — does the component normalization need per-country rules, or is best-effort fine at current data quality?
+- PO boxes — normalize as `street="po box", number=N`, or leave to the `fmt:` tier? (Countries without postal codes are now handled by spec rule 6 — empty slots degrade gracefully.)
 - Backfill geocoding for never-geocoded rows (costs Radar calls per row) or accept `fmt:` keys until a row is next touched?
 - Does this land before or with the Universe sync's `ALTER TABLE` for the other three sync columns (`content_hash`, `source_run_id`, `locked`)?
 

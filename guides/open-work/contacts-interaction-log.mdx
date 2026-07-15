@@ -37,11 +37,11 @@ Rationale per field in [Required changes to the activity tables](#required-chang
 
 ## Tables
 
-Three product tables plus the job-state row, all in AlloyDB. `contacts_interaction_log` is the read model the side panel hits. `contacts_interaction_monthly` is the history primitive — every temporal signal (averages, last-month, momentum) derives from it. `chat_activity` ships with the in-app chat feature.
+Three product tables plus the job-state row, all in AlloyDB, all created **now**. `contacts_interaction_log` is the read model the side panel hits. `contacts_interaction_monthly` is the history primitive — every temporal signal (averages, last-month, momentum) derives from it. `chat_activity` is created empty and stays empty until the in-app chat feature ships its webhook handler — the cron is fully correct against zero chat rows.
 
 ### Copy-paste migration (Go developers)
 
-Everything that gets created **now**, as one golang-migrate pair — identical to the per-table specs below, concatenated for convenience. `chat_activity` is deliberately excluded; its migration ships with the chat feature (DDL in [its section](#chat_activity-created-when-in-app-chat-ships)).
+Everything, as one golang-migrate pair — identical to the per-table specs below, concatenated for convenience. Includes `chat_activity`, which is created now and simply stays empty until the in-app chat feature starts writing to it.
 
 <CodeGroup>
 
@@ -71,9 +71,11 @@ CREATE TABLE contacts_interaction_log (
   opened                    INTEGER NOT NULL DEFAULT 0,
   last_opened_at            TIMESTAMPTZ,
 
-  -- app-feature counts (PLACEHOLDERS — features not yet deployed; stay 0)
+  -- in-app chat counts (cron-owned; from chat_activity — 0 until chat ships)
   total_in_app_chat_threads INTEGER NOT NULL DEFAULT 0,
   chat_interactions         INTEGER NOT NULL DEFAULT 0,
+
+  -- leverage loop counts (PLACEHOLDERS — feature not yet deployed; stay 0)
   total_leverage_loops      INTEGER NOT NULL DEFAULT 0,
   total_leverage_loop_assists INTEGER NOT NULL DEFAULT 0,
 
@@ -126,6 +128,22 @@ CREATE TABLE contacts_interaction_monthly (
 
 CREATE INDEX idx_cim_user_month ON contacts_interaction_monthly (user_id, month);
 
+CREATE TABLE chat_activity (
+  id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  user_id       BIGINT NOT NULL,   -- logical FK → Xano user.id (125)
+  my_person_id  BIGINT NOT NULL,   -- logical FK → Xano contacts.id (128)
+  channel_cid   TEXT NOT NULL,     -- Stream channel identifier (thread key)
+  message_id    TEXT NOT NULL,     -- Stream message id (webhook idempotency)
+  direction     TEXT NOT NULL CHECK (direction IN ('sent','received')),
+  message_ts    TIMESTAMPTZ NOT NULL,
+
+  CONSTRAINT chat_activity_message_id_key UNIQUE (message_id)
+);
+
+CREATE INDEX idx_chat_activity_person_ts ON chat_activity (my_person_id, message_ts);
+
 CREATE TABLE cron_state (
   job_name         TEXT PRIMARY KEY,
   high_water_mark  TIMESTAMPTZ,
@@ -136,6 +154,7 @@ CREATE TABLE cron_state (
 
 ```sql 0001_contacts_interaction_log.down.sql
 DROP TABLE IF EXISTS cron_state;
+DROP TABLE IF EXISTS chat_activity;
 DROP TABLE IF EXISTS contacts_interaction_monthly;
 DROP TABLE IF EXISTS contacts_interaction_log;
 ```
@@ -174,9 +193,11 @@ CREATE TABLE contacts_interaction_log (
   opened                    INTEGER NOT NULL DEFAULT 0,
   last_opened_at            TIMESTAMPTZ,
 
-  -- app-feature counts (PLACEHOLDERS — features not yet deployed; stay 0)
+  -- in-app chat counts (cron-owned; from chat_activity — 0 until chat ships)
   total_in_app_chat_threads INTEGER NOT NULL DEFAULT 0,
   chat_interactions         INTEGER NOT NULL DEFAULT 0,
+
+  -- leverage loop counts (PLACEHOLDERS — feature not yet deployed; stay 0)
   total_leverage_loops      INTEGER NOT NULL DEFAULT 0,
   total_leverage_loop_assists INTEGER NOT NULL DEFAULT 0,
 
@@ -238,9 +259,9 @@ CREATE INDEX idx_cim_user_month ON contacts_interaction_monthly (user_id, month)
 
 Bucketing is by **domain time** (`date_trunc('month', activity_timestamp)` for email, event start for meetings), consistent with the domain-time principle below. Months with zero activity get no row — readers treat missing as zero.
 
-### `chat_activity` (created when in-app chat ships)
+### `chat_activity`
 
-Webhook-fed mirror of `email_activity` for the GetStream in-app chat — see [In-app chat source](#in-app-chat-getstream--planned-source) for the event mapping. The migration ships with the chat feature, not now.
+Webhook-fed mirror of `email_activity` for the GetStream in-app chat — see [In-app chat source](#in-app-chat-getstream--planned-source) for the event mapping. **Created now** (it's in the migration above) and empty until the chat feature ships its webhook handler. The cron reads it from day one and is fully correct against zero rows — chat counts, buckets, and averages all compute to 0 with no special-casing.
 
 ```sql
 CREATE TABLE chat_activity (
@@ -297,8 +318,8 @@ CREATE TABLE cron_state (
 | `distinct_meeting_series` | Count of unique series masters + one-off events — "how many separate times did we decide to meet." A weekly standing 1:1 counts once here, ~50/yr in `total_meetings`. The better relationship-strength signal. |
 | `opened` | Times the user opened this contact in the side panel. **App-incremented**, not recomputable — there is no raw open-event log. |
 | `last_opened_at` | Timestamp of the most recent side-panel open. |
-| `total_in_app_chat_threads` | **Placeholder.** Distinct in-app chat threads (Stream channels) the user and contact share. Feature not yet deployed — integration design in [In-app chat source](#in-app-chat-getstream--planned-source). |
-| `chat_interactions` | **Placeholder.** Total messages **posted by the contact** in shared in-app chat threads — their engagement toward the user, not the user's own posts. |
+| `total_in_app_chat_threads` | Distinct in-app chat threads (Stream channels) the user and contact share — `COUNT(DISTINCT channel_cid)` over `chat_activity`. Cron-owned; 0 until the chat feature ships ([In-app chat source](#in-app-chat-getstream--planned-source)). |
+| `chat_interactions` | Total messages **posted by the contact** in shared in-app chat threads — their engagement toward the user, not the user's own posts. Cron-owned; `direction = 'received'` rows in `chat_activity`; 0 until chat ships. |
 | `total_leverage_loops` | **Placeholder.** Generic one-click leverage loops involving this contact. The user-facing feature is not yet implemented. |
 | `total_leverage_loop_assists` | **Placeholder.** Purpose-specific leverage loops — created to help with something specific, as opposed to the one-click generic loop counted above. |
 | `linkedin_connected_on` | LinkedIn connection date, from the LinkedIn import (`linkedin_csv.connected_on` 259 / `linkedin_connection_join.date_connected` 258). Domain time. |
@@ -315,13 +336,14 @@ Subset invariants (assert in tests, and after every backfill): `total_meetings_a
 ### Placeholder columns — features not yet deployed
 
 <Note>
-`total_in_app_chat_threads`, `chat_interactions`, `total_leverage_loops`, and `total_leverage_loop_assists` are **schema placeholders**. They count app features that have not shipped yet — the columns are reserved now so adding them later doesn't need a migration, and they stay `0` until the features deploy.
+`total_leverage_loops` and `total_leverage_loop_assists` are **schema placeholders**. They count a feature that has not shipped yet — the columns are reserved now so adding them later doesn't need a migration, and they stay `0` until it deploys.
 
-- **`total_in_app_chat_threads`** / **`chat_interactions`** — the upcoming in-app (user↔contact) chat, built on GetStream. This is *not* the copilot chat (`conversations` 636 / `copilot_chat_messages` 637). The source design is committed — see [In-app chat source](#in-app-chat-getstream--planned-source) — it just waits on the feature.
 - **`total_leverage_loops`** — the generic **one-click** leverage loop a user fires for a contact.
 - **`total_leverage_loop_assists`** — leverage loops created to **help with something specific**, as opposed to the generic one-click loop. Loops and assists are disjoint counts, not a subset.
 
-When each feature ships: define its source table, counting rule, and writer (nightly cron vs app-incremented), then update this page and the cron. Until then the nightly cron must **not** include these columns in its `DO UPDATE SET` list — same rule as the `opened` columns, so whichever writer they get later can't be clobbered retroactively.
+When the feature ships: define its source table, counting rule, and writer (nightly cron vs app-incremented), then update this page and the cron. Until then the nightly cron must **not** include these two columns in its `DO UPDATE SET` list — same rule as the `opened` columns, so whichever writer they get later can't be clobbered retroactively.
+
+The in-app chat columns (`total_in_app_chat_threads`, `chat_interactions`) are **not** placeholders: `chat_activity` exists from day one, the cron computes them on every run, and they're simply 0 until the chat feature starts writing rows. This is *not* the copilot chat (`conversations` 636 / `copilot_chat_messages` 637).
 </Note>
 
 ### Calendar classification rules
@@ -391,6 +413,7 @@ See the next section. Its upsert must list **only cron-owned columns** in the `D
 |---|---|---|
 | `to_emails`, `from_emails`, `total_emails` | `email_activity` (Xano 597) | Keyed by `my_person_id` → `contacts.id`. Direction from the activity's direction signal — today inferred from `activity_type_id` / `card_descriptor`; an explicit `direction` column is a required change below. |
 | All six meeting counts | `calendar_event_activity` (Xano 598) + `events` (221) | 598 rows keyed by `my_person_id`; recurrence via `events.master_event_id` (222). Location / conferencing / RSVP fields are required changes below. |
+| `total_in_app_chat_threads`, `chat_interactions` | `chat_activity` (AlloyDB-native) | Exists from day one, empty until in-app chat ships. Zero rows → counts, buckets, and averages compute to 0 — the job requires no chat data to run. |
 | `linkedin_connected_on` | `linkedin_connection_join` (258) / `linkedin_csv` (259) | Domain-time connection date. |
 | `orbiter_connected_at` | `contacts.status_connected` transition | Needs a transition timestamp — required change below. |
 | `first_known_interaction` | min across the three sources above | |
@@ -424,10 +447,10 @@ Target: the Universe standalone Go codebase (see [Orbiter Universe Standalone](/
 
 <Steps>
   <Step title="Migrations — create the tables">
-    Create the [Tables](#tables) as migrations (whatever tool the Universe repo standardizes on — golang-migrate or equivalent): `contacts_interaction_log`, `contacts_interaction_monthly`, and `cron_state` now. `chat_activity`'s migration ships with the chat feature, not in this pass.
+    Create all four [Tables](#tables) as migrations (whatever tool the Universe repo standardizes on — golang-migrate or equivalent) — the [copy-paste block](#copy-paste-migration-go-developers) is the whole thing, `chat_activity` included. It stays empty until the chat feature ships; the cron reads it regardless.
   </Step>
   <Step title="Activity readers — plain SQL">
-    An `ActivitySource` interface (`EmailsSince(watermark)`, `CalendarEventsSince(watermark)`, `LinkedInConnections(userID)`, `ContactsByID(...)`) backed by a single `PostgresActivityReader`: keyset-paginated SQL over `email_activity`, `calendar_event_activity` + `events`, `linkedin_connection_join`, and `contacts` in AlloyDB (`WHERE created_at > $watermark ORDER BY created_at, id LIMIT 500`). The interface exists for testability (fake source in unit tests), not for a second backend — there is deliberately no Nylas or Xano HTTP implementation.
+    An `ActivitySource` interface (`EmailsSince(watermark)`, `CalendarEventsSince(watermark)`, `ChatMessagesSince(watermark)`, `LinkedInConnections(userID)`, `ContactsByID(...)`) backed by a single `PostgresActivityReader`: keyset-paginated SQL over `email_activity`, `calendar_event_activity` + `events`, `chat_activity`, `linkedin_connection_join`, and `contacts` in AlloyDB (`WHERE created_at > $watermark ORDER BY created_at, id LIMIT 500`). The interface exists for testability (fake source in unit tests), not for a second backend — there is deliberately no Nylas or Xano HTTP implementation.
   </Step>
   <Step title="Classifiers as pure functions">
     `ClassifyEmailDirection(activity) → to|from`, `ClassifyMeeting(event) → {cancelled, remote, irl, recurring, attended}`, `MonthsBetween(anchor, today) → int`. No I/O — table-driven unit tests for every rule in [calendar classification](#calendar-classification-rules), including the URL-shaped-location edge cases and the `maybe`/`noreply` RSVP handling.
@@ -531,4 +554,5 @@ Once this table is populated and the side panel reads from it, the legacy rollup
 | `momentum` thresholds (`1.5×` rising, `0.5×` cooling, 6-month dormancy, 3-month `new`) | Initial guesses | Tune against real data after the first production runs — same convention as the Known scoring coefficients |
 | `opened` durability | Increment-only, unrecoverable | Add an open-event log if the count starts driving anything that matters |
 | Historical `orbiter_connected_at` backfill | Best-effort | When the `contacts.connected_at` column lands |
-| Placeholder columns (`total_in_app_chat_threads`, `chat_interactions`, `total_leverage_loops`, `total_leverage_loop_assists`) | Reserved in schema, always 0, no writer | Chat pair: source design committed (GetStream → `chat_activity`), waits on the chat feature — enable the Stream webhook **before launch** so no backfill is ever needed. Loop pair: define source + rules when the feature ships |
+| Placeholder columns (`total_leverage_loops`, `total_leverage_loop_assists`) | Reserved in schema, always 0, no writer | Define source + rules when the leverage-loop feature ships |
+| In-app chat go-live | `chat_activity` exists and the cron computes chat counts (0 today) | When chat ships: build the Stream webhook handler and enable the webhook **before launch** so no backfill is ever needed |

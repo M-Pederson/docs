@@ -1,0 +1,808 @@
+---
+title: "Important Dates & mem0"
+description: "Guide to how dates are enriched, captured, or user-added today — and the plan to optimize, improve, and deploy a coherent important-dates model"
+icon: "calendar"
+---
+
+## Purpose
+
+This page does two jobs:
+
+1. **A guide** — how dated personal facts (birthdays, anniversaries, milestones, relationship dates) are enriched, captured, or user-added today, verified against live Xano workspace 3.
+2. **A plan** — how we optimize, improve, and deploy a coherent important-dates model, including where mem0 fits.
+
+Started 2026-07-16. Facts in Part 1 were verified live on that date; Part 2 items are proposed until they graduate to Decisions.
+
+# Part 1 — How dates work today
+
+## The four ways a date arrives
+
+| Class | Example | Nature | Scope |
+|---|---|---|---|
+| **Enriched** | Birthday from IMDB; company founded / funding-round dates | Global truth about the entity | `master_person` / `master_company` — shareable |
+| **Captured** | vCard `BDAY`, LinkedIn *Connected On*, first email | Facts carried by imports and activity data — deterministic, recomputable, not asserted by anyone | Per-user contact — private |
+| **User-added** | Wedding anniversary the user types in | Private knowledge the user asserts | Per-user contact — private |
+| **Conversationally surfaced** | "My daughter graduates in June" via mem0 extraction | Unstructured memory that may deserve promotion | Per-user contact — private |
+
+Today these paths point at disconnected stores — and two of the four have no working path at all.
+
+## Table inventory
+
+Every place a birthday, birth date, or important date lives today.
+
+| Table / store | Scope | Status | What it holds |
+|---|---|---|---|
+| `important_date` (242) | User (via `contacts` 128) | **Empty — CRUD API exists, never used** | Any dated fact + descriptor + reminder |
+| `date_descriptor` (243) | Global + per-user custom | **Empty — never seeded** (get-or-create API exists) | The vocabulary (birthday, anniversary, …) |
+| `birthday_join` (406) | Enrichment (via `master_person` 139) | **20 rows live** | Birth date + birthplace, IMDB-sourced |
+| `contacts.birthdate` (128) | User | Column exists, **0 rows populated** | Single birthdate directly on the contact row |
+| `imdb_person.json` (394) | Enrichment raw | Live | `birth_date`, `birth_place`, spouse `marriage_date`/`end_date` |
+| `mb_artist.json` (737) | Enrichment raw | Live | MusicBrainz life-span (begin/end dates) |
+| FalkorDB `Person:Music_Artist` node | Graph | Live | `birth_date` / `death_date` properties |
+
+Notably absent: `master_person` (139) and `user` (125) have **no** birth columns at all. Birth data on the enrichment side lives only in the join table and raw JSON.
+
+### `important_date` (242) — user-scoped, never written
+
+Keyed on `my_person_id` → `contacts` (128), so it is per-user contact data. **Zero rows live.** No *function* writes it — but a user-facing CRUD API does exist (the [V2 Important Dates group](#the-v2-important-dates-api-group-176), below); it has simply never been used.
+
+| Column | Type | Notes |
+|---|---|---|
+| `my_person_id` | int → 128 | user-scoped contact (`contacts` table) |
+| `date_descriptor_id` | int → 243 | what kind of date this is |
+| `date` | date | nullable |
+| `annual_recurring` | bool | |
+| `note` | text | |
+| `reminder` | int | days before the date to remind the user |
+
+Indexes: PK + `created_at` only — no uniqueness on `(my_person_id, date_descriptor_id, date)`. The merge fold-in `merge/helpers/fold-my-persons-on-survivor` (#12951) already dedupes it on `(date_descriptor_id, date)` and merges `note`/`reminder`/`annual_recurring` — merge semantics exist for a table nothing writes.
+
+### `date_descriptor` (243) — the vocabulary, never seeded
+
+Table description: *"a growing list of date descriptors, but user can add custom ones for themselves."* Designed as global built-ins (`user_id` null) plus per-user custom descriptors (`user_id` set), with a search index and autocomplete on `descriptor`. **Zero rows** — not even the built-ins (birthday, anniversary, …) were ever seeded.
+
+| Column | Type | Notes |
+|---|---|---|
+| `descriptor` | text | search-indexed, autocomplete source |
+| `user_id` | int → 125 | null = global built-in, set = user's custom descriptor |
+
+### `birthday_join` (406) — enrichment-scoped, the only live store
+
+Keyed on `master_person_id` → 139. **20 rows live**, all IMDB-sourced (see [Enriched dates](#enriched-dates-birthdays) below).
+
+| Column | Type | Notes |
+|---|---|---|
+| `master_person_id` | int → 139 | |
+| `birthdate` | date | full date |
+| `birthday_month` / `birthday_day` | int (1–12 / 1–31) | schema supports year-unknown birthdays |
+| `birthplace_location` | text | free-text, e.g. "Vancouver, British Columbia, Canada" |
+| `created_by_user_id` | int → 125 | null on enrichment writes; stamped by user-facing `POST /birthdays` (#8111 — broken, see User-added dates). All 20 live rows: null |
+
+Indexes: PK + `created_at` only — no unique index on `master_person_id`, so one-row-per-person is enforced only in application code. In the master-person merge spec, its natural key is `(master_person_id, birthday_id)` (see [Merge](/guides/open-work/merge)).
+
+### `contacts.birthdate` (128) — a third store, also unused
+
+The user-scoped contact table (`contacts`, FK-named `my_person_id` elsewhere) carries a single `birthdate` date column directly on the row. **Zero rows have it populated.** So even for the birthday case alone, the schema today offers three homes — `important_date` row, `birthday_join` row, `contacts.birthdate` column — and only the enrichment one has data.
+
+## Enriched dates (birthdays)
+
+How birthdays are handled from enrichment today. Short version: **IMDB is the only pipeline that writes a structured birthday.** PDL, Enrich Layer, Fundable, and the base company waterfall never touch birth data; MusicBrainz captures it but keeps it in the graph.
+
+### The write path
+
+Both IMDB entry points share the same extraction and land in `birthday_join` (406):
+
+1. **Scrape** — Firecrawl fetches the IMDB person page; markdown is cleaned by a preprocessor lambda.
+2. **LLM extract** — an OpenRouter Gemini call returns structured JSON. The prompt contract for birth data is `"birth_date": "YYYY-MM-DD or null"` and `"birth_place": "string or null"` — **full ISO date or nothing**. A partial date on the IMDB page (year-only, or missing year) comes back null.
+3. **Persist raw** — the full JSON (birth fields included) is saved on `imdb_person.json`.
+4. **Guarded write** — if `birth_date` is non-empty, look up `birthday_join` by `master_person_id`:
+   - **No existing row** → insert with `birthdate` plus `birthday_month` / `birthday_day` derived from the full date (`format_timestamp "n"` / `"j"`, UTC) and `birthplace_location` from `birth_place`. `created_by_user_id` stays null — the marker that this row is enrichment-provenance, not user-entered.
+   - **Existing row** → the two writers diverge (see below).
+
+### The two writers
+
+<Card icon="play">
+
+```
+mvp/imdb/run-base-imdb-person-enrich — 12880
+```
+
+The waterfall person orchestrator (Phase 3, alongside `master_person` + `master_link` creation). **First write wins absolutely**: if a `birthday_join` row already exists for the person, the phase skips the birthday entirely — no field is ever updated. The person kill-switch precondition fires *before* this write, so a blocked run leaves no orphan birthday rows. Failures land in `log_crash` under phase `master_person`.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+mvp/imdb/add-imdb-to-master-person — 10509
+```
+
+The attach-IMDB-to-existing-person path. Same insert logic when no row exists, but on an **existing** row it does a `db.edit` refreshing `birthplace_location` only — `birthdate` / `birthday_month` / `birthday_day` are never updated once written. Note the quirk: the edit writes whatever `json.birth_place` holds, so a re-scrape that loses the birthplace **overwrites the stored location with null**.
+
+</Card>
+
+### Properties of the current behavior
+
+- **One row per person, by convention only.** Both writers check-then-insert on `master_person_id`; there is no unique index backstopping the race.
+- **Year-unknown support is unreachable in practice.** `birthday_month` / `birthday_day` exist precisely for partial birthdays, but the enrichment writers derive them from a required-full ISO date, and the one path that intends MM-DD input — user-facing `POST /birthdays` (#8111) — is broken (empty `function.run` target). No working code path can produce a month/day-only row.
+- **Birth dates are effectively immutable.** Neither writer corrects a wrong `birthdate` on re-enrich; only birthplace can change (via #10509).
+- **Provenance is a null.** Enrichment rows are distinguishable from (future) user rows only by `created_by_user_id IS NULL` — there is no `data_source_id` / `source` column like other enrichment-written tables carry.
+- **Merge handling exists.** Master-person merges treat `birthday_join` as a child table with natural key `(master_person_id, birthday_id)` per the [Merge](/guides/open-work/merge) spec; contact-level merges fold `important_date` via #12951.
+- **No known reader.** Nothing surfaces birthdays today — no reminder, no calendar row, no meeting-prep context line (unverified against every read path, but no candidate found).
+
+### What enrichment does NOT do with dates
+
+- **PDL / Enrich Layer / Fundable** — no birth extraction at all; PDL's raw `birth_date` field sits unparsed in `person_enrich_data` (500).
+- **MusicBrainz** — life-span dates go to the `Person:Music_Artist` graph node only, as `birth_date` / `death_date` properties (see [Ontology → Person:Music_Artist](/guides/ontology/nodes#music-person-artist)). Person-resolution (`mb/run-person-resolution` #13121, verified 2026-07-16) reads the life-span twice — birth *year* into the identity-verification set, end-date for the deceased guard — and persists neither. The only way a music person gets a `birthday_join` row is indirect: #13121's IMDb cross-enrich calls #10509 when the artist's MB url-rels include an IMDb name page — so the birthday is IMDB-sourced, and only for IMDb-listed artists. MB's own life-span data (structured, no LLM needed, frequently year-only) is never landed — one reason the target model needs partial-date parts.
+- **IMDB spouse dates** — `marriage_date` / `end_date` / `is_current` are extracted on every person scrape and never leave raw JSON. Anniversaries are already being collected, silently.
+
+## Captured dates
+
+Deterministic dates carried by imports and activity data. None of them have a structured home today.
+
+### Import payloads (specs, not built)
+
+- **Apple vCard import** — `BDAY` → `birthday_raw` + `birthday_omit_year` (Apple's placeholder-year flag). See [Apple vCard Import](/guides/open-work/apple-vcard-import).
+- **Nylas contacts import** — `birthday` → `birthday_raw`. See [Nylas Contacts Import](/guides/open-work/nylas-contacts-import).
+
+Both specs stage the raw value and defer validation to a processor whose target table is undefined — blocked on Part 2.
+
+### Relationship dates (implicit only)
+
+Facts about *this user's relationship* with a contact — LinkedIn *Connected On*, first email interaction, first meeting, when the contact was added. These exist implicitly in activity tables and import payloads but are never materialized as dates. They are system-derived and recomputable: no one asserts them, so if stored they must never be user-editable (at most user-hideable), and wipe + regenerate is always safe.
+
+## User-added dates
+
+**An API layer exists — but it has never been used, and part of it is broken.** (Corrected 2026-07-16: an earlier version of this page said no path existed; the API group was found via the API Reference nav, not the function search.)
+
+### The V2 Important Dates API group (176)
+
+Nine authenticated endpoints (canonical `mGnfV_UB`, created Oct 2024, extended Feb 2026), documented under [API Reference → V2 Important Dates](/api-reference/v2-important-dates/get-important-dates):
+
+- **`POST /important-dates` (#1908)** — correctly contact-scoped: takes a `master_person_id`, resolves the **caller's** `contacts` row (`user_id == auth.id`, 404 if the person isn't your contact), get-or-creates the descriptor, inserts `important_date`. Plus GET (by master person), PUT, DELETE.
+- **`GET`/`POST /date-descriptors` (#1923/#1910)** — descriptor autocomplete + get-or-create. Two flaws: lookup matches by **`includes` (substring)**, not exact slug — "birthday" matches "dog's birthday"; and created descriptors are always `user_id`-stamped — the global built-in tier can never be created through this API.
+- **`POST /birthdays` (#8111, 2026-02-25)** — writes `birthday_join` with `created_by_user_id = auth.id`, and accepts `YYYY-MM-DD` **or `MM-DD`** — partial-date intent existed! But it is **broken at runtime**: its date-parse helper is stored as `function.run ""` — an empty callee target (authoring trap: targets serialize empty when the callee doesn't resolve at save time, and never self-heal). Plus PUT/DELETE by id.
+
+**Why the tables are still empty:** the frontend never wired any of this up. Zero `important_date` rows, zero descriptors, and every `birthday_join` row has `created_by_user_id` null (all enrichment). So the user path exists on the backend, unused and partially broken — a user still cannot *actually* record a wedding anniversary today.
+
+## mem0 today
+
+The [mem0 section](/guides/open-work/mem0) covers the Zep → mem0 migration for AI-chat memory. Relevant decisions already made on [Universe &lt;&gt; Backend Sync](/guides/open-work/universe-backend-sync):
+
+- mem0 memories key on the **contacts record ID** (user-scoped side).
+- On merge, mem0 is treated as a **derived store**: wipe + re-process.
+- Still open there: ongoing mem0 writes + the content boundary (what belongs in mem0 vs structured tables).
+
+A date surfaced in conversation ("my daughter graduates in June") would today live only as an unstructured memory — nothing promotes it to a structured, remindable row.
+
+# Part 2 — The plan
+
+The ideal, scalable target: what we change, update, or add across tables and functions. Every item is **PROPOSED** until it graduates to Decisions.
+
+## Which backend owns what
+
+Two environments, per [Universe &lt;&gt; Backend Sync](/guides/open-work/universe-backend-sync):
+
+- **Universe** — the standalone source-of-truth master graph where the enrichment engine (the waterfalls) runs. `master_*` tables live ONLY here.
+- **Orbiter Backend** — the per-user app server connected to the frontend. Holds entity tables plus the two-tier detail tables: `enrichment_*` (shareable, projected down from Universe) and `contacts_*` (user-scoped, private).
+
+The rule for dates falls straight out of the class model:
+
+| Class | Canonical home | Reaches the frontend via |
+|---|---|---|
+| **Enriched** (birthday from IMDB) | **Universe** (`master_date`) | Push/projection → Orbiter Backend `enrichment_date` |
+| **Captured** (connected-on, first email, import birthdays) | **Orbiter Backend** (`contacts_date`) | Direct — activity + import data only exist Backend-side |
+| **User-added** (wedding anniversary) | **Orbiter Backend** (`contacts_date`) | Direct |
+| **mem0-promoted** | **Orbiter Backend** (`contacts_date`) | Direct — mem0 keys on the contacts record |
+
+Rows never cross-write between tiers. Conflicts resolve at **read time** on the Backend: `contacts_date` beats `enrichment_date` (the user correcting a wrong IMDB birthday sees their version; Universe keeps enrichment truth).
+
+<Note>
+**Interim state:** until Universe standalone ships, EVERYTHING — both tiers, all tables — is built and tested in the **Xano Demo Env** (workspace 3, the current build being refactored into Universe + Orbiter Backend). See [Xano Demo Env build scope](#xano-demo-env-build-scope) for exactly what gets built there and the tier discipline that keeps the later split a lift-and-shift, not a rewrite.
+</Note>
+
+## Target tables
+
+### `master_date` — NEW · Universe
+
+The canonical store for enrichment-sourced dated facts about an entity — **persons AND companies, one table** (decided direction 2026-07-16: company dates are in scope — funding rounds, founded, later product announcements). Entity-polymorphic via the `master_address` pattern: two nullable FKs, exactly one set per row, null slots deduping consistently. Supersedes `birthday_join` (406).
+
+| Column | Type | Notes |
+|---|---|---|
+| `master_person_id` | int → `master_person`, nullable | exactly one of person/company set per row |
+| `master_company_id` | int → `master_company` (142), nullable | company dates: founded, funding rounds, IPO, acquisition, product announcements |
+| `date_descriptor_id` | int → `date_descriptor` | system descriptors only (birthday, death, founded, funding_round, …) |
+| `year` / `month` / `day` | int, all nullable | partial dates first-class: "June 14, no year" = (null, 6, 14) |
+| `date` | date, nullable | derived, set only when all three parts present — keeps sorting and existing consumers simple |
+| `natural_key` | text | `slug\|yyyy\|mm\|dd` fixed pipe slots (empty ≠ shift, per the [address spec](/guides/robert-mark/workshop-address) convention); singleton descriptors key on slug alone |
+| `metadata` | json | descriptor-specific payload: `birthplace_location` for birthday, spouse name / `is_current` for anniversary |
+| `data_source_id` | int → 161 | real provenance (IMDb, MusicBrainz, PDL, …) |
+| `source` | text | matches the pattern on other enrichment-written tables |
+
+Indexes: **unique `(master_person_id, master_company_id, natural_key)`** — the `master_address` composite exactly; the missing race protection, and still the generic `(node_uuid, natural_key)` upsert contract from the [AlloyDB → Xano sync design](/guides/open-work/universe-backend-sync) once Universe keys on `node_uuid`. `master_date` becomes the **fifth facet table** in that projection (after email / phone / link / address) with zero new sync machinery.
+
+Company-date rule: **`master_date` rows are dated pointers, never a second source of truth.** A `funding_round` row carries the date + summary metadata (round type, amount, `origin_ref` → `fundable_deals` id / `Funding_Round` node uuid); the deal itself stays canonical in `fundable_deals` and the graph. Company rows are derived-recomputable (the deterministic pattern, enrichment-side): wipe + regenerate from the domain tables is always safe.
+
+Write semantics (enforced by the choke-point writer, not by each pipeline):
+- **Singleton descriptors** (birthday, death — `singleton = true` on the descriptor): one row per person per descriptor; a strictly-more-complete date **upgrades the row in place** (id + joins preserved — the address completeness policy applied to dates); conflicting equally-complete values keep the first and log the conflict.
+- **Repeatable descriptors** (anniversary): date parts join the natural key; multiple rows allowed.
+
+### `enrichment_date` — NEW · Orbiter Backend
+
+The projection mirror of `master_date`, same shape minus provenance internals. Read-only from the app's perspective; written only by the Universe push. This is what gives the frontend birthdays without ever touching Universe at render time.
+
+### `contacts_date` — EVOLVE `important_date` (242) · Orbiter Backend only
+
+One user-scoped table for all three private classes, discriminated by origin. Keeps table 242's id space and the merge fold-in it already has.
+
+| Column | Change | Notes |
+|---|---|---|
+| `my_person_id` | keep | → `contacts` (128) |
+| `date_descriptor_id` | keep | now also accepts system + custom descriptors |
+| `year` / `month` / `day` | **add** | partial-date parts, same semantics as `master_date` |
+| `date` | keep | derived when parts complete |
+| `annual_recurring` | keep | default from the descriptor's `default_recurring` |
+| `note`, `reminder` | keep | reminder = lead-days, already designed |
+| `origin` | **add** | enum `user` / `system` / `memory` / `import` — determines mutability |
+| `origin_ref` | **add** | json: `memory_id` (mem0 idempotency), import row id, activity ids (recompute provenance) |
+| `natural_key` | **add** | same convention as `master_date` |
+
+Indexes: **unique `(my_person_id, natural_key)`** — the fold-in (#12951) already assumes this natural key; the index makes it real.
+
+Mutability by origin: `user` rows fully editable; `system` rows never user-editable (at most hidden) and always safe to wipe + regenerate; `memory` rows editable but their `origin_ref.memory_id` guards against duplicate re-promotion when mem0 wipes + re-processes on merge.
+
+### `date_descriptor` (243) — EVOLVE · BOTH
+
+The shared vocabulary. Built-ins are seeded identically in both environments (a static, versioned seed — not synced at runtime); user-custom rows exist **only** on Orbiter Backend.
+
+| Column | Change | Notes |
+|---|---|---|
+| `descriptor` | keep | display name, search-indexed |
+| `slug` | **add** | stable machine key (`birthday`, `connected_on_linkedin`), unique — natural keys reference this, never the display name |
+| `kind` | **add** | enum `global` / `system` / `user_custom` — system descriptors are invisible to the custom-descriptor UI |
+| `singleton` | **add** | bool — one-per-person(-per-user) descriptors (birthday, death, connected-on) |
+| `default_recurring` | **add** | bool — birthdays/anniversaries yes, graduation no |
+| `user_id` | keep | set only on `user_custom` rows (Backend only) |
+
+Seed set (SIGNED OFF 2026-07-16) — person: `birthday`, `death` (global/enriched); `wedding_anniversary`, `work_anniversary`, `first_met` (global — `first_met` is the user-asserted "when we met", the landing slot for How I Know promotions, distinct from system-derived `first_meeting`); `connected_on_linkedin`, `connected_on_orbiter`, `first_email`, `first_meeting`, `contact_added` (system). Company: `founded` (singleton), `funding_round` (repeatable), `ipo`, `acquisition` (singleton), `product_announcement` (repeatable, future — lands as a descriptor row when news enrichment exists, zero schema change).
+
+**Seeding is a function, not hand-entered rows** — `dates/seed-date-descriptors`, an idempotent upsert-by-slug that owns the built-in vocabulary in code. It runs per environment and per data source (live / staging / sandbox), re-runs safely to add new built-ins, and re-runs at Universe split time. Row IDs differ across environments — which is why natural keys and writer lookups go through `slug`, never `date_descriptor_id`. The choke-point writers hard-fail on an unknown slug (a typo'd descriptor should never silently drop a date).
+
+### Disposition of today's tables
+
+| Table | Fate |
+|---|---|
+| `birthday_join` (406) | Migrate its 20 rows into `master_date` (`slug=birthday`, birthplace → `metadata`), repoint the two IMDB writers, then retire. Trivial volume. |
+| `important_date` (242) | Evolves in place into `contacts_date` (columns added, nothing dropped). |
+| `contacts.birthdate` (128) | Drop the column — zero rows, redundant third home. |
+| `date_descriptor` (243) | Evolves in place as above. |
+
+## Table Changelog — Universe & Orbiter Backend
+
+The target-state table changes per environment, in one copy/paste block. This is the split-time contract — the Xano Demo Env staging build is excluded (see [Xano Demo Env build scope](#xano-demo-env-build-scope) for how these shapes are staged there first).
+
+```text
+TABLE CHANGELOG — Important Dates model
+Environments: Universe + Orbiter Backend (Xano Demo Env staging excluded)
+Status: PROPOSED — workshop decisions dated 2026-07-16
+
+═══════════ UNIVERSE (source-of-truth master graph · enrichment engine) ═══════════
+
+[ADD] master_date
+  New table. Enrichment-sourced dated facts for persons AND companies — one
+  polymorphic table (master_address two-FK pattern), never a second source of
+  truth (rows are dated pointers into fundable_deals / the graph).
+  Columns:
+    master_person_id    int FK → master_person, nullable   ┐ exactly one set
+    master_company_id   int FK → master_company, nullable  ┘ per row
+    date_descriptor_id  int FK → date_descriptor (global/system descriptors only)
+    year / month / day  int, all nullable — partial dates first-class
+    date                date, nullable — derived, set only when all parts present
+    natural_key         text — slug|yyyy|mm|dd fixed pipe slots; slug-only for
+                        singleton descriptors (birthday, death, founded, ipo…)
+    metadata            json — birthplace_location, spouse (current marriage),
+                        round type/amount + deal ref, acquirer, exchange/ticker
+    data_source_id      int FK → data_source (161)
+    source              text
+  Indexes:  UNIQUE (master_person_id, master_company_id, natural_key)
+  Writes:   dates/upsert-master-date ONLY (choke point — singleton
+            upgrade-in-place, conflict-log-never-overwrite)
+  Projection: fifth facet table in the Universe→Backend push,
+            upsert on (node_uuid, natural_key)
+
+[ADD] date_descriptor            (Universe copy — built-ins only)
+  kind = global | system rows only; NO user_custom rows in Universe.
+  Columns: descriptor, slug (unique), kind, singleton, default_recurring
+  Seeded by dates/seed-date-descriptors (idempotent upsert-by-slug)
+
+[EXCLUDED] birthday_join (406)
+  Does not port. Rows migrate into master_date (slug=birthday, birthplace →
+  metadata) before the split; table retired.
+  Read-audit 2026-07-16: ZERO readers in live v1 — retirement unblocked.
+
+═══════════ ORBITER BACKEND (per-user app server · frontend UX) ═══════════
+
+[ADD] enrichment_date
+  Projection mirror of master_date (same shape minus provenance internals).
+  READ-ONLY for the app; written only by the Universe→Backend push.
+  All app reads of enrichment dates come from here — never from Universe.
+
+[CHANGE] contacts_date           (evolves from important_date, table 242)
+  Kept:  my_person_id → contacts, date_descriptor_id, date, annual_recurring,
+         note, reminder (lead-days)
+  Added:
+    + year / month / day  int, all nullable — partial dates
+    + origin              enum: user | system | memory | import — sets mutability
+                          (user editable · system recompute-only · memory
+                          confirm-first promoted · import processor-written)
+    + origin_ref          json — memory_id (mem0 idempotency), import row id,
+                          activity ids (recompute provenance)
+    + natural_key         text — same convention as master_date
+  Indexes:  + UNIQUE (my_person_id, natural_key)
+  Writes:   dates/upsert-contact-date ONLY
+  Future-proofed: nullable company reference addable later without rework
+  (decided 2026-07-16 — defer, design for it)
+
+[CHANGE] date_descriptor         (Backend copy — full vocabulary)
+  Kept:  descriptor, user_id (set only on user_custom rows)
+  Added:
+    + slug               text, UNIQUE — stable machine key; every lookup and
+                         natural key references slug, never row id
+    + kind               enum: global | system | user_custom
+    + singleton          bool
+    + default_recurring  bool
+  Seed (SIGNED OFF 2026-07-16): birthday, death, wedding_anniversary,
+  work_anniversary, first_met (global) · connected_on_linkedin,
+  connected_on_orbiter, first_email, first_meeting, contact_added (system) ·
+  founded, funding_round, ipo, acquisition, product_announcement (company)
+
+[DEPRECATE] contacts.birthdate   (column on contacts, table 128)
+  Drop. Zero rows populated; redundant third birthday home. User birthdays
+  become contacts_date rows (slug=birthday).
+
+[EXCLUDED] birthday_join (406)
+  Never ports to Backend either. Enrichment birthdays arrive via
+  enrichment_date; user birthdays via contacts_date.
+```
+
+## Function Changelog — Universe & Orbiter Backend
+
+Same contract, function side. Full specs in [Target functions](#target-functions) below.
+
+```text
+FUNCTION CHANGELOG — Important Dates model
+Environments: Universe + Orbiter Backend (Xano Demo Env staging excluded)
+Status: PROPOSED — workshop decisions dated 2026-07-16
+
+═══════════ SHARED (identical in both environments) ═══════════
+
+[ADD] dates/seed-date-descriptors
+  Idempotent upsert-by-slug owning the built-in vocabulary in code. Runs per
+  environment + per data source; re-runs are no-ops; re-run at split time.
+  Runs FIRST — every writer hard-fails on an unknown slug.
+
+[ADD] dates/parse-date-parts
+  Raw string → {year, month, day}. Handles full ISO, year-only, MM-DD,
+  vCard BDAY + X-APPLE-OMIT-YEAR, "June 14" prose partials. Also the
+  validation layer: leap-aware day checks, 1800–now sanity window,
+  birth < death. Invalid input → write NOTHING, log raw values.
+
+[ADD] dates/build-date-natural-key
+  (descriptor_slug, year, month, day, singleton) → slug|yyyy|mm|dd pipe-slot
+  key; slug-only for singletons. Mirrors mvp/address/build-address-natural-key.
+
+═══════════ UNIVERSE (enrichment engine · waterfalls) ═══════════
+
+[ADD] dates/upsert-master-date                              ★ the choke point
+  ONLY writer to master_date. Natural-key upsert · singleton
+  upgrade-in-place on strictly-more-complete · equal/less = no-op ·
+  contradiction = keep existing + log conflict, NEVER overwrite ·
+  metadata: non-empty incoming wins, empty never overwrites.
+
+[ADD] dates/recompute-company-dates
+  Derives company rows: founded (master_company.founded year-only int,
+  upgraded by fundable_organizations.founded_date) + one funding_round row
+  per fundable_deals deal (announced date; round type/amount + deal ref in
+  metadata). Idempotent; hooks end of company enrich + deal materialization
+  + batch backfill. product_announcement plugs in later.
+
+[CHANGE] mvp/imdb/run-base-imdb-person-enrich (#12880)
+  Phase 3 birthday block → one call to upsert-master-date. Prompt bumped to
+  v5: birth_date as {year,month,day} parts + NEW death_date/death_place +
+  extract-only-what-is-shown rules. Current marriage (is_current=true) also
+  lands as wedding_anniversary. Re-sync prompt to llm-system-prompts.mdx.
+
+[CHANGE] mvp/imdb/add-imdb-to-master-person (#10509)
+  Same replacement — behaviorally identical to #12880. Kills the
+  birthplace-nulled-on-rescrape quirk; 30-day re-scrape can now complete
+  partials or surface conflicts.
+
+[CHANGE] mb/run-person-resolution (#13121)
+  After master_person mint/link: backfill birthday + death from mb_artist
+  life-span via the choke point. Deterministic, no LLM, frequently
+  year-only (needs partial parts). Today this data dead-ends in the graph.
+
+[CHANGE] PDL person processing
+  Parse raw birth_date from person_enrich_data payloads when present
+  (rarely populated; near-free once the choke point exists).
+
+[CHANGE] base company enrich (#12814)                       — NEW extraction
+  Extract acquired-by + acquisition date and went-public date (+ exchange/
+  ticker) → acquisition / ipo rows. Only flags exist today (acquired bool,
+  ipo_status text — no dates anywhere). Partial dates expected (month-year
+  news). Also flip/validate the status flags on write.
+
+[CHANGE] merge: fold-master-persons
+  Add master_date as a child table: repoint to survivor, dedupe on natural
+  key, keep the more complete row. Replaces birthday_join merge handling.
+
+[CHANGE] Universe→Backend push (projection)
+  Register master_date as the FIFTH facet table — upsert on
+  (node_uuid, natural_key). Zero new sync machinery.
+
+[ONE-SHOT] birthday_join migration + raw-JSON re-parse
+  Migrate 20 birthday_join rows (slug=birthday, birthplace → metadata,
+  source=IMDb backfill). Then re-parse every imdb_person.json holding
+  birth data with no master_date row — zero re-scrapes. QA invariant:
+  raw birth data ⟹ master_date row.
+
+═══════════ ORBITER BACKEND (app server · frontend UX) ═══════════
+
+[ADD] dates/upsert-contact-date
+  ONLY writer to contacts_date. Origin-aware mutability (user editable ·
+  system recompute-only · memory confirm-first · import), natural-key
+  upsert, loop-guard aware.
+
+[ADD] dates/recompute-contact-system-dates
+  Derives deterministic dates per contact: connected_on_linkedin,
+  connected_on_orbiter, first_email, first_meeting, contact_added.
+  Idempotent, wipe-safe. Hooks: contact create, merge, periodic sweep.
+
+[ADD] dates/sync-dates-to-mem0
+  Three entry points: contacts_date write → contact-tier memory
+  (contacts_id) · enrichment_date projected → ONE shared-tier memory
+  (master_person_id / master_company_id), orbit-gated · first-orbit
+  linkage → backfill the entity's shared thread. No fan-out by design.
+  Loop guard: origin=memory rows never echo back.
+  Depends on: mem0 shared tier (two-tier doc §3).
+
+[ADD] API: dates-for-contact + upcoming-dates
+  The read path. dates-for-contact merges contacts_date + enrichment_date
+  with precedence user-added > enriched (the rule lives ONLY here).
+  upcoming-dates = recurrence-aware feed for calendar P0 + reminders.
+
+[CHANGE] API group: V2 Important Dates (176)
+  Keep the group + its contact-scoping. Fix: descriptor lookup by exact
+  slug (today: substring includes) · writes route through
+  upsert-contact-date · autocomplete hides system descriptors.
+
+[RETIRE] API: POST/PUT/DELETE /birthdays (#8111/#8109/#8110)
+  User birthdays become contacts_date rows (slug=birthday). Retiring #8111
+  also deletes its broken empty function.run target. Regenerate the
+  api-reference docs pages for group 176 after the rework.
+
+[CHANGE] merge: fold-my-persons-on-survivor (#12951)
+  important_date fold switches from (date_descriptor_id, date) to the
+  natural key. Post-merge: trigger system-date recompute + mem0
+  re-promotion for the survivor.
+
+[CHANGE] CREATE-CONTACTS flow
+  Two new hooks: recompute-contact-system-dates for the new contact +
+  first-orbit backfill of the entity's shared mem0 thread.
+
+[CHANGE] import processors (vCard / Nylas — per their specs, not yet built)
+  birthday_raw → parse-date-parts → upsert-contact-date (origin=import).
+  X-APPLE-OMIT-YEAR partials supported from day one.
+
+[ADD] mem0 promotion flow
+  Conversation-extracted dates (How I Know, chats, email memories) →
+  PROPOSED contacts_date, confirm-first (one tap) · origin=memory +
+  origin_ref.memory_id idempotency (merge wipe+reprocess safe). Built as
+  the reusable template — dates first, job changes/moves later.
+
+═══════════ EXCLUDED ═══════════
+
+dates/project-master-dates — Xano Demo Env-only bridge (master_date →
+enrichment_date copy). The ONE throwaway artifact; replaced by the real
+Universe→Backend push at split time.
+```
+
+## Target functions
+
+### Universe side (enrichment engine)
+
+<Card icon="wrench">
+
+```
+dates/parse-date-parts — NEW
+```
+
+Raw string → `{year, month, day}`. Handles full ISO, year-only, vCard `BDAY` with `X-APPLE-OMIT-YEAR`, and "June 14"-style partials. Pure helper, shared by both environments.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+dates/build-date-natural-key — NEW
+```
+
+`(descriptor_slug, year, month, day, singleton)` → the pipe-slot natural key. Mirrors `mvp/address/build-address-natural-key` — one key concept, one builder.
+
+</Card>
+
+<Card icon="play">
+
+```
+dates/upsert-master-date — NEW (the choke point)
+```
+
+The ONLY writer to `master_date`, same role `add-company-address` (#2451) plays for addresses. Natural-key upsert + singleton in-place completeness upgrade + provenance stamping + conflict logging. Every pipeline that learns a date calls this; no pipeline ever writes the table directly.
+
+</Card>
+
+Pipeline changes (all become one-line calls into the choke point):
+
+- **`mvp/imdb/run-base-imdb-person-enrich` (#12880)** — Phase 3 birthday block → `upsert-master-date`, per the "Spec — perfect IMDB birthday capture" below.
+- **`mvp/imdb/add-imdb-to-master-person` (#10509)** — same replacement, same spec; the two entry points become behaviorally identical.
+- **`mb/run-person-resolution` (#13121)** — after stamping `master_person_id`, backfill birthday (and death date) from the `mb_artist` life-span via the choke point — today this data dead-ends in the graph node, and only IMDb-listed artists get a birthday at all (via the cross-enrich hop). MB life-spans are frequently year-only, so this depends on `master_date`'s partial-date parts; it's also deterministic structured data — no LLM in the loop, unlike the IMDB path.
+- **PDL person processing** — parse raw `birth_date` when present (rarely populated; near-free once the choke point exists).
+- **`dates/recompute-company-dates` — NEW** — derives company rows through the same choke point: `founded` from `master_company.founded` (a year-only int — the partial-parts path) upgraded by `fundable_organizations.founded_date` when fuller; `funding_round` rows from `fundable_deals` — one per deal, dated by the deal's **announced/financing date** (`fundable_deals.date`), with round type + amount summary in `metadata` and `origin_ref` → deal id. Idempotent by natural key; hooks at the end of company enrich and deal materialization, plus a batch backfill. `product_announcement` plugs in here later.
+  Three data traps, verified against real sandbox rows 2026-07-16 (rules decided — see Decisions): **(1) Jan-1 coercion** — year-only `founded_date` values are stored as exactly January 1 (live examples: SoundCloud, Musiio, BandLab, SXSW); fundable `…-01-01` dates land as **year-only** partials. **(2) Day-1 coercion** — month-level dates are stored on the 1st (live example: UMG `1934-09-01` ≈ "September 1934"); fundable `founded_date` with `day = 1` lands as **month-only** (year + month, day null). **(3) Zero-timestamp sentinels** — `founded_date = 0` means *missing*, not epoch (live examples: Pandora, UVU Wolverine Fund, Leeds Angels); zero timestamps write **nothing**. Scope: these demotion rules apply to `fundable_organizations.founded_date` ONLY — `fundable_deals.date` keeps full-date trust (funding announcements genuinely carry real days).
+- **Acquisition + IPO date capture — NEW extraction, not derivation.** Today we hold only flags — `fundable_organizations.acquired` (bool) and `ipo_status` (text: private/public/delisted) — with **no date anywhere in the schema**. Enrichment must capture the events themselves: extend the base company enrich (Exa-first pipeline, #12814) to extract *acquired-by + acquisition date* and *went-public date* (+ exchange/ticker), landing as `acquisition` / `ipo` rows via the choke point with acquirer/exchange in `metadata`. Partial dates expected (news often gives month-year); singleton semantics with upgrade-in-place fit both. Also flip/validate the corresponding flags on write so `master_date` and the status fields never disagree.
+- **Merge (`fold-master-persons`)** — add `master_date` as a child table: repoint to survivor, dedupe on natural key, keep the more complete row. Replaces the current `birthday_join` handling in the [Merge](/guides/open-work/merge) spec.
+- **Projection** — register `master_date` as the fifth facet table in the Universe → Backend push (upsert on `(node_uuid, natural_key)`, the contract the sync design already defines).
+
+### Spec — perfect IMDB birthday capture
+
+The IMDB path is the reference implementation for enrichment date capture — every other pipeline inherits its rules via the choke point. Five layers, each closing a verified gap:
+
+**1. Extraction contract (prompt v5, both functions).** The birth fields change from a single ISO string to explicit parts, so the LLM captures exactly what the page shows instead of dropping partials:
+
+```json
+"birth_date": { "year": 1967, "month": 2, "day": 20 },   // any field null if not shown
+"birth_place": "string or null",
+"death_date": { "year": null, "month": null, "day": null },  // NEW — IMDB shows it; feeds the death descriptor
+"death_place": "string or null"                              // NEW
+```
+
+Prompt rules: extract only what is explicitly on the page — never infer a year from an age, never fill a placeholder. Each function's embedded prompt gets its `// vN` header bumped and re-synced to [LLM System Prompts](/guides/enrichment/waterfall/llm-system-prompts) per the sync convention. Closes: *partial dates dropped by the full-ISO-or-nothing contract* (year-only IMDB pages currently return null).
+
+**2. Deterministic validation (before any write).** `parse-date-parts` revalidates the LLM output — never trust extraction for data integrity:
+
+- month ∈ 1–12; day valid for that month (leap-aware); day-without-month rejected
+- year sanity window (1800 – current year); future dates rejected
+- birth < death when both present
+- On failure: write **nothing**, log the raw values to `log_crash` (raw JSON is already persisted, so a fixed validator can re-land it without a re-scrape)
+
+Closes: *unvalidated LLM output written directly to the table*.
+
+**3. Write semantics (all in `upsert-master-date`, not in the IMDB functions).** `birthday` and `death` are singleton descriptors — natural key is the slug, one row per person:
+
+| Incoming vs existing | Action |
+|---|---|
+| No existing row | Insert (parts + derived `date` + `metadata.birthplace_location` + `data_source_id`=IMDb) |
+| Strictly more complete, consistent (existing `1967` → incoming `1967-02-20`) | **Upgrade in place** — id + joins preserved |
+| Same or less complete, consistent | No-op (idempotent re-runs) |
+| **Contradiction** (different values at same completeness) | Keep existing, **log a conflict** with both values + sources for review — never silently overwrite |
+| `metadata` fields (birthplace) | Non-empty incoming wins; empty incoming never overwrites — kills the #10509 null-birthplace quirk by construction |
+
+Backstopped by the unique `(master_person_id, natural_key)` index: a concurrent duplicate insert (the #12880 / #10509 / #13121-cross-enrich race) fails cleanly and retries as an upgrade-or-noop. Closes: *first-write-wins immutability, the race, the null overwrite, missing provenance*.
+
+**4. Identical entry points.** #12880 Phase 3 and #10509 make the same one-line call with the same payload — no divergent behavior to reason about. #10509's 30-day re-scrape becomes useful for dates (it can now complete a partial or surface a conflict), and #13121's IMDb cross-enrich inherits everything for free.
+
+**5. Backfill + QA.**
+
+- Migrate the 20 `birthday_join` rows (`source`=IMDb backfill).
+- One-shot re-parse: every `imdb_person.json` with a `birth_date` but no `master_date` row (Phase-3 crashes, pre-dating rows) — lands from raw JSON, zero re-scrapes.
+- Coverage invariant for the QA agent: **every `imdb_person` with birth data in raw JSON has a `master_date` row** — plus a periodic review of the conflict log.
+
+Also in scope per the 2026-07-16 decision: the **current** marriage (`is_current = true`) lands as a `wedding_anniversary` row via the same call — spouse name in `metadata`; ended marriages stay raw-JSON only.
+
+### Orbiter Backend side (user experience)
+
+<Card icon="play">
+
+```
+dates/upsert-contact-date — NEW
+```
+
+The only writer to `contacts_date`. Origin-aware: enforces mutability rules, builds the natural key, upserts. Called by the CRUD API (`origin=user`), the recompute job (`origin=system`), import processors (`origin=import`), and mem0 promotion (`origin=memory`).
+
+</Card>
+
+<Card icon="clock-rotate-left">
+
+```
+dates/recompute-contact-system-dates — NEW
+```
+
+Derives the deterministic dates for a contact (or in batch) from activity + import data: LinkedIn *Connected On*, first email, first meeting, contact added. Idempotent by natural key; wipe + regenerate always safe. Runs on contact create, on merge, and as a periodic sweep.
+
+</Card>
+
+<Card icon="globe">
+
+```
+API: rework the V2 Important Dates group (176) — EVOLVE, not new
+```
+
+The CRUD surface already exists (see Part 1) and its contact-scoping pattern is right — keep the group, fix the internals: descriptor lookup by exact `slug` (today: substring `includes`), write through `upsert-contact-date` (natural key, `origin=user`, parts), descriptor autocomplete over global + own-custom only (system descriptors hidden), and **retire the `/birthdays` endpoints** — a user birthday becomes a `contacts_date` row (`slug=birthday`), never a user-authored `birthday_join` row (enrichment tier owns that table until `master_date` supersedes it). Fixes the broken empty `function.run` target in #8111 by deletion. The api-reference docs pages for this group get regenerated when it changes.
+
+</Card>
+
+<Card icon="globe">
+
+```
+API: dates-for-contact + upcoming-dates — NEW
+```
+
+The read path. `dates-for-contact` merges `contacts_date` + `enrichment_date` with the precedence rule (user beats enrichment on the same descriptor) — the single place the conflict rule lives. `upcoming-dates` is the recurrence-aware feed the calendar P0 and reminders consume.
+
+</Card>
+
+- **Import processors (vCard / Nylas)** — `birthday_raw` → `parse-date-parts` → `upsert-contact-date` (`origin=import`, partial dates supported from day one via `birthday_omit_year`).
+- **Contact merge (`fold-my-persons-on-survivor` #12951)** — switch its `important_date` fold from `(date_descriptor_id, date)` to the natural key; trigger a system-date recompute + mem0 re-promotion for the survivor.
+- **mem0 promotion** — extraction proposes a `contacts_date` (`origin=memory`, `origin_ref.memory_id`); **confirm-first (decided 2026-07-16)**: the user approves (one tap) before the row — and any reminder — exists. Applies only to conversation-extracted dates (How I Know, chats, email memories); deterministic paths never confirm.
+
+### Dates → mem0: the contact gate
+
+The reverse direction of promotion: structured dates become mem0 memories so AI chats (meeting prep, how-I-know) know them — but **only for entities that exist in at least one user's contacts**. Enrichment waterfalls mint people and companies at scale; none of them get mem0 memories until a user actually knows them.
+
+Date memories land in the two tiers of the [mem0 two-tier model](/guides/open-work/mem0/two-tier-architecture) (decided 2026-07-16, superseding an earlier per-contact fan-out sketch):
+
+| Date source | mem0 tier | Metadata key | Writes per event |
+|---|---|---|---|
+| `contacts_date` (user / system / import) | **Contact tier** — per-user, subjective | `contacts_id` | 1 — that user's contact scope |
+| `enrichment_date` (person or company) | **Shared entity tier** — objective, everyone's | `master_person_id` / `master_company_id` | **1 — total**, regardless of user count |
+
+An enrichment date is written **once** into the entity's shared thread — e.g. frame.io's seed-round date becomes one shared memory keyed `master_company_id`. When Mark adds frame.io as a contact, his contact-scoped reads *link* to that shared thread (the third search branch on the entity metadata key, per the two-tier doc §3) — nothing is copied per user. **There is no fan-out**; the mega-company cost question dissolves by design.
+
+**The gate — when does the shared thread get date memories?** Only when the entity is in ≥ 1 user's orbit:
+
+- **Person:** ≥ 1 `contacts` row references the master person.
+- **Company:** ≥ 1 of the user's contacts is currently employed there, OR a user explicitly tracks the company (collections / follows) — decided 2026-07-16.
+
+Two triggers make it ordering-proof:
+
+1. **Date-added:** `contacts_date` rows write their contact-tier memory immediately. Enrichment dates (landing Backend-side via `enrichment_date`) write the shared-tier memory **only if** the entity already has orbit; zero orbit = skip — waterfall-minted entities generate nothing. The structured tables keep everything either way.
+2. **First-orbit linkage:** when an entity *enters* someone's orbit (CREATE-CONTACTS for persons; track/first-employed-contact for companies), backfill its shared thread once from `enrichment_date`. A person enriched long before anyone knows them gets their shared date memories the moment they matter.
+
+Rules that keep it clean:
+
+- **Loop guard:** `origin = memory` rows are NEVER echoed back into mem0 — they *came from* a memory (promotion, direction 2). Only `user` / `system` / `import` / enrichment rows sync in.
+- **Derived, deterministic, regenerable:** date memories are rendered from the row by a per-descriptor template, and carry the `natural_key` + row provenance in memory metadata — so re-syncs update instead of duplicate, and the merge rule (mem0 wipe + re-process) regenerates them identically from the structured tables. The tables are the source of truth; these memories are a projection of them.
+- **Tier discipline:** all mem0 writes are backend-tier, triggered off `enrichment_date` (never `master_date`) — Universe stays mem0-ignorant.
+- **Dependency:** the shared entity tier is itself proposed-not-built (two-tier doc §3, plus a `master_company_id` key it doesn't yet name) — item 15 lands with or after that work.
+
+<Card icon="wrench">
+
+```
+dates/sync-dates-to-mem0 — NEW
+```
+
+Backend-tier writer with three entry points: on `contacts_date` write (contact-tier memory), on `enrichment_date` projection upsert (ONE shared-tier memory, gated on orbit), and on first-orbit linkage (backfill the entity's shared thread). Idempotent via natural-key-tagged memory metadata.
+
+</Card>
+
+## Why this scales
+
+1. **Generality without schema churn** — any new date kind is a descriptor row + optional metadata keys, never a new table or column.
+2. **Idempotent writers everywhere** — natural-key upserts with unique indexes; re-running any pipeline, import, or recompute is always safe.
+3. **Partial dates first-class** — the parts columns handle every real-world arrival (vCard omit-year, "June 14th", year-only IMDB) without lossy coercion.
+4. **Clean environment split** — enrichment truth in Universe, private context in Orbiter Backend, one projection contract already designed for four other tables.
+5. **Derived tiers stay derived** — system dates and mem0 both follow wipe-and-regenerate, so merges never strand state.
+6. **One conflict rule, one place** — precedence lives in the read path, not scattered across writers.
+
+## Xano Demo Env build scope
+
+What we actually do to the current Xano build (workspace 3 — the "Xano Demo Env", mid-refactor into Universe + Orbiter Backend). **All tables and all functions from the target architecture get built here first**, at target shape, for testing — the Universe/Backend column on each artifact is its *future* home, not where it's built.
+
+### The one discipline that makes the split cheap
+
+Tier boundaries are enforced by convention inside the single workspace:
+
+- **Universe-tier artifacts** (`master_date`, `upsert-master-date`, the pipeline edits) never read Backend-tier tables.
+- **Backend-tier artifacts** (`contacts_date`, CRUD/read APIs, recompute) never read `master_date` directly — they read `enrichment_date`, even though it's sitting in the same workspace.
+- The ONLY bridge is the projection function. When Universe standalone ships, `master_date` + its writers move out, the projection function is replaced by the real sync, and nothing else changes.
+
+Tag every new artifact `dates` plus `universe-tier` or `backend-tier` so the eventual move is a filter, not an archaeology dig.
+
+### Tables to build in the Demo Env (all four + two disposals)
+
+| Table | Action in Demo Env | Future home |
+|---|---|---|
+| `date_descriptor` (243) | Evolve in place: add `slug` / `kind` / `singleton` / `default_recurring` **via the Xano UI** (add-column — never MCP full-schema replace, per trap #16), then seed the built-ins | Both |
+| `important_date` (242) | Evolve in place into `contacts_date`: add parts / `origin` / `origin_ref` / `natural_key` via UI; add unique index `(my_person_id, natural_key)` | Orbiter Backend |
+| `master_date` | **Create new**, full target shape incl. both entity FKs + unique `(master_person_id, master_company_id, natural_key)` | Universe |
+| `enrichment_date` | **Create new**, even though it mirrors `master_date` in the same workspace — it exists so the Backend read path and the projection contract are tested against the real target shape from day one | Orbiter Backend |
+| `birthday_join` (406) | Keep read-only during the build; migrate its 20 rows into `master_date`; retire only after the read-side check confirms nothing renders from it | retired |
+| `contacts.birthdate` (128) | Drop the column, last step (zero rows — nothing to migrate) | dropped |
+
+### Functions to build in the Demo Env
+
+Everything from [Target functions](#target-functions), plus one demo-only stand-in:
+
+| Function | Tier | Notes |
+|---|---|---|
+| `dates/seed-date-descriptors` | shared | idempotent upsert-by-slug; run per data source, FIRST |
+| `dates/parse-date-parts` | shared | pure helper |
+| `dates/build-date-natural-key` | shared | pure helper |
+| `dates/upsert-master-date` | universe-tier | the choke point; create BEFORE editing its callers (`function.run` empty-target trap) |
+| `dates/upsert-contact-date` | backend-tier | |
+| `dates/recompute-contact-system-dates` | backend-tier | |
+| `dates/recompute-company-dates` | universe-tier | founded + funding rounds from domain tables |
+| `dates/project-master-dates` | **demo-only bridge** | copies `master_date` → `enrichment_date` on `(master_person_id, natural_key)`; callable per-person (end of enrich) or batch. Replaced by the real Universe → Backend push at split time — the ONLY artifact in this build that gets thrown away |
+| CRUD + descriptor APIs | backend-tier | new API group |
+| `dates-for-contact` + `upcoming-dates` APIs | backend-tier | reads `contacts_date` + `enrichment_date` only |
+| Edits: #12880, #10509, #13121, `fold-master-persons`, #12951 | per owner | save rollback `.xs` before each edit (edits publish LIVE) |
+
+### Demo Env test plan
+
+Run in STAGING/sandbox data sources, standard practice:
+
+1. **Seed + migrate** — run `seed-date-descriptors` (then re-run it: second pass must be a pure no-op); 20 `birthday_join` rows → `master_date` (`slug=birthday`, birthplace → `metadata`); verify natural keys + projection lands them in `enrichment_date`; confirm an unknown slug hard-fails the choke point.
+   Expected sandbox yield (simulated 2026-07-16): **~28 `master_date` rows** — 11 `founded` (6 year-only from `master_company.founded`, 5 from linked fundable orgs) + 17 `funding_round` (SoundCloud 9, Pandora 4, Musiio 2, BandLab 2); 0 person dates (sandbox has no IMDB/MB persons); 0 `contacts_date` and **0 mem0 memories** (no contacts rows → the orbit gate suppresses everything, as designed). Assert the three data traps: no `1970-01-01` rows, fundable Jan-1 dates land year-only, and UMG's `1934-09-01` lands month-only (year 1934, month 9, day null).
+2. **Enrichment upsert semantics** — re-run an IMDB enrich on a person with an existing birthday (in-place upgrade, no dupes); a contradicting value logs a conflict without overwriting; MB backfill on a year-only life-span (partial-parts path); confirm the #10509 birthplace-null quirk is gone; one-shot raw-JSON re-parse lands missed birthdays with zero re-scrapes.
+3. **User flow** — CRUD a wedding anniversary; user-corrected birthday wins over `enrichment_date` in `dates-for-contact` (precedence lives ONLY there).
+4. **System dates** — recompute on a test contact (first email / first meeting from activity data); re-run to prove idempotency.
+   Company side: `recompute-company-dates` on a fundable-linked company — `founded` lands year-only from `master_company.founded`, upgrades in place when `fundable_organizations.founded_date` is fuller; one `funding_round` row per deal; re-run = no-op.
+5. **Merges** — master-person merge folds `master_date` on natural key; contact merge triggers recompute; both leave unique indexes intact.
+6. **mem0, both directions** (once mem0 lands) — promotion: promote, wipe + re-process, verify `origin_ref.memory_id` prevents duplicates. Sync-in: enrichment date for a person with ZERO contacts writes no memories (the gate); CREATE-CONTACTS backfills the new scope; a promoted (`origin=memory`) row does NOT echo back; re-sync updates rather than duplicates.
+
+## Scoped Work
+
+The checklist view of the architecture above. **Env = future home; every item is built in the Xano Demo Env first** (see build scope above).
+
+| # | Item | Env | Spec |
+|---|---|---|---|
+| 1 | Sign off the class model + backend ownership rule | — | "Which backend owns what" |
+| 2 | Evolve + seed `date_descriptor` (slug, kind, singleton, default_recurring) | Both | `date_descriptor` table spec |
+| 3 | Evolve `important_date` → `contacts_date`; rework existing V2 Important Dates API group 176 (slug matching, upsert path, retire `/birthdays`) | Backend | `contacts_date` table spec, CRUD card |
+| 4 | Create `master_date` + the three shared helpers + choke-point writer | Universe | `master_date` table spec, function cards |
+| 5 | Repoint IMDB writers (#12880, #10509); migrate + retire `birthday_join` | Universe | Pipeline changes |
+| 6 | MusicBrainz backfill (#13121) + PDL parse | Universe | Pipeline changes |
+| 7 | `recompute-contact-system-dates` + merge-hook wiring | Backend | Function card |
+| 8 | Import landing (vCard/Nylas → `upsert-contact-date`) | Backend | Pipeline changes |
+| 9 | Read path: `dates-for-contact` + `upcoming-dates` (precedence rule) | Backend | API cards |
+| 10 | Register `master_date` in the Universe → Backend projection (`enrichment_date`) | Both | Projection note |
+| 11 | Drop `contacts.birthdate`; update merge specs (both layers) | Backend | Disposition table |
+| 12 | mem0 promotion pipeline (`origin=memory` + idempotency) | Backend | mem0 note |
+| 13 | Company dates: descriptor seeds + `recompute-company-dates` (founded, funding-round announced dates; product announcements later) | Universe | `master_date` spec, function bullet |
+| 14 | Acquisition + IPO date capture in base company enrich (new extraction — only flags exist today) | Universe | Function bullet |
+| 15 | `sync-dates-to-mem0`: contact-gated date memories (fan-out + CREATE-CONTACTS backfill + loop guard) | Backend | "Dates → mem0: the contact gate" |
+
+## Deployment order (proposed)
+
+| Phase | Items | Unlocks |
+|---|---|---|
+| **A — Foundation** | 1, 2 | Class model + vocabulary, both environments |
+| **B — User-added** | 3, 9 | A wedding anniversary is recordable and renderable; calendar P0 has real rows |
+| **C — Enrichment tier** | 4, 5, 6, 13 | Birthdays + company dates (founded, funding-round announced) flow through the choke point; `birthday_join` retired |
+| **C2 — New company extraction** | 14 | Acquisition + IPO dates captured by base company enrich (can trail C — new LLM extraction work, not just plumbing) |
+| **D — Captured tier** | 7, 8 | Deterministic relationship dates + import birthdays land |
+| **E — Split-readiness** | 10, 11 | Projection registered; schema hygiene done before the Universe lift-and-shift |
+| **F — mem0 (both directions)** | 12, 15 | Structured dates become memories (contact-gated); conversational dates become remindable; gated on the mem0 migration itself |
+
+Every phase builds and tests in the Xano Demo Env first (see [Xano Demo Env build scope](#xano-demo-env-build-scope)); the Universe lift-and-shift happens whenever the standalone is ready, independent of this sequence.
+
+## Decisions
+
+- **2026-07-16 — Fundable `founded_date` coercion rules.** Jan-1 dates land year-only; day-1 dates land month-only (UMG `1934-09-01` → September 1934); zero timestamps are sentinels and write nothing. Applies to `fundable_organizations.founded_date` ONLY — `fundable_deals.date` keeps full-date trust. Rare real Jan-1/first-of-month founding dates lose a level of precision; acceptable for `founded`.
+- **2026-07-16 — Captured dates: MATERIALIZE with recompute.** Deterministic dates are stored as `origin=system` rows in `contacts_date` (not computed at read) — calendar, reminders, and mem0 sync read one uniform source; recompute hooks (contact create, merge, periodic sweep) keep them honest; wipe + regenerate always safe.
+- **2026-07-16 — mem0 promotion is CONFIRM-FIRST.** Conversation-extracted dates (How I Know, chats, email memories) are proposed, not auto-created — the user approves before a row or reminder exists. Deterministic paths (enrichment, system, imports) never require confirmation.
+- **2026-07-16 — Descriptor seed set SIGNED OFF**, including two additions: `connected_on_orbiter` (system) and `first_met` (global, user-asserted — the How I Know landing slot). Full set on the `date_descriptor` spec.
+- **2026-07-16 — IMDB spouse dates: land the CURRENT marriage only.** When `is_current = true`, the marriage date becomes a `wedding_anniversary` row in `master_date` (spouse name in `metadata`) — the relationship-relevant anniversary. Ended marriages stay in `imdb_person.json` raw only.
+- **2026-07-16 — Promotion is a TEMPLATE, dates ship first.** The mem0 → structured machinery (`origin=memory`, `origin_ref.memory_id` idempotency, confirmation flow) is designed reusable; dates are deliberately the first and only implementation. Job changes / relocations ride the same rails later.
+- **2026-07-16 — Read-side audit DONE: `birthday_join` has NO readers in live v1.** Verified via dev-branch full-code grep + live reads of every 2026 artifact + V2 group inventory (no GET /birthdays exists). All live references are writers or maintenance (IMDB ×2, V2 POST/PUT/DELETE, merge fold, QA clear). Legacy dev-only writers (`unpack_name_v_2`, `add_master_person_imdb`, `test/birthday`) are deleted from v1. Item 5's retire step is unblocked — greenfield.
+- **2026-07-16 — Dates flow INTO mem0, orbit-gated, via the TWO-TIER model (no fan-out).** User-specific dates (`contacts_date`) write to that user's contact-tier scope (`contacts_id`). Enrichment dates write **once** into the entity's SHARED tier (`master_person_id` / `master_company_id` metadata) — e.g. frame.io's seed round is one shared memory; users who add frame.io as a contact link to it at read time (the two-tier doc's third search branch). Waterfall-minted entities get nothing until they enter ≥ 1 user's orbit (backfill on first linkage makes it ordering-proof); loop guard: `origin=memory` rows never echo back. This supersedes the earlier per-contact fan-out sketch — the mega-company fan-out question dissolves by design.
+- **2026-07-16 — Company orbit rule.** A company is in a user's orbit iff ≥ 1 of the user's contacts is currently employed there, OR the user explicitly tracks it (collections / follows).
+- **2026-07-16 — User-added company dates: defer, design for it.** `contacts_date` ships person-contact-scoped; its natural-key builder and unique index are written so a nullable company reference can be added later without breaking anything.
+- **2026-07-16 — Valuations: analytical only.** `fundable_valuations` / `latest_valuation_date` never become important-date rows — a valuation mark is not a relationship moment, and deal-tied valuations are already represented by their `funding_round` row. Company important dates = founded, funding rounds, IPO, acquisition (+ product announcements later).
+- **2026-07-16 — Company dates are IN scope.** Funding-round dates and founded dates from day one; product announcements and similar later. Mechanism: ONE polymorphic `master_date` (the `master_address` two-FK pattern), NOT a separate company-dates table — separate tables would duplicate the descriptor/natural-key/choke-point/projection machinery and re-merge anyway when Universe keys on `node_uuid`. Company rows are dated pointers into canonical domain data (`fundable_deals`, the graph), derived and recomputable.
+
+## Open questions
+
+**None — all workshop questions resolved 2026-07-16** (walkthrough with Mark; every outcome is in Decisions above). New questions land here as implementation surfaces them.
+
+Reference kept for item 13 — company-date sources: `master_company.founded` (year-only int); `fundable_organizations.founded_date`; `fundable_deals.date` (graph-materialized as `Funding_Round` nodes). `company_funding_round` (201) is deprecated — exclude it. Valuations: analytical only, per Decisions.

@@ -68,6 +68,10 @@ CREATE TABLE email_account_import (
   first_known_interaction   TIMESTAMPTZ,       -- min(first_email_at, first_meeting_at)
   last_known_interaction    TIMESTAMPTZ,       -- max(last_email_at, last_meeting_at)
 
+  -- processing state (flipped by the processing passes)
+  contact_logged            BOOLEAN NOT NULL DEFAULT false,  -- pass 1: contacts id created/identified + interaction log written
+  emails_logged             BOOLEAN NOT NULL DEFAULT false,  -- pass 2: individual email_activity rows written
+
   CONSTRAINT email_account_import_user_email_key UNIQUE (user_id, email_address)
 );
 ```
@@ -97,6 +101,8 @@ Counting and classification rules are identical to [`contacts_interaction_log`](
 | `first_meeting_at` / `last_meeting_at` | Event start of the earliest / latest shared event **already in the past** — future events never set these; they set `next_meeting_at`. |
 | `next_meeting_at` | Start of the earliest upcoming shared event — `NULL` when nothing is scheduled. |
 | `first_known_interaction` / `last_known_interaction` | Min / max across the email and calendar anchors — domain time, same convention as the interaction log. |
+| `contact_logged` | Pass-1 processing state — `true` once the contacts id is created or identified **and** the interaction-log row is created/updated. See [Process Email Account Import](/guides/open-work/log-parse-refactor/process-email-account-import). |
+| `emails_logged` | Pass-2 processing state — `true` once the person's individual `email_activity` rows are written. `false` by default. |
 
 ### Worked example
 
@@ -189,7 +195,7 @@ Four endpoints, list-only, no per-item GETs. Nylas ships no first-party v3 **Go*
 | Endpoint | Purpose | Key params | Requests |
 |---|---|---|---|
 | `GET /v3/grants/{grant_id}` | Grant owner's email address — the anchor for direction detection | — | 1 |
-| `GET /v3/grants/{grant_id}/messages` | Every message, **both directions, one sweep** | `received_after` (depth bound), `limit` (max page size), `page_token`, `select=id,thread_id,from,to,cc,bcc,date,folders` — headers only, bodies are never fetched; `folders` powers the spam/trash exclusion | ⌈messages / page size⌉ |
+| `GET /v3/grants/{grant_id}/messages` | Every message, **both directions, one sweep** | `received_after` (depth bound), `limit` (max page size), `page_token`, `select=id,thread_id,from,to,cc,bcc,date,folders,subject,snippet` — plus `body` **only when the grant has `ai_enabled = true`** (clean-message extraction needs it; same request count, bigger pages). Bodies are otherwise never fetched; `folders` powers the spam/trash exclusion; `subject` / `snippet` are staged for pass-2 activity logging | ⌈messages / page size⌉ |
 | `GET /v3/grants/{grant_id}/calendars` | Enumerate calendars | — | 1 |
 | `GET /v3/grants/{grant_id}/events` | Events per calendar — past window **and future horizon** | `calendar_id`, `start` / `end`, `expand_recurring=true`, `limit`, `page_token` | per calendar, ⌈events / page size⌉ |
 
@@ -270,7 +276,7 @@ Several prefixes are aggressive for an eligibility-gated import — `hello`, `te
     One binary (e.g. `cmd/email-account-import`), executed per **user**, not per grant: the caller passes `--user-id`, `--depth=7d|all`, and the user's **active grants** (grant_id + email pairs — the caller already holds them in `nylas_grant`, so the job never queries for them). Env: `NYLAS_API_KEY`, `ALLOYDB_DSN`, both sourced from Secret Manager. Structured logs from day one, including a **Nylas request counter** — the request budget is a stated requirement, so it must be observable per run.
   </Step>
   <Step title="Migrations">
-    Three tables: `email_account_import` (DDL above), `marketing_prefix` (`prefix` text, unique — [seed data](#marketing-prefix-seed-data)), and `import_run_state` (`user_id`, `depth`, `grants_covered`, window bounds, `status`, `nylas_requests`, per-sweep counters, timestamps) — one row per run, the audit and idempotency anchor.
+    Four tables: `email_account_import` (DDL above), `marketing_prefix` (`prefix` text, unique — [seed data](#marketing-prefix-seed-data)), `import_run_state` (`user_id`, `depth`, `grants_covered`, window bounds, `status`, `nylas_requests`, per-sweep counters, timestamps) — one row per run, the audit and idempotency anchor — and `import_email_message` (per-message metadata staged during the sweep: `message_id` unique, `thread_id`, direction, `date`, counterpart addresses, `participant_count`, `subject`, `snippet`, plus nullable `body` populated only for `ai_enabled` grants), which is what lets [pass 2](/guides/open-work/log-parse-refactor/process-email-account-import) log individual emails — and clean them on AI accounts — without ever re-calling Nylas.
   </Step>
   <Step title="Nylas client">
     Thin typed client covering only the four endpoints. `page_token` loop; retry with backoff honoring `Retry-After` on 429; the request counter incremented in exactly one place. Build the **own-address set** as: every grant email for the user ∪ any `from` address observed on a `SENT`-labeled message — the live run confirmed Gmail exposes that label, and this catches send-as aliases with zero extra API calls. Misclassifying an alias flips message direction, so this set is correctness-critical. All requests flow through one shared token-bucket limiter (start ~5 in-flight per grant) so the concurrent sweeps never exceed the grant's rate limit.
@@ -285,6 +291,7 @@ Several prefixes are aggressive for an eligibility-gated import — `hello`, `te
     - Per-thread mini-state keyed by `thread_id`: directions seen (→ `two_way_threads`), earliest message's timestamp + direction (→ the `threads_initiated_by_*` split), per-address membership (→ `total_threads`).
     - Names: header display names fold at **higher precedence than calendar names**; never overwrite non-empty with empty; when several names appear for one address, keep the most frequent (requirement 6).
     - Addresses lowercased; the grant's own addresses skipped.
+    - Every counted message also lands as one `import_email_message` staging row while the page is in hand (requirement 7: captured on first sight) — [pass 2](/guides/open-work/log-parse-refactor/process-email-account-import) reads these to log individual emails, never Nylas.
 
     Table-driven unit tests per rule.
   </Step>

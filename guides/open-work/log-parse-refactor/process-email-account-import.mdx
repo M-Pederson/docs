@@ -1,0 +1,73 @@
+---
+title: "Process Email Account Import"
+sidebarTitle: "Process Email Account Import"
+description: "Processing the email_account_import table — what happens to the per-person import records after the Log & Parse 2.0 parser writes them."
+icon: "gears"
+---
+
+<Note>
+**Processing the email_account_import**
+</Note>
+
+The [Log & Parse Refactor](/guides/open-work/log-parse-refactor) parser fills `email_account_import` with one record per person worth adding to the user's contacts, each carrying the counts and timestamps needed to seed the [Contacts Interaction Log](/guides/open-work/contacts-interaction-log). This page covers what happens next: processing those records.
+
+Processing runs per **import run** — an import ID tied to the user — in **two passes** over the import table, plus a **third, AI-only pass** when the account is enabled for AI processing (`nylas_grant.ai_enabled = true`). Pass 1 loops through every person record and gets each one into the user's contacts with a seeded interaction log; pass 2 goes through the table again and logs their **individual emails** as activity records — cleaning each message on AI-enabled accounts; pass 3 writes **per-thread AI summaries**. The first two passes each flip a state flag on the record (`contact_logged`, `emails_logged` — both `false` by default), so either can resume after a crash by selecting the un-flipped rows.
+
+## Pass 1 — people, contacts, interaction logs
+
+<Steps>
+  <Step title="Load the import">
+    Given the import ID (tied to `user_id`), fetch that run's `email_account_import` records and process them one person at a time.
+  </Step>
+  <Step title="Resolve or seed the person in the Universe">
+    Pass the record's `email_address` and `name` to `mvp/get-add/master-person-new` (**#13039**). It returns the **`node_uuid` and/or `master_person_id`**: the existing person when the Universe already knows the address, otherwise it seeds and creates the person (`person_created` flag in the response says which happened).
+  </Step>
+  <Step title="Check whether the person is already in the user's contacts">
+    With the `master_person_id`, check for an existing `contacts` (128) row for this user. It legitimately may already exist — a **LinkedIn import** or a **VCF import** can predate connecting this email account — so the contact id may or may not be there.
+  </Step>
+  <Step title="Contact exists → update the logging information">
+    Update the existing [`contacts_interaction_log`](/guides/open-work/contacts-interaction-log) row (upsert key `contacts_id`) with the import record's counts and timestamps.
+  </Step>
+  <Step title="No contact → create it, then create the interaction log">
+    Create the `contacts` row for (user, master_person), then create and populate its `contacts_interaction_log` row from the import record — the import columns were [designed as a straight copy](/guides/open-work/log-parse-refactor#table-email_account_import), so seeding needs no mailbox re-scan.
+  </Step>
+  <Step title="New contact only → parse the email signature (async)">
+    Fire `mvp/signature/email-signature-email-import` (**#10518**) **asynchronously** with the record's `email_address` and the run's `grant_id` — a separate process the loop never waits on; it extracts the person's signature from their emails (and returns `processed` if already done). This runs **only** when the previous step added the person to the user's contacts for the first time — never for contacts that already existed.
+  </Step>
+  <Step title="Create the KNOWS edge">
+    In both branches, finish by creating the **known edge** for the pair in the graph. **Edge property details to follow.**
+  </Step>
+  <Step title="Flip contact_logged">
+    Set `contact_logged = true` on the import record once the contacts id has been **created or identified** and the interaction-log row has been **created or updated**. Pass 1 selects on `contact_logged = false`, so a re-run resumes exactly where it stopped — and pass 2 uses the flag as its entry condition.
+  </Step>
+</Steps>
+
+Every step is get-or-create / upsert, so reprocessing an import run is safe — nothing duplicates.
+
+## Pass 2 — log the individual emails
+
+Once pass 1 has the whole run flipped (`contact_logged = true` everywhere), a second pass walks the table again and turns each person's messages into **individual `email_activity` rows** — the per-email interaction records the rest of Orbiter reads (side-panel activity, and the raw material the [interaction-log cron](/guides/open-work/contacts-interaction-log#cron) recomputes from).
+
+Instructions for the Go developers:
+
+- **Source data — never Nylas.** The parser already staged one `import_email_message` row per counted message during its single sweep (`message_id` unique, `thread_id`, direction, `date`, counterpart addresses, `participant_count`, `subject`) — requirement 7's capture-on-first-sight rule exists precisely so this pass has everything locally. Pass 2 makes **zero** API calls.
+- **Scope query:** the run's `email_account_import` rows with `contact_logged = true AND emails_logged = false`.
+- **Write:** for each record, select its staged messages (counterpart = the record's `email_address`) and insert one `email_activity` row per message, keyed to the contacts id / my_person resolved in pass 1 — `direction` from staging, `activity_timestamp` = the message `date`, plus `thread_id`, `participant_count`, and `subject` for the card. Idempotency key: unique `(my_person_id, message_id)`.
+- **AI-enabled accounts also extract clean messages in this pass.** When `nylas_grant.ai_enabled = true`, LLM-clean each message's staged body into `email_activity.clean_message` as its row is written (the staged body plays v1's `temp_email_body` role). This is why the parser's sweep adds `body` to its `select` **only for AI-enabled grants** — same request count, bigger pages — so this pass still makes zero API calls. Non-AI accounts skip cleaning; their rows carry headers, `subject`, and `snippet` only.
+- **One message, several imported people** → one row per person; `email_activity` is per-contact by design, matching the v1 shape.
+- **Flip `emails_logged = true` in the same transaction** as that record's activity batch — a crash mid-pass resumes on the un-flipped rows only.
+- **Batching and isolation:** insert in ~500-row batches; records are independent, so one record's failure is logged and skipped without blocking the rest of the pass.
+
+## Pass 3 — per-thread AI summaries
+
+**AI-enabled accounts only** (`nylas_grant.ai_enabled = true`); runs after pass 2 completes for the run.
+
+- **Scope:** the distinct `thread_id`s across the run's logged emails (records with `emails_logged = true`).
+- **Write:** one conversation summary per thread into `email_ai_summary` — v1's `mvp/activity/email-llm-summary` (**#12644**) takes an `email_thread_id` and **upserts** that table (edit-or-add keyed by thread), so it is idempotent per thread; call it, or replicate its semantics in Go, per distinct thread.
+- **Source:** the thread's cleaned messages from pass 2 — no Nylas calls in this pass either.
+- **Batching:** this pass is LLM-bound, not API-bound — run with bounded concurrency, log and skip per-thread failures, and let a re-run select threads that have no `email_ai_summary` row yet.
+- **Mem0 email memories, per contact.** Processing thread summaries also processes the contact's Mem0 email memories: for each contact in the run, dispatch `mem0/create-memories-from-contact-id-v2` (**#13149**) with the pass-1 `contacts_id` and an explicit `user_id` (a job has no auth context to default from). It extracts the contact's private email + calendar memories and links every memory to `contacts.master_person_id`. Two things the builder must not miss: **pass `dry_run = false`** — it defaults to `true` and writes nothing otherwise — and it batches itself (`max_threads_per_batch`, `page_token` continuation), doing its own Nylas thread fetches today; pointing it at the staged clean messages instead is a build-time option (design context: [Memories from email threads](/guides/open-work/mem0/memories-from-email-threads)).
+
+## Requirements
+
+{/* TODO: capture the processing requirements — triage/promotion flow into contacts, what the user sees/approves, and what gets written where */}

@@ -1,0 +1,334 @@
+---
+title: "Log & Parse Refactor"
+sidebarTitle: "Log & Parse Refactor"
+description: "Log & Parse 2.0 — parse a connected email account into one import record per person worth adding to the user's contacts, carrying every interaction count and timestamp needed to seed logged interactions, with a Go + Nylas v3 build plan."
+icon: "arrows-rotate"
+---
+
+<Note>
+**Mark's Ideas for Log & Parse 2.0**
+</Note>
+
+## Objective
+
+Parse a **connected email account** for a user, create a **table record for each person** that needs to be added to the user's contacts, and include **all total numbers and timestamps** needed for logged interactions — so promoting an import row to a real contact can seed its [Contacts Interaction Log](/guides/open-work/contacts-interaction-log) row directly, with no re-scan of the mailbox.
+
+The current pipeline this rethinks — webhook logging (`message-created`, `event-*`, `contact-created`, `grant-expired`), parse, historical backfill, and refresh activity — is documented under [Log & Parse](/guides/log-parse/index).
+
+## Table: `email_account_import`
+
+One row per **person discovered in the connected account** who is not yet in the user's contacts and passes the [eligibility gate](#requirements), keyed by `(user_id, email_address)`. The count and timestamp columns deliberately reuse the [`contacts_interaction_log`](/guides/open-work/contacts-interaction-log#contacts_interaction_log) names and counting rules so the two stay mentally interchangeable and promotion is a straight column copy.
+
+```sql
+CREATE TABLE email_account_import (
+  id                        BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  created_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  user_id                   BIGINT NOT NULL,   -- logical FK → user.id (125), owner of the connected account
+  name                      TEXT,              -- best display name across sources; see name resolution in Requirements
+  email_address             TEXT NOT NULL,
+  is_company_email          BOOLEAN NOT NULL DEFAULT false,  -- prefix matches marketing_prefix, kept because the user has emailed it
+
+  -- email counts (same rules as contacts_interaction_log)
+  total_emails              INTEGER NOT NULL DEFAULT 0,   -- invariant: = to_emails + from_emails
+  to_emails                 INTEGER NOT NULL DEFAULT 0,   -- user → person
+  from_emails               INTEGER NOT NULL DEFAULT 0,   -- person → user
+  total_threads             INTEGER NOT NULL DEFAULT 0,   -- distinct email threads shared with the person
+  two_way_threads           INTEGER NOT NULL DEFAULT 0,   -- threads with messages in both directions
+  threads_initiated_by_user INTEGER NOT NULL DEFAULT 0,   -- thread's earliest message sent by the user
+  threads_initiated_by_contact INTEGER NOT NULL DEFAULT 0, -- thread's earliest message came from the person
+  direct_emails             INTEGER NOT NULL DEFAULT 0,   -- user and person are the only participants on the message
+
+  -- email timestamps
+  first_email_at            TIMESTAMPTZ,
+  last_email_at             TIMESTAMPTZ,
+  last_to_email_at          TIMESTAMPTZ,       -- user's most recent message to the person
+  last_from_email_at        TIMESTAMPTZ,       -- person's most recent message to the user
+
+  -- calendar counts (same rules as contacts_interaction_log)
+  total_meetings            INTEGER NOT NULL DEFAULT 0,
+  total_meetings_attended   INTEGER NOT NULL DEFAULT 0,
+  total_irl_meetings        INTEGER NOT NULL DEFAULT 0,
+  total_remote_meetings     INTEGER NOT NULL DEFAULT 0,
+  total_recurring_meetings  INTEGER NOT NULL DEFAULT 0,
+  distinct_meeting_series   INTEGER NOT NULL DEFAULT 0,
+  one_on_one_meetings       INTEGER NOT NULL DEFAULT 0,   -- user and person are the only participants
+  meetings_organized_by_user INTEGER NOT NULL DEFAULT 0,  -- user sent the invite
+  meetings_organized_by_contact INTEGER NOT NULL DEFAULT 0, -- person sent the invite
+  upcoming_meetings         INTEGER NOT NULL DEFAULT 0,   -- non-cancelled events that have not started yet
+  total_meeting_minutes     INTEGER NOT NULL DEFAULT 0,   -- summed duration of ended, non-cancelled events
+
+  -- calendar timestamps
+  first_meeting_at          TIMESTAMPTZ,       -- earliest PAST event start shared with the person
+  last_meeting_at           TIMESTAMPTZ,       -- latest PAST event start shared with the person
+  next_meeting_at           TIMESTAMPTZ,       -- start of the next upcoming shared event
+
+  -- combined anchors (same derivation as contacts_interaction_log)
+  first_known_interaction   TIMESTAMPTZ,       -- min(first_email_at, first_meeting_at)
+  last_known_interaction    TIMESTAMPTZ,       -- max(last_email_at, last_meeting_at)
+
+  CONSTRAINT email_account_import_user_email_key UNIQUE (user_id, email_address)
+);
+```
+
+### Column semantics
+
+Counting and classification rules are identical to [`contacts_interaction_log`](/guides/open-work/contacts-interaction-log#column-semantics) — including the [calendar classification rules](/guides/open-work/contacts-interaction-log#calendar-classification-rules) for attended / IRL / remote / recurring — with "the contact" replaced by "the discovered person".
+
+| Column | Meaning |
+|---|---|
+| `user_id` | Owner of the connected email account being parsed. |
+| `name` | Best display name for the person across all sources — email headers usually carry one, calendar participants usually don't. Merge rule in [Requirements](#requirements): never overwrite a non-empty name with an empty one. |
+| `email_address` | The address that identifies the person within this account. Import natural key with `user_id`. |
+| `is_company_email` | `true` when the address has a prefix from `marketing_prefix` but the user **has emailed** it — a company / role mailbox kept in the import because there is real outbound correspondence. |
+| `total_emails` / `to_emails` / `from_emails` | Lifetime message counts across the parsed account, split by direction. `total_emails = to_emails + from_emails`. |
+| `total_threads` | Distinct email threads (Nylas `thread_id`) shared with the person — "how many separate conversations." Invariant: `total_threads <= total_emails`. |
+| `two_way_threads` | Threads with at least one message in each direction — real correspondence; a newsletter or cold-email thread never becomes two-way. Invariant: `two_way_threads <= total_threads`. |
+| `threads_initiated_by_user` / `threads_initiated_by_contact` | Split of `total_threads` by the direction of each thread's earliest message. They sum to `total_threads`. |
+| `direct_emails` | Messages where the user and the person are the only participants — no cc list, no group thread. |
+| `first_email_at` / `last_email_at` | Domain timestamps of the earliest and latest message exchanged with the person. |
+| `last_to_email_at` / `last_from_email_at` | Most recent message per direction. `last_to_email_at > last_from_email_at` reads as "awaiting their reply." |
+| `total_meetings` and subtype counts | Non-cancelled calendar events shared with the person, classified exactly as on the interaction-log page. |
+| `one_on_one_meetings` | Events where the user and the person are the only participants — the strongest meeting-quality signal. |
+| `meetings_organized_by_user` / `meetings_organized_by_contact` | Who sent the invite, from the event organizer. Meetings organized by a third party land in neither, so the two need not sum to `total_meetings`. |
+| `upcoming_meetings` | Non-cancelled shared events that have not started yet — "on the books." |
+| `total_meeting_minutes` | Summed duration of ended, non-cancelled shared events — time actually spent together, not meeting count. |
+| `first_meeting_at` / `last_meeting_at` | Event start of the earliest / latest shared event **already in the past** — future events never set these; they set `next_meeting_at`. |
+| `next_meeting_at` | Start of the earliest upcoming shared event — `NULL` when nothing is scheduled. |
+| `first_known_interaction` / `last_known_interaction` | Min / max across the email and calendar anchors — domain time, same convention as the interaction log. |
+
+### Worked example
+
+Computed live on **2026-07-17** by running the [counting contract](#counting-contract) against the real Nylas grant for `mark@orbiter.io` (`nylas_grant` record **1**, live data source — note the record carries `user_id` **12**) at all-history depth, for the address `charles@orbiter.io`. The whole pull cost **19 Nylas requests** (one message page via the `any_email` filter, one calendar list, seventeen event pages across six calendars) — the single-address `any_email` shortcut stands in for the production full-mailbox sweep and yields identical numbers for the address.
+
+```json email_account_import — example record
+{
+  "user_id": 12,
+  "name": "Charles Mariga",
+  "email_address": "charles@orbiter.io",
+  "is_company_email": false,
+  "total_emails": 139,
+  "to_emails": 58,
+  "from_emails": 81,
+  "total_threads": 106,
+  "two_way_threads": 5,
+  "threads_initiated_by_user": 31,
+  "threads_initiated_by_contact": 75,
+  "direct_emails": 76,
+  "first_email_at": "2025-06-11T14:34:28Z",
+  "last_email_at": "2026-07-15T11:43:43Z",
+  "last_to_email_at": "2026-07-15T11:43:43Z",
+  "last_from_email_at": "2026-07-13T15:27:59Z",
+  "total_meetings": 129,
+  "total_meetings_attended": 58,
+  "total_irl_meetings": 0,
+  "total_remote_meetings": 128,
+  "total_recurring_meetings": 32,
+  "distinct_meeting_series": 107,
+  "one_on_one_meetings": 3,
+  "meetings_organized_by_user": 120,
+  "meetings_organized_by_contact": 3,
+  "upcoming_meetings": 0,
+  "total_meeting_minutes": 6170,
+  "first_meeting_at": "2025-07-02T04:30:00Z",
+  "last_meeting_at": "2026-07-16T15:00:00Z",
+  "next_meeting_at": null,
+  "first_known_interaction": "2025-06-11T14:34:28Z",
+  "last_known_interaction": "2026-07-16T15:00:00Z"
+}
+```
+
+What the real data demonstrated:
+
+- **The dedupe rule was wrong, and this run caught it.** Recurring instances share the series `iCalUID`, so deduping on the uid alone collapsed every series to one row (129 raw instances → 107), understating meetings, minutes, attended, and recurring counts. The contract now dedupes on (`iCalUID`, start).
+- **Name resolution worked as specced** — the address appeared under two display names, **Charles Mariga** (176 mentions) and **Charles Njenga** (4); most-frequent wins.
+- **Reciprocity beats volume**: 106 threads but only 5 two-way, and 75 of 106 initiated by Charles — heavy one-way update traffic that raw `total_emails` (139) alone would overstate as correspondence.
+- **`next_meeting_at = null` is real, not a bug** — the latest shared events (July 14 and 16) are already in the past and nothing is on the books; every invariant (`attended <= total`, `irl + remote <= total`, splits summing) held on the live numbers.
+- **In production this record would never be written**: `charles@orbiter.io` is already one of the user's contacts, so the gate-and-filters pass drops the address before the writer. It is shown purely as a worked example of the counting contract.
+
+## Requirements
+
+1. **Two parse depths.** An import run parses either the last **7 days** or **all history** — selected when the run is kicked off. Counts are **window-scoped**: a run's numbers and timestamps reflect only what its window contains. The 7-day depth is the quick first pass; **all-history is the source of truth for lifetime counts** — it widens anything a 7-day run wrote, and a later 7-day run can never narrow it back (depth rules in the [build plan](#build-steps)).
+2. **Minimal Nylas usage.** Use as few Nylas API requests as possible — prefer bulk / paginated listing over per-thread or per-address calls.
+3. **Marketing prefixes → `is_company_email`.** A `marketing_prefix` table holds known marketing / role prefixes (`info`, `no-reply`, `notifications`, … — [full seed list](#marketing-prefix-seed-data)). An address whose prefix matches is dropped from the import — **unless the user has emailed that address**, in which case it gets a record with `is_company_email = true`.
+4. **Eligibility gate — records ONLY for people the user has actually engaged.** A person gets an import record only when at least one of these holds:
+   - the user **has emailed** the person (`to_emails > 0`), or
+   - the user **attended a meeting** with the person, or
+   - the person **invited the user** to a meeting, or the user **invited the person** to one.
+
+   Inbound-only email — the person emailed the user, the user never replied, and there is no shared meeting — does **not** create a record.
+
+   *Counter-example that must hold:* Mr. Z emails the user, but the user never emails Mr. Z and shares no calendar events with Mr. Z → **no record** for Mr. Z in the import table.
+5. **The gate controls whether a record exists, not what gets counted.** Once a person qualifies, **all** of their history counts — including inbound activity from before they qualified — and the earliest-interaction timestamp backdates to the first interaction in either direction.
+
+   *Edge case that must work:* Mr. X emails the user for the first time in **January**. The user writes an email **to** Mr. X for the first time in **February**, in a **new thread**. Mr. X becomes eligible in February and is added to the table for processing — but his January email is included in the counts (`from_emails` and `total_emails` count it; `total_threads` = 2, the January thread plus the February one), and `first_email_at` / `first_known_interaction` = **January**, not February.
+
+   *Second edge case — qualifying via calendar:* Mr. Y emails the user, and the user **never** emails Mr. Y — but they share a meeting. Mr. Y gets an import record (the meeting satisfies the gate), and that record **includes** the inbound email in its counts (`from_emails`, `total_emails`, `total_threads`) and its timestamps (`first_email_at`, and `first_known_interaction` = the email's date if it predates the meeting).
+
+   Implication for the parser: it cannot build counts from sent threads alone — once a person qualifies, their inbound-only threads must be counted too.
+6. **One record per unique email address, per user — with best-effort name resolution across sources.** The import key is `(user_id, email_address)`: a user never gets two records for the same address — email and calendar evidence for that address merge into the one record — while other users may hold their own record for the same address. Most calendar participants are parsed with **no name available, only an email**; the `name` field takes the best display name any source offers.
+
+   *Example:* the user has a meeting with `josh@orbiter.io` (no name available) and also has emails from **Josh Diamond** `<josh@orbiter.io>` — that is one record, and its `name` becomes "Josh Diamond" as soon as the email evidence is parsed.
+7. **Single-pass efficiency — never repeat an API call.** The flow must obtain and process the data as fast as it can be pulled: every message and event is fetched **exactly once per run** — no re-fetch, no second pass over Nylas, no per-address queries — pages stream straight into the accumulator as they arrive instead of buffering the whole mailbox, and the independent sweeps (messages; calendars/events) run **concurrently**. Anything a rule needs later must be captured into the accumulator on first sight; if a field is missing, fix the accumulator — never call Nylas again.
+
+{/* TODO: still to define — triage/promotion flow into contacts, and whether the import also emits monthly buckets for full interaction-log seeding */}
+
+## Build plan — Go + Nylas API
+
+Step-by-step plan for building the 2.0 parser as a **Go binary** against the **Nylas v3 API**, written for an AI builder — no code here; every counting rule it needs is on this page or on the [interaction-log page](/guides/open-work/contacts-interaction-log). Packaging follows the [Contacts Interaction Log Go plan](/guides/open-work/contacts-interaction-log#go-build-plan): the Universe standalone Go codebase, deployed as a Cloud Run Job, `pgx` against AlloyDB.
+
+<Note>
+**Confirm at build time:** (1) storage home for `email_account_import` — this plan assumes AlloyDB alongside `contacts_interaction_log`, with a Xano projection only if the App needs one; (2) the trigger — run on grant connect, plus a manual re-run path; (3) where `marketing_prefix` rows get maintained; (4) key provisioning — the Nylas API key currently lives in Xano's `environment_variables` table (the `is_nylas = true` rows read by `mvp/nylas/get-nylas-keys` #417), so the job's `NYLAS_API_KEY` env must be provisioned from the same source of truth. None of these change the parser's structure.
+</Note>
+
+### Nylas surface — the entire API footprint
+
+Four endpoints, list-only, no per-item GETs. Nylas ships no first-party v3 **Go** SDK (Node / Python / Java / Ruby / PHP only), so build a thin typed client over `net/http` — and confirm exact param names and max page sizes against the current v3 docs at build time.
+
+| Endpoint | Purpose | Key params | Requests |
+|---|---|---|---|
+| `GET /v3/grants/{grant_id}` | Grant owner's email address — the anchor for direction detection | — | 1 |
+| `GET /v3/grants/{grant_id}/messages` | Every message, **both directions, one sweep** | `received_after` (depth bound), `limit` (max page size), `page_token`, `select=id,thread_id,from,to,cc,bcc,date,folders` — headers only, bodies are never fetched; `folders` powers the spam/trash exclusion | ⌈messages / page size⌉ |
+| `GET /v3/grants/{grant_id}/calendars` | Enumerate calendars | — | 1 |
+| `GET /v3/grants/{grant_id}/events` | Events per calendar — past window **and future horizon** | `calendar_id`, `start` / `end`, `expand_recurring=true`, `limit`, `page_token` | per calendar, ⌈events / page size⌉ |
+
+Deliberately **not** used: `/threads` (every thread stat derives locally from `thread_id` on messages), per-message or per-event GETs, `/contacts`. That is what satisfies requirement 2: a 10,000-message mailbox costs ~50 message pages + 2 + a handful of event pages — versus v1's per-contact received-thread loop in `mvp/activity/nylas-history-parse` (#189), whose request count grows with the contact list.
+
+### Counting contract
+
+The exact derivation for every count and timestamp, so the accumulator is mechanical. Two definitions do most of the work, evaluated per candidate address `A`:
+
+- **Counted message (for A):** on a `sent` message, A appears in `to` or `cc` (**outbound-counted**); on a `received` message, A **is the sender** (**inbound-counted**). `bcc` never counts; cc'd third parties on received mail never count; messages in spam or trash folders are skipped — match on the `folders` ids (Google grants use literal `SPAM` / `TRASH` labels, verified live; other providers may need one folder-list call to resolve ids to roles).
+- **Shared event (for A):** a non-cancelled event where the grant owner and A are both participants (the organizer counts as a participant). Events are deduped by (`ical_uid`, start) across calendars before counting — recurring instances share the series `iCalUID`, so deduping on the uid alone collapses a whole series into one row (caught live in the [worked example](#worked-example)). **Past** = the event's end (or start, when no end exists) is before now. Nylas `when` shapes: `timespan` → `start_time` / `end_time`; all-day `date` / `datespan` → the date at 00:00 UTC for anchors and 0 minutes of duration.
+
+| Column | Derivation for address `A` |
+|---|---|
+| `to_emails` / `from_emails` / `total_emails` | Count of outbound-counted / inbound-counted messages; their sum. |
+| `direct_emails` | Counted messages whose entire participant set is exactly the grant owner + A, nobody else. |
+| `total_threads` | `COUNT(DISTINCT thread_id)` over A's counted messages. |
+| `two_way_threads` | Threads holding ≥ 1 outbound-counted **and** ≥ 1 inbound-counted message for A. |
+| `threads_initiated_by_user` / `threads_initiated_by_contact` | Per thread, the direction of **A's earliest counted message**: `sent` → user, `received` → contact. Every thread lands in exactly one bucket, so the two sum to `total_threads`. |
+| `first_email_at` / `last_email_at` | min / max message `date` over A's counted messages. |
+| `last_to_email_at` / `last_from_email_at` | max `date` over outbound-counted / inbound-counted messages. |
+| `total_meetings` | Shared events (expanded instances; future included). |
+| `total_meetings_attended` | Ended shared events where A's `participants[].status == "yes"` or A is the organizer. |
+| `total_irl_meetings` / `total_remote_meetings` / `total_recurring_meetings` | Shared events through the [interaction-log classification rules](/guides/open-work/contacts-interaction-log#calendar-classification-rules). |
+| `distinct_meeting_series` | Distinct series masters + one-off events. Verified live: with `expand_recurring=true`, instances carry `master_event_id` and the `recurrence` field never appears — recurring detection is simply `master_event_id` presence. |
+| `one_on_one_meetings` | Shared events with exactly two participants. |
+| `meetings_organized_by_user` / `meetings_organized_by_contact` | Organizer email equals the grant owner's / equals A. Third-party organizers land in neither. |
+| `upcoming_meetings` | Shared events with start in the future. |
+| `total_meeting_minutes` | Σ (`end_time` − `start_time`) over **ended** shared events; all-day or missing end contributes 0. |
+| `first_meeting_at` / `last_meeting_at` | min / max start over **past** shared events only. |
+| `next_meeting_at` | min start over upcoming shared events. |
+| `first_known_interaction` / `last_known_interaction` | `min(first_email_at, first_meeting_at)` / `max(last_email_at, last_meeting_at)` — past-only by construction. A person whose only evidence is a future meeting has `NULL` here yet still passes the gate. |
+
+Two predicates the build steps reference:
+
+- **Eligibility gate (requirement 4), concretely:** `to_emails > 0 OR total_meetings > 0`. A shared event covers every calendar arm of the gate — attended together, they invited the user, the user invited them — and also admits events where a third party invited both (flag at build time if that should be excluded).
+- **Marketing prefix match (requirement 3), concretely:** lowercase the local part (before the `@`) and test `startswith` against each `marketing_prefix.prefix`, stored bare (`no-reply`, `info`, `notifications`, …).
+
+### Marketing prefix seed data
+
+The live prefix list, pulled from Xano workspace 3 `marketing_prefix` (table **174**, `sandbox` data source, 2026-07-17) — **138 prefixes** after lowercasing and deduplicating. The raw sandbox rows carry two quirks worth cleaning at the source: `receipts` appears twice (ids 104 and 140), and `Unsub+` duplicates `unsub+` under the contract's case-insensitive matching.
+
+```sql marketing_prefix seed
+INSERT INTO marketing_prefix (prefix) VALUES
+  ('acc'), ('account'), ('accounts'), ('acct'), ('activation'), ('admin'),
+  ('alert'), ('alerts'), ('announcements'), ('auth'), ('authentication'), ('auto'),
+  ('auto-reply'), ('automail'), ('automated'), ('automation'), ('autoreply'), ('billing'),
+  ('blast'), ('bot'), ('bounce'), ('bounce+'), ('broadcast'), ('calendar'),
+  ('campaigns'), ('care'), ('community'), ('confirmation'), ('contact'), ('contact-us'),
+  ('contactus'), ('cs'), ('customer-care'), ('customer-service'), ('customer_service'), ('customercare'),
+  ('customerexperience'), ('cx'), ('daemon'), ('deals'), ('delivery'), ('digest'),
+  ('discount'), ('discounts'), ('do-not-reply'), ('donotreply'), ('e-news'), ('e-newsletter'),
+  ('email'), ('emails'), ('enews'), ('enewsletter'), ('enquiries'), ('event'),
+  ('events'), ('feedback'), ('gemini-notes'), ('hello'), ('help'), ('helpdesk'),
+  ('info'), ('inquiries'), ('inquiry'), ('insights'), ('invitation-do-not-reply'), ('invite'),
+  ('invoice'), ('invoices'), ('listserv'), ('mail'), ('mailer-daemon'), ('mailing'),
+  ('mailinglist'), ('marketing'), ('meetings-noreply'), ('members'), ('membership'), ('messages'),
+  ('messages-noreply'), ('news'), ('news-noreply'), ('newsletter'), ('no-reply'), ('nobody'),
+  ('noreply'), ('notification'), ('notifications'), ('notifier'), ('notify'), ('null'),
+  ('offer'), ('offers'), ('onboarding'), ('opt-out'), ('optout'), ('order'),
+  ('orders'), ('password'), ('payment'), ('postmaster'), ('promo'), ('promos'),
+  ('promotions'), ('receipt'), ('receipts'), ('remove'), ('reply'), ('reply+'),
+  ('reset'), ('return+'), ('returned'), ('robot'), ('rsvp'), ('sales'),
+  ('sc-noreply'), ('security'), ('service'), ('shipping'), ('subscribe'), ('support'),
+  ('support+notifications'), ('support-mail'), ('survey'), ('surveys'), ('system'), ('team'),
+  ('team.sales'), ('ticket'), ('tickets'), ('tracking'), ('undeliverable'), ('unsub+'),
+  ('unsubscribe'), ('updates'), ('verification'), ('verify'), ('webmaster'), ('welcome');
+```
+
+<Warning>
+Several prefixes are aggressive for an eligibility-gated import — `hello`, `team`, `contact`, `info`, `sales`, `events`, `rsvp`, `calendar`, `invite` are also how real small companies write to you. The requirement-3 exception (kept with `is_company_email = true` when the user has emailed the address) is what makes the breadth safe.
+</Warning>
+
+### Build steps
+
+<Steps>
+  <Step title="Scaffold and config">
+    One binary (e.g. `cmd/email-account-import`), executed per **user**, not per grant: the caller passes `--user-id`, `--depth=7d|all`, and the user's **active grants** (grant_id + email pairs — the caller already holds them in `nylas_grant`, so the job never queries for them). Env: `NYLAS_API_KEY`, `ALLOYDB_DSN`, both sourced from Secret Manager. Structured logs from day one, including a **Nylas request counter** — the request budget is a stated requirement, so it must be observable per run.
+  </Step>
+  <Step title="Migrations">
+    Three tables: `email_account_import` (DDL above), `marketing_prefix` (`prefix` text, unique — [seed data](#marketing-prefix-seed-data)), and `import_run_state` (`user_id`, `depth`, `grants_covered`, window bounds, `status`, `nylas_requests`, per-sweep counters, timestamps) — one row per run, the audit and idempotency anchor.
+  </Step>
+  <Step title="Nylas client">
+    Thin typed client covering only the four endpoints. `page_token` loop; retry with backoff honoring `Retry-After` on 429; the request counter incremented in exactly one place. Build the **own-address set** as: every grant email for the user ∪ any `from` address observed on a `SENT`-labeled message — the live run confirmed Gmail exposes that label, and this catches send-as aliases with zero extra API calls. Misclassifying an alias flips message direction, so this set is correctness-critical. All requests flow through one shared token-bucket limiter (start ~5 in-flight per grant) so the concurrent sweeps never exceed the grant's rate limit.
+  </Step>
+  <Step title="Message sweep — one pass, both directions">
+    Page `/messages` with `received_after` = now − 7 days, or unset for all-history. Direction is computed **locally** per message: `from` ∈ grant addresses → `sent`, otherwise `received`. No direction-scoped or per-contact queries — this one sweep replaces v1's per-contact loops entirely. Per requirement 7, each page streams straight into the fold as it arrives (no buffering the mailbox), and this sweep runs **concurrently** with the calendar sweep in its own goroutine. Users with several connected accounts sweep **once per grant, concurrently, into the one shared accumulator** — that is what keeps requirement 6's single record per address true across grants.
+  </Step>
+  <Step title="Accumulator — pure functions, no I/O">
+    A per-address struct mirroring every table column, folded message by message — implementing the [counting contract](#counting-contract) exactly:
+    - `sent` → each `to` / `cc` counterpart gets `to_emails`+1 and `last_to_email_at`; `received` → the **sender only** gets `from_emails`+1 and `last_from_email_at` (cc'd third parties on received mail don't count; `bcc` excluded) — same direction rules as the interaction log.
+    - `direct_emails`: the message's participant set is exactly the grant owner + this address.
+    - Per-thread mini-state keyed by `thread_id`: directions seen (→ `two_way_threads`), earliest message's timestamp + direction (→ the `threads_initiated_by_*` split), per-address membership (→ `total_threads`).
+    - Names: header display names fold at **higher precedence than calendar names**; never overwrite non-empty with empty; when several names appear for one address, keep the most frequent (requirement 6).
+    - Addresses lowercased; the grant's own addresses skipped.
+
+    Table-driven unit tests per rule.
+  </Step>
+  <Step title="Calendar sweep">
+    `/calendars` once, then page `/events` per calendar: `start` = the depth bound, `end` = a future horizon (default now + 18 months — `upcoming_meetings` / `next_meeting_at` need future events), `expand_recurring=true` so instances count while `distinct_meeting_series` groups by series master. Fold every participant address through the [interaction-log classification rules](/guides/open-work/contacts-interaction-log#calendar-classification-rules): the six base counts plus `one_on_one_meetings` (2 participants), the `meetings_organized_by_*` split (organizer vs grant owner vs the address), `upcoming_meetings`, `total_meeting_minutes` (ended events only; all-day → 0), and the `first` / `last` / `next_meeting_at` anchors. Calendar participant names are usually absent — fold them at lower precedence. Runs **concurrently** with the message sweep; individual calendars can page in parallel too (they're independent), respecting the shared rate-limit budget. Nothing is ever re-fetched (requirement 7).
+  </Step>
+  <Step title="Gate and filters — a post-pass over the accumulator, never inside the fold">
+    Requirement 5 dictates this shape: accumulate everything, then filter who gets **written**. In order: (1) drop grant-own addresses; (2) drop addresses already on the user's contacts (local DB lookup, no API); (3) apply the requirement-4 eligibility gate; (4) apply the `marketing_prefix` rule — drop on prefix match unless `to_emails > 0`, which keeps the record with `is_company_email = true`. Mr. X's and Mr. Y's inbound history survives because counting already happened; Mr. Z is dropped here.
+  </Step>
+  <Step title="Writer — one upsert per address">
+    Batch upsert `ON CONFLICT (user_id, email_address) DO UPDATE` — requirement 6's one-record-per-address-per-user rule lives in this constraint. `name` merges best-non-empty (an incoming empty name never overwrites a stored one); counts and anchors overwrite from this run's accumulator. Batches of ~500 rows per statement, and **all batches plus the `import_run_state` stamp commit in one transaction** — a failed run writes nothing, so re-runs are always safe.
+  </Step>
+  <Step title="Depth and re-run semantics">
+    `import_run_state` records the deepest completed window per user. **A shallower run must never clobber a deeper one**: after a completed all-history run, a 7-day request either no-ops per existing address or escalates to a delta parse from the stored window edge. Same-depth re-runs are full recomputes over the same window and must be idempotent.
+  </Step>
+  <Step title="Verify">
+    Assert the invariants from [column semantics](#column-semantics) over the written rows (`total_emails = to_emails + from_emails`; `two_way_threads <= total_threads`; the initiation splits sum to `total_threads`; every meeting subset `<= total_meetings`). Fixture tests for every requirement on this page: Mr. X (record appears only after the February outbound; `total_threads` = 2; `first_email_at` = January), Mr. Y (meeting-qualified; inbound email counted), Mr. Z (no record), the `josh@orbiter.io` name resolution (one record, name from email headers), the marketing-prefix exception, and both depths. Re-run at the same depth → zero value changes. Cross-check direction classification against the provider's sent folder — in the live worked example, 58 messages carried Gmail's `SENT` label and the fold independently computed `to_emails` = 58. Log the final Nylas request count and compare it to the page-count estimate.
+  </Step>
+</Steps>
+
+### Builder notes — Cloud Run specifics
+
+Answers to the questions a builder hits between "plan approved" and "job deployed". Defaults match the [interaction-log job](/guides/open-work/contacts-interaction-log#go-build-plan); confirm nothing here contradicts the Universe repo's conventions.
+
+**Packaging and trigger**
+
+- A Cloud Run **Job**, not a Service — the work is finite and needs no HTTP surface. Same project/region as AlloyDB; reach it over direct VPC egress (or the Auth Proxy sidecar — match whichever the interaction-log job ships with).
+- Per-run parameters (`user_id`, `depth`, the grant list) travel as **per-execution container overrides** on the Jobs API `run` call — confirm current API/gcloud override syntax at build time.
+- **Grant-connect trigger:** the Xano flow that today kicks off historical log-parse instead calls the Jobs API `run` with a dedicated service account. Manual re-run is the same call, or `gcloud run jobs execute`.
+- `taskTimeout` 3600s; `maxRetries` **1** — the run is idempotent by design, but every retry re-spends the API budget, so investigate failures rather than raising it. CPU 1, memory 512Mi–1Gi.
+- `NYLAS_API_KEY` and `ALLOYDB_DSN` come from **Secret Manager**, mounted as env vars.
+
+**Concurrency architecture (requirement 7)**
+
+- Page-fetcher goroutines (one per sweep, per grant) decode pages and push them into a channel; a **single folder goroutine** owns the accumulator map. No locks, deterministic folds, order-independent results.
+- One shared token bucket across all fetchers (~5 in-flight per grant to start). `429` → honor `Retry-After`; `5xx` → jittered exponential backoff, max ~3 attempts. The retry path is the only sanctioned repeat of any call.
+- Sizing: the accumulator holds per-address counters plus per-(address, thread) direction bits — a 100k-message mailbox with 10k counterparties fits in tens of MB. Expect ~250 pages for 50k messages, roughly 2–4 minutes wall-clock with the sweeps overlapped.
+
+**Failure taxonomy**
+
+- Nylas `401` (bad key) or `403` / `404` on the grant → end the run as `status = grant_error` and surface it so the caller can flip `nylas_grant.grant_expired` (the column already exists on that table) and prompt reconnection.
+- Any sweep failing after retries → `status = failed`, **nothing written** — the single write transaction never opens, so a re-run starts clean.
+- Success stamps `status = success` plus `nylas_requests`, messages/events seen, addresses written, and duration — the numbers to eyeball against the request-budget estimate every run.
+
+**Why the job runs per user, not per grant**
+
+`email_account_import` keys on `(user_id, email_address)` with overwrite semantics, so two grants written in **separate** runs would clobber each other's counts for shared correspondents. All of a user's grants therefore sweep in one run into one accumulator and one write (build steps 1 and 4). When a user connects an additional account later, re-run that user at all-history depth.

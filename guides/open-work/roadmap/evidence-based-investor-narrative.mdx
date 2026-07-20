@@ -9,7 +9,7 @@ icon: "dollar-sign"
 </Warning>
 
 <Info>
-  **⚡ ENTRY POINT: a funding round being added to the Universe graph.** That single event initiates all LLM work in this system — the round is classified **once**, idempotently on `(canonical_deal_id, rubric_version)`, serving every investor on the syndicate. **The classification LLM result is stored in `round_evidence_stage`**; the downstream **narrative LLM result is stored in `investor_evidence_narrative`** (with the model that produced it), and `investor_evidence_profile` in between is pure SQL — no LLM. **Investor enrichment reads; it never classifies.**
+  **⚡ TWO ENTRY POINTS — no backfill for now.** All LLM work starts from one of two events: **(1) a funding round is added to the Universe graph** → that round is classified **once**, idempotently on `(canonical_deal_id, rubric_version)`, serving every investor on the syndicate; **(2) an investor thesis is generated** → that investor's not-yet-classified rounds are **enqueued for the same once-per-round classification** (the PK makes repeat requests no-ops — syndicate-mates share rows), then the profile computes and the narrative generates. **Classification LLM results → `round_evidence_stage`; narrative LLM results → `investor_evidence_narrative`** (with the producing model); `investor_evidence_profile` in between is pure SQL — no LLM. Corpus coverage grows with usage; the ~~54k-round corpus backfill stays available later as an optional warm-up (~~\$15–25).
 </Info>
 
 ## What we're building
@@ -25,7 +25,7 @@ Same label, opposite evidence. The system classifies the **publicly evidenced st
 
 ## Fundable data contract
 
-**Stage-eligible population:** SEED **28,761** \+ SERIES\_A **25,282** \+ EQUITY/CONVERTIBLE\_NOTE passing the early cut (**size ≤ ~\$15M AND the company's 1st/2nd tracked financing**; exact count comes out of the backfill) ≈ **54k of 146,175 deals**. Every other round gets rationale-only extraction (`evidence_stage` null by design).
+**Stage-eligible population:** SEED **28,761** \+ SERIES\_A **25,282** \+ EQUITY/CONVERTIBLE\_NOTE passing the early cut (**size ≤ ~\$15M AND the company's 1st/2nd tracked financing**) ≈ **54k of 146,175 deals**. Every other round gets rationale-only extraction (`evidence_stage` null by design). With no backfill, these are ceiling numbers — actual classified coverage accumulates from the two entry points.
 
 | Table | Used for |
 | --- | --- |
@@ -76,7 +76,7 @@ User message shape: `ROUND: <label> | company: <name> | size_usd_millions: <n> |
 
 ### Step 2 — Profile (pure SQL, no LLM)
 
-**No round cap.** Classification is corpus-wide and idempotent, so profiles aggregate over an investor's **entire classified book** — a16z's 1,568 tracked investments cost nothing extra at profile time, and era buckets measure real drift from full history. The only cap is on the Step-3 prompt payload: full-book stats \+ top-6 receipts \+ a most-recent-~30 rounds digest keep it ~3k tokens regardless of book size.
+**No round cap.** Classification is once-per-round and idempotent, so profiles aggregate over an investor's **entire classified book** — the first thesis-generation event pays the book's classification once (a16z's 1,568 rounds ≈ \$3), every profile after that is free SQL, and era buckets measure real drift from full history. The profile job runs when the investor's classification queue drains (immediately if nothing was missing); still-pending rounds surface as coverage, never as blocking. The only cap is on the Step-3 prompt payload: full-book stats \+ top-6 receipts \+ a most-recent-~30 rounds digest keep it ~3k tokens regardless of book size.
 
 Join classified rounds → investors (orgs \+ angels). **Attribution guard:** a round counts toward a profile only if the investor matches the round's `attributed_investors`; excluded rounds → `guard_excluded`; if the guard would empty an investor, keep all rounds with `guard_bypassed` flagged (the narrative then carries an attribution caution). **Alias matching is mandatory** — legal name, common short forms, domain stem (`a16z` from `a16z.com`), social handle; display-name-only matching falsely excluded 15/64 a16z rounds (verified fixed: 15 → 0). Require **N ≥ 5 staged rounds** for a profile; `insufficient_evidence` rounds don't count toward N but are reported as coverage. Compute: stage distribution, median, `pre_evidence_pct` (≤E1), `proof_pct` (≥E3), `lead_pct`, era buckets (pre-2020 / 2020–22 / 2023\+ / all-time), `insufficient` coverage, rationale fingerprint (team/market/product/traction counts across all rounds, any stage).
 
@@ -146,7 +146,7 @@ The three tables above, anchored to your entities: profile/narrative investor re
 
 ### 3. Workers (the three steps)
 
-1. **`evidence-classify`** — every round; ladder only for early-stage rounds; Step-1 prompt verbatim; idempotent on `(canonical_deal_id, rubric_version)`; precompute `attributed_investors` with alias sets. **Trigger topology: ROUND-driven, never investor-driven** — fires when a round enters the system (backfill, then the Fundable changelog flow); the PK is the already-ran check; one classification serves the whole syndicate. Investor enrichment never classifies — Step 2 aggregates what exists, reports gaps as coverage, and enqueues missing rounds for non-blocking background catch-up. **Late-article recheck:** if the first pass finds zero windowed articles, re-run once after the raise window closes (~announce \+15d) and upsert; after that only a `rubric_version` bump re-touches a round.
+1. **`evidence-classify`** — every round; ladder only for early-stage rounds; Step-1 prompt verbatim; idempotent on `(canonical_deal_id, rubric_version)`; precompute `attributed_investors` with alias sets. **Trigger topology — two demand sources, one round-keyed worker:** (a) a round enters the system via the Fundable changelog flow → classify it; (b) an investor thesis is generated → enqueue every not-yet-classified round in that investor's book (full book, both modes — a16z-sized ≈ \$3 once at flash rates). The PK is the already-ran check either way: rounds classify **once**, syndicate-mates share rows, repeat requests are no-ops, and the investor path never re-classifies existing rows. **Late-article recheck:** if the first pass finds zero windowed articles, re-run once after the raise window closes (~announce \+15d) and upsert; after that only a `rubric_version` bump re-touches a round.
 2. **`evidence-profile`** — Step-2 SQL with the guard and N ≥ 5; recompute on new classified rounds.
 3. **`narrative-generate`** — Step-3 with the kimi→qwen failover contract and output validation; regenerate only on material profile change.
 
@@ -169,13 +169,13 @@ The three tables above, anchored to your entities: profile/narrative investor re
 | `narrative.payload_cap` | top-6 receipts \+ most-recent-30 rounds digest |
 | `narrative.validation` | JSON parse \+ "Revealed evidence bar:" line \+ no E0–E5 codes; 2 attempts per model before failover |
 
-### 5. Rollout order
+### 5. Rollout order (no backfill — event-driven from day one)
 
 1. Migrate the three tables; wire the config manifest.
-2. Early-stage ladder backfill (~54k rounds ≈ \$15–25 at flash rates; batch, cursor-resumable). Report the exact EQUITY early-cut count from this run.
-3. Rationale sweep over the remaining ~92k stage-suppressed rounds (same order of cost).
-4. Profiles (N ≥ 5, orgs \+ angels) → narratives (≈ \$30–70 at kimi prices).
-5. Projection wiring → investor-profile surface; hook new-deal classification into the Fundable changelog flow for continuous refresh.
+2. Wire **entry point 1**: Fundable changelog flow → new round → `evidence-classify`.
+3. Wire **entry point 2**: investor-thesis generation → enqueue the investor's unclassified rounds → on queue drain, `evidence-profile` (N ≥ 5) → `narrative-generate`.
+4. Projection wiring → investor-profile surface.
+5. **Optional, later:** corpus warm-up backfill (~54k early-stage rounds ≈ \$15–25; ~92k rationale-only rounds similar) if organic coverage needs a push — same worker, cursor-batched, nothing else changes.
 
 ### 6. Acceptance & observability
 
@@ -195,7 +195,7 @@ curl -X POST https://xh2o-yths-38lt.n7c.xano.io/api:7LJisE8R/investor-narrative-
 ## Open items
 
 - **Rubric v1.1:** Mark pastes the full Tobias thread when available; his ladder folds in as annotations and everything reclassifies idempotently.
-- **EQUITY early-cut count:** reported by the backfill (rollout step 2).
+- **EQUITY early-cut count:** measured as coverage accumulates (or by the optional warm-up backfill, whenever it runs).
 
 ## References
 

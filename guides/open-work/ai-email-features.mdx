@@ -1,0 +1,181 @@
+---
+title: "AI Email Features"
+description: "Fresh-lens review of every LLM touchpoint on email. Starts with the inventory of existing functions — body cleaning, thread summarization, signature extraction, and Mem0 memory processing — and what each does today."
+icon: "envelope-open-text"
+---
+
+This page anchors a fresh-lens review of all AI processing for email. Before redesigning anything, this is the complete inventory of what exists today: every Xano function that runs an LLM against email content, the deterministic neighbors around them, where their output lands, and what triggers them.
+
+<Info>
+  Surveyed 2026-07-22 from the live XanoScript bodies in workspace `3`. This page records current behavior — nothing here is a proposal yet. The full summarizer prompt lives on [Email Pipeline → LLM System Prompts](/guides/enrichment/email/llm-system-prompts); the Mem0 suite has its own deep reference at [mem0 Functions](/guides/open-work/mem0/functions).
+</Info>
+
+## Existing LLM Functions
+
+### At a glance
+
+| ID | Function | Job | Model (all via OpenRouter) | Runs today from |
+| --- | --- | --- | --- | --- |
+| 2363 | `clean-convo/llm_clean_messages` | Route to a cleaner, store `clean_message` | none — delegates | `message.created` webhook, historical parse |
+| 4647 | `clean-convo/clean-email-body` | Clean one email body (reply/plain) | `openai/gpt-5-nano` | via #2363 |
+| 12648 | `clean-convo/clean-email-body-forward` | Clean a forwarded email body | `openai/gpt-5-nano` | via #2363 — apparently never routed, see observations |
+| 12644 | `mvp/activity/email-llm-summary` | Thread → summary/bullets/sentiment/actions JSON | `google/gemini-3.1-flash-lite-preview` | `message.created` webhook, historical parse |
+| 4645 | `mvp/signature/email-signature-parse-process` | Extract signature \+ enrich person/company (monolith) | `moonshotai/kimi-k2-0905` | parse helper Branch C (first-time email address) |
+| 10518 | `mvp/signature/email-signature-email-import` | Fetch \+ LLM-parse signature only, stateless | `moonshotai/kimi-k2-0905` | account import, first-time contacts (async) |
+| 10519 | `mvp/signature/email-signature-process-only` | Apply a stored signature JSON (no LLM) | — | import/historical follow-up |
+| 13149 | `mem0/create-memories-from-contact-id-v2` | Email threads \+ calendar → private Mem0 memories | `deepseek/deepseek-v4-flash` (\+ `anthropic/claude-opus-4.8` tone stage) | user-triggered, dry-run default |
+| 13146 | `mem0/create-memories-from-contact-id` | Same plus inline graph-edge stage | same | user-triggered — source of the v2 split |
+| 13145 | `mem0/create-memories-from-email-threads-v2` | Legacy combined graph \+ email \+ tone | `deepseek/deepseek-v4-flash` | superseded |
+| 13077 | `mem0/create-memories-from-email-threads-v1` | Original v1 experiment | not re-verified (superseded) | superseded |
+
+### Body cleaning (clean-convo family)
+
+Three functions. The two cleaners are pure transform-and-return — all storage happens in the orchestrator. Both cleaners run a deterministic JS pre-clean first (quoted-reply chains, signature markers, mobile sign-offs, tracking images, legal disclaimers, empty containers) and then send the survivor to the LLM for a final polish.
+
+<Card icon="play">
+  ```text
+  clean-convo/llm_clean_messages — 2363
+  ```
+
+  **Entry point \+ writer.** Takes `body`, `message_id`, `user_id`. A lambda checks for forward markers (`---------- Forwarded message ----------`, `Begin forwarded message:`) and routes to the forward cleaner or the base cleaner, then writes the returned string onto **every** `email_activity` row matching `(user_id, message_id)` as `clean_message`. Returns `"success"`. No LLM of its own, no processed-guard — every call recleans.
+</Card>
+
+<Card icon="cloud-arrow-up">
+  ```text
+  clean-convo/clean-email-body — 4647
+  ```
+
+  **Base cleaner.** Regex pre-clean lambda (Apple/Gmail signature blocks, `On … wrote:` headers, blockquotes, `display:none` divs, trailing sign-off divs, 3\+ `br` collapse, `[No message content]` fallback), then `openai/gpt-5-nano` — temperature 0, `max_tokens` 8192, reasoning effort minimal, `data_collection: deny`. Static system prompt (cacheable prefix) with the body as the user message; 11 ordered cleanup tasks plus 7 few-shot examples; output is flattened single-`div` HTML. Returns the LLM string, stores nothing, no error handling on the call.
+</Card>
+
+<Card icon="cloud-arrow-up">
+  ```text
+  clean-convo/clean-email-body-forward — 12648
+  ```
+
+  **Forward variant — standalone near-clone of #4647**, not a wrapper. Pre-clean splits on the earliest forward marker, strips `From/Date/Subject/To/Cc:` header lines from the forwarded content, and scrubs the forwarder's own note above the marker into `new_text` — which is then discarded (only `cleaned_body` reaches the LLM). Identical LLM config to #4647 with a forwarded-email framing and 3 few-shot examples.
+</Card>
+
+### Thread summarization
+
+<Card icon="play">
+  ```text
+  mvp/activity/email-llm-summary — 12644
+  ```
+
+  **The email AI summary.** Takes `email_thread_id` \+ `grant_id`, pulls up to 50 messages for the thread straight from Nylas, cleans them with its **own inline lambda** (it does not reuse the clean-convo cleaners or stored `clean_message`), YAML-encodes the transcript into the `// v1` prompt, and calls `google/gemini-3.1-flash-lite-preview` — temperature 0.1, `max_tokens` 600, `response_format: json_object`, `data_collection: deny`. Output schema: `summary` (one sentence, ≤15 words), `bullet_points` (5–8), `sentiment` (`positive`/`negative`/`mixed`/null), `action_items` (`[Name] — commitment`). A second lambda regex-extracts deduped links and merges them in.
+
+  Upserts `email_ai_summary` keyed on `(grant_id, thread_id)` — idempotent per thread, refreshed on every call. Full prompt: [Email Pipeline → LLM System Prompts](/guides/enrichment/email/llm-system-prompts).
+</Card>
+
+### Signature extraction
+
+One monolith and a split-stage pair. #4645 does fetch → parse → store → enrich in one call; #10518 is the fetch\+parse half for the import pipeline (its caller persists the JSON); #10519 is the enrich half that consumes stored JSON later. #4645 and #10518 carry a **byte-identical** kimi-k2 prompt; #4645 and #10519 carry a duplicated enrichment block.
+
+<Card icon="play">
+  ```text
+  mvp/signature/email-signature-parse-process — 4645
+  ```
+
+  **Monolith worker.** Skip-guard: returns `"processed"` when `person_enrich_data.email_signature` is already non-empty. Otherwise fetches the person's 3 most recent messages from Nylas, runs a ~200-line content/link-extraction lambda, and calls `moonshotai/kimi-k2-0905` (temperature 0.2, `top_p` 0.1, `max_tokens` 800, `data_collection: deny`) to emit structured JSON: `signature_found`, `name`, `title`, `company`, `company_website`, `company_domain`, `phone` (e164/local/country), person/company social links, `calendar_url`.
+
+  Stores the JSON to `person_enrich_data.email_signature`, then enriches: phone via `add-person-pre-processed-phone`, links via `add-person-links`, deduped `scheduling_link`, and a company block — `work_experience` match else `master-company-new` \+ `add-bulk-company-links` \+ new `work_experience` row \+ `resolve-current-work` (all `data_source_id` 88).
+</Card>
+
+<Card icon="cloud-arrow-up">
+  ```text
+  mvp/signature/email-signature-email-import — 10518
+  ```
+
+  **Stateless fetch \+ parse half** for the email-account-import flow. Same Nylas fetch and byte-identical kimi-k2 prompt as #4645, hardened with a whole-body `try_catch` (returns `{}` on failure) and a 180s LLM timeout for bulk runs. No DB reads/writes, no processed marker — the header comment claiming one is stale; the caller persists the result.
+</Card>
+
+<Card icon="wrench">
+  ```text
+  mvp/signature/email-signature-process-only — 10519
+  ```
+
+  **Enrich half, no LLM.** Takes `master_person_id`, reads the stored `person_enrich_data.email_signature`, skips when `processed: true` or `signature_found: false`, applies the same enrichment writes as #4645 (phone, links, `scheduling_link` — without the dedup check — and the company/work block), then stamps `processed: true` back onto the JSON.
+</Card>
+
+### Email → Mem0 memory extraction
+
+The current pair, after the 2026-06-27 scope split (deep reference: [mem0 Functions](/guides/open-work/mem0/functions), design doc: [Memories from Email Threads](/guides/open-work/mem0/memories-from-email-threads)):
+
+<Card icon="play">
+  ```text
+  mem0/create-memories-from-contact-id-v2 — 13149
+  ```
+
+  **Current private-contact writer.** For one `contacts` row: scans the mailbox owner's Nylas threads with that contact, cleans transcripts with an inline deterministic lambda, prefilters with `deepseek/deepseek-v4-flash` (high-recall noise check, non-authoritative), extracts durable English-only memories with `deepseek/deepseek-v4-flash` (strict JSON, ≤5 candidates per thread, confidence ≥0.75, CJK suppression), then adds `calendar_event` memories. Writes to the owner's private Mem0 scope (`user.workos_id`) with `master_person_id` metadata; `infer=false`, hash-based duplicate checks, dry-run by default.
+
+  Optional stage: `run_email_tone=true` builds a per-contact sent-email voice profile with `anthropic/claude-opus-4.8` and upserts `email_draft_tone` — the reusable tone profile for drafting. No graph/Cypher stage.
+</Card>
+
+<Card icon="wrench">
+  ```text
+  mem0/create-memories-from-contact-id — 13146
+  ```
+
+  **Predecessor and source of the split.** Same email, calendar, and tone stages as #13149 but still contains the inline FalkorDB one-hop graph-edge stage that now lives in `mem0/create-master-person-memories` (#13148). Kept as the reference implementation.
+</Card>
+
+Legacy chain and non-email relatives:
+
+| Function | ID | Status |
+| --- | --- | --- |
+| `mem0/create-memories-from-email-threads-v2` | 13145 | Legacy combined graph \+ email \+ tone per contact; superseded by the #13148/#13149 split |
+| `mem0/create-memories-from-email-threads-v1` | 13077 | Original v1 experiment (subject-focused memories); superseded |
+| `mem0/create-master-person-memories` | 13148 | Graph edges → shared master-person scope — no email content |
+| `mem0/get-contacts-memories` | 13147 | Combined read path (private \+ shared, date-sorted) |
+| `mem0/delete-master-person-memories` / `delete-contact-memories` / `delete-all-memories` | 13150 / 13151 / 13152 | QA cleanup helpers |
+
+### Deterministic neighbors (no LLM)
+
+Functions that sit in the same email flows but decide without a model — plus the hidden cleaners:
+
+| Function | ID | What it actually does |
+| --- | --- | --- |
+| `mvp/email/detect-marketing-email` | 12835 | Pure JS heuristics on the **address only**: `unsubscribe` substring, hardcoded ESP domain list (customer.io, sendgrid.net, mailchimp.com, …), machine-generated local-part patterns. Never sees the body. |
+| `mvp/nylas/enrich-messages` | 12649 | Pure join/decorator: annotates Nylas messages with `master_email`/`master_person` identity, swaps attachment rows, and attaches stored `clean_message` for display. |
+| `mvp/email/classify-email_v2` | 2756 | Table lookups only: `email_provider` (consumer domains) → `marketing_prefix` → `master_company` by domain. Returns personal/work classification. Despite its description it never creates a company. |
+| Inline cleaning lambdas | — | #12644 and the Mem0 extractors each carry their **own** deterministic HTML/quote/signature strippers, separate from the clean-convo family and from the shared extraction lambda in #4645/#10518. |
+
+## Where the output lands
+
+| Store | Written by | Read by |
+| --- | --- | --- |
+| `email_activity.clean_message` (table 597) | #2363 after each cleaner run | `mvp/nylas/enrich-messages` #12649 for inbox display; merge logic |
+| `activity.clean_message` (table 218) | carried per the merge spec — writer not confirmed in this sweep | merge logic |
+| `email_activity.temp_email_body` | raw body staged at parse time | signature parsing on first contact |
+| `email_ai_summary` | #12644 upsert keyed `(grant_id, thread_id)` | EmailSummary endpoints (Go backend) |
+| `person_enrich_data.email_signature` | #4645 directly; #10518 via its caller | #10519 enrich pass |
+| `email_draft_tone` | tone stage inside #13146/#13149 (#13145 legacy) | email drafting features |
+| Mem0 (external API) | #13149 and predecessors, `infer=false` | `mem0/get-contacts-memories` #13147 |
+
+## Trigger map — where these run today
+
+- **Live inbound mail:** the `message.created` webhook (#180) helper filters drafts/spam/promotions, creates activity rows, and — only when `nylas_grant.ai_enabled` — fires #2363 and #12644 async. See [Message Created](/guides/log-parse/message-created).
+- **First-time email address:** the parse helper's Branch C (brand-new `master_email`) fires #4645 async unless `signature_mode == "skip"` — so each address is signature-parsed at most once per user. See [Parse](/guides/log-parse/parse).
+- **Historical import:** `mvp/activity/nylas-history-parse` (#189) runs an AI stage per recent message (`get-message` → #2363) and per unique thread (#12644); the account-import path fires #10518 for newly added contacts and #10519 to apply stored signatures. See [Historical](/guides/log-parse/historical).
+- **Log & Parse 2.0 (planned Go refactor):** AI-enabled accounts LLM-clean staged bodies into `email_activity.clean_message` during import, one `email_ai_summary` upsert per thread reusing #12644 semantics, #10518 fired async for first-time contacts. See [Process Email Account Import](/guides/open-work/log-parse-refactor/process-email-account-import).
+- **User-triggered:** the Mem0 extractors (#13149 current) run on demand per contact, dry-run by default.
+
+## First-pass observations
+
+Verified while reading the live bodies for this inventory — logged here for the review, not yet actioned:
+
+1. **Five separate cleaning implementations** exist: the two clean-convo LLM cleaners (each with its own JS pre-clean), #12644's inline lambda, the Mem0 extractors' inline lambda, and the shared extraction lambda duplicated in #4645/#10518. The Mem0 design doc already flags consolidating on one shared cleaner.
+2. **#2363's forward routing appears dead.** The detect lambda reads `$var.body`, but the value only exists as `$input.body` — so `is_forward` is always false and every message routes to the base cleaner. #12648 (and its discarded `new_text`) would never run from this path.
+3. **#2363 has no processed-guard** — every invocation re-fetches nothing but re-runs the LLM clean and overwrites `clean_message` on all matching rows.
+4. **#12644 returns the pre-write row** — first-ever run returns empty, re-runs return the previous summary. It also fetches `ai_enabled` without checking it (gating happens upstream) and has no try/catch around the Nylas or OpenRouter calls.
+5. **#12644 re-fetches and re-cleans from Nylas** even when a stored `clean_message` already exists for the messages — cleaned output is not reused across features.
+6. **Signature prompt and enrich logic are duplicated**, not shared: prompt byte-identical in #4645/#10518, enrich block near-identical in #4645/#10519 (#10519 lacks the `scheduling_link` dedup fix).
+7. **Processed-marker semantics are inconsistent:** #4645 treats field-non-empty as done; #10519 checks `processed: true`. A #4645-written signature passes #10519's guard, so the pair can double-enrich (bounded by the `work_experience` match query).
+8. **#10518 embeds a live Nylas API key literal** in a disabled debug block — should be removed and the key rotated.
+9. **#4645 runs its enrichment block even when `signature_found: false`** (only per-field null guards apply).
+10. **#2756's no-match branch mis-computes `company_domain`** (returns the split array, not the domain string), and its header claim of creating companies is stale.
+
+## Next
+
+The fresh-lens review starts from this inventory: which of these jobs survive, where cleaning should live (import-time per the Log & Parse 2.0 `ai_enabled` plan vs. on-demand), whether one shared cleaner replaces the five implementations, and what the model lineup should be. Nothing is decided on this page yet.

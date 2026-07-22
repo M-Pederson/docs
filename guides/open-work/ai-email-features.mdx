@@ -11,7 +11,7 @@ This page anchors a fresh-lens review of all AI processing for email. Before red
 </Info>
 
 <Note>
-  **Changes applied 2026-07-22 during this review:** removed the hardcoded Nylas key from #10518 (published \+ byte-verified). `clean-convo/llm_clean_messages` was deleted as deprecated and then restored the same day — it now lives at **#13269** with a byte-identical body (the original #2363 id and its Xano version history are unrecoverable), and the #189 per-message clean loop was restored byte-exact. Also applied 2026-07-22: a forward-exclusion guard in the signature parsers #4645/#10518 — deterministic truncation at forward markers plus a prompt rule (see R6).
+  **Changes applied 2026-07-22 during this review:** removed the hardcoded Nylas key from #10518 (published \+ byte-verified). `clean-convo/llm_clean_messages` was deleted as deprecated and then restored the same day — it now lives at **#13269** with a byte-identical body (the original #2363 id and its Xano version history are unrecoverable), and the #189 per-message clean loop was restored byte-exact. Also applied 2026-07-22: a forward-exclusion guard in the signature parsers (deterministic truncation at forward markers plus a prompt rule, see R6), and the signature monolith #4645 was retired — deleted, with its call site removed from parse helper #12773. The split pair #10518/#10519 is the single signature implementation.
 </Note>
 
 ## Terminology
@@ -47,7 +47,7 @@ The account's captured AI state changes only the body-related work, and all of i
 
 | AI state at connect | Preprocessing | Processing |
 |---|---|---|
-| **On** (default) | Email bodies are saved, every email is cleaned to a `clean_email_body`, and signatures are extracted. | Unchanged — graph work is AI-independent. |
+| **On** (default) | Email bodies are saved; every message within the **AI Processing Depth** (default 90 days) is cleaned to a `clean_email_body` and every thread within the depth is summarized; signatures are extracted. | Unchanged — graph work is AI-independent. |
 | **Off** | No email bodies are saved, no emails are cleaned, no signatures are extracted. | Unchanged — graph work is AI-independent. |
 
 ### R3 — Toggle lifecycle and locking
@@ -82,7 +82,7 @@ Success criterion: after the scrub, the account's stored data is indistinguishab
 
 The reverse path: the account was imported and processed with AI **off** (email events exist, but no bodies were saved), and the user then turns AI **on**. A **separate backfill API** works from the **existing email events** for that account and **adds** the raw email body and `clean_email_body` for each.
 
-**Scope: full AI-on parity.** The backfill also runs signature extraction and thread summaries over the backfilled mail — everything AI-on preprocessing would have produced.
+**Scope: full AI-on parity, bounded by the AI Processing Depth (default 90 days).** For each email event within the depth, the backfill adds the raw body and `clean_email_body`, runs signature extraction, and generates thread summaries — everything AI-on preprocessing would have produced.
 
 Success criterion: after the backfill, the account is indistinguishable from an account originally imported with AI on. Backfill is necessarily best-effort — messages deleted upstream since the import cannot be re-fetched.
 
@@ -104,7 +104,6 @@ Signature extraction runs on the user side as part of the user's own import pipe
 
 | ID | Function | Job | Model (all via OpenRouter) | Runs today from |
 | --- | --- | --- | --- | --- |
-| 4645 | `mvp/signature/email-signature-parse-process` | Extract signature \+ enrich person/company (monolith) | `moonshotai/kimi-k2.6` | parse helper Branch C (first-time email address) |
 | 10518 | `mvp/signature/email-signature-email-import` | Fetch \+ LLM-parse signature only, stateless | `moonshotai/kimi-k2.6` | account import, first-time contacts (async) |
 | 10519 | `mvp/signature/email-signature-process-only` | Apply a stored signature JSON (no LLM) | — | import/historical follow-up |
 | 13269 | `clean-convo/llm_clean_messages` | Route to a cleaner, store `clean_message` | none — delegates | historical parse #189 (recreated 2026-07-22; was #2363) |
@@ -118,15 +117,15 @@ Signature extraction runs on the user side as part of the user's own import pipe
 
 ### Signature extraction
 
-One monolith and a split-stage pair. #4645 does fetch → parse → store → enrich in one call; #10518 is the fetch\+parse half for the import pipeline (its caller persists the JSON); #10519 is the enrich half that consumes stored JSON later. #4645 and #10518 carry a **byte-identical** kimi-k2 prompt; #4645 and #10519 carry a duplicated enrichment block. As of 2026-07-22 both LLM parsers truncate every message at the first forward marker (`Forwarded message`, `Begin forwarded message:`, entity-encoded `From:` headers) before the model call and carry an explicit prompt rule — a forwarded email's inner signature is never attributed to the contact.
+The split-stage pair is the single implementation: #10518 is the stateless fetch\+parse half for the import pipeline (its caller #10517 persists the JSON); #10519 is the enrich half that consumes stored JSON later. The former monolith #4645 (fetch → parse → store → enrich in one call, wired to inbound parse helper #12773) duplicated both halves and was retired 2026-07-22 — deleted, call site removed; inbound signature extraction returns with the deferred webhook path, via this same pair. The LLM parser truncates every message at the first forward marker (`Forwarded message`, `Begin forwarded message:`, entity-encoded `From:` headers) before the model call and carry an explicit prompt rule — a forwarded email's inner signature is never attributed to the contact.
 
-**Current model — identical in both LLM parsers (#4645/#10518):**
+**Current model (#10518):**
 
 ```text
 moonshotai/kimi-k2.6
 ```
 
-**Current system prompt — byte-identical in both parsers (as of 2026-07-22, includes the R6 forward rule; `{{$var.body}}` is the extracted message content):**
+**Current system prompt (#10518 — includes the R6 forward rule; `{{$var.body}}` is the extracted message content):**
 
 <Accordion title="Full system prompt — click to expand">
 
@@ -221,16 +220,6 @@ INPUT:
 ```
 
 </Accordion>
-
-<Card icon="play">
-  ```text
-  mvp/signature/email-signature-parse-process — 4645
-  ```
-
-  **Monolith worker.** Skip-guard: returns `"processed"` when `person_enrich_data.email_signature` is already non-empty. Otherwise fetches the person's 3 most recent messages from Nylas, runs a ~200-line content/link-extraction lambda, and calls `moonshotai/kimi-k2.6` (temperature 0.2, `top_p` 0.1, `max_tokens` 800, `data_collection: deny`) to emit structured JSON: `signature_found`, `name`, `title`, `company`, `company_website`, `company_domain`, `phone` (e164/local/country), person/company social links, `calendar_url`.
-
-  Stores the JSON to `person_enrich_data.email_signature`, then enriches: phone via `add-person-pre-processed-phone`, links via `add-person-links`, deduped `scheduling_link`, and a company block — `work_experience` match else `master-company-new` \+ `add-bulk-company-links` \+ new `work_experience` row \+ `resolve-current-work` (all `data_source_id` 88).
-</Card>
 
 <Card icon="cloud-arrow-up">
   ```text
@@ -346,7 +335,7 @@ Functions that sit in the same email flows but decide without a model — plus t
 ## Trigger map — where these run today
 
 - **Live inbound mail:** the `message.created` webhook (#180) helper filters drafts/spam/promotions and creates activity rows — but as of 2026-07-22 the live bodies of #180, #190, and parse-from/to/cc contain no LLM dispatch at all: the async clean/summary kickoff documented on [Message Created](/guides/log-parse/message-created) is no longer in the code (that page is stale).
-- **First-time email address:** the parse helper's Branch C (brand-new `master_email`) fires #4645 async unless `signature_mode == "skip"` — so each address is signature-parsed at most once per user. See [Parse](/guides/log-parse/parse).
+- **First-time email address:** retired 2026-07-22 — the parse helper's Branch C no longer fires signature extraction (#4645 deleted; call site removed from #12773). Inbound signature extraction returns with the deferred webhook path, via the #10518/#10519 pair. The [Parse](/guides/log-parse/parse) page predates this.
 - **Historical import:** `mvp/activity/nylas-history-parse` (#189) runs an AI stage per recent message (`get-message` → `llm_clean_messages` #13269) and an AI summary per unique recent thread (#12644). The account-import path fires #10518 for newly added contacts and #10519 to apply stored signatures. See [Historical](/guides/log-parse/historical).
 - **Log & Parse 2.0 (planned Go refactor):** AI-enabled accounts LLM-clean staged bodies into `email_activity.clean_message` during import, one `email_ai_summary` upsert per thread reusing #12644 semantics, #10518 fired async for first-time contacts. See [Process Email Account Import](/guides/open-work/log-parse-refactor/process-email-account-import).
 - **User-triggered:** the Mem0 extractors (#13149 current) run on demand per contact, dry-run by default.
@@ -360,10 +349,10 @@ Verified while reading the live bodies for this inventory. The hardcoded-key ite
 3. **#13269 has no processed-guard** — every invocation re-runs the LLM clean and overwrites `clean_message` on all matching rows.
 4. **#12644 returns the pre-write row** — first-ever run returns empty, re-runs return the previous summary. It also fetches `ai_enabled` without checking it and has no try/catch around the Nylas or OpenRouter calls.
 5. **#12644 re-fetches and re-cleans from Nylas** on every summary even where `clean_message` was already stored — cleaned output is not reused across features.
-6. **Signature prompt and enrich logic are duplicated**, not shared: prompt byte-identical in #4645/#10518, enrich block near-identical in #4645/#10519 (#10519 lacks the `scheduling_link` dedup fix).
-7. **Processed-marker semantics are inconsistent:** #4645 treats field-non-empty as done; #10519 checks `processed: true`. A #4645-written signature passes #10519's guard, so the pair can double-enrich (bounded by the `work_experience` match query).
+6. **Resolved — #4645 retired (2026-07-22):** signature prompt and enrichment logic are now single-sourced in the split pair. Carry-over: #10519 still lacks the `scheduling_link` dedup fix #4645 had.
+7. **Resolved by #4645's retirement:** the processed-marker mismatch is gone — #10519's `processed: true` guard is the only marker.
 8. **Resolved — hardcoded Nylas key removed from #10518 (2026-07-22, byte-verified).** The literal sat in a disabled debug block; it remains visible in Xano version history, so rotating the key is still recommended.
-9. **#4645 runs its enrichment block even when `signature_found: false`** (only per-field null guards apply).
+9. **Moot — #4645 retired.** (It enriched even when `signature_found: false`; #10519 guards correctly.)
 10. **#2756's no-match branch mis-computes `company_domain`** (returns the split array, not the domain string), and its header claim of creating companies is stale.
 11. **The log-parse docs are stale on AI dispatch:** the live `message.created` chain (#180/#190/parse-from/to/cc) no longer contains the async clean/summary kickoff those pages document — the AI stage lives in the historical parse #189 today.
 

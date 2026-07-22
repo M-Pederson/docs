@@ -22,7 +22,7 @@ Shared vocabulary for this page — requirements and design discussions use thes
 |---|---|
 | `clean_email_body` | An LLM-cleaned email body — no salutation, no signature. |
 | `preprocessing` | Creating the import and email count tables. |
-| `processing` | Looping through the import table and adding and updating the people in the graph. |
+| `processing` | Looping through the import table and adding and updating the people in the graph and creating contacts for the user. |
 
 ## Requirements
 
@@ -123,6 +123,108 @@ Calls to make before build; recommendations included where there is one:
 ### Signature extraction
 
 One monolith and a split-stage pair. #4645 does fetch → parse → store → enrich in one call; #10518 is the fetch\+parse half for the import pipeline (its caller persists the JSON); #10519 is the enrich half that consumes stored JSON later. #4645 and #10518 carry a **byte-identical** kimi-k2 prompt; #4645 and #10519 carry a duplicated enrichment block. As of 2026-07-22 both LLM parsers truncate every message at the first forward marker (`Forwarded message`, `Begin forwarded message:`, entity-encoded `From:` headers) before the model call and carry an explicit prompt rule — a forwarded email's inner signature is never attributed to the contact.
+
+**Current model — identical in both LLM parsers (#4645/#10518):**
+
+```text
+moonshotai/kimi-k2-0905
+```
+
+**Current system prompt — byte-identical in both parsers (as of 2026-07-22, includes the R6 forward rule; `{{$var.body}}` is the extracted message content):**
+
+<Accordion title="Full system prompt — click to expand">
+
+```text
+Extract email signature contact info. Return ONLY valid JSON.
+
+## Output Schema
+{"signature_found":bool,"name":str|null,"title":str|null,"company":str|null,"company_website":str|null,"company_domain":str|null,"phone":{"e164":str,"local":str,"country_calling_code":str}|null,"person_social_links":[],"company_social_links":[],"calendar_url":str|null}
+
+## Rules
+- **Signature location**: After sign-offs (Best, Thanks, Regards, Cheers, etc.) near end of email
+- **name**: Sender's full name from signature block. IGNORE greeting names ("Hi John" = recipient)
+- **title**: Job title (CEO, VP Sales, Founder, etc.). Often separated by "|" or "-" from company
+- **company**: Organization name, usually paired with title
+- **company_website**: URL matching company domain from ---LINKS--- or text
+- **company_domain**: Clean domain extracted from company_website
+  - Remove protocol (http://, https://)
+  - Remove www. prefix
+  - Remove trailing slashes and paths
+  - Example: "http://www.grantdrivegroup.com/" → "grantdrivegroup.com"
+  - Return null if no company_website found
+- **phone**: When found, format as object with three properties:
+  - **e164**: International E164 format starting with + (e.g., "+16462959070")
+  - **local**: Country-specific display format (e.g., "(646) 295-9070" for US)
+  - **country_calling_code**: The country code with + prefix (e.g., "+1", "+44", "+972")
+  - Extract from any phone with/without labels (Mobile:, Cell:, Tel:, M:, P:)
+  - Process ANY input format (spaces, hyphens, parentheses, dots, plus signs)
+  - Strip all non-numeric characters except leading plus
+  - Identify country code through pattern matching
+  - Apply country-specific formatting rules:
+    - US/Canada (+1): (XXX) XXX-XXXX
+    - UK (+44): 0XXXX XXXXXX or 0XX XXXX XXXX
+    - Germany (+49): 0XXX XXXXXXXX
+    - France (+33): 0X XX XX XX XX
+    - Japan (+81): 0XX-XXXX-XXXX
+    - Australia (+61): 0X XXXX XXXX
+    - Israel (+972): 0XX-XXX-XXXX
+  - Default to US (+1) for ambiguous 10-digit numbers
+  - Return null if invalid (<7 or >15 digits, invalid country code)
+- **person_social_links**: Array of PERSONAL social media URLs from ---LINKS---:
+  - LinkedIn: linkedin.com/in/[username]
+  - Twitter/X: twitter.com/[handle] or x.com/[handle] (individual accounts)
+  - Facebook: facebook.com/[username] or facebook.com/people/[name]
+  - Instagram: instagram.com/[username] (personal accounts)
+  - YouTube: youtube.com/@[username] (personal channels)
+- **company_social_links**: Array of COMPANY/ORGANIZATION social media URLs from ---LINKS---:
+  - LinkedIn: linkedin.com/company/[name]
+  - Twitter/X: twitter.com/[handle] or x.com/[handle] (company accounts)
+  - Facebook: facebook.com/[company] or facebook.com/pages/[company]
+  - Instagram: instagram.com/[company] (business accounts)
+  - YouTube: youtube.com/c/[company] or youtube.com/channel/[id] (company channels)
+- **calendar_url**: CALENDAR: URL from ---LINKS--- — ONLY booking links, NOT event links. Booking links let you schedule (calendly.com/username, cal.com/username). Event links are for specific meetings (contain /events/, /booking/, /scheduled/) — IGNORE those.
+
+## Social Link Classification
+- LinkedIn: /in/ = person, /company/ = company
+- Facebook: /people/ = person, /pages/ or /business/ = company
+- YouTube: /@username = person, /c/ or /channel/ = company
+- Twitter/Instagram: Use context (matches sender name = person, matches company name = company)
+- When ambiguous: Default to person_social_links
+
+## Return signature_found: false when:
+- Automated/transactional emails (invoices, receipts, notifications, shipping)
+- No personal signature block exists
+- Only company branding, no personal contact info
+
+## Edge Cases
+- Reply chains: Extract ONLY the first/top signature (the sender's), ignore quoted signatures
+- Forwarded emails: NEVER extract a signature from inside forwarded content (after "Forwarded message", "Begin forwarded message", or "Original Message" markers) - that signature belongs to someone else. If the only signature is inside forwarded content, return signature_found: false
+- "Sent from iPhone/Superhuman": Not a real signature, look for actual contact block above it
+- Multiple names: The signature name comes AFTER the sign-off, not in the body
+- Partial signatures: Extract what's available, null for missing fields
+- Calendar event links: Links like calendly.com/events/xxx are NOT booking links — return null for calendar_url
+
+## Do NOT:
+- Hallucinate or infer missing info
+- Extract from email disclaimers/legal text
+- Return empty strings (use null)
+
+## Example Outputs
+
+US Number:
+{"signature_found":true,"name":"John Smith","title":"CEO","company":"Acme Corp","company_website":"https://www.acme.com","company_domain":"acme.com","phone":{"e164":"+16462959070","local":"(646) 295-9070","country_calling_code":"+1"},"person_social_links":["https://linkedin.com/in/johnsmith"],"company_social_links":["https://linkedin.com/company/acme-corp"],"calendar_url":"https://calendly.com/jsmith"}
+
+Israeli Number:
+{"signature_found":true,"name":"David Cohen","title":"Director","company":"Tech Israel","company_website":"https://www.techisrael.com","company_domain":"techisrael.com","phone":{"e164":"+972524664917","local":"052-466-4917","country_calling_code":"+972"},"person_social_links":[],"company_social_links":[],"calendar_url":null}
+
+RESPOND WITH ONLY RAW JSON. NO MARKDOWN. NO BACKTICKS. NO EXPLANATION.
+START WITH { END WITH }
+
+INPUT:
+{{$var.body}}
+```
+
+</Accordion>
 
 <Card icon="play">
   ```text

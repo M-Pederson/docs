@@ -1,0 +1,126 @@
+---
+title: "Deep Bio LLM Repair"
+description: "Built and live-proven 2026-07-22: an in-webhook LLM repair fixes deep-research bios against the verified position context — sourced new roles are kept via evidence, sourced departures demote stale records, stale SQL gets flagged as human_review_required rows, and those rows suppress downstream present-tense enforcement. Cloud Run is never re-run."
+icon: "wand-magic-sparkles"
+---
+
+<Check>
+**Status: BUILT + LIVE-PROVEN (2026-07-22).** All four authorized live test subjects (Scott Belsky, Emery Wells, Kyle Jackson, Katelyn Gallanty) produced committed, validator-clean deep bios through the new chain — covering the clean-valid path, the one-attempt repair path, and the two-attempt repair path with evidence-kept roles. The stale-SQL loop (researcher markers → repair demotion → `human_review_required` rows → bios-chain suppression) is **verified live end to end**: Emery Wells's Frame.io departure produced the first two review rows (sources `llm_repair_evidence_ended` and `researcher_sql_stale_marker`) and his committed bio opens with the truthful departure instead of the stale prepend. This page is also the portable spec for the Go/AlloyDB rebuild. Related: [Deep Research Bio](/guides/enrichment/waterfall/deep-research-bio).
+</Check>
+
+## The problem in one paragraph
+
+When a deep-research bio comes back from Cloud Run claiming a **present-tense role the person no longer holds** (or any current-role claim outside the verified position list), the callback webhook rejects the payload. The original design answered a rejection by telling **Cloud Run to re-run the entire research job**; since v1.40 (2026-07-17) those retries were disabled and the first invalid payload closed the job terminally — the deep bio was **discarded**. The fix, now built and proven: keep the validation exactly as is, but answer a tense/current-role failure with a **cheap LLM repair pass** — fix the offending claims against the verified position context, re-validate, commit. No Cloud Run re-run, and bios that were being thrown away get saved.
+
+## The four layers
+
+1. **Researcher** (#12833) — writes truth: allow-listed roles present-tense, sourced departures of allow-listed roles past-tense with a machine-readable `SQL_STALE_ROLE_ENDED:` marker in `unverified_claims`.
+2. **Webhook repair tier** (#8303 + #13278) — when validation fails, the LLM repairs the payload: unsourced current claims re-tensed, citation-backed claims kept (`evidence_authorized_positions`) or demoted (`evidence_ended_positions`), re-validated against the evidence-augmented allowlist before commit.
+3. **Terminal writer** (#13208) — independently re-validates with the same augmented allowlist, writes `deep_bio`, and inserts stale-SQL rows into `human_review_required`.
+4. **Bios chain suppression** (#13189) — unverified `role_ended` review rows suppress the deterministic "X currently serves as TITLE at COMPANY." prepend and the past→present "repair" for the flagged organizations, so a stale `current_title` can no longer reintroduce a departed role. Verifying the row (or fixing SQL) lifts the suppression.
+
+## The two evidence rules (decided 2026-07-22)
+
+Deep research surfaces true facts that SQL doesn't know yet — in **both directions**. The payload carries its own evidence (`citations[]` with reliability grades and per-claim `claims_supported[]`, plus `unverified_claims[]`), and the pipeline now honors it symmetrically:
+
+1. **Promotion** — a violating current-role claim **supported by the payload's own citations** (HIGH, or two independent MEDIUM) is kept present-tense and declared in `evidence_authorized_positions` (title, organization, citation ids, rationale). The declared positions augment the validator allowlist for re-validation, the pre-commit fixed-point checks, and the terminal writer's independent validation.
+2. **Demotion (stale records)** — citations proving an *authorized* position has **ended** (departure announcement, dated exit, named successor) demote it: past tense with the departure timing, `current: false`, declared in `evidence_ended_positions`. The researcher prompt carries the same rule and marks such findings with a machine-readable `SQL_STALE_ROLE_ENDED:` prefix in `unverified_claims`. Sourced accuracy beats the stale record. (Trigger case: an Emery Wells record still carried `current_title: CEO` at Frame.io fifteen months after his sourced November 2024 departure — the bio opened with the stale claim.)
+
+## The stale-SQL signal: `human_review_required` rows
+
+When evidence contradicts SQL, the terminal writer inserts a row into the existing `human_review_required` table (#757) — one per (person, kind, organization), deduped against unverified rows, never auto-applied. Fields added 2026-07-22 for this: `kind` (`role_missing` — sourced current role absent from SQL | `role_ended` — sourced departure of an allowlisted role), `title`, `organization`, `evidence_urls` (json, resolved from payload citations), `source` (`llm_repair_evidence_authorized` | `llm_repair_evidence_ended` | `researcher_sql_stale_marker`), `source_job_id`. The existing `reason` carries the human-readable note, `verified` starts false for the reviewer workflow. The rows are **load-bearing**: #13189 reads unverified `role_ended` rows to suppress present-tense enforcement for those organizations. (An earlier same-day `master_person.data_updates_needed` field was dropped in favor of this table per Mark.)
+
+## What was built
+
+| Piece | ID | Role |
+|---|---|---|
+| `mvp/bios/llm-repair-deep-research-payload` | **#13278 v1.6** | The repair engine. `moonshotai/kimi-k2.6` primary (temp 0, json_object, `reasoning: {enabled: false}`, 240s), `qwen/qwen3.7-plus` fallback (150s, reasoning off). Prompt v3 below. Deterministic post-checks before anything counts as repaired: no-new-organizations invariant, citation ids must exist in the original payload, biography ≥ half original length, evidence entries need title + company + citations. No database writes. |
+| `webhooks/enrich-profile` | **#8303 v1.50** | LLM tier runs **first** on `error_kind == unsupported_current_role` (≤2 attempts; attempt 2 gets the surviving violations **and attempt 1's evidence-kept claims as a protected set**); the deterministic deletion repair #13218 is the fallback and can no longer clobber an LLM success. Repaired payloads re-validate against the evidence-augmented allowlist (`$callbackEffectiveCurrentPositions`), which also feeds both pre-commit fixed-point validations. Evidence arrays + method/model/attempt are persisted through the pre-commit overwrite into `provider_payload_validation`. Exhaustion and non-repairable kinds (`subject_identity_mismatch`, `malformed_provider_payload`, `invalid_biography_payload`) fall through to the v1.40 terminal close. Cloud Run is never re-run for validation failures. |
+| `mvp/enrich/run-person-callback-terminal` | **#13208 v4.5** | Independent validation augments its allowlist with the job's persisted evidence (v4.3) and inserts the stale-SQL rows into `human_review_required` (v4.5). |
+| `mvp/deep-research/deep-person-basic` | **#12833** (amended) | Researcher prompt: stale-allowlist rule — sourced departures of allow-listed roles are written past-tense with the `SQL_STALE_ROLE_ENDED:` marker. |
+| `mvp/bios/enforce-current-role` | **#13189** (amended) | Present-tense enforcement now suppressed per organization by unverified `role_ended` review rows — the layer that was prepending stale current-role sentences onto truthful researcher bios. |
+| `human_review_required` additions | table 757 fields | `kind`, `title`, `organization`, `evidence_urls`, `source`, `source_job_id` — the stale-SQL signal rows (signal-only). |
+| `qa/run-deep-bio` | #8932 (group 42) | QA trigger for the launcher (X-Data-Source aware). |
+
+## The system prompt (deployed verbatim in #13278)
+
+```text
+// deep-bio-llm-repair v3
+You are a surgical biography payload repair editor for a professional knowledge graph. You receive a deep-research payload JSON that FAILED current-role validation, the exact validator violations, and the verified position context. Your ONLY job is to repair the violations. You are an editor, not a researcher: you may not add information that is not already in the payload.
+
+## THE CONTRACT
+
+Current-role (present-tense) claims are authorized by exactly two sources:
+1. The AUTHORIZED_CURRENT_POSITIONS list (verified employment records).
+2. Evidence inside the payload itself: a violating current-role claim that is directly supported by the payload's own citations (claims_supported entries or citation snippets, reliability HIGH — or two independent MEDIUM citations) MUST be KEPT as current and declared in evidence_authorized_positions with the exact title, organization, and supporting citation ids.
+
+Re-tensing or removing a claim that has qualifying evidence is an ERROR. Deep research legitimately surfaces true, freshly sourced roles that are not yet in the employment records — evidence keeps them alive.
+
+## DECISION PROCEDURE (run this for EVERY violation, in order)
+
+1. Search the payload citations: does any claims_supported entry or snippet directly support this exact role at this organization? Qualifying support = one HIGH-reliability citation, or two independent MEDIUM citations.
+2. If YES: KEEP the claim in present tense everywhere it appears, set the organization current_authorization to "allowlisted", and add one entry to evidence_authorized_positions (exact title, organization, citation ids, one-sentence rationale naming the source).
+3. If NO, but the claim is a title variant of an AUTHORIZED_CURRENT_POSITIONS entry at the same organization: rewrite to the exact authorized title (action "aligned_title").
+4. If NO evidence and no authorized variant: rewrite the complete role clause into grammatical past tense (action "retensed").
+5. Only if the clause cannot be re-tensed without changing its meaning: remove that clause alone (action "removed").
+
+## STALE RECORDS (the reverse direction)
+
+The AUTHORIZED_CURRENT_POSITIONS list comes from employment records that can be STALE. If the payload's citations directly support that an authorized current position has ENDED (a departure announcement, a dated exit, a named successor; reliability HIGH or two independent MEDIUM), the biography must reflect reality: write that role in grammatical past tense with the departure timing everywhere it appears, set its organization to current: false with current_authorization "historical", and declare it in evidence_ended_positions (exact title, organization, citation ids, one-sentence rationale, end date if known). Accuracy from sourced evidence beats the stale record. Never do this without qualifying citations — an authorized role with no departure evidence stays present tense.
+
+## REPAIR RULES
+
+1. Repair ONLY what the violations identify. Every sentence not implicated by a violation must remain byte-identical to the input.
+2. Re-tense by rewriting the complete role clause, never by swapping single words: "currently sits on the board of X" becomes "previously sat on the board of X"; "She is an active advisor to Y" becomes "She previously advised Y". Preserve every unrelated fact in the sentence.
+3. Credentials are not roles: "holds a degree" stays present tense; never write "held a degree".
+4. Structured fields follow prose: a re-tensed organization in extracted_entities.organizations gets current: false and current_authorization: "historical"; an evidence-kept organization keeps current: true with current_authorization: "allowlisted". A relationship whose time_period was "present" for a re-tensed role gets its factual historical period or null.
+5. NEVER invent a role, organization, title, date, citation, or URL. NEVER add new sentences or claims. NEVER delete non-violating content.
+6. If a violating claim has no in-payload evidence AND cannot be re-tensed without changing its meaning, remove ONLY that claim's clause and record it in repairs with action "removed".
+7. When a violation is a title variant of an authorized position at the same organization (for example "Founder and CEO" where "Founder" is authorized), rewrite to the exact authorized title instead of re-tensing.
+8. If PRIOR_ATTEMPT_FEEDBACK is present, it lists violations that survived your previous repair. Resolve those specifically — and ONLY those. If PRIOR_EVIDENCE_KEPT is present, those claims stay present tense and must be re-declared in evidence_authorized_positions unchanged.
+9. Facts repeat across biography, biography_sections, relationships, and extracted_entities. Apply the SAME decision to every copy of a claim — an evidence-kept claim stays present tense in all four places; a re-tensed claim must be re-tensed in all four places.
+
+## OUTPUT
+
+Return ONLY a JSON object, no markdown fences, no commentary:
+{
+  "repaired_payload": <the COMPLETE corrected payload, exact same schema as the input payload>,
+  "evidence_authorized_positions": [
+    {"title": "...", "company_name": "...", "citation_ids": [3, 7], "rationale": "one sentence naming the supporting source(s)"}
+  ],
+  "evidence_ended_positions": [
+    {"title": "...", "company_name": "...", "citation_ids": [2], "rationale": "one sentence naming the departure source", "ended": "YYYY-MM or null"}
+  ],
+  "repairs": [
+    {"code": "<validator violation code>", "organization": "...", "action": "retensed | kept_evidence | aligned_title | removed", "before": "offending text, max 200 chars", "after": "replacement text or null"}
+  ]
+}
+```
+
+The user message assembles: `EXPECTED_SUBJECT`, `AUTHORIZED_CURRENT_POSITIONS`, `HISTORICAL_POSITIONS`, `VALIDATOR_VIOLATIONS`, optional `PRIOR_EVIDENCE_KEPT` and `PRIOR_ATTEMPT_FEEDBACK` (attempt 2), then the full payload JSON.
+
+## Live test results (2026-07-22, all subjects authorized by Mark)
+
+| Subject | Path exercised | Outcome |
+|---|---|---|
+| Kyle Jackson (mp 9) | Valid first pass | 8-paragraph bio, zero repairs, clean tense discipline |
+| Katelyn Gallanty (mp 1002) | One-attempt LLM repair | Unsourced GT Securities current-role claims re-tensed across all payload sections; committed and materialized clean |
+| Scott Belsky (mp 693) | Two-attempt LLM repair + evidence-kept roles | A24 Partner + A24 Labs Founder kept via citations (Atlassian IR + scottbelsky.com) — roles absent from SQL that the old pipeline would have discarded; MoMA/COOP/Kindling/Cornell re-tensed; attempt 2 resolved section-copy stragglers. Rerun issued after the `PRIOR_EVIDENCE_KEPT` fix so the kept roles stay present-tense |
+| Emery Wells (mp 5422) | Valid first pass; the stale-SQL case | Researcher (amended prompt) wrote his sourced Nov 22, 2024 Frame.io departure truthfully **and** emitted the `SQL_STALE_ROLE_ENDED:` marker; the repair tier declared `evidence_ended` (CEO, ended 2024-11). His record's stale `current_title: CEO` exposed the #13189 prepend, which drove the suppression layer — verified live: rows 1–2 in `human_review_required` (CEO @ Frame.io, ended 2024-11, LinkedIn + Content&nbsp;+&nbsp;Technology evidence URLs) and a committed bio that opens with the November 2024 departure. Terminal stage also surfaced the live duplicate-person pair (5422/4376) via an IMDb ownership collision — flagged for merge |
+
+## Defects found and fixed along the way
+
+The live tests were the first production executions of the repair→commit path, and they flushed out five dormant defects plus two prompt-behavior gaps — all fixed:
+
+1. **Serializer fixed-point mismatch** (webhook v1.43): repairs committed via Xano `|json_encode` while the validator canonicalizes with JS `JSON.stringify` — the pre-commit digest could never settle; every repaired payload died as `committed_payload_digest_mismatch`. Latent since v1.34. All commit sites now use the validator's serializer.
+2. **Xano lambda JSON-decode quirk** (v1.45): `api.lambda` return values that parse as JSON are decoded back into objects — `return JSON.stringify(x)` silently yields the object again. All serializer lambdas return `{text: ...}` and read `.text`.
+3. **Object-shaped provider results** (v1.44/v1.46): `payload.result` can arrive as a parsed object; it hit `|sha256` and a text-column write raw. Both sites now coerce.
+4. **Pretty-printed result strings** (v1.47): the validator's "exact" digest is computed over its canonical text, not literal bytes — a pretty-printed result string could never reach the fixed point. The terminal coercion canonical-normalizes (parse → compact re-stringify).
+5. **Evidence lost at two seams** (v1.49 + #13208 v4.3): the pre-commit overwrite dropped the evidence fields from the persisted validation, and the terminal writer rebuilt its allowlist from SQL only — every evidence-kept commit failed the "independent validation" until both sides used the same augmented list.
+6. **kimi model behavior**: kimi-k3 defaulted into extended thinking past the timeout (fixed with `reasoning: {enabled: false}`, later superseded by the kimi-k2.6 decision); kimi-k2.6 under prompt v1 re-tensed a cited claim — prompt v2 made the evidence check a mandatory per-violation procedure, verified at 20s/pass.
+7. **Attempt-2 over-repair**: attempt 2 re-tensed attempt 1's evidence-kept claims — fixed with the `PRIOR_EVIDENCE_KEPT` protected set (fn v1.6 / webhook v1.50).
+8. **Downstream staleness injection**: even a truthful researcher bio was re-opened with "X currently serves as TITLE at COMPANY." by the deterministic bios chain (#13189), sourced from a stale `current_title` — fixed by the review-row suppression layer.
+
+## Current state before this change (verified from live XanoScript)
+
+The chain: `deep-person-basic` #12833 (kimi-k2.6 researcher, citation schema, allowlist + tense rules) → transport #12747 → Cloud Run `orbiter-enrich` → callback `webhooks/enrich-profile` #8303 + `profile_enrichment_job` #686 ledger + `person_terminal_stage` #761 stage machine. Validator #13209 (validator-v6) checks prose and structured fields organization-locally against the position context (master_person + work_experience split current/historical); the tense family is `error_kind: unsupported_current_role` with six violation codes. Prior repairs: #13218 (deterministic, deletion-based) and the ordinary-bio re-tenser #13189. v1.27–v1.32 built the Cloud-Run retry protocol; v1.40 disabled it (bios discarded on first invalid payload) — which this project replaced with the repair tier.

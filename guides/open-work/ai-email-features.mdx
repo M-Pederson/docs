@@ -26,48 +26,69 @@ Shared vocabulary for this page — requirements and design discussions use thes
 
 ## Requirements
 
-Forward-looking spec for the rebuild, numbered for reference. The Existing Functions inventory below is the as-is baseline.
+Forward-looking spec for the rebuild, numbered for reference. The Existing Functions inventory below is the as-is baseline. Recommendations and open calls are collected in [Open questions](#open-questions) at the end of this section.
 
-### R1 — Global "Enable AI Features" default toggle (default: on)
+### R1 — AI Features toggles: global default + per-account override
 
-A single **Enable AI Features** toggle sits at the top of the user account interface where accounts are connected. It defaults to **true** and acts as the global default state for AI email processing.
+- A single **Enable AI Features** toggle sits at the top of the user account interface where accounts are connected. **Default: true.** It is the global *default state* for AI email processing, not a hard switch.
+- When an email account is connected, the account inherits the global state at that moment; once the account appears in the UI, it carries its **own toggle, initialized to mirror that inherited state** and overridable per account (the override wins for that account).
+- **State is captured at connect time.** The captured state governs the entire import; changing the global toggle never affects an in-flight import.
+- Backing today: the per-account toggle maps to `nylas_grant.ai_enabled`. The global default is new — a user-level setting.
 
-- When an email account is connected and appears in the UI, the account row carries its **own toggle, initialized to mirror the global setting**.
-- The per-account toggle can be overridden independently; the override wins for that account.
-- Backing today: the per-account toggle maps to `nylas_grant.ai_enabled`. The global default is new — a user-level setting that seeds each account's flag at connect time.
+### R2 — Import pipeline: what the AI state changes
 
-**Preprocessing behavior** — the account's effective toggle state at the time the email account is connected governs what preprocessing does:
+An email account import runs in two stages, as defined in [Terminology](#terminology): **preprocessing** (create the import and email count tables), then **processing** (loop the import table, add and update people in the graph). **Processing is triggered automatically when preprocessing finishes.**
 
-| Effective state at connect | Preprocessing |
-|---|---|
-| **On** (default) | Email bodies are saved, every email is cleaned to a `clean_email_body`, and signatures are extracted — all during preprocessing. |
-| **Off** | No email bodies are saved, no emails are cleaned, and no signatures are extracted. |
+The account's captured AI state changes only the body-related work, and all of it happens during preprocessing:
 
-**Toggle lifecycle** — the per-account toggle is locked until processing completes:
+| AI state at connect | Preprocessing | Processing |
+|---|---|---|
+| **On** (default) | Email bodies are saved, every email is cleaned to a `clean_email_body`, and signatures are extracted. | Unchanged — graph work is AI-independent. |
+| **Off** | No email bodies are saved, no emails are cleaned, no signatures are extracted. | Unchanged — graph work is AI-independent. |
 
-1. The account connects and preprocessing starts immediately with the effective state inherited from the global default — e.g. global on → the entire import table and all of its records are built with AI features enabled. **Processing is triggered automatically when preprocessing finishes.**
-2. Through both stages — preprocessing and processing — the per-account toggle stays **disabled or hidden**: the user has no chance to enable or disable it away from the global default until processing is complete.
-3. Only once processing is complete is the toggle presented again, and the user can reverse the choice: turning AI features **off** triggers the scrub/delete endpoint (R2); turning AI features **on** after an AI-off import triggers the backfill API (R3).
+### R3 — Toggle lifecycle and locking
 
-<Note>
-  To decide: whether flipping the global toggle later re-syncs account toggles that were never manually overridden, or only seeds accounts connected after the change. (Enable-later on an AI-off import is now covered by R3.)
-</Note>
+The per-account toggle is **locked** (disabled or hidden) from the moment the account connects until processing completes — the user has no chance to diverge from the inherited default mid-import. Only once processing is complete is the toggle presented, and the user may reverse the choice:
 
-### R2 — AI-off purge API
+- **On → off** triggers the scrub API (R4).
+- **Off → on** triggers the backfill API (R5).
 
-Turning AI features **off** for an account that has completed processing is not just a flag flip: a **separate, dedicated scrub/delete API** runs immediately and deletes, for that account, **every cleaned email body (`clean_email_body`) and every saved raw email body**.
+The same lock applies while R4 or R5 runs: the toggle is locked whenever any body-mutating job — import, scrub, or backfill — is running for the account.
 
-<Note>
-  To decide: whether the purge also covers artifacts derived from those bodies — extracted signatures, thread summaries, Mem0 memories — or only the bodies themselves.
-</Note>
+```mermaid
+stateDiagram-v2
+    [*] --> Preprocessing: connect - inherits global default, toggle locked
+    Preprocessing --> Processing: auto-trigger
+    Processing --> Ready: complete - toggle unlocked
+    Ready --> Scrubbing: user turns AI off (R4)
+    Ready --> Backfilling: user turns AI on (R5)
+    Scrubbing --> Ready: bodies deleted
+    Backfilling --> Ready: bodies and clean_email_body added
+```
 
-### R3 — AI-on backfill API
+### R4 — AI-off scrub API
 
-The reverse path: the import table was created with AI features **off**, all of the account's emails were processed from it (email events exist, but no bodies were saved), and the user then turns AI features **on**. A **separate API** works from the **existing email events** for that account and **adds** the raw email bodies and their `clean_email_body` for each.
+Turning AI features **off** on a completed account is not just a flag flip: a **separate, dedicated scrub/delete API** runs immediately and deletes, for that account, **every `clean_email_body` and every saved raw email body**.
 
-<Note>
-  To decide: whether the backfill also runs signature extraction (which an AI-on preprocessing would have done), or adds bodies only.
-</Note>
+Proposed success criterion: after the scrub, the account's stored data is indistinguishable from an account originally imported with AI off.
+
+### R5 — AI-on backfill API
+
+The reverse path: the account was imported and processed with AI **off** (email events exist, but no bodies were saved), and the user then turns AI **on**. A **separate backfill API** works from the **existing email events** for that account and **adds** the raw email body and `clean_email_body` for each.
+
+Proposed success criterion: after the backfill, the account is indistinguishable from an account originally imported with AI on. Backfill is necessarily best-effort — messages deleted upstream since the import cannot be re-fetched.
+
+### Open questions
+
+Calls to make before build; recommendations included where there is one:
+
+1. **Global flip → existing accounts.** Does changing the global toggle re-sync per-account toggles that were never manually overridden, or only seed future connections? *Recommendation: future connections only — per-account state changes only by explicit per-account action. Least surprising, and no hidden mass scrubs or backfills.*
+2. **Scrub scope vs. shared enrichment.** Bodies, thread summaries, and account-derived Mem0 memories are account-scoped and delete cleanly. Signature-derived enrichment is **not** account-scoped — it lands on shared person/company records (`person_enrich_data.email_signature`, work history, links) visible to other users. *Recommendation: R4 deletes account-scoped artifacts only; shared person-level enrichment stays.* Needs an explicit call.
+3. **Parity for derived artifacts.** If the R4/R5 success criteria above are adopted, the derived-artifact questions answer themselves: scrub also removes thread summaries and account-scoped memories; backfill also runs signature extraction and summaries, not just bodies. Confirm parity is the intent.
+4. **Ongoing mail after import.** These requirements govern the historical import. A forward-path requirement is missing: does each new message arriving via webhook after the account is Ready follow the account's *current* AI state (save + clean at receipt)? Today the live webhook chain runs no AI steps at all (see First-pass observations, item 11).
+5. **Locked-toggle UX.** "Disabled or hidden" — *recommendation: disabled with a "finishing import…" state rather than hidden.* A hidden toggle reads as a missing feature; a disabled one communicates the lock and when it lifts.
+6. **Serialization and idempotency.** Rapid off → on → off flips would race the scrub against the backfill. *Recommendation: one per-account job lock (the R3 re-lock), jobs idempotent and resumable.*
+7. **Terminology gaps.** `import table`, `email count tables`, and `email events` are load-bearing in R2/R5 but not yet defined in Terminology — worth pinning down which tables these are in the new design.
 
 ## Existing Functions
 

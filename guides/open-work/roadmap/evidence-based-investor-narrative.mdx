@@ -1,0 +1,203 @@
+---
+title: "Evidence Based Investor Narrative"
+description: "Three-loop plan: LLM-classify the publicly evidenced traction stage of every pre-seed, seed & Series A round from Fundable press articles, aggregate per investor, and generate an evidence-stage narrative for early-stage investors."
+icon: "dollar-sign"
+---
+
+<Warning>
+  **🚨 THIS IS THE GO / ALLOYDB HANDOFF DOC.** Production is built by the Go team on the Universe backend; nothing ships from Xano. Every model, prompt, threshold, and guard on this page is **decided, tested on real sandbox data, and frozen** — build from this page. It introduces **three NEW production tables**: `round_evidence_stage`, `investor_evidence_profile`, `investor_evidence_narrative`. Sandbox-only test artifacts (never ship): Xano tables #765/#766, endpoints #8912/#8913 (LLM Test Harness group).
+</Warning>
+
+<Info>
+  **⚡ TWO ENTRY POINTS — no backfill for now.** All LLM work starts from one of two events: **(1) a funding round is added to the Universe graph** → that round is classified **once**, idempotently on `(canonical_deal_id, rubric_version)`, serving every investor on the syndicate; **(2) an investor thesis is generated** → that investor's not-yet-classified rounds are **enqueued for the same once-per-round classification** (the PK makes repeat requests no-ops — syndicate-mates share rows), then the profile computes and the narrative generates. **Classification LLM results → `round_evidence_stage`; narrative LLM results → `investor_evidence_narrative`** (with the producing model); `investor_evidence_profile` in between is pure SQL — no LLM. Corpus coverage grows with usage; the ~~54k-round corpus backfill stays available later as an optional warm-up (~~\$15–25).
+</Info>
+
+## What we're building
+
+Per [Martin Tobias](https://x.com/martingtobias/status/2078600868635820436) (Incisive Ventures): round names are labels — the real question is **which investors fund at your evidence stage**. From our own tables:
+
+| Company | Label | Size | Public evidence at raise |
+| --- | --- | --- | --- |
+| /dev/agents | Seed | \$56M | "pre-product"; first release "early-to-mid next year" → **E0** |
+| Chingari | Seed | \$1.3M | 25M downloads, 3M DAU → **E3–E4** |
+
+Same label, opposite evidence. The system classifies the **publicly evidenced stage** of every early-stage round from press at raise, aggregates per investor, and generates a **receipt-cited evidence narrative** — the bar an investor actually funds at, with verbatim quotes as receipts. Surfaces: investor profiles first (expandable receipts), then Discover, [Intelligence Engine](/guides/open-work/intelligence-engine) stage-alignment, [Deal Flow](/guides/open-work/roadmap/deal-flow).
+
+## Fundable data contract
+
+**Stage-eligible population:** SEED **28,761** \+ SERIES\_A **25,282** \+ EQUITY/CONVERTIBLE\_NOTE passing the early cut (**size ≤ ~\$15M AND the company's 1st/2nd tracked financing**) ≈ **54k of 146,175 deals**. Every other round gets rationale-only extraction (`evidence_stage` null by design). With no backfill, these are ceiling numbers — actual classified coverage accumulates from the two entry points.
+
+| Table | Used for |
+| --- | --- |
+| `fundable_deals` (671) | Round meta: `financing_type`, `pre`, `size_usd`, `date`, `canonical_deal_id`, `long_description` (article-derived synthesis, reliably populated) |
+| `fundable_articles` (680) | **Full article text** \+ `date`, `source_priority`, `is_primary`, keyed by `canonical_deal_id` (394,076 rows; early-stage deals carry 2–8 articles) |
+| `fundable_institutional_investments` (678) / `fundable_angel_investments` (679) | Investor org / person ↔ deal \+ `lead_investor` |
+| `fundable_organizations` (666) / `fundable_people` (667) | Investor entities (`is_investor`, `name`, `domain`, social handles — alias sources) |
+
+Three verified gotchas the implementation must honor:
+
+1. **`pre` is a generic "Pre-X" modifier** (a `SERIES_C, pre=true` row is a Pre-C round). Pre-seed = `SEED + pre=true`; there is no `PRE_SEED` enum.
+2. **Point-in-time window is mandatory:** articles group per deal, not per raise — a 2023 seed's article group can contain a 2024 PR citing "\$17M lifetime revenue." Classify only articles in **\[announce − 90d, \+14d\]**, `is_primary` first, `source_priority` ascending, ≤2 articles, ~5k chars each.
+3. **Same-name investor misjoins exist** (Incisive Ventures' investment list contains an "Incisive Capital" deal) — the attribution guard is required, not optional.
+
+## Pipeline spec
+
+### Step 1 — Classify (one LLM call per round)
+
+Input: round label \+ `pre`, `size_usd`, `date`, `long_description`, windowed articles. **Model: `google/gemini-3.1-flash-lite`**, `reasoning: {enabled: false}`, temperature 0. **Escalate to `moonshotai/kimi-k3` on objective triggers only** — zero windowed articles, `claims_only` on a \$10M\+ round, parse/validation retries — never on self-reported confidence (measured unusable: 198/200 "high"). Early-stage rounds emit the full contract; later rounds run stage-suppressed (rationale \+ `claims_vs_metrics` only). Idempotent on `(canonical_deal_id, rubric_version)`. Also precompute **`attributed_investors`**: every syndicate investor whose alias set (name, domain stem, social handle) appears verbatim in the round's text.
+
+**The evidence ladder (config, not code):** E0 team & idea · E1 product shipped · E2 pilots & validation · E3 paying/named customers · E4 repeatability (logos, usage, growth numbers) · E5 distribution proof. Riding rules: a named customer or hard number beats any adjective ("used by leading brands" is a claim → `claims_vs_metrics`); no articles ≠ E0 → `insufficient_evidence`; output is the **publicly evidenced floor**.
+
+**System prompt (verbatim — `classifier v0`):**
+
+```text
+You classify the publicly evidenced traction stage of a startup at the moment of a specific funding round, using ONLY the provided deal description and press articles. You also extract what evidence investors said drove their decision to invest.
+
+EVIDENCE LADDER (assign the highest stage with direct evidence in the texts):
+E0 = team and idea only; nothing shipped. Signals: pedigree bios, pre-product, vision quotes.
+E1 = product shipped or demoable; no external proof. Signals: launches, out of stealth, demo walkthroughs.
+E2 = external validation without clear payment: named pilots, design partners, LOIs, clinical or technical validation, waitlists.
+E3 = paying or named customers, or live revenue mechanics: customer lists, live pricing or subscriptions, first revenue.
+E4 = repeatability: multiple logos, usage, retention or growth numbers such as downloads at scale, DAU or MAU, growth rates, revenue figures.
+E5 = distribution proof: a scalable acquisition or distribution channel demonstrably working with numbers.
+
+RULES:
+1. POINT IN TIME: judge only what was demonstrably true at the round date per the texts. Anything described as a plan, expectation or upcoming release is NOT evidence.
+2. A named customer or a hard number beats any adjective. Phrases like used by leading brands are claims, not evidence.
+3. If the material contains no usable traction evidence, set insufficient_evidence to true and evidence_stage to null.
+4. The stage is the publicly evidenced FLOOR of what the company achieved, not its actual private stage.
+5. investor_rationale: include only statements explicitly attributed to a named investor or firm about why they invested. Tag each with evidence_type: team, market, traction, product or other.
+
+Return ONLY valid JSON with exactly these keys, no markdown fences, no commentary:
+{"evidence_stage": "E0|E1|E2|E3|E4|E5 or null", "confidence": "high|medium|low", "insufficient_evidence": false, "company_evidence": [{"type": "product_status|customers|usage|revenue|validation|team", "quote": "verbatim from text", "stage_implied": "E0..E5"}], "investor_rationale": [{"investor": "name or firm", "evidence_type": "team|market|traction|product|other", "quote": "verbatim"}], "what_drove_check": "one sentence on what evidence drove investors", "claims_vs_metrics": "metrics|claims_only|none"}
+```
+
+User message shape: `ROUND: <label> | company: <name> | size_usd_millions: <n> | announce_date: <iso>` \+ `DEAL DESCRIPTION:` \+ `PRESS ARTICLES IN RAISE WINDOW (n of m):`.
+
+### Step 2 — Profile (pure SQL, no LLM)
+
+**No round cap.** Classification is once-per-round and idempotent, so profiles aggregate over an investor's **entire classified book** — the first thesis-generation event pays the book's classification once (a16z's 1,568 rounds ≈ \$3), every profile after that is free SQL, and era buckets measure real drift from full history. The profile job runs when the investor's classification queue drains (immediately if nothing was missing); still-pending rounds surface as coverage, never as blocking. The only cap is on the Step-3 prompt payload: full-book stats \+ top-6 receipts \+ a most-recent-~30 rounds digest keep it ~3k tokens regardless of book size.
+
+Join classified rounds → investors (orgs \+ angels). **Attribution guard:** a round counts toward a profile only if the investor matches the round's `attributed_investors`; excluded rounds → `guard_excluded`; if the guard would empty an investor, keep all rounds with `guard_bypassed` flagged (the narrative then carries an attribution caution). **Alias matching is mandatory** — legal name, common short forms, domain stem (`a16z` from `a16z.com`), social handle; display-name-only matching falsely excluded 15/64 a16z rounds (verified fixed: 15 → 0). Require **N ≥ 5 staged rounds** for a profile; `insufficient_evidence` rounds don't count toward N but are reported as coverage. Compute: stage distribution, median, `pre_evidence_pct` (≤E1), `proof_pct` (≥E3), `lead_pct`, era buckets (pre-2020 / 2020–22 / 2023\+ / all-time), `insufficient` coverage, rationale fingerprint (team/market/product/traction counts across all rounds, any stage).
+
+### Step 3 — Narrative (one LLM call per investor)
+
+Fires on material profile change (median shift ≥ 1 stage or ≥ 20% new rounds). **Model contract: `moonshotai/kimi-k3` primary → `qwen/qwen3.7-plus` ONLY on call failure** (retry-exhausted 429/5xx/timeout/empty or invalid output); record which model produced the text. Temp 0.2, `max_tokens` ≥ 900, reasoning off.
+
+<Warning>
+  **The narrative text is vectorized — stage codes are banned from prose.** "E4" is semantically empty in embedding space; a query like "investors who back proven revenue traction" can never match it. The prompt carries a stage-meanings glossary and the model writes the _meaning_; codes stay in the structured profile/receipts fields for badges and filters.
+</Warning>
+
+**Output validation (enforced, 2 attempts per model before failover):** must JSON-parse, must contain a "Revealed evidence bar:" line, must contain **no E0–E5 codes** (regex check). Both failure modes were observed in testing.
+
+**System prompt (verbatim — `narrative v0.1.1`; user message = JSON of investor, profile, receipts, rounds):**
+
+```text
+You write a short evidence-stage narrative about ONE investor, grounded ONLY in the provided profile JSON and receipts.
+
+STAGE MEANINGS (the profile and receipts use codes E0 through E5; your prose must use the meanings, NEVER the codes):
+E0 = backing team and idea only, before any product exists
+E1 = a shipped or demoable product with no external proof yet
+E2 = external validation without clear payment: pilots, design partners, letters of intent, clinical or technical validation
+E3 = paying or named customers and first revenue
+E4 = repeatable traction: multiple customers or logos, usage at scale, retention or revenue growth numbers
+E5 = a proven, scalable distribution channel
+
+RULES:
+1. Two to five sentences, then a final sentence starting with: Revealed evidence bar: followed by the meaning of the bar in plain language - never a code, never a count.
+2. Never write the codes E0, E1, E2, E3, E4 or E5 anywhere in the narrative. This text is embedded for semantic search, so meaning-bearing words matter: write demonstrated traction, paying customers, pre-product, and so on.
+3. Every number must be copied field-for-field from a profile field. Never invent or conflate counts: n_classified is the count of classified rounds; distribution values are per-stage counts; do not mix them.
+4. Every qualitative claim must trace to a receipt; cite companies by name and keep their numbers verbatim.
+5. Start with a bold markdown claim about the evidence bar this investor funds at, in plain language.
+6. Never mention internal mechanics: guards, bypasses, field names, JSON, coverage plumbing.
+7. If profile.n_staged is below 5, state plainly that coverage is thin.
+8. If profile.guard_bypassed is true, add one caution sentence that the link between this investor and some rounds could not be verified in the source text.
+9. If profile.n_tracked_total is greater than profile.n_considered, the analysis covers only the most recent rounds - word counts accordingly, for example: across the 16 most recent of 214 tracked rounds. Never present a sample as the whole book.
+10. The evidence bar and stage statistics describe EARLY-STAGE rounds only (pre-seed, seed, Series A). If profile.n_later_stage_rounds is greater than 0, you may note that the sample also includes that many later-stage rounds which are not scored on the early-stage bar.
+Return ONLY valid JSON, no markdown fences: {"narrative": "text with markdown bold", "receipts_used": [{"company": "name", "quote": "short quote"}]}
+```
+
+**Expected output (real pipeline run — kimi, Incisive Ventures):**
+
+> **Incisive Ventures funds at the demonstrated traction bar, backing companies with multiple customers, usage at scale, or measurable revenue growth.** Across 14 classified rounds, the portfolio concentrates on repeatable traction, with only a small share of pre-product or early-validation bets. TurnStay had processed over ZAR 250M in transactions since its pre-seed, Shoppinpal worked with over 100 applications and software systems across 10,000 customers and partners, and Moddule grew revenue 6x since September 2024. Even at pre-seed labels, Incisive Ventures appears to enter after proof exists: Spare8 had recorded more than 30K downloads, and Katalyst had shipped more than 1,200 units through its Early Access program. Revealed evidence bar: repeatable traction with multiple customers, usage at scale, or revenue growth numbers.
+
+## Storage spec — NEW production tables (AlloyDB)
+
+| Table | Shape |
+| --- | --- |
+| `round_evidence_stage` | `canonical_deal_id`, `rubric_version`, `evidence_stage` (null for non-early rounds), `confidence`, `signals` json, `investor_rationale` json, `attributed_investors` json, `article_ids`, `claims_vs_metrics`, `insufficient_evidence`, `model`, `classified_at` — PK `(canonical_deal_id, rubric_version)` |
+| `investor_evidence_profile` | investor entity ref \+ fundable org/person uuid, `n_rounds`, distribution json, `median_stage`, `pre_evidence_pct`, `proof_pct`, `lead_pct`, era buckets, rationale fingerprint json, `guard_excluded_count`, `insufficient_coverage`, `computed_at` |
+| `investor_evidence_narrative` | investor ref, `narrative`, `receipts` json, `profile_fingerprint`, `model` (actual producer), `prompt_version`, `rubric_version`, embedding column per house convention, `generated_at` |
+
+## Deployment (Universe backend)
+
+Premise: **investor thesis already runs in Go on AlloyDB in Orbiter Universe**, publishing to Orbiter Backend via the [projection pattern](/guides/open-work/orbiter-univers-standalone/projection-pattern). The evidence narrative deploys as a **sibling of the thesis feature** — same investor entities, same projection channel.
+
+### 1. Add
+
+The three tables above, anchored to your entities: profile/narrative investor ref = **the Universe investor entity id the thesis feature keys on**, plus the source `fundable_organizations.id` / `fundable_people.id` for lineage. Vectorize `narrative` the same way thesis text is embedded so both retrieve side by side.
+
+### 2. Change (minimal, additive)
+
+- **Thesis surface:** no schema change — join `investor_evidence_narrative` by investor entity id at read time (or add a nullable `evidence_narrative_id` if you denormalize).
+- **Projection package:** additive optional `side_panel_facts.evidence_narrative` section for investor-type entities — `{ narrative, receipts, median_stage, era_medians, proof_pct, coverage: {n_classified, n_insufficient, guard_excluded}, model, generated_at }`. Backend applier upserts it as a Universe-owned section (replace mode), never touching App-owned sections.
+- **`company_display` / `person_display`:** optionally surface `evidence_bar` (e.g. "E3–E4") in `badges`; no new columns.
+- **Universe graph (optional):** mirror `evidence_bar_current` onto investor nodes for stage-aligned graph matching.
+
+### 3. Workers (the three steps)
+
+1. **`evidence-classify`** — every round; ladder only for early-stage rounds; Step-1 prompt verbatim; idempotent on `(canonical_deal_id, rubric_version)`; precompute `attributed_investors` with alias sets. **Trigger topology — two demand sources, one round-keyed worker:** (a) a round enters the system via the Fundable changelog flow → classify it; (b) an investor thesis is generated → enqueue every not-yet-classified round in that investor's book (full book, both modes — a16z-sized ≈ \$3 once at flash rates). The PK is the already-ran check either way: rounds classify **once**, syndicate-mates share rows, repeat requests are no-ops, and the investor path never re-classifies existing rows. **Late-article recheck:** if the first pass finds zero windowed articles, re-run once after the raise window closes (~announce \+15d) and upsert; after that only a `rubric_version` bump re-touches a round.
+2. **`evidence-profile`** — Step-2 SQL with the guard and N ≥ 5; recompute on new classified rounds.
+3. **`narrative-generate`** — Step-3 with the kimi→qwen failover contract and output validation; regenerate only on material profile change.
+
+### 4. Config manifest (config, not code — every row stamps its versions)
+
+| Key | Frozen value |
+| --- | --- |
+| `rubric_version` | `v1` = house E0–E5 ladder above (Tobias-thread annotations land as `v1.1`; bump = idempotent reclassify) |
+| `classifier_prompt` | `v0` verbatim above |
+| `narrative_prompt` | `v0.1.1` verbatim above |
+| `model.bulk_classifier` | `google/gemini-3.1-flash-lite`, reasoning off, temp 0 |
+| `model.escalation_classifier` | `moonshotai/kimi-k3`; triggers: zero windowed articles · `claims_only` \+ size ≥ \$10M · parse/validation retry |
+| `model.narrative` | `moonshotai/kimi-k3`, temp 0.2, `max_tokens` ≥ 900, reasoning off |
+| `model.narrative_failover` | `qwen/qwen3.7-plus` — fires only on primary call failure; record producer |
+| `window` | \[announce − 90d, \+14d\]; ≤2 articles; `is_primary` first, `source_priority` asc; ~5k chars each; late-article recheck at \+15d |
+| `early_cut` | `SEED`, `SERIES_A` (incl. Pre-A), or `EQUITY`/`CONVERTIBLE_NOTE` with size ≤ ~\$15M AND 1st/2nd tracked financing |
+| `profile.min_staged_rounds` | 5 (`insufficient_evidence` excluded from N, reported as coverage) |
+| `profile.era_buckets` | pre-2020 / 2020–22 / 2023\+ / all-time |
+| `narrative.regen_threshold` | median shift ≥ 1 stage OR ≥ 20% new classified rounds |
+| `narrative.payload_cap` | top-6 receipts \+ most-recent-30 rounds digest |
+| `narrative.validation` | JSON parse \+ "Revealed evidence bar:" line \+ no E0–E5 codes; 2 attempts per model before failover |
+
+### 5. Rollout order (no backfill — event-driven from day one)
+
+1. Migrate the three tables; wire the config manifest.
+2. Wire **entry point 1**: Fundable changelog flow → new round → `evidence-classify`.
+3. Wire **entry point 2**: investor-thesis generation → enqueue the investor's unclassified rounds → on queue drain, `evidence-profile` (N ≥ 5) → `narrative-generate`.
+4. Projection wiring → investor-profile surface.
+5. **Optional, later:** corpus warm-up backfill (~54k early-stage rounds ≈ \$15–25; ~92k rationale-only rounds similar) if organic coverage needs a push — same worker, cursor-batched, nothing else changes.
+
+### 6. Acceptance & observability
+
+- **Acceptance:** run Incisive Ventures, Village Global, Andreessen Horowitz, **and angel Elad Gil (the person-path fixture — 192-round book, alias from social handle, 13 later-stage rounds correctly stage-suppressed)** through the pipeline and diff against the rig's stored runs (`investor_narrative_poc` #766, tags `rig-v05-smoke` / `rig-v06-village` / `rig-v07-a16z` / `rig-v07-angel-elad`; referee classification labels under `evidence_stage_poc` #765, `run_tag=ref-kimi`). Stages may drift ±1 on the margin (provider nondeterminism — measured); medians, guard exclusions, and receipt fidelity must match.
+- **Report per run:** coverage %, insufficient rate, guard exclusions, **kimi→qwen failover rate** (the kimi capacity-health signal — kimi has a single OpenRouter provider, Moonshot AI; if the rate climbs, revisit the narrative-model choice), narrative validation failures, token spend by model.
+
+## Parity rig (Xano sandbox)
+
+`investor-narrative-poc` (#8913) runs the full pipeline for one investor per call with the exact production contracts — use it to generate fresh comparison fixtures during the build. Inputs: `org_id` or `person_id`, plus optional `run_tag`, `stage_model`, `narrative_model`, `narrative_fallback_model`, reasoning modes, `narrative_max_tokens`, `prompt_version`, `max_rounds` (default 24, most recent deals first, true book size surfaced). Single-round classification: `evidence-stage-poc` (#8912).
+
+```bash
+curl -X POST https://xh2o-yths-38lt.n7c.xano.io/api:7LJisE8R/investor-narrative-poc \
+  -H "Content-Type: application/json" -H "X-Data-Source: sandbox" \
+  -d '{"org_id": "80ae3466-d889-4bd4-bcdc-dc719a4ec214"}'
+```
+
+## Open items
+
+- **Rubric v1.1:** Mark pastes the full Tobias thread when available; his ladder folds in as annotations and everything reclassifies idempotently.
+- **EQUITY early-cut count:** measured as coverage accumulates (or by the optional warm-up backfill, whenever it runs).
+
+## References
+
+- [Projection pattern](/guides/open-work/orbiter-univers-standalone/projection-pattern) — the Universe → Backend integration contract this deploys through
+- [Martin Tobias — the evidence-stage thread](https://x.com/martingtobias/status/2078600868635820436) (X, 2026-07-18) — the thesis this operationalizes

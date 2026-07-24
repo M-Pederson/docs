@@ -1,6 +1,6 @@
 ---
 title: "Email Domain Employer Fallback"
-description: "Planned: when an email-seeded person resolves zero enrichment, classify the seed email's domain (classify-email_v2 #2756), get-add the domain company through master-company-new #12558, and write a titleless current WORKS_AT edge + work_experience placeholder — which later real enrichment overrides in place."
+description: "Planned: when an email-seeded person resolves zero enrichment, classify the seed email's domain (classify-email_v2 #2756), get-add the domain company through master-company-new #12558, and write a titleless current WORKS_AT edge + work_experience placeholder — which later real enrichment overrides in place. Also carries the Master Person Array Updates scope: lowercase expertise / roles / skills / languages text[] facets on master_person, synced at node-update time."
 icon: "at"
 ---
 
@@ -111,3 +111,70 @@ Verify graph state through `tool/run-cypher` #8665 (`X-Data-Source: sandbox`); e
 2. **Junk-domain tolerance:** v1 auto-create + monitoring, or gate creation on LLM identity confidence / a `human_review_required` lane from day one?
 3. **Flag default:** OFF on live until the Log & Parse volume implications are sized, or ON immediately after sandbox validation?
 4. **`master_email.master_company_id` backfill:** worth a one-shot sweep linking existing work-typed emails to already-known companies while we're here?
+
+---
+
+## Master Person Array Updates
+
+**Second scope on this page — also planning only, nothing built.** Verified against live workspace 3 on 2026-07-24: the four target columns already exist on `master_person` #139 (`expertise`, `roles`, `skills`, `languages` — all `text` list-style with trim validators, at the schema tail), and **no live function writes them** — sampled live rows carry `null` in all four. That means **zero schema work**: do not touch `updateTableSchema` (the full-replace would strip `filters=trim` from every text column on the table — CLAUDE.md trap #16).
+
+### What lands where
+
+Every person sync fills the four arrays with **lowercase, trimmed, deduplicated** text values — a queryable facet projection on the master row, no joins needed at read time.
+
+| Column | Source of truth | Read path |
+| --- | --- | --- |
+| `expertise` | Graph — **direct** `HAS_EXPERTISE` edges only | One Cypher call by the person's `node_uuid` via `mvp/falkor/send-cypher` #2815; collect the names of `DomainExpertise` / `SubDomainExpertise` targets. No `HAS_SUBDOMAIN` parent hop — a person linked to a sub-domain does not inherit the parent domain's name |
+| `roles` | `role_join` #329 → `role` #179 (`role` column) | Join rows by `master_person_id` (btree-backed), resolve names. #10510 capitalizes on insert — lowercase on read |
+| `skills` | `skills_join` #325 → `skills` #130 (`skill` column) | Same pattern (btree on `master_person_id`) |
+| `languages` | `language_join` #326 → `languages` #178 (`language` column) | Same pattern (btree on `master_person_id`) |
+
+Expertise Cypher sketch (label predicate via `IN labels()` — FalkorDB rejects `x:Label` in WHERE, trap #5):
+
+```cypher
+MATCH (p:Entity {uuid: $node_uuid})-[:HAS_EXPERTISE]->(x)
+WHERE 'DomainExpertise' IN labels(x) OR 'SubDomainExpertise' IN labels(x)
+RETURN collect(DISTINCT toLower(x.name)) AS expertise
+```
+
+### The writer
+
+New standalone helper — proposed `mvp/person/sync-master-person-arrays` (`master_person_id` input):
+
+1. Read `master_person.node_uuid`; run the expertise Cypher when present (#2815 returns errors as **strings** — `typeof r === 'string'` guard, trap #5).
+2. Read the three join tables by `master_person_id`, resolve lookup names.
+3. Normalize each list: trim → lowercase → drop empties → dedupe → alphabetical sort (deterministic writes make QA diffs trivial).
+4. One `db.edit master_person` writing all four arrays + `updated_at`. Per-source failure policy: a **failed** read leaves that column untouched; a **successful empty** read writes `[]` (truth). No naming-collision risk — the helper declares no inputs named after the data keys.
+
+### Call sites
+
+- **`update-person-node` #2758** (v1.15, 2026-07-22) — immediately **after** the `send-cypher` node write (line ~430), try_catch-wrapped so an array failure never blocks the node sync, and assigned to its own vars so `$falkorResponse` (the function's response) is untouched. #2758's callers make this fire at every enrichment completion: `complete-person-enrich` #12590 (phase 11), the deep-research webhook #8303 fan-out, and the #13040 post-thesis retry. Precedent for graph-adjacent list projection already lives here — v1.15 writes `Person.profiles` as a native list from `master_link`.
+- **Expertise chain tail** — the #8303 fan-out currently runs #2758 **before** the #12666 expertise re-run, so a #2758-only hook would trail fresh deep-research expertise by one sync. Add a second helper call at the end of `llm-identify-person-expertise` #12666 (after its per-signal #12926 loop completes) so the `expertise` array always reflects the just-rewritten edge set. Verify the fan-out order at build time.
+
+### Backfill
+
+6,648 live `master_person` rows (2026-07-24) carry null arrays. One-shot task (ships `active = false`) sweeping the helper with an `after_id` cursor, the #13176 country-backfill batching pattern. Join-only people (no graph node) still get roles/skills/languages; `expertise` stays `[]` until a node exists.
+
+### Sandbox tests
+
+| Case | Expected |
+| --- | --- |
+| Person with `HAS_EXPERTISE` edges + join rows | All four arrays populated, lowercase, deduped, sorted; re-run byte-identical |
+| Person with no joins, no node | `[]` for all; no crash |
+| Cypher failure (bad uuid / graph down) | `expertise` column untouched, other three still written, `qa_passed` log row |
+| Phase-8 re-resolution (edges deleted + rewritten) | `expertise` array matches the new edge set after the #12666-tail call |
+
+### Build sequence
+
+1. Helper standalone + sandbox unit runs.
+2. Wire into #2758 (re-fetch first — it moved v1.11 → v1.15 in two weeks) and the #12666 tail.
+3. Sandbox matrix above; then live promote (`--publish`, trap #20).
+4. Backfill task over live; deactivate at zero remaining.
+5. Docs: add the arrays to [Person Waterfall Tables](/guides/enrichment/waterfall/person-tables) (`master_person`) and the #2758 card on [Person Waterfall Functions](/guides/enrichment/waterfall/person-functions).
+
+### Open questions (arrays)
+
+1. **Empty means `[]` or `null`?** `[]` proposed — cleaner for app-side filters; `null` would mean "never synced," which is also useful. Pick one and keep it.
+2. **Alphabetical sort** — proposed for deterministic writes; drop if insertion order carries meaning for the UI.
+3. **Mirror onto the graph node too?** #2758 v1.15's `Person.profiles` list sets the precedent; not requested here, cheap to add later.
+4. **Trigger the backfill immediately after live promote,** or let arrays fill lazily as people re-enrich?

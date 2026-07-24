@@ -1,0 +1,113 @@
+---
+title: "Email Domain Employer Fallback"
+description: "Planned: when an email-seeded person resolves zero enrichment, classify the seed email's domain (classify-email_v2 #2756), get-add the domain company through master-company-new #12558, and write a titleless current WORKS_AT edge + work_experience placeholder — which later real enrichment overrides in place."
+icon: "at"
+---
+
+**Status: scope & planning only.** Nothing on this page is built — no functions changed, no flags created. Every function ID and behavior cited below was verified against live XanoScript (workspace 3 `OrbiterV2`, branch `v1`) on 2026-07-23/24. Note the live pipeline is **ahead of the waterfall docs family** (last audited 2026-07-09): `master-person-new` #13039 is at v1.26 and `enrich-master-person` #13040 at v3.73 — re-fetch both at build time.
+
+## Why
+
+Seed `evanson@orbiter.io` through the person gate #13039 ([Person Waterfall Entry Points](/guides/enrichment/waterfall/person-entry-points)) and let every provider miss: PDL 404s, the Enrich Layer email path returns nothing, Exa Fiber can't verify, Exa has no LinkedIn slug to filter on, and the async FullEnrich tier (#13036 → webhook #8594 → #13049) comes back empty too. The person row, node, and `master_email` row all exist — but there are zero `work_experience` rows, `master_person.master_company_id` is null, and the graph holds a bare Person node with no `WORKS_AT` edge.
+
+The one fact we **did** have is classified and then thrown away. `add-person-email` #2784 already calls `classify-email_v2` #2756 on every email write and stores `email_type: "work"` on `master_email` #155 — but nothing acts on it (#2784 doesn't even persist the `master_company_id` the classifier returns). A work-domain email is employment evidence: the person currently works at the company that runs that mailbox. This plan makes the pipeline record exactly that — company in the graph, `WORKS_AT` edge with a description like *"Evanson works at Orbiter."*, null title, null dates — and guarantees later real enrichment updates and overrides the placeholder for the same company.
+
+The population this helps most is the Log & Parse lane: interaction-log contacts seeded by email at scale, where a large share resolve no enrichment today and land as orphan Person nodes.
+
+## What already exists (leverage, not build)
+
+Almost the entire lane is production machinery; the build is one new helper, one orchestrator hook, and two small dedupe amendments.
+
+| Piece | Where | What it gives this build |
+| --- | --- | --- |
+| Email classifier | `mvp/email/classify-email_v2` #2756 — deterministic, no LLM | `email_provider` #175 domain list → `personal`; `marketing_prefix` #174 (info@, noreply@ …) → `human: false`; else `email_type: "work"` + `master_company_id` when the domain already matches `master_company.company_domain` |
+| Domain normalizer | `mvp/format/domain-extractor` #4587 | PSL registrable domain — `mail.orbiter.io` → `orbiter.io`, so subdomain mailboxes can't mint duplicate companies |
+| Company gate | `master-company-new` #12558 (v2.18 + governor — [Company Waterfall Entry Points](/guides/enrichment/waterfall/company-entry-points)) | `domain` + `hold_downstream: true` creates local-only with the sync LLM preflight #12974 (identity, logo, profiles); placeholder guard, directory-host guard, kill switch #12789, `source_*` traceability — and it returns `master_company_id` |
+| Work-row writer | `mvp/work/add-position-record` #12608 v1.8 | Upsert with `current_mode: "current" \| "historical" \| "infer"` contract; PDL (#12824), Enrich Layer (#12615), and Exa (#13031) all route work rows through it |
+| Work-edge writer | `mvp/edges/create-work-edges` #2800 v2.23 | **Verified: needs zero changes for the happy path.** A titleless row is `WORKS_AT`-eligible (classifier default `return true`), gets seniority `Individual Contributor` rank 20 → **weight 20, current**; the Cypher description fallback is literally `p.name + ' works at ' + c.name + '.'`; the inline deepseek writers (#13003/#13008) upgrade the prose; one `MERGE (p)-[r:WORKS_AT]->(c)` per person–company pair with `r.uuid` preserved |
+| Current-role selector | `mvp/work/choose-best-current-role` #12621 v1.7 | A resolved, explicitly-current, titleless row is an eligible candidate; as the only row it sets `master_person.master_company_id` and leaves `current_title` null. Its lifecycle check auto-rejects companies the saved Company_LLM payload says are closed |
+| Depth-0 company handoff | #13040 exit — the `$nonBioCurrentCompanyDependencyRequired` continuation + `plan-person-current-company-depth0` | Reads `master_person.master_company_id` at exit and dispatches depth-0 full company enrichment — **including for companies created with `hold_downstream: true`**. Since 2026-07-19, #12558's header states #13040 owns the durable depth-0 selected-current-company handoff |
+| Re-entry on late data | FullEnrich webhook #8594 → #13049 → `force_run: true` re-dispatch of #13040 | The async tier re-enters the same exit region minutes later, so one hook covers the initial run, the FullEnrich re-run, and queue drains |
+
+## Design decision — hook at the #13040 exit, not the gate
+
+"Did enrichment resolve anything?" is only decidable after all phases have run — and FullEnrich lands asynchronously and re-dispatches the orchestrator. One try_catch-isolated block in the #13040 exit region:
+
+- runs on the initial dispatch, the FullEnrich `force_run` re-run, and drained queue rows — idempotent by construction (its trigger is *zero work rows*, so a run that already created the placeholder no-ops);
+- sits immediately before the existing selected-current-company continuation, so on root runs the newly linked company rides the **existing** depth-0 full-enrich dispatch — no new company-enrichment plumbing;
+- keeps the #13040 diff to one guarded block, with the whole lane in a new standalone helper (#13040 moved v3.33 → v3.73 in 13 days; small diffs matter).
+
+## The fallback lane
+
+New helper — proposed name `mvp/work/resolve-employer-from-email-domain`, callable standalone for QA:
+
+1. **Pick the email.** Active `master_email` rows for the person: prefer `orbiter_verified`, else earliest active. Re-run #2756 live; proceed only on `human: true` and `email_type: "work"` (marketing prefixes and provider domains stop here).
+2. **Normalize the domain** through #4587. Derive the domain ourselves — do not consume #2756's `company_domain` output (bug below).
+3. **Get-add the company.** #12558 with `{domain, source: "Email Domain Inference", source_function, source_entity_type: "master_person", source_entity_id, hold_downstream: true, queue: false, cascade_depth: <person's depth>}`. Kill switch, placeholder guard, or a null shell → log a `qa_passed` row and exit cleanly. Leaving `return_fast` off means the sync LLM preflight gives the company real identity immediately.
+4. **Write the placeholder row.** #12608 with `{master_person_id, master_company_id, company_name, company_domain, current_mode: "current", source: "Email Domain Inference"}` — title and all date parts null.
+5. **Set the FK.** #12621 — the placeholder as the only resolved current row sets `master_person.master_company_id`, `current_title` stays null.
+6. **Write the edge.** #2800 for the person → `WORKS_AT` weight 20, current, deterministic description *"«Name» works at «Company»."*, LLM prose upgrade inline, `edge_uuid` written back to the row.
+
+**Trigger condition** (evaluated in the #13040 exit hook): feature flag ON ∧ not `current_company_only` ∧ `master_person.master_company_id` empty ∧ zero `work_experience` rows ∧ an active work-typed email exists. Root runs then get the company full-enriched by the existing exit continuation; leaf runs (depth > 0) leave it local-only, matching the [controlled-waterfall](/guides/enrichment/waterfall/person-waterfall#the-controlled-waterfall) leaf policy (phase 3 resolves leaf employers `hold_downstream: true` today).
+
+## Override semantics — how later real data wins
+
+The graph side is already self-healing: #2800 MERGEs one `WORKS_AT` edge per person–company pair and SETs title, weight, tense, dates, and description on every pass while preserving `r.uuid` — a later "CEO at Orbiter" row overrides the placeholder edge in place.
+
+The relational side is not, and this is the part that needs real design. #12608 v1.8's dedupe requires a **title match** (exact `person + company_name + title`, then a normalized pass that still requires `titleMatches`), so a later real row would insert *alongside* the titleless placeholder instead of upgrading it. Three amendments:
+
+1. **#12608 absorb rule.** Extend the normalized-dedupe lambda: an existing same-company row with an **empty title** is an upgrade target for an incoming *current* row — checked after title-match candidates, so distinct real roles at the same company still get their own rows. Covers PDL #12824, Enrich Layer #12615, and Exa #13031, which all route through #12608.
+2. **Exit cleanup.** In the helper, on re-runs: when a title-bearing row for the same company now exists, merge the placeholder into it (carry `edge_uuid` if the placeholder holds the canonical one) and delete the placeholder. Covers FullEnrich #13049, which inserts `work_experience` directly with its own title-keyed dedupe. Absorb only into **current** rows — if providers found only a historical stint there, keep the placeholder: an active mailbox is still current-employment evidence.
+3. **#12621 tie-break nudge.** When multiple explicit-current resolved rows compete, deprioritize empty-title rows so a surviving placeholder can never beat a provider-asserted role at a *different* company in primary-role selection.
+
+## Guards, risks, and policy
+
+| Concern | Position |
+| --- | --- |
+| Personal vanity domains (`john@johnsmith.com`) mint junk companies | #12974's preflight supplies identity evidence; the gate's placeholder + directory-host guards already run. v1 = auto-create + monitor the `Email Domain Inference` log rows; option B = require a confident, non-error LLM identity before committing, or route no-match domains to a `human_review_required` row (the Exa Fiber pattern) |
+| `.edu` / school domains | The gate detects `is_school`. v1 still writes `WORKS_AT` (staff assumption) — open question below |
+| Provider-list coverage | `email_provider` #175 has only 44 rows (no `proton.me`, `hey.com`, `fastmail.com`, `gmx.*` …). Every gap is a future junk company — top up as part of this build |
+| Company kill switch #12789 ON | Gate returns null/blocked → helper logs and exits; retried naturally on the next enrichment run |
+| Race with pending FullEnrich | Intentional: the placeholder is created at first exit; if FullEnrich later lands real employment, the `force_run` re-run overrides the edge and the exit cleanup absorbs the row |
+| Closed companies | #12621's lifecycle check rejects them as current — the FK stays null even if the placeholder row exists |
+| `log_crash.phase` | Strict enum — new log rows reuse an allowed phase value or omit `phase` entirely |
+| Rollout switch | New `environment_variables` row (proposed `email_domain_employer_fallback`), read in the #13040 hook; ship OFF on live until sandbox-validated |
+| Cost | Fires only when every provider returned nothing; ≈ one gemini-flash-lite + Serper preflight per triggering person, plus a deepseek edge description |
+
+## Quirks found while verifying (fix-alongs)
+
+- **#2756's "company not found" branch returns a broken `company_domain`** — `|split:("@"|last)` yields the whole split *list*, not the domain string. Currently unconsumed by any caller. Fix to `|split:"@"|last` while in there (v3), but the helper derives its own domain regardless.
+- **#2784 never persists the classifier's `master_company_id`** onto `master_email` — the column exists and stays null on this path. Optional: write it on insert so the classification round-trip is visible in the row.
+
+## Sandbox test plan
+
+All against the `sandbox` data source, seeded through #13039 (or `POST /master-persons` #7977):
+
+| Seed | Expected |
+| --- | --- |
+| Fresh fake work-domain email (`someone@<real-domain>.com`), no LinkedIn | Placeholder row (title/dates null, `current: true`, `source: "Email Domain Inference"`), `WORKS_AT` w20 with the works-at sentence, FK set, company created and (root run) full-enriched by the exit continuation |
+| Same seed, orchestrator re-run (`force_run`) | No duplicate placeholder, no duplicate edge |
+| Then apply a real row (title "CEO", same company) and re-run | Edge title/weight/description overridden in place, `r.uuid` unchanged; placeholder row absorbed |
+| Real row at a *different* company | Provider row wins current-role selection; placeholder + edge persist (mailbox evidence) |
+| `@gmail.com` seed | No-op (classified personal) |
+| `info@<domain>` seed | No-op (`human: false`) |
+| Company kill switch ON | Clean skip, one log row |
+| Domain of a lifecycle-closed company | Row written, FK stays null (lifecycle rejection) |
+
+Verify graph state through `tool/run-cypher` #8665 (`X-Data-Source: sandbox`); end-to-end through a real API endpoint, not the MCP runner (debugger artifact — CLAUDE.md trap #21).
+
+## Build sequence
+
+1. Helper function standalone + unit runs against sandbox persons.
+2. #12608 absorb rule + #12621 tie-break; replay mixed-source fixtures.
+3. #13040 exit hook behind the env flag (re-fetch v3.7x and anchor before the selected-current-company continuation).
+4. Full sandbox matrix above.
+5. Live promote (CLI `xano function edit … --publish` — trap #20), flag ON, monitor `Email Domain Inference` log rows.
+6. Docs: fold the shipped behavior into the [person-waterfall family](/guides/enrichment/waterfall/person-waterfall) (overview, functions, edges, entry-points), which needs a general v1.26/v3.73 refresh regardless.
+
+## Open questions
+
+1. **Schools:** keep `WORKS_AT` for `.edu`-style domains (staff assumption), or skip/flag when the gate says `is_school`?
+2. **Junk-domain tolerance:** v1 auto-create + monitoring, or gate creation on LLM identity confidence / a `human_review_required` lane from day one?
+3. **Flag default:** OFF on live until the Log & Parse volume implications are sized, or ON immediately after sandbox validation?
+4. **`master_email.master_company_id` backfill:** worth a one-shot sweep linking existing work-typed emails to already-known companies while we're here?

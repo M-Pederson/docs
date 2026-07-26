@@ -784,3 +784,60 @@ and block *verification* rather than work.
    (Phase 3), or keep the queue row a bare int?
 4. Is `entity_rank` **person 1, award 2, title 3** right, or should a title outrank a
    person once award/title tiers are equalized?
+
+---
+
+## Defect 10 — equalization compared the wrong tier (found 2026-07-26)
+
+Found on a Ryan re-verification run *after* the first nine defects were fixed and the page
+already recorded a 9/9. It is the clearest example on this page of a green fixture hiding a
+live bug.
+
+**Symptom.** 18 mismatches across 55 award/title pairs, every sample `award_tier=1` /
+`title_tier=2`, plus an award queue 81% concentrated at tier 1 (`degenerate_bands`
+tripped `bands_discriminate`).
+
+**Cause.** In `mvp/queue/upsert-imdb-award-graph` (`#13244`), the two equalization writes —
+the title pull and the sibling propagation — both compared against `$pairTier`, which is
+derived from the internal notability band:
+
+```
+$pairTier = min($awardTier, titleTier)              // notability-derived
+$seedTier = explicit caller priority_tier, if given // CAN BE BELOW $pairTier
+```
+
+A comment claimed the seed/promotion tiers derive from the pair tier. They don't: an explicit
+caller `priority_tier` wins outright. So with one non-prestige nominee (`$awardTier = 2`), a
+title at tier 2 and an explicit caller tier of 1: `$pairTier = min(2,2) = 2`, the award row is
+written at **1**, and the title-pull gate evaluates `2 < 2` → false. The title stays at 2 and
+the pair is permanently split. The sibling propagation had the identical flaw, which is what
+concentrated the award queue at tier 1 without dragging the titles along.
+
+**Fix (`#13244` v1.7).** Equalize on the tier **actually written**:
+
+```
+$effectiveTier = min($pairTier, isNew ? $seedTier : $promotedTier)
+```
+
+applied to the title-pull gate, the title write, the sibling query, and the sibling write.
+
+**Verified.** 18 → **0** mismatches / 55 pairs, `degenerate_bands` empty, full 9/9 with 0
+vacuous checks, settled 19.4 min.
+
+### The fixture reported a false pass
+
+`imdb-queue-equalization-fixture` (`8958`) returned `passed: true` for the entire life of this
+bug. Case A creates **three** award rows, so `$awardTier = 1`, and it passes **no** explicit
+`priority_tier` — meaning `$seedTier` always equalled `$pairTier` and the two values could not
+diverge. The fixture was structurally incapable of reaching the failure.
+
+Upgraded to `imdb_queue_equalization_v2` with **Case B**: one non-prestige nominee
+(`$awardTier = 2`), title seeded at 2, award upserted with an explicit `priority_tier: 1`.
+Asserts `explicit_tier_award_written_at_1`, `explicit_tier_title_equalized_to_1` and
+`explicit_tier_pair_equal`. Confirmed observing `case_b_award: 1, case_b_title: 1`,
+`residue_rows: 0`.
+
+**Lesson.** A fixture that only exercises the path where two values coincide cannot detect
+them diverging. When a code path picks between an explicit input and a derived default,
+the fixture must supply the explicit input — and supply it at a value that *disagrees* with
+the default, or the assertion is vacuous while still reporting green.

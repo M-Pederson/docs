@@ -1,0 +1,786 @@
+---
+title: "IMDb & Music Queue Refactor"
+description: "Plan to unify the three IMDb queues on the MusicBrainz drain contract, band priority by notability then recency, make the tier-0 backlog reachable, and close the promotion-audit gap in the music queues."
+---
+
+# IMDb & Music Queue Refactor
+
+<Note>
+  **Phases 0-2 are built and verified with a standing QA harness. Phases 3-7 are planned.** Measured against live
+  workspace `3` / branch `v1` on 2026-07-25 — every table shape, function ID, task state,
+  and validator below was read from the Metadata API or proved by a live write, not
+  inferred.
+</Note>
+
+## Status ledger
+
+Six wipe-and-rerun cycles on 2026-07-25. Everything below was measured, not inferred.
+
+### Shipped and verified
+
+| Item | Evidence |
+| --- | --- |
+| `queue_imdb_title.priority_tier` relaxed to `min:0` | tier-0 write proved to land; other 6 validators survived the UI edit |
+| Calibrated V1 title bands (`12875` v2.1) | 4 variants measured; V1 chosen on spread + defensible top band |
+| Role-primary person bands, vote-gated (`12876`) | `json.rating` is `{score, votes}` — confidence gate at `votes >= 1000` |
+| **Silent drops removed** | T3 overflow demoted not dropped; **all** producers and cast kept. Person queue went **4 → 19 rows** |
+| **Promotion debounce, 30 min** (`12871`/`12872`/`13244`) | title tier-0 **26 → 0**, award tier-0 **61 → 0**, despite unchanged re-add counts of 4-60 |
+| Insert-time window stamp | a fresh row no longer claims one free mechanical promotion |
+| Zero-aggregation guard (`13244`) | 15 unlinked awards, **all tier 3** — previously all forced to tier 1 by matching each other |
+| `$awardTier` ordering bug fixed | was defined *after* its consumers → `undefined` → `NaN` → every award silently fell back to 3 |
+| Music debounce ported (`13083`, `13086`) | the **only 2 of 7** music upserts that still decremented |
+| Promotion audit on 6 music queues | `promoted_at` + `promotion_source`, mirroring `queue_mb_artist` |
+| **Regression fixture `8956` v2** | 6 checks incl. `promotes_after_window` (backdates 2 h). Replaces a ~25 min rerun with a sub-second check |
+| 19 columns added, **zero validator loss** | incremental `POST /schema/type/{type}` verified safe under real use |
+| **Symmetric equalization** (`12872` v2.4) | 0 mismatches / 55-62 pairs. One-directional pulls could not converge — 30 mismatches one way, 18 the other, because whichever side wrote last won |
+| **Award notability propagation** (`13244` v1.5) | 0 under-banded. Sibling propagation from the last-queued award; a one-shot reconciliation pass was tried, desynced 18 pairs, and was removed |
+| **Benign-race classification** (`10509`, `12881`) | `Duplicate record detected` logged as telemetry, not a crash. Two catch sites needed it; fixing one left the other reporting a real crash |
+
+### Open
+
+| Item | State |
+| --- | --- |
+
+
+| Music banding, signal quality, hygiene | planned |
+| **QA harness** — `8956` tier probe, `8958` equalization fixture, `8959` music debounce fixture, `8957` standing health gate | **done, all passing** |
+| Composite unique index on `film_tv_award (canonical_identity_key, imdb_person_id)` | **done** — id `b69c6ec6`. Do NOT index the key alone: it is the graph MERGE key, so co-nominees share it by design |
+| Ryan Reynolds **9/9 clean pass, no warnings** — 20.4 min, 38-credit scrape | **verified** |
+| Chamillionaire clean pass, 14.6 min — first music-heavy run | **verified** |
+| Music debounce port (`13083`/`13086`) | **fixed and verified** — shipped incomplete (no insert stamp), caught by fixture `8959` |
+| Live vs sandbox severity | **recalibrated** — the tier collapse never manifested in live; task `191` drains awards continuously and live shows 0 tier-0 rows with 2,893/2,893 awards materialized |
+| Drain, lease/retry, graph shortfall | **out of scope** by decision |
+
+<Note>
+  **Correction on music.** An earlier revision of this page claimed all 7 music upserts
+  shared the collapse bug. That was wrong — it was **2 of 7** (`13083` label, `13086` work).
+  The other five were already hardened: artist, recording and release-group use
+  `min(current, requested)`, person-resolution uses `min(a, b)`, and event uses depth-based
+  logic. The false positive came from a regex matching the `- 1` inside a v1.1 header
+  *comment* rather than live code. **Strip comments before pattern-matching XanoScript.**
+</Note>
+
+## Why
+
+The IMDb backlog is **structurally unreachable**. A sandbox census found **126 queued
+rows and zero tier-0-eligible rows**, with no mechanism that can ever move a row to
+tier 0:
+
+- `queue_imdb_person` and `queue_imdb_title` carried `priority_tier` validators
+  `{min: 1, max: 4}` — tier 0 was **forbidden by the column** while the drain
+  contract processes *only* tier 0.
+- Nothing decrements a tier. The only promotion path in the music model is
+  duplicate discovery, and the IMDb upserts used
+  `$input.priority_tier|first_notempty:4`, which coerces an explicit `0` back to `4`
+  (docs trap #7 — `0` is "empty").
+- There is **no person or title drain function at all**. Tasks `159` /`160` exist but
+  are inactive, and no `mvp/queue/process-imdb-person` / `-title` function exists.
+
+Separately, a person can carry 100+ credits. Queuing them all at a flat tier `4`
+throws away the only information that matters at that volume: **how recent** the
+credit is and **how substantial** it is.
+
+## Current state (measured)
+
+| | `queue_imdb_person` 706 | `queue_imdb_title` 707 | `queue_imdb_award_graph` 764 |
+| --- | --- | --- | --- |
+| Lifecycle columns | `processing`, `count` | `processing`, `count` | full: `status`, `attempt_count`, `max_attempts`, `next_attempt_at`, `lease_token`, `lease_expires_at`, `completed_at`, `last_error`, `result`, `idempotency_key` |
+| `priority_tier` default | 4 | 4 | 3 |
+| `priority_tier` validators | `{}` — stripped, compensated in code | `{min:0, max:4}` — **relaxed 2026-07-25** | none |
+| Drain function | **none** | **none** | `13245` |
+| Task | `159` inactive | `160` inactive | `191` active (live-scoped) |
+| Retry / backoff | none | none | yes |
+| Lease | none | none | yes |
+| Promotion audit | none | none | none |
+
+The three queues implement **three different contracts**. `award_graph` is the newest
+and richest; `person` and `title` are the oldest and thinnest.
+
+### Music, for contrast
+
+`mb/queue/process-next` (`13102`) is a **single unified drain across all six**
+`queue_mb_*` tables. Its own contract note:
+
+> Selects the single best TIER-0 pending row ACROSS all six MusicBrainz queues
+> (`entity_rank`: artist 1, label 2, event 3, work 4, release_group 5, recording 6)
+> ordered by `cascade_depth ASC, entity_rank ASC, id ASC`, skipping rows with future
+> `next_attempt_at`. Nonzero tiers stay queued until duplicate discovery promotes them
+> to 0.
+
+Music columns the IMDb person/title queues do **not** have (11): `retry_count`,
+`last_attempt_at`, `last_error`, `lease_token`, `lease_expires_at`,
+`lease_reclaim_count`, `next_attempt_at`, `promoted_at`, `promotion_source`,
+`lifecycle_epoch_uuid`, `execution_scope`.
+
+`promoted_at` + `promotion_source` are the missing promoter's **audit trail** — IMDb
+has no equivalent, which is why the stalled backlog was invisible.
+
+Note the vocabulary split: music counts retries as `retry_count` + `lease_reclaim_count`;
+`award_graph` uses `attempt_count` + `max_attempts` + `status`. Unification has to pick one.
+
+## The validator contract — settled by experiment
+
+This governs every schema decision below, so it comes first.
+
+**Column validators can only be written in the Xano UI.** Verified 2026-07-25 by trying
+every available API route against a throwaway table:
+
+| Route | Result |
+| --- | --- |
+| `PUT /table/{id}/schema` (whole schema) | 200, `validators` **silently dropped** |
+| `POST /table` (create with validators) | 200, `validators` **silently dropped** |
+| `PUT` / `PATCH` / `POST /table/{id}/schema/{field}` | **404** — the element route is GET-only |
+| `POST /table/{id}/schema/type/int` | 200, column created, `validators` **dropped** |
+| `xano` CLI | no `table` topic exists; only `workspace push`, which wiped a data source (trap #19) |
+
+Two consequences, both load-bearing:
+
+1. **Validators are enforced on write.** A tier-0 insert into a column with `min:1` returns
+   `ERROR_CODE_INPUT_ERROR: "Value is less than the minimum value of 1"`. They are not
+   advisory, so a too-tight validator is a hard functional block, not a lint.
+2. **The whole-schema `PUT` is destructive to validators.** It cannot restore them either —
+   re-sending a byte-exact pre-change snapshot still lands with every validator gone. A UI
+   edit, by contrast, **preserved all six other validators** on `queue_imdb_title` while
+   changing one. Never use the API to touch a table that carries validators you care about.
+
+**Therefore: bounds and normalization belong in the functions, not the columns.** Both
+IMDb upserts now clamp tier to `[0, 4]`, clamp `cascade_depth` to `>= 0`, and apply
+`filters=trim` to every text input. The column validators are a redundant second line of
+defence — good to have, never the thing being relied on.
+
+<Note>
+  **One open experiment worth running.** `POST /table/{id}/schema/type/int` is an
+  *incremental* column add, not a whole-schema replace, and it returned 200. If it also
+  preserves other columns' validators, then the column additions in Phase 3 and Phase 7a
+  become automatable instead of manual UI work. This is **untested** — a validator cannot
+  be created by API, so proving it needs a throwaway table with one UI-set validator on it.
+  Until then, treat all column additions as UI work.
+</Note>
+
+## Phase 0 — Unblock — **DONE**
+
+Tier 0 is reachable on the person and title queues, verified end to end.
+
+### What landed
+
+1. **`queue_imdb_title.priority_tier` → `min:0, max:4`** (Xano UI). A tier-0 insert now
+   succeeds; the same insert previously returned
+   `ERROR_CODE_INPUT_ERROR: "Value is less than the minimum value of 1"`. All six other
+   validators on the table survived the edit untouched.
+2. **`upsert-imdb-person` `12871`** — published and probe-verified:
+   - the `priority_tier` input default is the sentinel `-1`, so "absent" is distinguishable
+     from an explicit `0` (trap #7 — `first_notempty` coerces `0` back to the default)
+   - an explicit tier is honoured and clamped to `[0, 4]`
+   - re-add decrements one step toward floor `0`; an explicit tier may promote further but
+     never demote — `max(0, min(decremented, explicit))`
+   - `cascade_depth` clamped to `>= 0` in code
+   - `filters=trim` on all four text inputs, protecting `imdb_url` as the unique dedup key
+3. **`upsert-imdb-title` `12872`** — the same logic at floor `0`, published.
+
+### Verification
+
+Probe API `8956` (`imdb-queue-tier-probe`, sandbox-forced):
+
+| Case | Expected | Actual |
+| --- | ---: | ---: |
+| `priority_tier` omitted | 4 | **4** |
+| re-add of an existing row | 3 | **3** |
+| explicit `0` | 0 | **0** |
+| residue rows left behind | 0 | **0** |
+
+### Still open in this phase
+
+- **`upsert-imdb-award-graph` `13244`** — **done** (v1.1). Sentinel default `-1`, seed tier
+  `3` (one ahead of titles, since an awarded title is more notable than an unawarded one),
+  one-step promotion to floor `0`, and `cascade_depth` clamped. The previous
+  `first_notempty:3` coerced an explicit `0` to `3`, so the bootstrap lane was unreachable
+  for awards.
+- **`count` column on `queue_imdb_award_graph`** (UI) — no rediscovery counter exists there,
+  so duplicate-driven promotion cannot be measured or audited.
+- **Optional: restore `queue_imdb_person` 706 validators** (UI) — `imdb_url`, `name`,
+  `source_function`, `source_entity_type` → `trim`; `count`, `cascade_depth` → `min 0`;
+  `priority_tier` → `min 0, max 4`. Nothing depends on this: the function now enforces all
+  of it. It is a second line of defence, not a fix.
+
+<Warning>
+  **Execution halted before the wipe on 2026-07-25 — Xano instance database outage.**
+
+  All three code changes are published and fetch-back verified. Everything from step D
+  (wipe) onward is blocked, and deliberately so.
+
+  Symptom: `{"code":"ERROR_FATAL","message":"SQL Error: HY000"}` / HTTP 500, sustained
+  across repeated attempts on **unauthenticated** endpoints (`imdb-queue-tier-probe`,
+  `graph-connected-subgraph-readonly`) that had returned correct `200`s twenty minutes
+  earlier. `HY000` is a generic SQLSTATE general error, typically a lost DB connection, and
+  because it reproduces without auth it is not a token problem.
+
+  The five preflight workflow tests failing with `SQL Error: 7` are part of this same
+  outage, not test failures and not a regression from these changes. Confirmed by
+  correlation rather than assumption: the authed `401`s, the unauth `500`s, and the
+  workflow-test `SQL Error: 7` all appear and disappear **together**. During the one healthy
+  window every symptom cleared simultaneously; when it degraded again all three returned.
+
+  **Diagnostic rule worth keeping:** a Xano instance losing its database surfaces as `401
+  Invalid token` on authenticated routes, because the auth lookup itself hits the failed
+  DB. Do not read that as an expired token. Check an unauthenticated endpoint first — if it
+  returns `500`, the token is fine and the instance is the problem. This cost a wrong
+  diagnosis and a wrong instruction to re-run `xano auth` during this session.
+
+  The Metadata API also returned `401` on every route during the window. That was **the
+  same outage, not token expiry** — auth lookups hit the same failed database. Once the
+  instance recovered, the unchanged token returned `200` immediately and the CLI worked
+  again. Do not conclude a token is dead from `401`s that coincide with `500`s elsewhere;
+  check an unauthenticated endpoint first to separate the two.
+
+  **Do not wipe while the database is failing.** The wipe is a two-frame contract that must
+  reach `ready` with two `empty_verification` cycles; a half-completed wipe against a
+  failing DB leaves stale rows that read as fresh bugs. Three wipes in this project were
+  already lost to starting one under bad conditions.
+
+  **Still unresolved.** One brief healthy window (~19:11-19:12) allowed a single clean probe
+  and a Metadata API `200`, then the instance degraded again. Sampled every ~22s from
+  19:14:54 to 19:19:00: **12 of 12 samples failed**, authed `401` and unauth `500` every
+  time, with no recovery. Execution is parked at step C. The
+  pre-wipe baseline was captured while healthy: sandbox quiescent (15/15 terminal receipts
+  `success`, 0 pending), queues at **6 + 51 + 69 = 126 rows**, matching the original
+  census exactly.
+</Warning>
+
+## Execution runbook
+
+Ordered so every cheap check runs before anything expensive, and nothing is wiped while
+work is in flight.
+
+### A — Where the banding actually lives
+
+Phase 1 is a **rewrite of an existing lambda**, not new plumbing. `cascade-credits-from-person`
+`12875` already tiers every credit at lines 125-197 and already holds `roles`, `rating`,
+`year`, and `type` per credit. Its current rules invert the requirement:
+
+```js
+if (isVideoGame || isMusicVideo || isShortLow) tier = 4;
+else if (hasDirector || hasWriter)            tier = 1;   // role beats notability
+else if (hasProducer && (rating >= 7 || year === now))  tier = 2;
+else if (hasExecProd || hasCinema || rating >= 7)       tier = 3;
+else tier = 4;
+```
+
+Three defects: role outranks notability (a director of an obscure short beats an actor in a
+3-Oscar winner); no award signal at all; and `year === now` tests the exact current year
+rather than a 3-year window. A fourth is a silent data loss — see step 1.
+
+Awards are **not** knowable at credit-tiering time (they are scraped separately by
+`cascade-awards-from-person` `12877`), so the award effect is applied later by Phase 2
+equalization. The two phases are complementary by design, not redundant.
+
+### B — Code, smallest blast radius first
+
+1. **`12875` — rewrite the tiering lambda** to the band model. Includes the overflow
+   decision: the T3 cap at lines 174-181 currently `filter`s tier-3 credits beyond the top
+   20 out of `kept` entirely, so they are **never queued at any tier**. Under the band model
+   they belong in "Everything else" at tier 4. Demoting instead of dropping queues every
+   credit (100+ rows for a heavy filmography) rather than discarding the tail.
+2. **`12876` — `cascade-crew-from-title`**: apply the same bands on the person side, where
+   the above-the-line rule and its `min(tier, 2)` cap carry the most weight.
+3. **`13244` — award/title equalization**: pull the paired title row to
+   `min(title_tier, award_tier)` via `queue_imdb_award_graph.film_tv_id`, stamping
+   `promotion_source = award_equalization`. One-way, promote only.
+4. **Title-node self-heal — already present, no change needed.** Verified 2026-07-25: the
+   concern belongs to the graph writer `add-node-edge-imdb-award` `2334`, not
+   `resolve-upsert-award` `13246` (which only upserts the `film_tv_award` table row). `2334`
+   already does `MERGE (f:Film_TV { imdb_url: ... })` rather than requiring the node to
+   exist, and when there is no `film_tv_id` at all it swaps the award's MERGE key to
+   `person_uuid` so a person-only award still persists. Drain order therefore cannot strand
+   an award behind its title.
+5. Publish each with `--publish` and **byte-verify the fetch-back** (trap #1 — the
+   serializer silently rewrites inline literals into dead template strings).
+
+### C — Verify before spending a 22-minute run
+
+6. Deterministic preflight gates: workflow tests `87`, `89`, `90`, `92`, `93`, and function
+   `13210`. These are cheap and catch a regression before a wipe is spent.
+7. Tier probe `8956` — confirm the tier arithmetic still gives omit→4, re-add→3,
+   explicit 0→0, residue 0.
+8. **Dry-run the new bands against the credits already in the sandbox** before wiping
+   anything. Ryan's `imdb_person.json` / `browse_json` holds the raw credit list with
+   `roles`/`rating`/`year`/`type`, so the new tier distribution can be computed offline and
+   eyeballed. This is the cheapest possible check on whether the bands discriminate
+   sensibly, and it costs nothing to run twice.
+
+### D — Wipe
+
+<Warning>
+  **Deactivate the active queue crons before wiping — this is not optional.** The task
+  inventory taken on 2026-07-25 found **two queue crons still active**, contrary to the
+  assumption that everything was parked for the Go/AlloyDB migration reference:
+
+  | Task | Name | Risk |
+  | ---: | --- | --- |
+  | `194` | `process-queue-musicbrainz-sandbox` | **Sandbox-scoped and active** — it drains music queues in the exact data source we are about to wipe and re-seed |
+  | `191` | `process-queue-imdb-award-graph` | Active; believed live-scoped, **verify before trusting that** |
+
+  Also active but not queue drains: `184` `TEMP-backfill-music-images-live`, `181`
+  `backfill-music-edge-descriptions`.
+
+  `194` is the dangerous one. A sandbox drain firing between the wipe and the QA read
+  mutates the very state being measured, and its writes would be indistinguishable from
+  waterfall output in the census. Set every queue cron inactive, confirm with a task-list
+  read, and only then start the two-frame wipe.
+
+  Remember trap #9: a task ships **live** unless `active = false` is set explicitly.
+</Warning>
+
+9. **Confirm the sandbox is quiescent first.** Three wipes in this project were spent while
+   Deep Bio was still in flight; stale workers then retried into a fresh sandbox and
+   produced red rows that looked like new bugs.
+10. Wipe through API `8955`, honouring the two-frame contract: `mode=start` → epoch → poll
+    `mode=status` until `ready` with two consecutive `empty_verification` cycles.
+11. Confirm the post-wipe taxonomy baseline before seeding.
+
+### E — Re-seed and QA Ryan
+
+12. Seed the Ryan Reynolds fixture at `cascade_depth: 0`, `deep_research: true`.
+13. Poll until counts stop advancing. Expect **~22 minutes** — ~12 minutes of IMDb writes,
+    then 120 s quiescence plus up to two task-`193` cycles. A receipt sitting `pending`
+    inside that band is expected, not stuck.
+14. Run the full QA pass. Gate: 0 failures, 0 warnings, `full_enrich = true`, 15/15 terminal
+    receipts `success`, graph/table parity.
+
+### F — Queue census (the point of the exercise)
+
+15. Tier distribution per queue — `priority_tier` histogram across 706, 707, 764.
+16. **Equalization check:** every queued award carrying a `film_tv_id` must sit at the same
+    tier as its title row.
+17. **No-silent-loss check:** raw scrape credit count must equal synced + queued + explicitly
+    demoted. This is the assertion that would have caught the T3 drop.
+18. Compare against the pre-refactor baseline: **126 rows, 0 tier-0-eligible.**
+
+<Warning>
+  **Tier-0 rows will accumulate and not process — that is expected here.** The unified IMDb
+  drain is Phase 5 and does not exist yet; `_sync` remains the now-vs-later gate for this
+  run. Tier 0 currently means "eligible the moment the drain lands", so a tier-0 row sitting
+  still after QA is **not** a failure at this stage. Do not report it as one.
+</Warning>
+
+## Phase 1 — Tier bands, calibrated on real data — **BUILT**
+
+Every threshold here was measured against Ryan Reynolds' real 38-credit filmography and
+93 award rows. Three earlier drafts of these rules failed on contact with that data; what
+shipped is the version that survived. **The bands are calibrated, not guessed.**
+
+The title queue and the person queue get **different rules on purpose** — that was the
+single biggest correction the data forced.
+
+### Titles — `cascade-credits-from-person` `12875` (live, v2.1)
+
+| Band | Tier | Rule (first match wins) |
+| --- | ---: | --- |
+| **Notable** | 1 | `rating >= 8.0` |
+| **Solid** | 2 | `rating >= 7.0` |
+| **Recent or decent** | 3 | released within 3 years, **or** `rating >= 6.0` |
+| **Everything else** | 4 | default — old, unrated, obscure |
+
+Then, never past 4: `+1` for Short / Video Game / Music Video, `+1` for uncredited,
+archive footage, thanks, or miscellaneous credits.
+
+**Role deliberately does not affect a title's tier**, and this is the load-bearing finding:
+
+<Warning>
+  Adding an above-the-line floor to the title queue put **74% of credits into a single band
+  and left the top band completely empty**. An actor-producer carries a producer credit on
+  nearly everything, so "producer" is their baseline rather than a distinction — a producer
+  credit on a 5.1-rated series tied *Deadpool & Wolverine*. This is the same defect as the
+  code being replaced (role beating notability), merely relocated to a different tier.
+</Warning>
+
+Measured alternatives, on the same 38 credits:
+
+| Variant | Distribution | Worst band |
+| --- | --- | ---: |
+| **V1 — rating 8.0 / 7.0 / 6.0, no role effect** *(shipped)* | `{1:3, 2:9, 3:15, 4:11}` | **39%** |
+| V2 — V1 + strong role promotes one step | `{1:8, 2:8, 3:16, 4:6}` | 42% |
+| V3 — V1 + strong role floored at tier 2 | `{1:3, 2:18, 3:11, 4:6}` | 47% |
+| V4 — rating 7.5 / 6.5 / 5.5 + promote | `{1:9, 2:11, 3:15, 4:3}` | 39% |
+
+V1 and V4 tie on spread, but V1's top band is defensible — *Welcome to Wrexham* (8.3),
+*Underdogs* (8.2), *John Candy* (8.0). V4's tier 1 pulls in promotional Deadpool video
+shorts on writer credits, which are not notable by any reading.
+
+**The tier-1 bar is 8.0, not 8.5.** At 8.5 the top band was *empty* for a real
+filmography — his highest-rated credit is 8.3.
+
+### People — `cascade-crew-from-title` `12876` (live)
+
+Here role **is** the primary signal. This is where the writer/director/producer rule
+belongs — it is a statement about which *people* matter, not which titles.
+
+| Role on the title | Base tier |
+| --- | ---: |
+| Director, Writer, Creator | 1 |
+| Producer, Executive Producer | 2 |
+| Cinematographer, Composer | 3 |
+| Cast — top 3 billed | 3 |
+| Cast — remainder | 4 |
+
+Title notability then nudges by one step, **gated on vote count**:
+
+- `score >= 8.0` **and** `votes >= 1000` → promote one step (floor 1)
+- `score < 6.0` **and** `votes >= 1000` → demote one step (cap 4)
+- `votes < 1000` → no adjustment at all
+
+Tier 0 is never seeded; the floor is 1.
+
+<Note>
+  **Correction to this plan: vote counts DO exist.** An earlier revision stated no vote
+  count existed in any table. That was wrong — `film_tv.json.rating` is an *object*,
+  `{"score": 8.3, "votes": 26000}`. So the rating-noise problem (a 9.0 from 40 votes
+  outranking a 7.0 from 400k) is genuinely solvable on the person side, and `12876` now
+  gates on it. Credit-level `rating` inside `imdb_person.json` is a bare number with no
+  votes, so the **title** queue still cannot gate on confidence — which is a further reason
+  its bands lean on recency rather than fine rating distinctions.
+</Note>
+
+### Two silent drops removed
+
+Both queues were discarding data with no trace:
+
+| Where | Old behaviour | Now |
+| --- | --- | --- |
+| `12875` T3 cap | tier-3 credits beyond the top 20 `filter`ed out of the result — never queued at any tier | demoted to tier 4, `_demoted_overflow` flagged |
+| `12876` producers | only `producers[0]` queued, every other producer discarded | **all** producers queued at tier 2 |
+| `12876` cast | `cast.slice(0, 3)`, remainder discarded | all cast kept; beyond top-3 billed demoted to tier 4 |
+
+Dropping producers 2..n was the worst of the three: it discarded *above-the-line people
+outright*, directly contradicting the priority rule. Keeping the full cast is bounded
+because the scrape itself returns only ~10 cast entries — the real breadth cap is upstream
+and visible, rather than hidden in our code.
+
+### Signal reality, measured
+
+- **Only 2 of 53 `film_tv` rows are enriched.** Titles are stubs when queued, so `year`,
+  `imdb_rating`, `type`, and `json` are all empty at tiering time. Signals must come from
+  the person's scrape payload, never from `film_tv`.
+- `imdb_person.json.credits` carries exactly what is needed: `type`, `year`, `roles`,
+  `rating`, `title`, `imdb_url`, `imdb_title_id` — 36 of 38 credits had a rating.
+- `imdb_credit_join.position` is **NULL on every row**, so billing order is excluded from
+  the rules. Populating it during the scrape is a prerequisite for ever using it.
+- Awards are **not** knowable at credit-tiering time. The award effect is applied by
+  equalization in Phase 2, not duplicated here.
+
+### Predicted outcome — the verification target
+
+Combining the shipped title bands with the shipped award equalization over Ryan's real
+data gives a concrete prediction to check the re-run against:
+
+| Tier | Predicted `queue_imdb_title` rows | Re-adds to reach tier 0 |
+| ---: | ---: | ---: |
+| 1 | 7 | 1 |
+| 2 | 9 | 2 |
+| 3 | 11 | 3 |
+| 4 | 11 | 4 |
+
+Worst band **29%** — a materially better spread than any single-signal variant, because
+equalization promotes 7 awarded titles that rating alone ranked lower. Bands before
+equalization are `{1:3, 2:9, 3:15, 4:11}`; after, `{1:7, 2:9, 3:11, 4:11}`.
+
+**No-loss assertion: 38 credits scraped must equal 38 credits banded.** Verified in the
+dry run. If the post-run census shows fewer queued+synced rows than scraped credits,
+something is dropping data again.
+
+## Phase 2 — Award / title equalization
+
+Rules, as specified:
+
+- An award and its title must land at the **same** tier.
+- That shared tier must be **lower** (more important) than a title with no award.
+
+Implementation — one shared tier for the pair:
+
+```
+pair_tier = clamp(title_base_tier - award_bonus, 1, 4)
+award_bonus = 2 if winner else 1
+```
+
+Apply `pair_tier` to both the `queue_imdb_title` row and the `queue_imdb_award_graph`
+row, joined on `queue_imdb_award_graph.film_tv_id`. Equalization is
+`min(existing_tier, pair_tier)` so it only ever promotes, never demotes — matching the
+one-way decrement rule everywhere else. Stamp `promotion_source = award_equalization`.
+
+**Drain order must not matter.** Since the pair shares a tier, `entity_rank` decides
+which runs first, and awards rank ahead of titles — so an award can be processed before
+its title node exists. The award writer (`resolve-upsert-award` `13246`) must therefore
+**self-heal a missing title node** rather than defer. This mirrors the fix already made
+to `resolve-edges-certifications` `12578` v2.8, where an unresolved issuer company left
+`edge_id` empty and the strict gate then compared against it forever, making the row
+permanently unreprocessable.
+
+## Phase 3 — Unify the lifecycle
+
+Bring `queue_imdb_person` and `queue_imdb_title` up to the music column set:
+`retry_count`, `last_attempt_at`, `last_error`, `lease_token`, `lease_expires_at`,
+`lease_reclaim_count`, `next_attempt_at`, `promoted_at`, `promotion_source`,
+`lifecycle_epoch_uuid`.
+
+**Recommendation: standardize on the music vocabulary**, because `13102` already
+implements lease reclaim against exactly those names and the goal is for the IMDb drain
+to match it. Leave `queue_imdb_award_graph` alone — its `status` / `result` /
+`idempotency_key` are a genuinely useful superset, and renaming `attempt_count` →
+`retry_count` there is a destructive column operation for cosmetic gain. Record the
+`attempt_count` vs `retry_count` split as accepted debt.
+
+All column additions go through the **Xano UI**. Both automated routes are known to
+cause collateral damage (traps #16 and #19, plus the `706` incident above).
+
+## Phase 4 — Promotion: `-1` per re-add attempt
+
+**Every attempt to add an entity that is already queued decrements its tier by 1**, floor
+`0`. Re-add attempts *are* the promoter: a credit the waterfall keeps rediscovering is by
+that fact more important, and it climbs one hop toward `0` each time.
+
+Combined with Phase 1 banding, a row's tier is exactly **how many more rediscoveries
+until it is processed**:
+
+| Band | Tier | Re-adds until processed |
+| --- | ---: | ---: |
+| Highly notable | 1 | 1 |
+| Notable | 2 | 2 |
+| Recent | 3 | 3 |
+| Everything else | 4 | 4 |
+
+Rules:
+
+- The decrement is **one-way** — promote only, never demote. Award equalization (Phase 2)
+  uses `min()` for the same reason.
+- Floor is `0`; reaching `0` makes the row eligible for the drain (Phase 5).
+- An explicit `priority_tier` on the call may promote further but never demote:
+  `max(FLOOR, min(decremented, explicit))`. This is the logic already live in
+  `upsert-imdb-person` `12871`.
+- `count` increments alongside the decrement, which is why `queue_imdb_award_graph` needs
+  a `count` column (Phase 0, step 4).
+- Stamp `promoted_at` and `promotion_source`
+  (`duplicate_discovery` | `award_equalization` | `explicit`) on every move, so a stalled
+  backlog is visible rather than silent — the failure mode that hid the current
+  126-row / 0-eligible state.
+
+### Age decay — considered and deferred
+
+A row that is never rediscovered stays at its banded tier indefinitely and never
+processes. For a 100-credit filmography that long tail is **acceptable by design**: the
+obscure, unrated, decades-old minor credits are exactly the ones not worth a frame, and
+banding already guarantees the valuable ones sit 1–2 hops from processing.
+
+If guaranteed eventual drain is wanted later, add a bounded cron that applies
+`tier -= 1` where `now - max(created_at, promoted_at) > DECAY_DAYS`, with a batch cap and
+a `log` line naming how many rows moved, stamping `promotion_source = age_decay`. It is
+**not in scope for this refactor.**
+
+## Phase 5 — One unified IMDb drain
+
+New `mvp/queue/process-next-imdb`, mirroring `13102`:
+
+- Selects the single best **tier-0** row across all three IMDb queues.
+- `entity_rank`: **person 1, award 2, title 3** — a person unlocks a whole filmography,
+  and awards outrank titles per the tier rules.
+- Ordered `cascade_depth ASC, entity_rank ASC, id ASC`; skips future `next_attempt_at`.
+- Real lease claim (`lease_token` + `lease_expires_at`), lease-token-verified deletes,
+  and a reclaim pass across all three queues at **any** tier that increments
+  `retry_count` + `lease_reclaim_count`, sets `last_error = lease_expired`, and applies
+  backoff so a reclaimed row is not retried in the same invocation.
+
+Then retire tasks `159` / `160` in favour of one task per environment, matching music's
+`194` (sandbox) / `180` (live) split. Task `191` is currently **active but live-scoped** —
+confirm that is intended before adding another active cron.
+
+<Note>
+  All IMDb and music queue tasks are inactive by design except `191` / `194` / `181` / `184`.
+  They are retained as reference for the Go / AlloyDB migration, so **do not activate
+  them as part of this refactor** — build and verify the drain against the sandbox
+  endpoint instead.
+</Note>
+
+## Phase 6 — Observability and tests
+
+- Status endpoint per queue, following `status-imdb-award-graph` `13243`.
+- Sandbox drain endpoint mirroring the music equivalent `8918`, so the drain can be
+  stepped without activating a cron.
+- Regression fixture covering: tier arithmetic (omit / explicit 0 / re-add decrement /
+  floor), award-title equalization, age decay bounds, lease reclaim, and
+  promotion-source stamping.
+- Extend the `qa-the-sandbox` registry with the new IDs and a tier-0 census check, so
+  "queued but unreachable" is a **hard QA failure** rather than something found by hand.
+
+## Phase 7 — Improvements back into the music queues
+
+Music is the reference implementation for lifecycle and leases, and its tier arithmetic
+is already correct — `max(0, min(existing, incoming) - 1)` with `first_notnull:4`, which
+is the trap-#7-compliant form IMDb got wrong. Two gaps are worth closing with the same
+intent.
+
+### 7a. Promotion audit on all six queues
+
+`promoted_at` and `promotion_source` exist on **only one of six** music queues
+(`queue_mb_artist` 745), written by `upsert-artist` `13081`. The other five —
+`queue_mb_recording` 746, `queue_mb_release_group` 749, `queue_mb_work` 750,
+`queue_mb_label` 747, `queue_mb_event` 748 — apply the decrement and leave **no record of
+who promoted a row, when, or why** (`13082` and `13085` have zero references to either
+column).
+
+This is the highest-value, lowest-risk item in the whole plan: it is the exact blindness
+that let IMDb sit at 126 rows / 0 eligible without anyone noticing. Add both columns via
+the UI and write them in `13082`, `13085`, `13086`, `13083`, `13084`.
+
+### 7b. Notability banding for music
+
+All six music queues seed a flat `4`, so a landmark album and a throwaway single enter at
+identical priority. The Phase 1 band model applies — but with a real caveat:
+
+<Warning>
+  **MusicBrainz has no rating and no award data**, and the mb entity tables carry no
+  notability columns whatsoever — `mb_artist`, `mb_recording`, `mb_release_group`, and
+  `mb_release` keep everything inside a raw `json` blob. Music notability must therefore
+  be **structurally proxied** and read from the MB API payload at queue time, exactly as
+  IMDb reads the scrape payload. It is a **weaker discriminator** than rating + awards.
+</Warning>
+
+| Band | Tier | Music proxy (from the MB payload) |
+| --- | ---: | --- |
+| Highly notable | 1 | `primary-type` = Album, official status, and a canonical release resolved |
+| Notable | 2 | Album or EP, **or** artist release volume above a threshold |
+| Recent | 3 | `first-release-date` within 3 years |
+| Everything else | 4 | Single, compilation, live, bootleg, or unknown date |
+
+Demote by one tier for bootleg/unofficial status, mirroring the IMDb short-film demotion.
+
+Validate against a real music-heavy subject before committing — Chamillionaire is the
+un-run parity fixture and would exercise it. Do **not** ship music banding on the same
+change as IMDb banding; the signal quality is different enough to warrant separate proof.
+
+### 7c. Lifecycle superset — noted, not recommended yet
+
+`queue_imdb_award_graph` has `status`, `result`, and `idempotency_key`; no music queue
+does. These are genuinely useful for post-hoc debugging, but adding them to six tables is
+schema work on the riskiest path for a benefit that `promoted_at` / `promotion_source`
+mostly already delivers. Revisit after 7a.
+
+## Scope — enqueue correctness only
+
+<Note>
+  **Current scope decision (2026-07-25): the drain crons are explicitly OUT of scope.** The
+  only concern right now is getting the **right rows into the queues, at the right tier, by
+  the right rule**. Nothing about consuming them.
+
+  This re-ranks the plan below and **changes one fix**. The award-notability race (item 2)
+  was parked as "re-evaluate at drain time" — that is no longer available, so it needs an
+  enqueue-side reconciliation pass instead. See item 2.
+
+  **In scope:** what gets queued (completeness), at what tier (banding), promotion semantics,
+  award/title equalization, notability signal quality, and regression cover for all of it.
+
+  **Out of scope for now:** the unified drain (Phase 5), lease/retry columns (worker
+  concerns), drain-side monitoring, task `191`/`194` behaviour, and the graph-materialization
+  shortfall (68 of 89 awards and 24 of 30 titles have no node) — that is a *consequence* of
+  having no consumer, not an enqueue defect. It stays documented so it is not forgotten.
+</Note>
+
+## Remediation plan — everything outstanding
+
+Compiled 2026-07-25 after five wipe-and-rerun cycles against a clean sandbox. Ordered by
+whether it makes the system **wrong**, then **useless**, then **opaque**. Every item was
+observed, not speculated.
+
+### P0 — Correctness. The system produces wrong data until these land.
+
+| # | Defect | Evidence | Fix |
+| --- | --- | --- | --- |
+| 1 | **Award/title equalization loses the ordering race** | 30 of 61 pairs stuck at `award=3, title=1-2`. `13244` looks up the title, but award rows are written first, so the lookup is empty and the award keeps its own tier. | **DONE, in validation** — `12872` v2.3 pulls awards from the title side, where both rows are guaranteed to exist. |
+| 2 | **Award notability query races the award rows** | 13 awards carry a `film_tv_id` but were banded tier 3, because `db.query film_tv_award` counted only the rows written *so far*. When award #1 of 16 is queued the rest do not exist, so `rows.length >= 3` is false. Run 4: **17 rows at `count=1`** were inserted once, never re-upserted, so never re-evaluated — those are the 26 stuck at tier 3. Rows with `count=3` (47 of them) did get correct tiers via re-evaluation. | **Enqueue-side reconciliation pass.** After the award cascade finishes writing all `film_tv_award` rows for a person, recompute the notability tier for every queued award of each affected title. Belongs in `cascade-awards-from-person` `12877` or `add-award-records-from-imdb-person` `12887` as a final step. Drain-time re-scoring is **not** an option under the current scope. |
+| 3 | **Sweeper starves its own quiescence gate** | `run-person-non-bio-terminal-continuation` writes `master_person`, resetting the 120 s stillness window the sweeper waits on. Observed `still_ms: 4533` with `entertainment_settled: true`. The 6-min cron absorbs it; anything faster starves closeout to the 60-min ceiling. | Scope the watermark to writes owned by the person's own enrichment, or exclude the sweeper's own writer from the stillness check. |
+
+### P1 — The queue does not drain. Tier ordering is currently decorative.
+
+| # | Gap | Consequence |
+| --- | --- | --- |
+| 4 | **No unified IMDb drain exists** | Tier-0 rows accumulate and are never processed. Confirmed live: `imdb_person` stubs (Colin Hanks, John Candy, Bill Murray, Chris Candy) sit at `enrich_success=false` permanently. Tasks `159`/`160` are inactive and no `process-imdb-person`/`-title` function exists. |
+| 5 | `queue_imdb_person` / `_title` lack the lease + retry contract | No `retry_count`, `lease_token`, `lease_expires_at`, `lease_reclaim_count`, `next_attempt_at`, `last_error`. A worker that dies mid-row cannot be reclaimed. |
+
+Phase 5 delivers both: one drain across all three queues, `entity_rank` person 1 / award 2 /
+title 3, ordered `cascade_depth ASC, entity_rank ASC, id ASC`, real leases, and a reclaim
+pass. **Item 2 folds into this** — the drain re-scores notability as it picks each row up.
+
+### P2 — Parity and observability
+
+| # | Gap | Note |
+| --- | --- | --- |
+| 6 | **Music promotion audit missing on 5 of 6 queues** | `promoted_at` / `promotion_source` exist only on `queue_mb_artist`. Cheapest high-value item in the plan — this blindness is what hid the IMDb stall. Now automatable (see below). |
+| 7 | No status endpoint for the person/title queues | `13243` exists for awards only. |
+| 8 | No regression fixture for tier arithmetic | Probe `8956` covers the person path only; nothing covers banding, equalization, or the debounce. |
+| 9 | Music notability banding | All six music queues still seed a flat `4`. Weaker signals than IMDb — ship separately, prove against Chamillionaire. |
+
+<Note>
+  **Column additions are no longer manual.** Verified 2026-07-25: `POST /table/{id}/schema/type/{type}`
+  is an *incremental* add and **preserves every other column's validators** — all 7 on
+  `queue_imdb_title` survived. Only the whole-schema `PUT` is destructive. This is how
+  `last_promoted_at` reached all three queues and `count` was added to `764`. Items 5, 6 and
+  9 can therefore be scripted rather than hand-clicked.
+</Note>
+
+### P3 — Environment. Not ours to fix, but it blocks verification.
+
+| # | Issue | Action |
+| --- | --- | --- |
+| 10 | **Instance drops its database intermittently** | `SQL Error: HY000` / `7` on unauthenticated endpoints; authed routes return `401` from the same cause. Recovered and re-broke repeatedly between 19:05 and 20:00. Status page stays green because the HTTP layer answers. **Raise with Xano support.** |
+| 11 | **Workflow-test runner is broken independently** | `workflow_test run` returns `SQL Error: HY000` even while every other endpoint returns 200. Costs the entire deterministic preflight suite (WT `87`/`89`/`90`/`92`/`93`). Report separately from item 10. |
+| 12 | Deep Bio provider failing | `provider_terminal_error` after 3 attempts on run 4. Optional branch, correctly isolated — `full_enrich` preserved, Core never reopened. Diagnose the Cloud Run provider. |
+
+### P4 — Data quality and hygiene
+
+| # | Item |
+| --- | --- |
+| 13 | `imdb_credit_join.position` is **NULL on every row** — billing order is unusable, and any rule referencing it silently contributes nothing. Populate during the scrape or leave it out deliberately. |
+| 14 | No vote count at credit level. `film_tv.json.rating` has `{score, votes}` for *enriched* titles, so `12876` can gate on confidence, but the title queue cannot. Capture votes in the credit payload to make rating trustworthy there too. |
+| 15 | `queue_imdb_person` (706) validators still stripped. Fully compensated in code; restore in the UI only as a second line of defence. |
+| 16 | `log_crash` is an audit log, not a crash log — 151-304 rows per run with **zero** real errors. QA must filter on non-empty `error_message`. Recorded in the `qa-the-sandbox` skill. Consider renaming or splitting the table. |
+| 17 | Stale active tasks: `186`/`187` are one-off recovery jobs dated **2026-06-23**, still active a month later. `184` is `TEMP-` prefixed and pointed at **live**. Review and retire. |
+
+### Suggested order — enqueue-correctness scope
+
+1. **Confirm item 1** in the validation run (title-side equalization).
+2. **Item 2 — award notability reconciliation pass.** The last correctness defect in what
+   gets written to the queue, and the only P0 still unaddressed.
+3. **Item 6 — music promotion audit** (`promoted_at` / `promotion_source` on 5 of 6 music
+   queues). Cheap, scriptable now, and it is queue-write instrumentation rather than drain
+   work. This is the blindness that hid the original stall.
+4. **Item 8 — tier regression fixture.** Locks in banding, debounce, and equalization so the
+   five defects found today cannot silently return. Probe `8956` covers only the person path.
+5. **Item 9 — music notability banding**, then P4 signal quality (items 13, 14).
+
+**Deferred with the drain:** items 4 and 5 (drain + lease/retry contract), and the
+graph-materialization shortfall. Item 3 (sweeper watermark) only bites throughput, so it
+waits unless closeout stalls become a nuisance.
+
+Items 10 and 11 are environmental and need someone outside this repo; they run in parallel
+and block *verification* rather than work.
+
+## Risks
+
+| Risk | Mitigation |
+| --- | --- |
+| Schema writes strip validators or wipe data | UI only. Never `workspace push`, never MCP `updateTableSchema`. Re-read and diff after every change. |
+| Rating without a vote count misranks | Awards outrank rating; rating only ever sets a band, never a fast lane. Capture a vote count before trusting it further. |
+| Award processed before its title | Award writer self-heals the missing title node (Phase 2). |
+| `0` silently coerced to default | Sentinel `?=-1` + `first_notnull` semantics, never `first_notempty` (trap #7). Music `13081`/`13082` are the reference. |
+| Long tail never processes | Accepted by design — obscure minor credits are not worth a frame. Age decay stays available if that changes. |
+| Music banding on weaker signals | Ship separately from IMDb banding, proved against Chamillionaire. |
+
+## Open questions
+
+1. ~~Is a single nomination enough for tier 1?~~ **Answered by measurement** — no. It
+   promotes 100% of awarded titles. Bar is **≥ 3 awards or a prestige win** (~15% of a
+   filmography). Confirm the prestige body list, and re-calibrate on a prestige-heavy
+   subject.
+2. Capture an IMDb vote count during the scrape, so rating can be trusted beyond a band
+   boundary?
+3. Persist `credit_year` / `imdb_rating` / `role_labels` on the queue row for re-scoring
+   (Phase 3), or keep the queue row a bare int?
+4. Is `entity_rank` **person 1, award 2, title 3** right, or should a title outrank a
+   person once award/title tiers are equalized?

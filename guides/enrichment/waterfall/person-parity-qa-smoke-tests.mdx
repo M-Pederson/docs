@@ -43,6 +43,62 @@ waterfall settles, require all of the following:
 - Every materialized education row has both a positive school ID and a valid preserved `ATTENDED` edge UUID; neither field alone is sufficient.
 - Expertise table rows and graph edges pass count, property, recency, date, tense, and description parity.
 
+## Expected Settle Times
+
+Measured on a wiped sandbox, from the entry request to `master_person.full_enrich = true`,
+letting task `193` settle the terminal receipt naturally (no manual sweeper calls).
+Do not call a run stuck before its band has elapsed.
+
+| Subject shape | Example | Measured settle | Notes |
+| --- | --- | ---: | --- |
+| Plain person (no film/music) | Chia Jeng Yang | ~10 min | Companies + education + expertise only |
+| Person + C-suite descendant | Hazel Savage | ~7 min | Descendant enriches in parallel; both reach `full_enrich` |
+| Film-heavy (IMDb) | Ryan Reynolds | **14-26 min, median ~20** | n=11 runs, 2026-07-25. Spread tracks credit count |
+| Music-heavy (MusicBrainz) | Chamillionaire | **14.6 min**, or **~25 min** with a selected-company retarget | n=2 clean, 2026-07-25/26. Music queues drain during the run. A retarget adds a second terminal sequence (10 receipts instead of 5) |
+
+### How to measure it yourself
+
+`master_person` (table **139**) carries both ends on one row — no external timing needed:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `created_at` | `timestamp` (epoch ms, not null) | Start. Row is created **~4 s after** the seed call, since the entry point dedups and resolves identity first. Treat as ±5 s. |
+| `last_full_enrich` | `timestamp` (epoch ms, **nullable**) | End. Set on completion, so it doubles as the done-flag. |
+
+```
+duration_ms = last_full_enrich - created_at
+```
+
+Use the **root** person's row only — cascaded descendants have their own, shorter
+durations, and averaging across them understates the end-to-end figure.
+
+For per-phase timing rather than one wall-clock number, `enrich_history_person`
+(table **160**) carries `processing_time` alongside `created_at` / `last_updated` /
+`master_person_id`.
+
+### Why the spread is wide
+
+Eleven Ryan Reynolds runs on 2026-07-25 came in at 13.8, 17.0, 17.8, 17.8, 19.9, 20.4,
+20.9, 22.1, 24.1, 25.0 and 25.9 minutes. Two factors account for it:
+
+1. **IMDb scrape variance.** The same subject returned **10, 38, and 54 credits** across
+   runs. More credits means more titles, awards and queue writes. Queue counts are therefore
+   **not comparable between runs** — compare assertions and ratios, not raw totals.
+2. **Terminal closeout tail.** Entity and company work lands in the first ~3 min, entertainment
+   enrichment runs as long as it needs, then Core closeout adds a **120 s quiescence window
+   plus up to two task-`193` cycles (~6 min each)** — so closeout alone trails the last
+   entertainment write by 2-14 min.
+
+A receipt sitting `pending` inside that tail is expected, not stuck: the sweeper reports
+`action = deferred_person_not_quiescent` with a `quiescence` block showing `still_ms` while
+it waits. **Do not invoke the sweeper manually to inspect it** — its continuation writes
+`master_person`, which resets the very stillness window it is waiting on.
+
+**Sizing guidance for the Go/AlloyDB port:** budget a **30-minute** ceiling for a
+film-heavy person and treat anything past 35 minutes as genuinely stuck. The floor is not
+the enrichment work — it is the 120 s quiescence plus sweeper cadence, so a faster
+implementation still cannot settle a run in under ~3 minutes without changing that contract.
+
 ## Smoke Tests
 
 Use the cases below as inputs for `get-add/master-person-new`.
@@ -275,7 +331,7 @@ Notes:
 
 ### Chamillionaire (Hakeem Seriki) — LinkedIn only, triggers IMDb + Music waterfalls
 
-- [ ] Passed QA
+- [x] Passed QA — **certified 2026-07-26.** The terminal-preflight generation deadlock that previously blocked certification is **fixed and verified** in `#13194` — see [Terminal preflight generation deadlock](/guides/open-work/terminal-preflight-generation-deadlock). The certifying run **hit the selected-company retarget** (company 1 → 4), the exact condition that used to deadlock, and completed anyway: `terminal_preflight_generation` `success` on both passes, `full_enrich=true`, ~25 min, 9 `success` + 1 `superseded` receipts (the superseded row is the v3.76 pre-phase-7 reservation placeholder, correctly superseded by the real materialization). Music queues banded correctly and did **not** collapse: `queue_mb_recording` 15 rows all at tier 1, `queue_mb_release_group` 5 at tier 1 / 12 at tier 2 despite `count=7` re-adds each, `queue_mb_event` 3 at tier 2. `queue_mb_artist` drained to 0 during the run via task `194`. Graph parity: `Company` 5/5 and `Film_TV_Award` 5/5 exact; `Film_TV` 2 materialized against 16 still queued; `Person` = 2 by design (a `Music_Artist`-labelled stage-name identity linked `SAME_AS` to the canonical Person). Caveats: he generates **no label or work rows**, so the `13083`/`13086` debounce port is deployed but unexercised; and his IMDb footprint is thin (16 titles, **0 queued awards**), so the IMDb equalization, under-banding and zero-aggregation checks come back **vacuous** — pair with Ryan Reynolds for those.
 
 Notes:
 

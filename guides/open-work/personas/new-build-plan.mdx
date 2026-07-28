@@ -1,0 +1,131 @@
+---
+title: "New Build Plan"
+description: "Context scoping for the next persona-narrative build — what we already capture per dimension, where it lives, and where we're light."
+---
+
+Planning page for the next iteration of the person-side persona build. Before touching the [Build Persona](/guides/open-work/personas/build-persona) prompt or the rollup pipeline, this page scopes the **context we can actually feed the LLM** — narrative by narrative — from signals Orbiter already captures.
+
+<Note>
+  **Principle for this build:** synthesize from captured context only. A researcher swarm (Kimi K3 class) *could* web-search per narrative to fill gaps, but that is explicitly deferred — see [Deferred: per-narrative web search](#deferred-per-narrative-web-search-kimi-k3-swarm). The gap list at the bottom doubles as the future search-target list.
+</Note>
+
+## The context pull — three layers
+
+### Layer 1 — Graph RAG pull (the foundation)
+
+One pull per person from FalkorDB: the `Entity:Person` node, **every 1-hop edge with its `description`**, and the key properties of each neighbor node (name, labels, and the neighbor's own `description` where it has one — `DomainExpertise`, `Company`, `Certification`, `Honor`, `Funding_Round`, `Publication`, …).
+
+This is the richest single source we have. Effectively **every person edge carries an LLM-or-deterministic `description` plus `valid_from` / `valid_to` timestamps** — the pull alone reads as a life story in dated sentence fragments. Canonical references: [Nodes](/guides/ontology/nodes) · [Edges](/guides/ontology/edges).
+
+| Edge family | Edges | What the pull gives us | Primarily feeds |
+| --- | --- | --- | --- |
+| Work | `FOUNDED` · `WORKS_AT` · `BOARD_MEMBER_OF` · `ADVISOR_TO` · `MEMBER_OF` · `INVESTED_IN` (angel, w25) | Role sentence per edge + titles, seniority, date ranges | `identity_profile`, `track_record` |
+| Investor (round-scoped) | `LEAD_INVESTED_IN` · `INVESTED_IN` · `FOLLOW_ON_INVESTED_IN` · `INVESTMENT_PARTNER_IN` · `INVESTMENT_PARTNER_AT` | Deal-level descriptions + `Funding_Round` neighbor props (round type, amount, date) | `track_record`, `domain_focus`, `community_affiliation` |
+| Expertise | `HAS_EXPERTISE` → `DomainExpertise` / `SubDomainExpertise` | 15–30-word LLM sentence per domain (#13020 v2.3, written inline on new edges) | `domain_focus` |
+| Education | `ATTENDED` · `ATTENDED_TOGETHER` · `STUDIED_UNDER` | Guaranteed descriptions, incl. peer/instructor overlap | `track_record`, `community_affiliation` |
+| Credentials & honors | `HAS_CERTIFICATION` · `RECEIVED_HONOR` | Edge descriptions + `Certification` / `Honor` node descriptions | `track_record`, `domain_focus` |
+| Work products | `CONTRIBUTED_TO` · `AUTHORED` | Project / publication neighbors with their own descriptions | `track_record`, `public_engagement` |
+| Mentorship | `MENTOR` | e.g. YC-partner mentorship sentences | `community_affiliation`, `soft_skills` |
+| Volunteering | `VOLUNTEERED_AT` | Cause-level affiliation | `passions_interests`, `community_affiliation` |
+| Film/TV & music | `WORKED_ON` · `WON_AWARD` · `NOMINATED_FOR` · music credit set | Credit-level descriptions | `track_record`, `passions_interests` |
+| Location | `LOCATED_IN` → `IN_REGION` → `IN_COUNTRY` | Geo chain | `identity_profile` |
+
+The Person **node itself is deliberately thin** — `name`, extra labels (`:Angel`, `:C_Suite`), `short_biography` / `long_biography` (projections of the Xano bios), `linkedin_url`, avatar. The rich scalars live in Xano, which is Layer 2.
+
+<Warning>
+  `HAS_EXPERTISE` descriptions are written inline for **new** edges only (resolver-v2 #12926 → #13019/#13020/#13021, wired 2026-05-17). The historical back-fill (`backfill-has-expertise-descriptions-v2` #13046, Task #177) is **inactive** — older expertise edges may arrive description-less. The context assembler should tolerate bare edges, and the back-fill should run before a corpus-wide persona rebuild.
+</Warning>
+
+### Layer 2 — `master_person` adds (#139)
+
+Fields worth appending to the graph pull. Coverage measured on the **live** datasource, 2026-07-28 (6,648 people total):
+
+| Field | What it is | Availability |
+| --- | --- | --- |
+| `bio` (≤229) · `bio_500` | Short/long LLM bios (#2537) — also projected onto the node | Near-universal for enriched people |
+| `deep_bio` | Deep-research biography paragraph array — Kimi K2.6 agentic web research ([Deep Research Bio](/guides/enrichment/waterfall/deep-research-bio)). Only `biography[]` lands here — the **full research payload survives in the job ledger** (see the [interests ladder](#proposed-interests-synthesis-ladder)) | **Minority** — optional `deep_research=true` tier only. Add when present |
+| `social_insights` | 6–9 evidence-linked strings (Grok 4.5, #12669): current focus/momentum, recurring theses & causes, platform posting behavior, tone, audiences & collaborators, builder/writer/speaker footprint | **2,969 / 6,648 (~45%)**. Add when present; check `social_insights_updated_at` for staleness |
+| `social_media_influence` | Follower/influence summary from the platform-scraper chain (#2495) | Partial |
+| `current_title` + `master_company_id` | Current role (choose-best-current-role #12621) | High |
+| `primary_location_id` · `is_angel` · `is_c_suite` · `status_orbiter` | Structured identity flags | High |
+| `expertise` · `roles` · `skills` · `languages` | **New text-list columns** — in the live schema but not yet on [Person Tables](/guides/enrichment/waterfall/person-tables), null on spot-checks; write path in flight | **Not yet populated** — fold in once the array-updates work lands |
+
+`deep_bio` and `social_insights` are exactly the two conditional adds this build should treat as first-class: when present they carry the most narrative-dense signal we have, and both already feed each other (deep_bio is an input to the social-insights prompt).
+
+### Layer 3 — relational joins where the graph is thin
+
+- **`person_has_expertise` (#711, Track A)** — weight, evidence, and recency per expertise row. Richer than the edge for *ranking* which domains lead the `domain_focus` narrative.
+- **`master_link` (#166)** — verified profile URLs. Which platforms a person maintains is itself a weak `public_engagement` / `communication_style` signal.
+- **`linkedin_follower` (#495)** — audience size for calibrating "influence" language.
+- **Assembly precedents** — `get-person-context` #12570 already builds meeting-prep YAML (work history, education, skills, roles, location); `mvp/deep-research/deep-person-basic` #12833 assembles the researcher context the same way; `enrichment/build_org_enrichment_context` #12980 is the org-side pattern. The persona assembler should be the superset of #12570, not a parallel invention.
+
+## Narrative → context map
+
+| # | Dimension | Question | Primary context | Coverage |
+| :-: | --- | --- | --- | :-: |
+| 1 | `identity_profile` | Who are they right now? | `master_person` scalars + current `WORKS_AT` / `FOUNDED` descriptions + location chain | ✅ |
+| 2 | `domain_focus` | What do they know? | `HAS_EXPERTISE` descriptions + #711 weights/evidence | ✅ |
+| 3 | `soft_skills` | What can they do? | Inference only — work-edge scope/tenure, `MENTOR` / `ADVISOR_TO`, social-insights tone strings | 🔴 |
+| 4 | `track_record` | What have they done? | The full dated edge set — work, investor, education, credentials, honors, work products, film/TV/music | ✅ |
+| 5 | `public_engagement` | What do they talk about? | `social_insights` (~45%) + `AUTHORED` / `CONTRIBUTED_TO` + `master_link` platform presence | 🟡 |
+| 6 | `communication_style` | How do they talk about it? | Tone strings inside `social_insights` only; `deep_bio` incidentally | 🟡 |
+| 7 | `community_affiliation` | Who are they with? | `MEMBER_OF` · `VOLUNTEERED_AT` · `MENTOR` · `ATTENDED_TOGETHER` · investor-partner edges + social-insights communities | 🟡 |
+| 8 | `passions_interests` | What beyond work? | `VOLUNTEERED_AT` + occasional causes strings in `social_insights` / `deep_bio` + `languages` (future) | 🔴 |
+
+Per-dimension sourcing ideas:
+
+**1. `identity_profile` ✅** — name, `current_title`, employer node, `is_angel` / `is_c_suite`, `bio` / `bio_500`, `LOCATED_IN` chain, plus the *current* (`valid_to IS NULL`) work edges. `roles` column once populated. Strongest possible open.
+
+**2. `domain_focus` ✅** — `HAS_EXPERTISE` edge sentences give the narrative voice; #711 `weight` / `evidence` decide which domains lead; employer-node descriptions supply the industry/niche frame; `deep_bio` thought-leadership paragraphs deepen it when present. Caveat: the back-fill gap above.
+
+**3. `soft_skills` 🔴** — no direct source anywhere. Ideas from what we do have: team-scope and seniority language inside work-edge descriptions, `MENTOR` / `ADVISOR_TO` / `BOARD_MEMBER_OF` edges as capability proxies, collaborator/audience strings in `social_insights`, relationship tiers in the `deep_bio` payload. We capture **no recommendations or peer mentions** — the open question flagged on [Personas](/guides/open-work/personas#open-questions) still stands. Expect heavy use of the null rule here.
+
+**4. `track_record` ✅** — the graph pull *is* this narrative: every dated role, founding, deal, degree, certification, honor, project, publication, and credit, each already described in a sentence. Nothing to add.
+
+**5. `public_engagement` 🟡** — `social_insights` covers theses, causes, platform mix, and speaking/writing footprint — when present (~45%) and within a 6-to-9-string budget shared across all its dimensions. `AUTHORED` / `CONTRIBUTED_TO` edges and `master_link` platform presence supplement. We persist **no content corpus** (posts, talks, podcasts are fetched as evidence, summarized, and discarded).
+
+**6. `communication_style` 🟡→🔴** — second-hand only: the tone strings inside `social_insights` (evidence-gated, may be omitted entirely), plus whatever style leaks through `deep_bio` quotes. Without a stored corpus the LLM is summarizing a summary.
+
+**7. `community_affiliation` 🟡** — structural affiliation is decent: `MEMBER_OF`, `VOLUNTEERED_AT`, `MENTOR`, `ATTENDED` / `ATTENDED_TOGETHER`, and the investor-partner edge set (fund/syndicate membership). Scene-level membership ("AI tooling Twitter", local ecosystems) only arrives via `social_insights` audience/community strings.
+
+**8. `passions_interests` 🔴** — weakest by pipeline design. Today: `VOLUNTEERED_AT` edges, film/TV/music side-credits, occasional causes strings, `languages` once populated. No extractor targets hobbies, side projects, or advocacy — the dedicated LLM cut flagged on the Personas page was folded into the rollup but has almost nothing to read. Proposed fix: the [interests synthesis ladder](#proposed-interests-synthesis-ladder).
+
+## Where we're light — ranked
+
+1. **`passions_interests`** — no dedicated signal captured anywhere in the pipeline. Highest-value target — proposed ladder in the [next section](#proposed-interests-synthesis-ladder).
+2. **`soft_skills`** — zero recommendation/peer-mention capture; inference-only. Second-highest augmentation target.
+3. **No content corpus** — `communication_style` and `public_engagement` both lean on ~45%-coverage derived strings; the underlying posts/talks are never persisted. Persisting even the *bounded evidence* the social-insights run already fetches (#13190's Exa results) would materially improve both at near-zero marginal cost.
+4. **Conditional coverage** — `deep_bio` is a minority tier; `social_insights` sits at ~45% live and can be stale (`social_insights_updated_at`); `HAS_EXPERTISE` descriptions need the back-fill run before a corpus-wide build.
+5. **New array columns** (`expertise` / `roles` / `skills` / `languages`) — in schema, not yet populated or documented; either land the write path first or exclude from v1 context.
+
+## Proposed — interests synthesis ladder
+
+`passions_interests` is the reddest dimension, so it gets its own build ladder. Two findings shape it:
+
+1. **The full deep-bio research payload is persisted.** Only `biography[]` lands on `master_person.deep_bio`, but the `profile_enrichment_job` ledger keeps the full `llm_response` — `relationships`, `extracted_entities`, `unverified_claims`, `citations` ([Deep Research Bio](/guides/enrichment/waterfall/deep-research-bio)). Hobbies and personal orgs disproportionately live in `extracted_entities` and `unverified_claims` (they are rarely citable), and none of it currently reaches any narrative.
+2. **The social-insights evidence corpus is discarded.** #12669 prefetches two bounded Exa evidence sets (profile candidates + recent activity) and throws them away after synthesis.
+
+| # | Option | What it is | Cost / person | Coverage ceiling |
+| :-: | --- | --- | --- | --- |
+| A | **Interests cut over captured context** | New `persona/extract-interests` fn — input YAML: `deep_bio` paragraphs + the **full job-ledger payload** + `social_insights` + `VOLUNTEERED_AT` / side-credit edges + `bio_500`. Output: 3–6 evidence-backed interest facets with confidence, null allowed. A *focused* pass recovers what the omnibus 8-dimension prompt skims past | ~$0.001 (cheap model) | People with `deep_bio` or `social_insights` (~45%+) |
+| B | **`social_insights` interests lane** | Prompt rev on #12669 / #13190: a separate `interest_signals` output key (0–4 strings) so it doesn't tax the 6–9 professional-insight budget; permit hobbies / causes / side projects when evidenced. The Instagram / TikTok / YouTube / Substack candidates it already audits are where personal content lives | Same call, + output tokens | Follows the insights refresh cycle — **verify the live trigger path first** (person-functions.mdx lists the deep-research webhook #8303 fan-out as the caller; if that's the only one, cadence is tied to deep-bio runs) |
+| C | **Scoped web-search interests call** | Mini `deep-person-basic`: one research thread instead of six, 2–3 search budget instead of 12, identity-collision protocol intact. Targets where personal color actually lives publicly: conference speaker bios ("when she's not…"), personal-site /about pages, podcast guest intros, nonprofit board listings | ~$0.01–0.05 | Anyone public — **gate** to A/B-null × high-value people (persona-build targets, a user's active network) |
+| D | **Persist the Exa evidence** | Store #12669's two evidence sets keyed on `master_person_id` + fetched-at. Option A then reads raw personal-platform evidence instead of distilled strings — and it's the same corpus `communication_style` needs later | ~0 marginal (fetch already happens) | Piggybacks every insights run |
+| E | **Deterministic graph hints** | Always inject `VOLUNTEERED_AT`, off-profession film/TV/music credits, non-professional `MEMBER_OF`, `languages` (once populated) as YAML hints — free grounding for the null rule | 0 | Whatever the graph has |
+
+**Sequencing:** E is free and immediate. **A first** — prototype against the 10-person tiered sample (next steps below) and measure the interests null-rate before touching anything else. **B + D together** on the next social-insights prompt rev (one function, one deploy). **C last**, as a gated escalation once A + B's residual null set is known — it doubles as a single-narrative pilot of the Kimi K3 swarm architecture without funding the whole swarm.
+
+**Honest ceiling:** for many professionals this data does not exist publicly. Irreducible nulls are acceptable — the [Build Persona](/guides/open-work/personas/build-persona) null rule is designed for exactly this, and the matcher already down-weights `passions_interests` per query (vendor searches weight it ~0.02).
+
+## Deferred — per-narrative web search (Kimi K3 swarm)
+
+A researcher swarm could take the assembled context and run *targeted* searches per light dimension — passions, style corpus, peer evidence — reusing the deep-bio identity-collision protocol and search budgeting. Explicitly **out of scope for this build**: first exhaust captured context, measure per-dimension null rates, and let the ranked gap list above define the swarm's search targets if/when we fund it. Option C in the [interests ladder](#proposed-interests-synthesis-ladder) is the deliberately-scoped exception — a single-narrative pilot of this pattern.
+
+## Next steps
+
+1. **Decide the assembler shape** — extend `get-person-context` #12570 into the persona YAML superset vs. a new `persona/build-context` function. (Lean extend: meeting prep and personas want the same pull.)
+2. **Draft the one-shot graph pull** — Cypher returning node props + all 1-hop edges with descriptions + neighbor summaries, FalkorDB-safe per the [cyphers](/guides/cyphers) conventions.
+3. **Run the coverage audit** — `deep_bio` / `social_media_influence` counts per datasource (the simple metadata search can't filter list-emptiness; needs a small function or manual query), and re-count `social_insights` on staging.
+4. **Resolve the new array columns** — document on Person Tables, land the write path, or explicitly exclude from v1.
+5. **Sample build** — assemble context for ~10 people across coverage tiers (bare / enriched / enriched+insights / enriched+deep-bio), run the existing Build Persona prompt, and eyeball null rates per dimension to validate this map before changing anything.
+6. **Interests ladder, step 1** — prototype `persona/extract-interests` (Option A) against the same sample, and check the live #12669 trigger path (the Option B dependency).

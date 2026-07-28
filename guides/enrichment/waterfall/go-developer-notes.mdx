@@ -1,10 +1,166 @@
 ---
 title: "Go Developer Notes"
-description: "Implementation notes and handoff material for Go developers rebuilding the enrichment waterfalls."
+description: "Implementation notes and handoff material for Go developers rebuilding the enrichment waterfalls — including the failure modes the sandbox QA skill was written to catch."
 ---
 
 This section collects implementation notes and reference material for Go developers working on the enrichment waterfall rebuild.
 
-<Card title="q-the-sandbox Skill file" icon="file-code" href="/guides/enrichment/waterfall/go-developer-notes/q-the-sandbox-skill-file">
-  Placeholder for the `q-the-sandbox` skill file and its Go developer handoff notes.
+<Card title="qa-the-sandbox Skill file" icon="file-code" href="/guides/enrichment/waterfall/go-developer-notes/qa-the-sandbox-skill-file">
+  The full `qa-the-sandbox` skill file in one copy-paste block — the read-only QA workflow for auditing enrichment sandbox test runs.
 </Card>
+
+## What the QA skill is really telling you
+
+The [`qa-the-sandbox` skill](/guides/enrichment/waterfall/go-developer-notes/qa-the-sandbox-skill-file) reads as a QA runbook, but most of it is a **catalogue of failure modes that actually happened** — each entry earned by a wrong result or a wasted 25-minute run. That makes it the most concentrated source of design guidance available for the rebuild.
+
+The guidance below generalizes those lessons. They are **not** Xano trivia: nearly every one is a distributed-systems or observability problem that will reappear in Go unless it is designed out. Where a lesson is genuinely Xano-specific, it is marked as such and the transferable part is called out.
+
+<Note>
+  Read this alongside the per-pipeline rebuild specs (e.g. [Person Go/AlloyDB Rebuild Spec](/guides/enrichment/waterfall/person-go-rebuild-spec)). The specs say *what to build*; this page says *what has already gone wrong when building it*.
+</Note>
+
+---
+
+## 1. "Done" is a predicate, not a quiet moment
+
+The single most expensive class of error in the campaign was **declaring a run finished while it was still running**.
+
+- A poller comparing only row counts declared quiescence while terminal receipts were still advancing (`success=5 → 7 → 9`) and the subject had not reached `full_enrich`.
+- The person watermark sat still for **223 seconds** mid-run while `queue_imdb_award_graph` grew from 2 to 80 — because IMDb writes `film_tv`, `film_tv_award`, and `imdb_credit_join` **without touching the person row**. A timing-based stillness check committed a preflight, and IMDb then invalidated it.
+
+**For Go:**
+
+- Model completion as an **explicit semantic predicate** — "every terminal receipt is `success`, this person's own IMDb/music rows are terminal, `full_enrich = true`" — never as "nothing changed for N seconds."
+- **Scope the predicate to the entity.** An unscoped "newest row in table X" check lets one busy entity stall every other entity's closeout in production.
+- Any stillness window must be **longer than the slowest actor that can wake the system**. A "4 identical polls" rule over ~3.5 minutes fired entirely between 6-minute sweeper cycles and reported a stalled run as settled.
+- **Deferral is not an error.** A receipt deliberately deferring, or a dependency that is not yet ready, must be excluded from stranded/idle detection — otherwise every long-running root reports a false positive.
+
+## 2. Diagnostics must not perturb what they measure
+
+Calling the sweeper to find out why a receipt was stuck **reset the 120-second quiescence window on every call**. The receipt was reported stuck for 15 minutes; it settled 90 seconds after the manual calls stopped.
+
+**For Go:** keep a strict separation between the **read/inspect path** and the **actuate path**. Expose a read-only status endpoint that reports the receipt, its lease, and the quiescence inputs without touching them. If an operator can only diagnose a worker by invoking it, the system cannot be debugged under load.
+
+Related: the quiescence gate also fails open — *any* unrelated writer touching the watched row inside the window starves closeout up to the 60-minute ceiling. Prefer a predicate over specific expected state to a generic "has anything changed" watch.
+
+## 3. Health is not row counts — instrument severity from day one
+
+`log_crash` is **an audit log that also carries success telemetry**. On a freshly wiped sandbox: 24 rows, **zero** with a non-empty `error_message`. During a normal run it climbs into the hundreds with zero actual failures.
+
+Worse, the inverse also fails: the `phase` column is a strict enum, so a genuine crash writing an unlisted value **kills the logger and leaves no row at all**. Absence of rows is not health either.
+
+**For Go:**
+
+- Separate `severity` as a first-class typed column. Never infer failure from a row count.
+- An unknown/unmapped enum value must degrade to a safe default, **never** fail the write. A logger that can fail on the error path is worse than no logger.
+- Report `real_failures` and `telemetry` as distinct numbers in any health output.
+- **Small-N movement is noise.** A duplicate count moved 3 → 1 → 3 → 2 across runs while the underlying bug was untouched — that was input-size variance, not evidence a fix worked. Confirm the root cause, then confirm the count is *zero*.
+
+## 4. The recurring defect shape
+
+Five separate bugs in one campaign were the same bug at different scopes:
+
+> **A value computed from a partial view, with nothing to revisit it once the rest arrived.**
+
+The successive fixes widened the scope each time — debounce, then sibling propagation, then symmetric equalization, then a writer-side refresh — because each fix still computed from an incomplete view.
+
+**For Go**, when any derived/denormalized field looks wrong, ask two questions before touching the formula:
+
+1. What did this see at the moment it was computed?
+2. What would ever recompute it?
+
+Two hard rules fall out:
+
+- **One writer per mutable field.** A second writer added "to reconcile" desynced 18 previously-correct pairs.
+- **Prefer a self-healing write path to a one-shot cleanup pass.** A reconciliation pass at the end of a cascade loses races against writes that continue after it, and silently misses rows outside its scoping key.
+
+Corollary for comparisons: **the value used in a gate must be the value that gets persisted.** One bug compared against a derived `pairTier` while writing `seedTier`, producing permanently split pairs. A code comment asserting the two are equal is not proof — that comment existed and was wrong.
+
+## 5. When a race is legitimate, classify it — don't try to prevent it
+
+A check-then-insert against a unique constraint with concurrent callers **will** collide, and the loser's outcome is already correct: the row exists, which is what was wanted. Four attempts to swallow the collision inside the writer failed or made things worse (one turned 2 benign log entries into 9 hard failures).
+
+The fix that worked was to **classify at the catch site**: a benign duplicate is recorded as telemetry with the original error preserved in a data field; real failures log unchanged.
+
+**For Go:** this is `INSERT ... ON CONFLICT DO NOTHING` followed by an unconditional read-back — express the intent declaratively rather than guarding it. And **expect more than one call site**: the same duplicate surfaced from two independent callers, and fixing one left the other reporting a real crash. Grep every error path before declaring it done.
+
+## 6. A green test is not evidence unless it can fail
+
+A fixture returned `passed: true` for the **entire life** of a live bug that produced 18 mismatches across 55 pairs. Its setup made the derived default and the explicit input always equal, so the assertion was structurally incapable of reaching the failure.
+
+**For Go / the parity harness:**
+
+- For every test, ask **what value it varies**. When code chooses between an explicit input and a derived default, the test must supply an explicit input that **disagrees** with the default.
+- **A check with no rows must report `vacuous`, never pass.** A green tick on an empty set is how a 126-row stall stayed hidden. This applies directly to the parity harness: a fixture that exercises zero awards must not report the award assertions as green.
+- Assert the **boundary**, not just the happy path. Debounce tests backdate the clock by two hours to prove a promotion still fires — without that, a debounce that never promotes looks identical to a working one.
+- Beware order effects: fixtures that seed real rows will corrupt a census taken concurrently.
+
+## 7. Identity: canonicalize on stable keys, and don't over-index
+
+- **Canonicalize on the provider's stable natural key** — a normalized IMDb `nm…` id, an MBID — **never** a transient internal row id. Strip query/fragment, tolerate scheme/host/trailing-slash variants. Duplicate root rows created because one entity was represented by two internal ids are hard failures.
+- **Two nodes for one human can be correct.** A `Music_Artist`-labelled stage-name node with `master_person_id = null`, linked by `SAME_AS` to the canonical Person, is by design — the artist node legitimately carries the music subgraph. Read `labels(n)` and resolve `SAME_AS` before reporting duplication.
+- **Do not put a unique index on a shared MERGE key.** `canonical_identity_key` is the graph MERGE key for awards, so co-nominees deliberately share it — uniqueness on it alone would shatter one award into N nodes. The correct constraint was the **composite** `(canonical_identity_key, imdb_person_id)`.
+- **Read the actual index list before theorising about any duplicate error.** Three consecutive fix attempts were wasted guarding a table that had no unique index at all.
+
+## 8. A queue row is not a graph node
+
+Deferred materialization makes the relational and graph views diverge badly: **68 of 89 award rows and 24 of 30 title rows had no graph node** while every queue row looked healthy.
+
+**For Go:**
+
+- Always cross-check the **table row carrying a non-empty `node_uuid`** against a `MATCH (n:Label) RETURN count(n)`. A clean queue census says nothing about graph completeness.
+- When reconciling, subtract the undrained queue before escalating — "18 rows vs 2 nodes" is not a leak when 16 rows are still queued.
+- A near-empty downstream queue can be a **symptom of a missing drain upstream**, not a regression in the thing that fills it. Confirm the upstream precondition before opening a bug hunt.
+
+## 9. Graph write semantics that bite silently
+
+Carry these into `internal/graph` as helper behaviour, not per-writer discipline:
+
+- **The graph wrapper may return an error as a *string* rather than raising.** Validate that the response is an object with a non-empty `data` array before indexing it. A Go client must turn this into a real `error` — otherwise failures read as silent nulls and the older graph stays untouched while the caller reports success.
+- **Required properties must be stamped on the update path too**, not only on create. Identity preservation without property parity is not a successful repair — compare the settled row against an independent graph readback after replay.
+- **Do not derive one property from another assigned earlier in the same `SET` clause** — the derived expression may evaluate against the pre-update value. Derive both from the authoritative source, or split into ordered clauses.
+- Insert an explicit `WITH` boundary before a `MATCH`/`OPTIONAL MATCH` that follows a `MERGE`/`SET`.
+- Use `'Label' IN labels(n)` in `WHERE`; remove a property by setting it to `NULL`; parameterize so query plans cache.
+- **Assert idempotency by replaying in both directions.** Replay person-first and title-first and require unchanged node, edge, and queue identities — self-healing must not mint a second node.
+
+## 10. Distinguish "no data" from "couldn't read"
+
+A one-sample instance blip made a `|| echo 0` fallback print zeros for every table, which looked exactly like a wiped database. Separately, a run against an empty sandbox logged 26 consecutive minutes of "0 errors" — indistinguishable from a clean pass.
+
+**For Go:** never let a failed read collapse into a zero. Return an explicit error/sentinel, and **always print a denominator alongside any error count**. Zero errors over zero rows is not a pass.
+
+The same reasoning applies to preconditions: assert that the work actually started (a real invocation returns an id and takes ~24s; a dedup no-op returns HTTP 200 in ~2s). **Timing alone can distinguish a real run from a no-op** — assert on the outcome, not the status code.
+
+## 11. Cross-run totals are not comparable
+
+The IMDb scrape returned **10, 38, and 54 credits across runs of the same subject**. Any assertion on a raw total is therefore unstable by construction.
+
+**For Go:** parity assertions must compare **pass/fail predicates and ratios**, not absolute counts, and every census should record the input size it came from. This is the same instinct the migration plan already applies to LLM prose — exact-match structured identity fields, tolerance elsewhere.
+
+## 12. Xano-specific traps — and what survives the port
+
+These are Xano artifacts. Do not reimplement them, but **do** carry the underlying lesson:
+
+| Xano trap | Transferable lesson |
+| --- | --- |
+| A whole-table schema save silently strips column validators — including through the UI, irreversibly | Don't let correctness depend on a storage-layer constraint you can lose in a routine migration. Enforce canonical values **in code**; treat DB constraints as a redundant second line. |
+| A variable bound inside `try` is out of scope afterwards; `var.update` before a `try` isn't visible inside it | Scope rules differ between languages, but the general form holds: **verify control-flow assumptions at runtime**, not by reading. This one turned 2 benign logs into 9 hard failures. |
+| A publish that parses does not prove embedded code blocks serialized correctly — fetch back and diff | **A successful deploy is not a successful change.** Verify the artifact that actually landed. |
+| Authenticated routes return `401 Invalid token` when the instance's DB is down, because auth hits the same DB | An auth error can be a **dependency** error. Check an unauthenticated path before concluding anything about credentials — and require several consecutive clean checks before starting a long run. |
+| Table IDs that "look obvious" are wrong (`160` is not `master_person`) | Resolve identifiers **by name** at startup; never hardcode a numeric id you inferred. |
+
+## 13. Suggested acceptance gate
+
+The QA skill's standing gate is a good model for the Go parity harness. A clean run means **all** of these, not "mostly green":
+
+1. Derived/denormalized fields agree across every related pair — 0 mismatches.
+2. No entity banded/tiered worse than its own evidence implies.
+3. No aggregation onto a null/zero key.
+4. No collapse to a default tier that is only reachable by promotion.
+5. No silent loss — inputs consumed ≤ rows materialized + rows queued.
+6. **Real** failures = 0, filtering on severity; benign races classified as telemetry.
+7. All core terminal receipts `success`.
+8. Optional branches (e.g. Deep Bio) scored **separately** — `success` or `not_requested`, never folded into the core score.
+9. Every entity reaches its completion flag.
+
+Point 8 matters structurally: an optional branch folded into the core score makes a passing run look degraded and a degraded run look passing.

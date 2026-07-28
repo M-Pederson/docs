@@ -1,0 +1,702 @@
+---
+title: "Person Go/AlloyDB Rebuild Spec"
+sidebarTitle: "Go Rebuild Spec"
+description: "Rebuild-grade implementation contract for porting the Person waterfall from frozen Xano workspace 3 into Go services on GCP, AlloyDB, and Orbiter Universe."
+---
+
+<Warning>
+  **The Person waterfall is NOT frozen.** The [migration plan](/guides/open-work/orbiter-univers-standalone/enrichment-gcp-migration) pins every spec to a hard-frozen reference (Step 1). Measured against live Xano on **2026-07-28**: **115 of 201** function bodies carry a version line dated *after* the 2026-07-09 freeze sign-off, and **two changed today** — `enrich-master-person` #13040 (v3.85) and `deep-research-person-or-company` #12747. Treat this page as a **dated snapshot, not a pinned contract**, and re-run the extraction at actual freeze time before a developer builds against it.
+</Warning>
+
+## 1. Executive Summary
+
+The Person waterfall turns a thin identity hint — a name, an email, a LinkedIn URL — into an enriched `master_person` record, a `Person:Entity` graph node with its work/education/expertise edges, and a projection package the App renders as a person card.
+
+The live call graph is **201 functions** reached from **10 execution roots**. Structurally it is four layers:
+
+| Layer | What it does | Anchor |
+| --- | --- | --- |
+| **Entry gate** | Normalize input → kill-switch → pre-API dedup → provider cascade → resolve → write rows → dispatch | `master-person-new` #13039 |
+| **Orchestrator** | 13 phases (0–12, phase 9 twice) over the resolved person | `enrich-master-person` #13040 |
+| **Terminal layer** | Deterministic checkpoint receipts + lease-based retry sweeps that decide when a run may be called finished | `seed-person-terminal-run` #13205, sweep #13260 |
+| **Leaf layer** | ~130 record writers, link/social scrapers, graph and storage helpers | `process-enrich-layer` #12615, `create-master-link` #2541 |
+
+Three things dominate the port:
+
+1. **The terminal/receipt layer is the hard part, not the phases.** A person run is not "done" when phase 12 returns — it is done when a seeded checkpoint set is satisfied and the current-company dependency resolves. This layer was built after the last spec-grade audit and is where the recent churn is concentrated.
+2. **Two load-bearing default-coercion bugs** (section 20) change queue behavior for explicit `0`. Reproducing them faithfully is arguably wrong; both are flagged as `Open question for Mark`.
+3. **The graph MERGE key must change.** Xano MERGEs `Person` on `master_person_id` (an int PK). Universe has no such id — the Go writer must MERGE on `universe.entity.id`. This is the single largest intentional deviation in the port.
+
+## 2. How to Use This Spec
+
+- **This page is the Go build contract.** The [Person Waterfall](/guides/enrichment/waterfall/person-waterfall), [Entry Points](/guides/enrichment/waterfall/person-entry-points), [Functions](/guides/enrichment/waterfall/person-functions), [Tables](/guides/enrichment/waterfall/person-tables), [Nodes](/guides/enrichment/waterfall/person-nodes), [Edges](/guides/enrichment/waterfall/person-edges), [Crons](/guides/enrichment/waterfall/enrichment-crons), [prompts](/guides/enrichment/person-pipeline/llm-system-prompts), [model summary](/guides/enrichment/person-pipeline/model-summary), and [cyphers](/guides/cyphers/person-pipeline) pages are reference context — not the implementation checklist.
+- **Implement the shared `internal/*` packages first** (section 3), then this pipeline. Do not build provider, LLM, embedding, or graph clients inline.
+- **Parity-first** ([decision #3](/guides/open-work/orbiter-univers-standalone/enrichment-gcp-migration#decisions-made)). Any change to orchestration order, dedup keys, graph shape, queue semantics, or a provider contract needs **Mark's sign-off before implementation**, not after.
+- Where this spec says `Fix in Go` or `Open question for Mark`, it is recording a deliberate divergence candidate — not licence to redesign freely.
+
+## 3. Shared Go Foundations Expected
+
+Person is the **long pole** and the deepest consumer of the shared substrate. It cannot start until these exist:
+
+```text
+internal/config        env, provider keys, runtime datasource, feature flags
+internal/provenance    canonical source strings + the "source rides the record" rule
+internal/providers     PDL, Enrich Layer, Exa, FullEnrich, Serper, ScrapeCreators, Firecrawl
+internal/llm           OpenRouter client, strict JSON parsing, retry-on-empty-content, model registry
+internal/embeddings    Gemini gemini-embedding-001 (1536, L2-normalized)
+internal/graph         Universe FalkorDB writer, MERGE envelope helper, vecf32 helper
+internal/store         AlloyDB repositories (pgx/v5 + pgxpool), transactions, unique constraints
+internal/queues        depth/tier/upsert primitives, lease + SKIP LOCKED workers, DLQ
+internal/projections   person projection package builder
+internal/fixtures      provider replay + parity assertions
+```
+
+**Blocking for Person specifically:** PDL, Enrich Layer, Exa, and FullEnrich clients (FullEnrich is **async webhook-based** — it needs a callback route, not just a client), plus the Cloud Run deep-research transport.
+
+## 4. Freeze Manifest
+
+Full 201-row inventory with `updated_at`, newest in-body version date, and the pulled-vs-cited reconciliation lives at `/Users/markpederson/work/rebuild_specs/person/manifest.md`. **72 functions are cited by ID** in this spec; **129 are folded into summary tables** (sections 8.6 and 12) — none were silently dropped.
+
+### Execution roots
+
+| Root | Kind | Driver |
+| --- | --- | --- |
+| `mvp/get-add/master-person-new` #13039 | function | HTTP `POST /master-persons` endpoint #7977 (group 350, `api:WKgay2AU`) |
+| `mvp/enrich/enrich-master-person` #13040 | function | direct async dispatch; Task #126 |
+| `mvp/get-add/master-person-from-exa` #12997 | function | company orchestrator #12992 Step 7 (C-suite) |
+| `mvp/enrich/process-full-enrich` #13049 | function | **API #8594** `api:8hTTyqsU/webhook/contact-finished` |
+| `mvp/enrich/ingest-deep-bio-provider-callback` #13296 | function | Cloud Run Deep Bio callback (API-driven; no function caller) |
+| `mvp/enrich/sweep-person-non-bio-terminal-retries` #13260 | function | **Task #192 (ACTIVE, live, 60 s)**, Task #193 (ACTIVE, sandbox) |
+| `mvp/enrich/sweep-person-deep-bio-retries` #13297 | function | **none — undriven** |
+| `mvp/queue/process-enrichment-queue` #12816 | function | manual / "Run Now" |
+| `mvp/queue/upsert-enrich-person` #12854 | function | Task #156 |
+| `batch-seed-fundable-person` #12853 | function | Task #155 |
+
+<Note>
+  **API-endpoint IDs and function IDs are separate sequences.** API #8594 is the FullEnrich webhook; function #8594 is unrelated. Fetch endpoints with the Metadata API, never `xano function get`.
+</Note>
+
+### Cron state (part of the frozen contract)
+
+| Task | Function | Source | Freq | Active |
+| :-: | --- | --- | ---: | :-: |
+| **#192** | `sweep-person-non-bio-terminal-retries` #13260 | live | 60 s | **true — load-bearing** |
+| **#193** | sandbox twin | sandbox | 60 s | **true** |
+| #126 | `process-person-queue` → #13040 | live | 600 s | false |
+| #155 / #156 / #179 / #185 | seeds + backfills | live/sandbox | — | false |
+
+Task #192 is the only executor of a reserved terminal receipt. Without it, every person's receipt stays pending forever — it is control-plane, not throughput.
+
+## 5. Source Docs Read
+
+[Enrichment GCP Migration](/guides/open-work/orbiter-univers-standalone/enrichment-gcp-migration) (decisions, target architecture, deferred items) · [Projection Pattern](/guides/open-work/orbiter-univers-standalone/projection-pattern) · [Universe Lookup Tables](/guides/open-work/orbiter-univers-standalone/universe-lookup-tables) · [Tables: Universe vs Orbiter Backend](/guides/open-work/orbiter-univers-standalone/tables-universe-vs-orbiter-backend) · the seven Person waterfall pages · [person system prompts](/guides/enrichment/person-pipeline/llm-system-prompts) · [model summary](/guides/enrichment/person-pipeline/model-summary) · [person cyphers](/guides/cyphers/person-pipeline) · [expertise cyphers](/guides/cyphers/expertise).
+
+## 6. Entry Points and Public Contracts
+
+### `POST /master-persons` — endpoint #7977
+
+Bearer auth plus `X-Data-Source` and `X-Branch`. Supplying `master_person_id` **short-circuits the gate**: emails/phones/notes attach to that existing person and #13039 is never called.
+
+### `mvp/get-add/master-person-new` #13039 — input contract
+
+Live input block, verbatim types and filters:
+
+| Field | Type | Opt | Filters | Default semantic |
+| --- | --- | :-: | --- | --- |
+| `full_name` | `text?` | ✅ | `trim` | split by #2649 |
+| `email` | `email[]` | ✅ | `trim\|lower` | — |
+| `links` | `text[]` | ✅ | `trim` | — |
+| `phone_numbers` | `text[]` | ✅ | `trim` | — |
+| `company_name`, `title` | `text?` | ✅ | `trim` | employer hints |
+| `user_id` | `int?` | ✅ | — | `=0` |
+| `queue` | `bool` | ✅ | — | queue instead of sync-enrich |
+| `deep_research` | `bool` | ✅ | — | gates the whole Deep Bio branch |
+| `cascade_depth` | `int` | ✅ | — | `first_notempty:0` — **benign** (default is 0) |
+| `priority_tier` | `int` | ✅ | — | `first_notempty:4` — ⚠️ **explicit 0 → 4** |
+| `is_c_suite`, `hold_downstream`, `orbiter_verified` | `bool` | ✅ | — | no coercion filter |
+| `source`, `data_source`, `source_function` | `text?` | ✅ | `trim` | provenance |
+| `source_entity_id` | `int?` | ✅ | — | `=0` |
+| `source_entity_uuid`, `source_entity_type` | `text?` | ✅ | `trim` | provenance |
+
+<Warning>
+  **`source` vs `data_source` are different things.** `source` is business attribution (a provenance string that rides the record). `data_source` is the **environment selector** (`live` / `staging` / `sandbox`). The legacy numeric `data_source_id` input was dropped in #13039 v1.4; table 161 is deprecated. **The AlloyDB target uses `source` text only** — do not recreate `data_source_id`.
+</Warning>
+
+## 7. End-to-End Worked Example
+
+### Example A — happy path, new person (Zeno Rocha)
+
+```json
+{
+  "full_name": "Zeno Rocha",
+  "email": ["zeno@resend.com"],
+  "profile_url": "https://www.linkedin.com/in/zeno-rocha-6270a914"
+}
+```
+
+Expected control flow:
+
+1. **#13039** trims/lowers inputs; `name-format` #2649 splits `full_name` → first/middle/last/suffix/nickname.
+2. **Kill switch** `check-kill-switch-v2` #4617. Blocked → `log_crash` #542 and return; no person row.
+3. **Pre-API local dedup** — `master_link` on normalized LinkedIn URL, then `master_email`, then `master_person` name match.
+4. **Provider cascade** `cascade-person-data` #13037: PDL `POST /v5/person/enrich` → Enrich Layer `person-linkedin` / `person-email` → Exa fiber `#13179` → Exa profile `#12738`.
+5. **Resolve** `match-master-person` #13038 (also E.164-formats phones via #2540).
+6. **New-person branch** — `db.add master_person`, `add-person-node` #2601 (graph), `create-master-link` #2541, `upsert-person-alias` #13187, emails/phones, `link-fundable-person` #12793.
+7. **Dispatch** — `enrich-master-person` #13040 **async-shared** (or `upsert-enrich-person` #12854 if `queue` or `cascade_depth > 0`).
+8. **#13040** seeds the terminal checkpoint set (#13205) **before phase 7**, runs phases 0→12, then `run-person-orchestrator-terminal` #13207.
+9. Root closeout selects a sparse current company → records `person_terminal_company_dependency` #760 → dispatches `enrich-master-company` #12992 at depth 0.
+10. **Task #192** (60 s) reclaims the receipt if the async terminal dispatch was lost.
+
+Expected AlloyDB writes:
+
+| Table | Key | Important fields |
+| --- | --- | --- |
+| `universe.entity` | `id` (uuid) | `entity_type='person'`, `enrichment_state`, `cascade_depth=0`, `graph_node_uuid` |
+| `universe.entity_identifier` | `(kind,normalized_value)` where strong | `linkedin` → strong; `email` → strong; `name` → soft |
+| `universe.person` | `entity_id` | names, `current_title`, `current_company_id`, `bio`, `avatar_url` |
+| `universe.entity_fact` | `(entity_id,field)` where chosen | one row per source per field, `is_chosen` winner |
+| `universe.enrichment_payload` | `(entity_id,provider,request_hash)` | raw PDL / EL / Exa envelopes |
+| `person_terminal_stage` | `(entity_id, run_id, stage)` | checkpoint receipts |
+
+Expected graph writes:
+
+| Node/Edge | MERGE key | Required properties |
+| --- | --- | --- |
+| `(:Person:Entity)` | `universe.entity.id` (**was** `master_person_id`) | `uuid`, `created_at`, `updated_at`, `display_label`, `name`, `visibility`, `embeddings` |
+| `(p)-[:WORKS_AT]->(c)` | endpoint pair | `created_at` via `coalesce`, `updated_at`, `title`, `weight`, `description` |
+| `(p)-[:HAS_EXPERTISE]->(d)` | endpoint pair | `weight` = `min(round(10 + match_score × 160), 50)`; created edges flat `10` |
+
+Acceptance checks:
+
+- Re-running the same input creates **no** second `universe.entity`.
+- Re-run leaves graph `created_at` unchanged and moves `updated_at`.
+- The person node carries `:Entity` (the shared vector index lives on that base label).
+
+### Example B — explicit-zero regression (the parity trap)
+
+```json
+{ "full_name": "Ada Lovelace", "email": ["ada@example.com"], "priority_tier": 0, "queue": true }
+```
+
+Live Xano behaviour: #13039 applies `priority_tier|first_notempty:4`, so **tier 0 becomes tier 4**. Task #126 drains only `priority_tier <= 1` — the row never drains. Entering through `upsert-enrich-person` #12854 directly instead applies `first_notnull:4` and **tier 0 survives**.
+
+The fixture must assert whichever behaviour Mark rules correct (section 22, Q1). Do not let a developer pick silently.
+
+### Example C — dedup hit
+
+Same LinkedIn URL, second submission: the pre-API dedup resolves before any provider call, no PDL/EL/Exa spend, `count` on the queue row increments, `priority_tier`/`cascade_depth` take the **better** (lower) of existing vs incoming, and `source_*` fields are backfilled with `first_notempty` only where currently empty.
+
+## 8. Function Contract Sheets
+
+### 8.1 `mvp/get-add/master-person-new` #13039
+
+**Role:** THE entry gate. 2,973 lines, 53 `try_catch` blocks, 6 lambdas, `first_notempty` ×25, `first_notnull` ×0.
+
+**Reads:** `master_person`, `master_link`, `master_email`, `master_phone`, `fundable_people`, `fundable_angel_investments`, `runtime_metadata`.
+**Writes:** `master_person`, `person_enrich_data`, `enrich_history_person`, `log_enrichment_person`, `human_review_required`, `log_crash`.
+**Calls:** #13037, #13038, #2649, #4617, #12820, #13183, #13187, #2541, #2601, #2784, #2783, #2540, #12793, #12615, #2536, #237, #13036, #12854, #13040.
+**Dispatch mode:** `async-shared`.
+
+```go
+func MasterPersonNew(ctx context.Context, in GateInput) (GateResult, error) {
+    in = normalize(in)                       // trim; lower emails
+    name := nameFormat(ctx, in.FullName)     // #2649 LLM split
+
+    if blocked, _ := killSwitch(ctx, in); blocked {
+        logCrash(ctx, "kill-switch", in)
+        return GateResult{Blocked: true}, nil   // no person row
+    }
+
+    // pre-API local dedup, in this order — cheapest and strongest first
+    if id, ok := findByNormalizedLinkedIn(ctx, in.Links); ok { return existing(ctx, id, in) }
+    if id, ok := findByEmail(ctx, in.Email);            ok { return existing(ctx, id, in) }
+    if id, ok := findByNameHints(ctx, name, in);        ok { return existing(ctx, id, in) }
+
+    payloads := cascadePersonData(ctx, in)   // #13037 — PDL → EL → Exa fiber → Exa
+    match    := matchMasterPerson(ctx, in, payloads) // #13038
+
+    entity := createPersonEntity(ctx, name, in, match) // universe.entity + universe.person
+    writePersonNode(ctx, entity)                       // #2601 equivalent
+    upsertAliases(ctx, entity, payloads)               // #13187
+    attachLinksEmailsPhones(ctx, entity, in, payloads)
+    linkFundable(ctx, entity)                          // #12793
+
+    // PARITY TRAP — see §20 D1. Live Xano coerces an explicit 0 to 4 here.
+    tier  := firstNotEmpty(in.PriorityTier, 4)
+    depth := firstNotEmpty(in.CascadeDepth, 0)   // benign: default is 0
+
+    if in.Queue || depth > 0 {
+        return queueUpsert(ctx, entity, depth, tier, in.DeepResearch)
+    }
+    go enrichMasterPerson(ctx, entity.ID, in.DeepResearch, depth) // async-shared
+    return GateResult{EntityID: entity.ID}, nil
+}
+```
+
+**Idempotency key:** normalized LinkedIn URL (strong) → email (strong) → name + employer hint (soft, must not be globally unique).
+**Failure behaviour:** every stage is individually `try_catch`-wrapped; a failed stage logs to `log_crash` and the gate continues. Only the kill switch returns early.
+**Artifact decisions:** the 53 nested try/catch blocks are a Xano control-flow workaround — in Go use one error type per stage plus a stage-result accumulator, not 53 nested recoveries. `Xano artifact — do not reimplement`.
+
+### 8.2 `mvp/enrich/cascade-person-data` #13037
+
+**Role:** provider cascade. No DB writes except `log_crash`.
+**Calls:** `api/enrich_layer/person-email` #12734, `api/enrich_layer/person-linkedin` #12612, `api/exa/fiber-person-email` #13179, `mvp/enrich/get-exa-profile` #12936.
+**Direct HTTP:** `https://api.peopledatalabs.com/v5/person/enrich`.
+**Contract:** tiered — PDL first; Enrich Layer supplements (a rich PDL response used to suppress volunteering/newer roles, which is why #13039 v1.26 requests one supplemental EL LinkedIn profile for depth-0 roots); Exa is the fallback identity source.
+
+### 8.3 `mvp/resolve/match-master-person` #13038
+
+Resolves provider payloads to an existing person id and formats phones to E.164 via `llm-phone-format` #2540 — the `master_phone` dedup key. Observability field `match_via` records which key won.
+
+### 8.4 `mvp/enrich/enrich-master-person` #13040
+
+**Role:** the orchestrator. 3,383 lines, `try_catch` ×37, `precondition` ×8, `first_notnull` ×26, `first_notempty` ×7. **v3.85 (2026-07-28).**
+
+**Input:** `master_person_id` plus `deep_research`, `cascade_depth`, `force_run`, `current_company_only`, `allow_investor_network_cascade`.
+
+**Pre-flight:** stale-dispatch guard (person row deleted since the async fire → early return + `log_crash`), then a **60 s source-keyed debounce** on `enrich_history_person` where `source == "Master Person Enrich"`; `force_run: true` bypasses. The setup row is upsert-keyed on `(master_person_id, source)`, so the debounce key is `updated_at`.
+
+```go
+func EnrichMasterPerson(ctx context.Context, req EnrichReq) error {
+    p, ok := loadPerson(ctx, req.EntityID)
+    if !ok { logCrash(ctx, "stale dispatch"); return nil }
+    if debouncedWithin(ctx, p, 60*time.Second) && !req.ForceRun { return nil }
+
+    seedTerminalRun(ctx, p)                       // #13205 — BEFORE phase 7
+
+    for _, ph := range []int{0,1,2,3,4} { runPhase(ctx, p, ph) }
+    runExaProfile(ctx, p)                         // 4b — #13031
+    runPhase(ctx, p, 5)
+    runPhase9(ctx, p, WithThesis(false))          // EARLY phase 9
+    runPhase(ctx, p, 6)
+    chooseBestCurrentRole(ctx, p)                 // #12621
+    recordTerminalStage(ctx, p, "pre_phase_7")    // #13203
+    runPhase(ctx, p, 7)                           // edge resolvers
+    runPhase(ctx, p, 8)                           // expertise
+    reverseMusicBridge(ctx, p)                    // 8b, env-gated #13171
+    runPhase9(ctx, p, WithThesis(true))           // phase 9 AGAIN
+    runPhase(ctx, p, 10)                          // NO-OP STUB — still called
+    runPhase(ctx, p, 11); runPhase(ctx, p, 12)
+
+    finalizeSemanticState(ctx, p)                 // #13194 — the success gate
+    runOrchestratorTerminal(ctx, p)               // #13207
+}
+```
+
+Every phase runs in its own `try_catch` writing per-phase `qa_passed` / `CRASH: phase-N` rows to `log_crash` #542 — whose `phase` column is a **strict enum**; writing an unlisted value makes the crash logger itself fail. Failures are logged but never block later phases.
+
+**`Fix in Go`:** phase 10 #12831 is an empty stack (`{}`) still invoked with its own try/catch and qa log. Do not port the call site.
+
+### 8.5 Terminal receipt layer
+
+| Function | ID | Contract |
+| --- | :-: | --- |
+| `seed-person-terminal-run` | #13205 | Seeds one deterministic checkpoint set per run. Called **before phase 7** so an uncatchable phase-7 death is observable rather than silent. |
+| `record-person-terminal-stage` | #13203 | Records a stage transition; sanctions `success → running` for the auxiliary preflight stage. 3 preconditions. |
+| `run-person-orchestrator-terminal` | #13207 | Settles the orchestrator barrier immediately after terminal materialization, **before** shared coordination. |
+| `run-person-non-bio-terminal-continuation` | #13235 | 1,179 lines, 12 preconditions. The canonical run id emits the **company-less** path so a person with no resolvable employer still terminates. |
+| `sweep-person-non-bio-terminal-retries` | #13260 | 1,408 lines, 6 preconditions. **Task #192**, 60 s. Reclaims due retry receipts; re-enters #13194, #12621, #13277 directly. |
+| `ensure-person-terminal-current-company` | #13206 | Derives the selected company from the canonical current-role row. |
+| `retry-person-current-company-dependency` | #13277 | A claimed retry that fails closes through its **owned lease token** rather than stranding a running receipt. |
+
+**Go model:** this is a durable saga with leases. Implement as a `person_terminal_stage` table plus a `FOR UPDATE SKIP LOCKED` lease worker — not as in-process retries. The lease token is load-bearing: #13277 v1.2 exists specifically because closing without it stranded receipts.
+
+### 8.6 Leaf layer (129 functions, folded)
+
+Record writers (`add-education-record` #2788, `add-position-record` #12608, `add-person-skills` #1459, …), link/social scrapers under `create-master-link` #2541, Crunchbase parsers, avatar + GCS storage helpers, and the `merge/company-v2` #12956 subtree reached via `reconcile-source-duplicates` #13191. Full roster and grouping: [Person Waterfall Functions](/guides/enrichment/waterfall/person-functions). Each is dedup/idempotent-keyed and carries no orchestration logic; in Go they collapse into repository methods on `internal/store`, not separate services.
+
+## 9. Orchestration State Machine
+
+```text
+                    ┌─────────────┐
+  HTTP #7977 ──────►│  #13039     │──kill switch blocked──► log_crash, STOP
+  C-suite #12997 ──►│  entry gate │
+                    └──────┬──────┘
+                           │ dedup miss
+                    ┌──────▼──────┐
+                    │  #13037     │ PDL → EnrichLayer → Exa fiber → Exa
+                    │  cascade    │
+                    └──────┬──────┘
+                    ┌──────▼──────┐
+                    │  #13038     │ resolve + E.164 phones
+                    └──────┬──────┘
+              queue||depth>0 │ else async-shared
+              ┌──────────────┴───────────────┐
+       ┌──────▼──────┐                ┌──────▼─────────┐
+       │  #12854     │  Task #126     │   #13040       │
+       │ queue upsert│───(inactive)──►│  orchestrator  │
+       └─────────────┘                └──────┬─────────┘
+                                             │ seed #13205 BEFORE phase 7
+                          phases 0..4 → 4b → 5 → 9(early) → 6 → role sync
+                                    → 7 → 8 → 8b → 9 → 10(stub) → 11 → 12
+                                             │
+                                    ┌────────▼────────┐
+                                    │  #13194         │ semantic success gate
+                                    └────────┬────────┘
+                                    ┌────────▼────────┐
+                                    │  #13207         │ orchestrator terminal
+                                    └────────┬────────┘
+                            selected sparse current company
+                                    ┌────────▼────────┐
+                                    │ dependency #760 │──► #12992 at depth 0
+                                    └────────┬────────┘
+                              Task #192 (60s) ──► #13260 sweep ──► #13235 continuation
+```
+
+**Deep Bio branch** (only when `deep_research=true`): `#12747` reserves via `#13301`, Cloud Run calls back into **`#13296`**, which claims a lease and runs `#13295` → `#13294` → `#13208`. `#13297` is the stranded-state sweeper and is **currently undriven**.
+
+## 10. Provider Contracts
+
+| Provider | Host | Called by | Notes |
+| --- | --- | --- | --- |
+| **People Data Labs** | `api.peopledatalabs.com/v5/person/enrich` | #13037, #12857, #13049 | primary identity + employment source |
+| **Enrich Layer** | `enrichlayer.com` | #12734 (email), #12612 (linkedin) | supplements PDL; richer volunteering/recent roles |
+| **Exa** | `api.exa.ai` | #13179 fiber-email, #12936 profile, #12669 social insights | identity fallback + social discovery |
+| **FullEnrich** | `app.fullenrich.com` | #13036 | **async** — replies to webhook API #8594 |
+| **Serper** | `google.serper.dev` | #12846 avatar, #2769 Signal NFX | search |
+| **ScrapeCreators** | `api.scrapecreators.com` | 6 link/social functions | LinkedIn/Twitter/Instagram/YouTube |
+| **Firecrawl** | `api.firecrawl.dev` | #4515, Crunchbase parsers | page scrape |
+| **Cloud Run deep research** | `orbiter-enrich-…run.app` | #12747 | async, callback into #13296 |
+| **ui-avatars.com** | — | #1832 | placeholder avatar |
+| **OpenRouter** | `openrouter.ai` | 25 functions | all LLM traffic — see section 11 |
+
+### FullEnrich — the async one that shapes the architecture
+
+`enrich/full-enrich-reverse-email-lookup` #13036 dispatches; FullEnrich calls back into **API #8594** `POST api:8hTTyqsU/webhook/contact-finished`, which:
+
+1. Reads `custom.person_enrich_data_id`, `custom.data_source`, `custom.current_company_only`, `custom.cascade_depth` off each item.
+2. **v1.8 safety guard** — refuses any item with empty `custom.data_source`, logging and counting it as `refused_no_data_source`. This exists because a sandbox dispatch with `data_source=""` defaulted to **live** and corrupted a real person's record, then retried 5× because FullEnrich's client timeout is shorter than the 95–180 s processing window.
+3. Waits on `enrich_history_person.processing == false` with a 30 s grace and a **30-minute deadline**, then calls `process-full-enrich` #13049 regardless.
+
+<Warning>
+  **Go rebuild must not reproduce the wait loop.** A 30-minute synchronous hold inside an HTTP handler is a Xano-shaped workaround for the lack of a durable queue. In Go: ack the webhook immediately, persist the payload, and enqueue the apply step. The **data_source guard is a real invariant** and must be kept. `Xano artifact — do not reimplement` (the wait); `Preserve for parity` (the guard).
+</Warning>
+
+## 11. LLM Contracts
+
+All LLM traffic is OpenRouter. **Do not duplicate prompts here** — they are canonical on [Person system prompts](/guides/enrichment/person-pipeline/llm-system-prompts) and [model summary](/guides/enrichment/person-pipeline/model-summary). The rebuild contract is:
+
+| Function | Model | Contract note |
+| --- | --- | --- |
+| `name-format` #2649 | `google/gemini-3.1-flash-lite` | strict `json_schema` + response healing, temp 0, 500 tok |
+| `llm-phone-format` #2540 | `google/gemini-3.1-flash-lite` | temp 0.2 / 30 s, one same-model retry; produces the `master_phone` dedup key |
+| `create-llm-person-bios` #2537 | `moonshotai/kimi-k2.5` | two calls + backup-model retry; 229-char + 500-char bios |
+| `llm-identify-person-expertise` #12666 | `qwen/qwen3.7-plus` | reasoning **off**, 2500 tok |
+| `resolve-person-expertise-v2` #12926 | `qwen/qwen3.7-plus` | blurb + guard-band merge adjudication (0.15–0.25) |
+| `deep-person-basic` #12833 | `moonshotai/kimi-k2.6` pinned `["moonshotai","fireworks"]`, `allow_fallbacks:false` | + `openrouter:web_search` / `web_fetch` |
+| `create-expertise-edge-description-from-graph` #13019 | `deepseek/deepseek-v4-flash` | reasoning off; 402 throws via #13136 |
+| `best-current-role` #4540 | `$env.LLM_MODEL_JSON_PARSE` | env-selected — **the Go registry must resolve this indirection** |
+
+**Mandatory client behaviours** (`internal/llm`):
+
+- **Retry on empty content.** Reasoning models can spend the whole completion budget on reasoning tokens and return `content: ""` with the thinking in `message.reasoning`. Pass `reasoning: {enabled:false}` + a `max_tokens` cap for short structured outputs.
+- **Validate then repair.** `validate-deep-research-payload` #13299 → `llm-repair-deep-research-payload` #13291 → `repair-unsupported-current-role-payload` #13292 is a real three-stage contract, not defensive noise.
+- Prose fields are **shape-asserted, never byte-matched** in parity (migration plan, Key risks).
+
+## 12. AlloyDB Target Schema
+
+Person maps onto the four-table Universe backbone plus one typed table. Full DDL: [Universe Lookup Tables](/guides/open-work/orbiter-univers-standalone/universe-lookup-tables).
+
+| Universe table | Person's use | Xano source |
+| --- | --- | --- |
+| `universe.entity` | one row per person; owns `graph_node_uuid`, `enrichment_state`, `cascade_depth`, `merged_into` | `master_person` |
+| `universe.entity_identifier` | LinkedIn / email / phone / PDL / Fundable keys | `master_link`, `master_email`, `master_phone` |
+| `universe.entity_fact` | per-source candidate facts + the `is_chosen` winner | `work_experience`, `education_experience`, `certification`, `honor`, … |
+| `universe.enrichment_payload` | raw PDL / EL / Exa / FullEnrich envelopes | `person_enrich_data` |
+| `universe.person` | distilled winners: names, `current_title`, `current_company_id`, bios, `is_angel`, `is_c_suite`, `avatar_url` | `master_person` |
+
+### Identity strength — the load-bearing rule
+
+```sql
+CREATE UNIQUE INDEX entity_identifier_strong_uq
+    ON universe.entity_identifier (kind, normalized_value)
+    WHERE is_strong_identity;
+```
+
+| Kind | Strong? | Rationale from live Xano |
+| --- | :-: | --- |
+| `linkedin` | ✅ | #13039's first dedup probe; normalized before compare |
+| `email` | ✅ | second probe |
+| `phone` | ✅ | E.164 via #2540 **is** the `master_phone` dedup key |
+| `pdl`, `fundable`, `imdb`, `mbid` | ✅ | provider-issued |
+| `domain`, `name` | ❌ | soft — must map to many entities (two people share a company domain) |
+
+<Note>
+  **The spec deliberately adds constraints Xano lacks.** Xano enforces person dedup in application code with no unique index, leaving a double-create window under concurrency. The Go/AlloyDB target closes it with the partial unique index above. This is an intentional divergence, not a parity break.
+</Note>
+
+### Terminal-stage state (new in AlloyDB)
+
+```sql
+CREATE TABLE universe.person_terminal_stage (
+    id           UUID PRIMARY KEY,
+    entity_id    UUID NOT NULL REFERENCES universe.entity(id) ON DELETE CASCADE,
+    run_id       UUID NOT NULL,
+    stage        TEXT NOT NULL,
+    state        TEXT NOT NULL,          -- pending|running|success|failed
+    lease_token  UUID,                   -- #13277: a claimed retry closes through ITS token
+    lease_expires_at TIMESTAMPTZ,
+    attempts     INT  NOT NULL DEFAULT 0,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (entity_id, run_id, stage)
+);
+```
+
+Provenance: `source` **text** only. Do not recreate `data_source_id` or table 161.
+
+## 13. Queue and Worker Contract
+
+### `queue_enrich_person` (#582) worker
+
+**Upsert key:** `master_person_id` → `entity_id`.
+
+**Merge semantics from `upsert-enrich-person` #12854 (live, verbatim):**
+
+- `cascade_depth` ← `$input.cascade_depth|first_notempty:0` then `best_depth = min(existing, incoming)`; existing default when absent is **99**.
+- `priority_tier` ← `$input.priority_tier|first_notnull:4` then `best_tier = min(existing, incoming)`; existing default **4**. **`first_notnull` here — explicit 0 survives.**
+- `count` ← `existing.count + 1` (existing default 1).
+- `source_*` fields backfilled with `first_notempty` — set only where currently empty.
+
+```sql
+-- drain: strictly ordered, one row per tick in Xano; batch in Go
+SELECT * FROM universe.queue_enrich_person
+ WHERE processing = false AND priority_tier <= $1
+ ORDER BY priority_tier ASC, cascade_depth ASC, id ASC
+ FOR UPDATE SKIP LOCKED
+ LIMIT $2;
+```
+
+**Failure path (live):** on error the drain writes `log_crash` and resets `processing = false` so the row retries. There is **no attempt cap and no DLQ** — a poison row retries forever. `Fix in Go`: add `attempts` + DLQ.
+
+**Cron state:** Task #126 is `active = false`, gated to `priority_tier <= 1` since 2026-07-03. The queue is drained manually via #12816 or "Run Now". **The frozen contract is "not draining."**
+
+## 14. Graph Node and Edge Contract
+
+### `(:Person:Entity)` — writer `mvp/node/add-person-node` #2601
+
+Live Cypher, reconstructed from the generating lambda:
+
+```cypher
+MERGE (p:Person { master_person_id: $master_person_id })
+ON CREATE SET
+  p.uuid           = randomUUID(),
+  p.created_at     = timestamp(),
+  p.updated_at     = timestamp(),
+  p.display_label  = 'Person',
+  p.name           = $name,
+  p.name_embedding = vecf32($openai_1536),   -- optional
+  p.embeddings     = vecf32($gemini),        -- optional
+  p.visibility     = false
+ON MATCH SET
+  p.updated_at     = timestamp(),
+  p.name           = $name,
+  p.name_embedding = vecf32($openai_1536),
+  p.embeddings     = vecf32($gemini)
+SET p:Entity
+RETURN p
+```
+
+| Aspect | Contract |
+| --- | --- |
+| MERGE key | `master_person_id` → **must become `universe.entity.id`** in Universe |
+| `created_at` | set **only** ON CREATE — stable across re-runs (assert this) |
+| `:Entity` | always added; the shared vector index lives on this base label, **not** per-node-type |
+| `visibility` | `false` on create |
+| Embeddings | Xano dual-writes OpenAI `name_embedding` (1536) + Gemini `embeddings`. **Universe carries Gemini `gemini-embedding-001` (1536, L2-normalized) only** — decision #1. `Fix in Go`: drop `name_embedding`. |
+| Retry | 3 attempts, then `log_crash` and abort |
+
+### Edge envelope — `mvp/edges/create-work-edges` #2800
+
+```cypher
+MERGE (p)-[r:WORKS_AT]->(c)
+SET r.created_at  = coalesce(r.created_at, timestamp()),
+    r.updated_at  = timestamp(),
+    r.title       = $title,
+    r.weight      = $weight,
+    r.description = CASE WHEN ... END
+```
+
+`coalesce(r.created_at, timestamp())` is the idempotency guarantee — **one shared helper in `internal/graph`**, never hand-written per writer.
+
+<Warning>
+  **`mvp/falkor/send-cypher` #2815 returns Cypher errors as strings, not thrown errors.** #2601's `try_catch` retry loop therefore cannot see a Cypher-level failure — it only catches transport errors. A Go client **must** inspect the response and return a real `error`, or graph failures read as silent nulls. `Fix in Go`.
+</Warning>
+
+Other conventions carried from the live graph: use `'Label' IN labels(a)` in `WHERE` (FalkorDB rejects `a:Label` there); remove a property by setting it to `NULL` (no `REMOVE`); use parameterized queries so plans cache. Node/edge catalog: [Person Nodes](/guides/enrichment/waterfall/person-nodes) · [Person Edges](/guides/enrichment/waterfall/person-edges) · [person cyphers](/guides/cyphers/person-pipeline).
+
+<Note>
+  **Two known graph gaps carried from the frozen reference** (already documented on the functions page): work-derived `INVESTED_IN` is a dead branch — the classifier hardcodes `isInvestor:false`, so investment edges come only from the deal writers; and **no live writer stamps `:C_Suite`** since #2758 v1.8 dropped the dynamic-label lambda. Decide in Go rather than porting the gap silently (section 22, Q4).
+</Note>
+
+## 15. Projection Contract
+
+One package per completed run, `person_projection.v1` — full shape on [Projection Pattern](/guides/open-work/orbiter-univers-standalone/projection-pattern#person-flow).
+
+```json
+{
+  "schema_version": "person_projection.v1",
+  "run_id": "enrich_run_01H...",
+  "universe_person_uuid": "up_01H...",
+  "source_updated_at": "2026-07-28T19:00:00Z",
+  "display": {
+    "display_name": "Zeno Rocha", "headline": "Founder at Resend",
+    "avatar_url": "https://...", "primary_company_name": "Resend",
+    "primary_company_domain": "resend.com", "location_label": "San Francisco, CA",
+    "summary": "...", "top_skills": [], "top_links": [],
+    "enrichment_status": "complete"
+  },
+  "side_panel_facts": {
+    "roles": [], "skills": [], "work_experience": [], "links": [],
+    "emails": [], "phones": [], "primary_location": {}
+  }
+}
+```
+
+Backend applies it via `apply_person_projection`: validate `schema_version` → resolve/create App identity → upsert `person_display` → **replace** Universe-owned role/skill/location sections → upsert contact methods → record run status.
+
+| Rule | Contract |
+| --- | --- |
+| Direction | **One-way**, Universe → App. Universe never reads `person_display`. |
+| Replace vs merge | Universe-owned sections are **replaced**; product-owned dynamic data (notes, collections, permissions) is never touched. |
+| Idempotency | `projection_run_id`; re-applying the same run is a no-op. |
+| Timing | A seed row appears immediately (`seeded_at`, `seed_source`); the enriched refresh follows on completion. |
+
+**Emission point:** publish only after `finalize-person-semantic-state` #13194 succeeds — that is the live success gate. Emitting at phase-12 completion would publish people whose terminal state later fails.
+
+## 16. Idempotency and Dedup Contract
+
+| Surface | Key | Enforcement today | In Go |
+| --- | --- | --- | --- |
+| Person identity | normalized LinkedIn → email → name+employer | app-code only, **no unique index** | partial unique index on strong identifiers |
+| Phone | E.164 via #2540 | `master_phone` lookup | strong identifier row |
+| Graph node | `master_person_id` | `MERGE` | `MERGE` on `universe.entity.id` |
+| Graph edge | endpoint pair + type | `MERGE` + `coalesce(created_at)` | shared envelope helper |
+| Queue row | `master_person_id` | upsert, `count++`, min-tier/min-depth | same, plus `attempts` + DLQ |
+| Terminal stage | `(entity_id, run_id, stage)` | app-code | `UNIQUE` constraint + lease token |
+| Provider payload | `(entity_id, provider, request_hash)` | whole-envelope JSON | same |
+| Orchestrator re-entry | 60 s debounce on `(master_person_id, source)` | `updated_at` window | same; `force_run` bypass |
+| Deep Bio launch | single-flight reservation #13301 | terminal reservations return `already_completed` | same |
+
+<Note>
+  **Whole-envelope persistence.** `person_enrich_data` stores the **entire** provider response, not just `.data`. Several downstream readers reach into envelope metadata. Persist the full envelope into `universe.enrichment_payload.raw`.
+</Note>
+
+## 17. Error Handling and Observability
+
+| Concern | Live behaviour | Go target |
+| --- | --- | --- |
+| Crash log | `log_crash` #542; `phase` is a **strict enum** — an unlisted value makes the logger itself fail | typed enum in code; unknown → `other`, never a failed write |
+| Log semantics | `log_crash` is an **audit log**, not a crash log — it carries success telemetry too | separate `severity`; never infer health from row counts |
+| Per-phase | each phase writes `qa_passed` / `CRASH: phase-N` and continues | structured per-phase span + result accumulator |
+| Silent death | phase 7 could die uncatchably → `enrich_success=false`, `reason=null`, **zero** crash logs | pre-seeded terminal receipt (#13205) makes it observable — **keep this design** |
+| Graph failure | 3 retries then `log_crash`, run continues | same, but Cypher-string errors must become real errors |
+| Provider failure | logged, cascade continues to next tier | same; record which tier answered |
+
+## 18. Golden Fixture Plan
+
+Capture against an **isolated data source** (sandbox), never live, pinned to the freeze.
+
+| Fixture | Input | Frozen payloads | Key assertions |
+| --- | --- | --- | --- |
+| `person-happy-linkedin` | Zeno Rocha, email + LinkedIn | PDL, EL, Exa, OpenRouter | full write-set, node + WORKS_AT edges, projection emitted |
+| `person-dedup-hit` | same input, second run | none (no provider spend) | no second entity, `count++`, providers **not** called |
+| `person-explicit-zero` | `priority_tier: 0, queue: true` | none | tier semantics per Mark's Q1 ruling |
+| `person-email-only` | email, no LinkedIn | PDL miss → EL → Exa | fallback tier order, `match_via` |
+| `person-company-less` | person with no resolvable employer | PDL thin | #13235 company-less path terminates |
+| `person-csuite-leaf` | via #12997 at depth 1 | Exa + EL | current-roles-only filter; **no** WORKS_AT fanout; education still resolves |
+| `person-deep-bio` | `deep_research: true` | Cloud Run callback | single-flight reservation; #13296 duplicate delivery acks without overwrite |
+| `person-fullenrich` | email-only triggering #13036 | webhook payload | `data_source` guard refuses empty; apply is idempotent |
+| `person-kill-switch` | blocked identity | none | no person row, `log_crash` written |
+| `person-terminal-retry` | run with a dropped async terminal dispatch | — | Task #192 sweep reclaims; lease token closes correctly |
+
+Every fixture defines: expected AlloyDB write-set, graph subgraph (nodes+edges+properties), queue side effects, projection row; exact-match fields (ids, keys, tiers, `source`) vs shape-tolerant fields (bios, descriptions, expertise blurbs); and a **re-run assertion** — counts stable, uuids stable, `created_at` unchanged, `updated_at` moved.
+
+## 19. Acceptance Checks
+
+### Contract checks
+- Given a `full_name` + `email` with no existing match, the gate returns a new entity id and creates exactly one `universe.entity`.
+- A second identical submission returns the **same** entity id and creates no new row.
+- Supplying `master_person_id` on #7977 never invokes the gate.
+- Kill-switch-blocked input creates **no** person row and writes one `log_crash`.
+
+### Provider replay checks
+- With `person-happy-linkedin`, PDL/EL/Exa clients consume recorded payloads and produce identical normalized structs.
+- `person-dedup-hit` makes **zero** provider calls.
+- Full provider envelopes land in `universe.enrichment_payload.raw`, not just `.data`.
+
+### Graph checks
+- Re-run does not duplicate MERGE-keyed nodes or edges.
+- `created_at` unchanged on re-run; `updated_at` advances.
+- Every person node carries `:Entity`.
+- Empty/null optional properties are **absent**, not empty strings.
+- A Cypher-level error surfaces as a Go `error`, never a silent null.
+
+### Queue checks
+- Duplicate hit increments `count` and takes min tier / min depth.
+- Explicit `priority_tier: 0` behaves per Mark's Q1 ruling — asserted, not assumed.
+- Worker locks one row via `SKIP LOCKED`; a poison row DLQs after N attempts rather than retrying forever.
+
+### Terminal checks
+- A run whose async terminal dispatch is dropped is reclaimed by the sweep within one interval.
+- A claimed retry that fails closes through its own lease token, leaving no `running` receipt.
+- A company-less person reaches a terminal state.
+
+### Projection checks
+- No package is emitted before #13194 equivalent succeeds.
+- Re-applying the same `projection_run_id` is a no-op.
+- Product-owned dynamic sections are untouched.
+
+## 20. Xano Artifact Decision Table
+
+| # | Behaviour | Decision |
+| :-: | --- | --- |
+| D1 | `priority_tier\|first_notempty:4` in #13039 — explicit `0` becomes `4`; Task #126 drains only `tier <= 1`, so a tier-0 request never drains | **Open question for Mark** (Q1) |
+| D2 | Same field uses `first_notnull:4` in #12854 — the two entry paths disagree | **Open question for Mark** (Q1) |
+| D3 | `cascade_depth\|first_notempty:0` | `Preserve for parity` — benign, default is 0 |
+| D4 | Phase 10 #12831 is an empty stub still invoked with try/catch + qa log | `Fix in Go` — drop the call site |
+| D5 | 53 nested `try_catch` blocks in #13039 | `Xano artifact — do not reimplement` — one error type per stage |
+| D6 | Webhook #8594 holds an HTTP request up to 30 min waiting on `processing` | `Xano artifact — do not reimplement` — ack + enqueue |
+| D7 | Webhook #8594 refuses items with empty `custom.data_source` | `Preserve for parity` — real invariant, prevented live corruption |
+| D8 | `send-cypher` #2815 returns Cypher errors as **strings** | `Fix in Go` — return real errors |
+| D9 | Dual embeddings (OpenAI `name_embedding` + Gemini `embeddings`) | `Fix in Go` — Gemini only, decision #1 |
+| D10 | Person dedup enforced in app code, no unique index | `Fix in Go` — partial unique index on strong identifiers |
+| D11 | Queue drain has no attempt cap and no DLQ | `Fix in Go` |
+| D12 | Terminal receipt seeded **before** phase 7 | `Preserve for parity` — this is the fix for silent phase-7 death |
+| D13 | `log_crash.phase` strict enum can break the logger | `Fix in Go` — unknown maps to a safe value |
+| D14 | Work-derived `INVESTED_IN` dead branch (`isInvestor:false` hardcoded) | **Open question for Mark** (Q4) |
+| D15 | No live writer stamps `:C_Suite` since #2758 v1.8 | **Open question for Mark** (Q4) |
+| D16 | `sweep-person-deep-bio-retries` #13297 has no cron and no caller | **Open question for Mark** (Q3) |
+| D17 | `mvp/work/add-employment-current` #4552 belongs to the email-signature flow, not this waterfall | `Xano artifact — do not reimplement` |
+| D18 | Graph MERGE key is `master_person_id`, an int PK Universe does not have | `Fix in Go` — MERGE on `universe.entity.id` |
+
+## 21. Docs-vs-Xano Gap Report
+
+Bucketed per the skill's four categories. This is doc drift — separate from the rebuild gaps above, and Mark's to fix independently.
+
+| Bucket | Finding |
+| --- | --- |
+| **Docs are stale** | Fixed 2026-07-28 in the same pass as this spec: [Person Waterfall Functions](/guides/enrichment/waterfall/person-functions) listed 78 of 201 live functions and documented #13040 as v3.59 (live: v3.85). 132 functions added; the terminal-receipt, Deep Bio callback, semantic-state, and alias subsystems were entirely absent. |
+| **Docs are stale** | The functions page listed only Task #126 and omitted **Task #192 / #193 — both ACTIVE on live**. Now corrected. |
+| **Docs are stale** | `mvp/work/add-employment-current` #4552 was listed as a person current-role function; its only caller chain is the email-signature flow. Moved to Deviations. |
+| **Docs are accurate but not rebuild-grade** | Person **table schemas** are still the largest gap (the migration plan flags this too). [Person Tables](/guides/enrichment/waterfall/person-tables) documents shape but not the exact column types/constraints the AlloyDB DDL needs. |
+| **Docs are accurate but not rebuild-grade** | No provider request/response **JSON snapshots** exist for PDL, Enrich Layer, Exa, or FullEnrich — section 10 names endpoints; fixtures (section 18) must capture the payloads. |
+| **Xano behaviour is uncertain — needs fixture confirmation** | The exact provider precedence inside #13037 when PDL returns partial data (which fields EL is allowed to overwrite) is not deterministic from static reading. |
+| **Xano behaviour is uncertain — needs fixture confirmation** | Whether the #13260 sweep can interleave with a live orchestrator run on the same person, and what wins if both write the current company. |
+| **Docs match live Xano** | Node/edge catalogs, the cypher pages, and the prompt/model pages verified consistent for every function cited in this spec. |
+
+## 22. Open Questions for Mark
+
+**Q1 — `priority_tier` explicit zero (blocks the queue fixture).** #13039 coerces `0 → 4`; #12854 preserves `0`. Same logical field, two behaviours, and Task #126 drains only `tier <= 1`. Which is correct? Options: (a) make both `first_notnull` — explicit 0 is the bootstrap lane; (b) make both `first_notempty` — 0 is not a valid caller tier; (c) preserve the asymmetry as-is. **This changes queue behaviour and needs a ruling before the fixture is frozen.**
+
+**Q2 — the freeze.** 115 of 201 bodies changed after the 2026-07-09 sign-off, 2 today. Is the person waterfall in scope for the freeze yet, or is it still being certified (the company-less person work is dated 7/27)? A Go dev building against this page today is building against a moving target.
+
+**Q3 — `sweep-person-deep-bio-retries` #13297 has no driver.** No cron across all 49 tasks, no function caller. Is a Task #194-style twin intended, or is it superseded by the #13296 ingress? As it stands a Deep Bio receipt stranded before the provider callback has no sweeper.
+
+**Q4 — two known graph gaps.** Work-derived `INVESTED_IN` can no longer fire (`isInvestor:false` hardcoded), and nothing stamps `:C_Suite` since #2758 v1.8. Should the Go rebuild reproduce these gaps, or fix them in the greenfield graph where there is no legacy data to be consistent with?
+
+**Q5 — terminal-layer scope.** The receipt/lease layer is ~10 functions and the most recently churning part of the pipeline. Is it settled enough to spec as a contract, or should the Go port implement the *intent* (durable saga with leases) and re-derive the details after the freeze?
+
+**Q6 — projection emission for partial runs.** If #13194 fails but core identity landed, does the App get a partial `person_display` row or nothing? The seeded-fast-response pattern implies a seed row exists; this spec assumes the enriched package is withheld until the gate passes.
+
+**Q7 — deferred from the migration plan** (unchanged, listed for completeness): projection-sync cadence and event format; which product actions trigger forward enrichment; Fundable bulk-seed volume and pacing; ScaNN tuning; provider-set review.

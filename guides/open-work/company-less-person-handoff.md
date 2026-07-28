@@ -248,3 +248,59 @@ so any single URL works, including an IMDb one.
   after the cross-waterfall music/IMDb phase. Mark chose *tolerate* first. Lower value than it
   appeared — the bio **is** generated later regardless, and `13194` independently validates it at
   terminal time. Would also reduce (not eliminate) defect 5's watermark drift.
+
+---
+
+# Evening addendum (2026-07-27, late) — five more defects, and where certification actually stands
+
+The gated chain was run six more times after the morning section above. Each run's failure was
+diagnosed to root cause and fixed. **The terminal/company-less machinery is green end-to-end in
+two consecutive runs** (chains 9 and 10: 10/10 receipts `success` with `terminal_materialization
+att=1` under `person-{pid}-nocompany-dependency-{did}`, `full_enrich=True`, equalization clean,
+zero terminal-path crashes). Janet and Ryan each recorded one full 100% gated pass during the day
+(chain 6/7 era). **No chain has yet passed all three subjects end-to-end** — see the MusicBrainz
+finding at the bottom, which is why work paused here.
+
+## Defects 10–14 (all fixed and live, byte-verified, no drafts)
+
+| # | Function | What |
+|---|---|---|
+| 10 | `13260` **v1.31** | v1.29's `selected == dependency` equality THREW on a retargeted person, blocking the ONLY code that repairs a retarget (`13235`'s reselection, which early-returns before every gate that consumes `proof.verified`). Now a proof failing ONLY the company gate (both ids > 0, different) dispatches `13235` instead of throwing; the v2 proof commit stays gated on `verified` (a verified=false proof must never commit). Proven live: supersede → retarget → replacement run → materialized, in 7 minutes. |
+| 11 | `13244` **v2.0** | `$safeFilmTvId` falls back to the EXISTING row's `film_tv_id` when a caller passes 0. `12887`'s repair/overflow paths hardcode `film_tv_id: 0` for anchored awards, blinding the title-pull and sibling propagation → award=1/title=2 mismatches (12 across 7 titles). Volume-dependent: only fires when upgrades exceed the 10-row inline budget. |
+| 12 | `13192` **v4.3** | Equal-specificity ambiguous work match no longer hard-fails the WHOLE person (Mark's call: skip row, keep person). The ambiguous row rides the normal `matched:false` repair flow with recency PRESERVED — decision committed, edge mirrored — so `13194`'s per-row gates hold. A naive skip would have just moved the failure to `13194` (`semanticDecisionMissing`/`graphMatches`). Telemetry carries the tied candidates. Trigger observed: a `Maximum Effort Investments` work row landing next to `Maximum Effort` (scrape variance). |
+| 13 | `13194` | A company-less person can carry `master_company_id` **NULL, not just 0** — observed flipping run-to-run on the same fixture. Lambdas treat them identically; a raw `db.get field_value = null` throws `Missing param: field_value`, which killed the finalizer from ALL THREE call surfaces at once (root closeout, sweeper preflight, deep-bio callback). The two company fetches are now gated on id > 0. Hot-path audit: `13208`/`13040`/`13189` already guarded; table 760 coerces the dependency write to 0. **The null-vs-0 writer inconsistency upstream is NOT chased down** — open item. |
+| 14 | `13040` **v3.84** + `13194` | The root's closeout finalizer runs MID-FLIGHT for IMDb/music-heavy people (measured racing `12887`'s own award enqueue — row existed, queue row not yet — and an unarrived deep-bio callback). The sweeper retried and succeeded minutes later; only the red first-try logs failed the gate. Both log sites now classify: live terminal reservation exists → telemetry; none → red. Bounded/sweeper-mode failures stay red unconditionally. Control flow unchanged. |
+
+Also: `qa_snapshot.py` was masking failures when piped through `tee` (exit code became tee's) and
+one diagnostic script silently returned zero crashes because Metadata API `per_page=600` exceeds
+the cap and returns an error object. Both were operator errors, not pipeline defects; noted so the
+next person doesn't re-learn them.
+
+## 🔴 The open blocker: MusicBrainz drain churn vs the zero-crash gate
+
+Chain 10's Janet: every terminal criterion PASS, but **8 red rows from `mb/queue/process-next` /
+`mb/run-base-artist-enrich`** ("artist cascade did not reach terminal success", "catalog preview
+plan is invalid", "lease lost before terminal delete") ~35–40 min after seed. The MB root queue
+row shows `retry_count: 3`, next attempt scheduled, `preview_state` progressing
+(`materialized_count` advancing, `no_progress_count: 0`) — i.e. **expected churn under the
+1-row/min sandbox drain (task `194`) against Janet's 20-recording / 20-release-group catalog**,
+logged red on each deferred cycle.
+
+The uncomfortable implication, measured: chains 6/7 "passed" because Janet settled in ~18 min and
+the gate snapshot closed BEFORE the churn turned red; chains 9/10 settled slower and the snapshot
+landed after. **The earlier passes were partly timing luck.** The zero-crash bar + slow sandbox
+drain + large catalog is structurally flaky for music-heavy subjects, independent of the
+company-less work.
+
+Recommended fix (deliberately NOT attempted at end of session — untouched pipeline, fresh eyes):
+apply the same expected-deferral classification used four times today — in the MB drain, log red
+only when the root queue row actually EXHAUSTS; while retries are scheduled and the preview is
+progressing, log telemetry without `error_message`. Then re-run the full chain.
+
+## Certification status
+
+- Company-less path (Janet): terminal machinery green twice consecutively; one full 100% gated
+  pass on the day. Blocked from a repeatable pass only by MB churn timing.
+- Company-ful regression (Ryan): one full 100% gated pass (63 equalization pairs, 0 mismatches).
+- Retarget (Chamillionaire): v1.31 mechanism proven live on the stuck-run testbed; **no gated
+  pass yet** — chain never reached him after chain 6.

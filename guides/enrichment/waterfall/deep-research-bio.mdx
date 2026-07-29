@@ -1,179 +1,356 @@
 ---
 title: "Deep Research Bio"
-description: "The agentic web-research biography pipeline for people — the deep-person-basic prompt function, the async Cloud Run transport, the enrich-profile webhook, and every function the webhook fans out to."
+description: "The optional person-research branch: Kimi web research, single-flight Cloud Run launch, durable callback ingress, payload repair, and isolated Deep Bio materialization."
 ---
 
-Deep Research Bio is the optional, most expensive tier of person enrichment: an agentic LLM run with live web-search tools that expands a person's short `bio_500` into a comprehensive, citation-backed profile — biography paragraphs, a mapped relationship network, credentials, and unverified-claim flags. The result lands on `master_person.deep_bio` and feeds the derived-bio, social-insights, and graph-node sync steps.
+Deep Research Bio is the optional, most expensive tier of person enrichment. An agentic LLM uses live web-search tools to expand a person's short biography into a citation-backed profile: biography paragraphs, relationships, credentials, citations, extracted entities, identity conflicts, and unverified claims.
+
+The accepted biography array lands on `master_person.deep_bio`. For ordinary supplemental launches it also refreshes derived bios, social insights, expertise, aliases, the Person graph node, and expertise-driven IMDb/MusicBrainz bridges. Descendant launches use a narrower Deep-Bio-only write scope.
 
 <Note>
-  **Last verified: July 17, 2026.** Deep Bio is an optional branch, not part of
-  the core person-enrichment completion contract. With `deep_research=false`,
-  #13040 creates no Deep Bio dispatch, job, callback, receipt, retry, or barrier
-  wait; the independently complete non-bio path closes through #13194.
+  **Last verified against live Xano workspace 3 / branch `v1`: July 28,
+  2026.** The active chain is `deep-person-basic` #12833 v4.16 →
+  transport #12747 v2.1 → webhook #8303 v2.0 → ingress #13296 → leased
+  worker #13295 → processor #13294 v1.62 → terminal materializer #13208.
+  Xano is the source of truth for the behavior below.
 </Note>
 
-It is **asynchronous end-to-end**: Xano launches a job on an external runner and returns immediately; the runner executes the long tool-use loop and posts the result back to a webhook, which does all the write-back and fan-out.
+<Warning>
+  Deep Bio is optional and does not own Core Person completion. The root
+  orchestrator closes Core Person through the profile-job-independent semantic
+  finalizer with `require_deep_bio=false`. A Deep Bio launch, callback, repair,
+  or terminal failure cannot demote a successful `full_enrich` result.
+</Warning>
 
 ## Flow at a glance
 
 ```text
-orchestrator (deep_research=true)          #13040 / #12880 phase 4b / batch tools
-  └─> mvp/deep-research/deep-person-basic  #12833  — context + researcher prompt
-        └─> mvp/enrich/deep-research-person-or-company  #12747 — payload + launch
-              └─> POST Cloud Run /enrich  (external runner, X-API-Key)
-                    ├─ inserts profile_enrichment_job (processing=true)
-                    └─ … runner executes Kimi K2.6 + web_search/web_fetch …
-                          └─> POST webhooks/enrich-profile  #8303  (callback)
-                                ├─ preserve callback + validate JSON/identity/biography
-                                ├─ invalid → same-job retry or terminal provider error
-                                └─ valid → provider_payload_committed receipt
-                                      └─ #13208 callback terminal runner
-                                            ├─ master_person.deep_bio ← biography[]
-                                            ├─ derived bio/social/expertise/node writers
-                                            └─ #13196 terminal barrier → #13194 final readback
+root person phase 6 #12827
+  deep_research=true + master_person.bio is non-empty
+IMDb descendant phase 4b #12880 / explicit tools
+  └─> mvp/deep-research/deep-person-basic #12833
+        └─> mvp/enrich/deep-research-person-or-company #12747
+              ├─> reserve-person-deep-bio #13301
+              │     └─ inserts the single-flight profile_enrichment_job reservation
+              └─> POST Cloud Run /enrich
+                    └─ … Kimi K2.6 + web_search/web_fetch …
+                          └─> POST webhooks/enrich-profile #8303
+                                ├─ archive raw callback in profile_enrichment_log #770
+                                └─> ingest-deep-bio-provider-callback #13296
+                                      ├─ immutable ingress receipt in person_terminal_stage #761
+                                      ├─ duplicate delivery → acknowledge; do not overwrite
+                                      └─> async leased worker #13295
+                                            └─> callback processor #13294
+                                                  ├─ validator-v6 + canonicalization
+                                                  ├─ current-role LLM/deterministic repair
+                                                  └─> async terminal materializer #13208
+                                                        ├─ independent digest + role validation
+                                                        ├─ master_person.deep_bio write
+                                                        ├─ scoped downstream fan-out
+                                                        └─> terminal transition #13305
+                                                              processing=false
+                                                              active_person_key=null
 ```
+
+The active isolated Deep Bio chain does **not** wait on the older two-writer Core Person barrier. `coordinate-person-terminal-barrier` #13196 remains a compatibility path for non-isolated/legacy jobs; new person jobs close their own Deep Bio ledger through #13305.
 
 ## Launch points
 
-The `deep_research` boolean threads through the person pipeline: `mvp/queue/upsert-enrich-person` (12854) OR-promotes it on queue upgrades, while `mvp/enrich/enrich-master-person` (13040) normalizes it once and gates every Deep Bio-owned surface. Only true may launch the provider, create a `profile_enrichment_job`, add profile-job terminal dependencies, or enter the durable Deep Bio barrier. False routes directly to the non-bio finalizer with `require_deep_bio=false`; stale profile-job rows cannot reactivate the optional branch. Batch tools that call a Deep Bio function directly are explicit opt-in launch points.
+The main launch gate is `mvp/enrich/process-person-phase-6` **#12827**. It runs `create-llm-person-bios` first, then calls #12833 only when:
+
+- `deep_research=true`; and
+- `master_person.bio` is non-empty.
+
+`mvp/enrich/enrich-master-person` **#13040** normalizes the input flag, but Core Person terminal ownership remains independent even when the optional branch is enabled. With `deep_research=false`, the root creates no Deep Bio launch, reservation, callback receipt, retry, or wait.
+
+Other launch surfaces are explicit:
+
+- `mvp/imdb/run-base-imdb-person-enrich` **#12880** launches #12833 from its optional phase 4b with `branch_scope=deep_bio_descendant_optional`.
+- `mvp/enrich/deep-research-person-prompt` **#4578** is a compatibility wrapper that delegates to #12833.
+- `temp/deep-lsi-enrich` **#12865** uses the separate LITE function #12863 for batch work.
 
 ## The research function
 
 <Card icon="play">
 
-```
-mvp/deep-research/deep-person-basic — 12833
+```text
+mvp/deep-research/deep-person-basic — #12833 v4.16
 ```
 
-The prompt/agent definition (v4.1). Assembles the person's verified context — name, current title, company, `bio_500`, certifications, and work history via addons — into YAML, and pairs it with a senior-researcher system prompt: a **hard 12-search budget** (3 per thread), **footprint triage** (RICH / MODERATE / THIN sizes the effort and word count), an **identity-collision protocol** (2+ anchor matches required before trusting any source; same-name individuals tracked and surfaced in `identity_conflicts`), six parallel research threads (identity, career, credentials, relationship mapping, thought leadership, recognition), relationship-strength tiers (CONFIRMED / LIKELY / INFERRED), and a strict-JSON output contract (biography paragraph array, `biography_sections`, `relationships`, `citations`, `unverified_claims`, `extracted_entities`, `metadata`).
+Builds verified YAML context from the person record, current and historical positions, non-authoritative current-role context, certifications, and work history. The prompt includes:
 
-Model: `moonshotai/kimi-k2.6`, provider-pinned to `["moonshotai", "fireworks"]` with `allow_fallbacks: false` (v4 fix — unpinned routing leaked raw tool-call tokens), temperature 0.6, top_p 0.9, max_tokens 16,000, reasoning capped at 8,000, tools `openrouter:web_search` (native engine, 6 per call / 24 total) + `openrouter:web_fetch` (6,000 content tokens).
+- a hard 12-search budget and three-search-per-thread limit;
+- RICH / MODERATE / THIN footprint triage;
+- a two-anchor identity-collision protocol;
+- six research threads covering identity, career, credentials, relationships, thought leadership, and recognition;
+- CONFIRMED / LIKELY / INFERRED relationship strength;
+- an exclusive current-position allowlist for present-tense appointments;
+- a stale-allowlist rule: sourced evidence that an allowlisted role ended must be written in past tense and surfaced with an `SQL_STALE_ROLE_ENDED:` marker; and
+- a zero-narration terminal contract: the final message's first and last characters must be `{` and `}`, with no search-status prose or code fence.
+
+Current model and routing:
+
+| Setting | Live value |
+| --- | --- |
+| Model | `moonshotai/kimi-k2.6` |
+| Provider order | `moonshotai`, then `fireworks` |
+| Provider fallback | **Enabled** (`allow_fallbacks=true`) |
+| Temperature / top-p | `0.3` / `0.9` |
+| Output tokens | `16,000` |
+| Reasoning budget | `8,000` tokens |
+| Response mode | OpenRouter `json_object` |
+| Search tool | `openrouter:web_search`, native engine, 6 results/call, 24 total results |
+| Fetch tool | `openrouter:web_fetch`, 6,000 content tokens |
+
+The output contract includes `subject_name`, `subject_aliases`, `identity_conflicts`, `biography[]`, `biography_sections`, `relationships`, `citations`, `unverified_claims`, `extracted_entities`, and `metadata`.
 
 </Card>
 
 <Card icon="wrench">
 
-```
-mvp/deep-research/deep-person-basic-LITE — 12863
+```text
+mvp/deep-research/deep-person-basic-LITE — #12863
 ```
 
-Slimmer sibling used by batch sweeps where full-depth research per person is not warranted.
+The smaller batch-oriented sibling. It uses the shared transport but is not the root person waterfall's full research prompt.
 
 </Card>
 
-## The transport / launcher
+## Reservation and transport
+
+<Card icon="lock">
+
+```text
+mvp/enrich/reserve-person-deep-bio — #13301 v1.2
+```
+
+Reserves a person job **before** the Cloud Run call:
+
+- Automatic launches use the lifetime key `deep_bio:auto:person:<person_uuid>:v1`.
+- Every launch mode shares `deep_bio:active:person:<person_uuid>` while active.
+- Unique indexes on `logical_job_key` and `active_person_key` make concurrent losers re-read and return the winning reservation instead of making another provider call.
+- A terminal automatic reservation returns `already_completed` or `already_launched` and remains non-launchable.
+- Only `explicit_operator_authorized=true` omits the automatic lifetime key; changing `launch_mode` alone does not. Operator-authorized launches still cannot overlap an active person job.
+
+</Card>
 
 <Card icon="cloud-arrow-up">
 
+```text
+mvp/enrich/deep-research-person-or-company — #12747 v2.1
 ```
-mvp/enrich/deep-research-person-or-company — 12747
+
+Builds the OpenRouter request payload and POSTs it to:
+
+```text
+https://orbiter-enrich-cprh6jsjpa-uc.a.run.app/enrich
 ```
 
-Shared person/company transport. Builds the OpenRouter chat payload from the caller's prompts + params (Perplexity models get collapsed to a single user message; `provider_order` and `allow_fallbacks` pass through), then POSTs it to the **external runner** — Cloud Run `https://orbiter-enrich-20506320032.us-east4.run.app/enrich`, authenticated with `X-API-Key: $env.deep_research_api_key` — along with the callback: `webhook_url = https://xh2o-yths-38lt.n7c.xano.io/api:nFBFWRKy/enrich-profile?x-data-source=<current datasource>` (the datasource is appended so the callback writes to the same data source the launch ran on).
+The request uses `X-API-Key: $env.deep_research_api_key` and includes:
 
-On a `job_id` response it inserts a **`profile_enrichment_job`** row and returns. The row keeps the exact Cloud Run request in `data._cloud_run_request`, the launch response in `data._cloud_run_launch_response`, and request SHA-256, character count, model, callback datasource, and send time in `data._payload_audit`. These fields are the authoritative launch-side forensic record. A missing `job_id` writes a `log_crash` row and returns `"crushed"`.
+- `master_person_id` or `master_company_id`;
+- the stable `request_id` from the reservation;
+- the model payload; and
+- `webhook_url=https://xh2o-yths-38lt.n7c.xano.io/api:nFBFWRKy/enrich-profile?x-data-source=<current datasource>`.
 
-The runner itself is the long-running piece: it executes the multi-turn Kimi + web-search loop (minutes, beyond Xano's request budget) and posts results back under the original `job_id`. Bounded retries remain on that same logical job. Xano also treats a malformed person success payload as retryable: it records the complete invalid attempt and returns a retry disposition to Cloud Run until the attempt budget is exhausted. Historical API docs: `bio-enrich.fly.dev/docs` (the runner's earlier Fly.io home).
+For a person launch, #12747 edits the existing reservation with the returned `job_id`, exact Cloud Run request and launch response, request SHA-256/size, model, datasource, send time, branch scope, write scope, and cutover version. It does not insert a second row.
+
+If Cloud Run fails or returns no `job_id`, the reservation is closed with `terminal_status=error`, its active-person key is released, and a `WARN` audit row stores the swallowed optional error without making Core Person fail.
 
 </Card>
+
+## Durable ledgers
 
 <Card icon="database">
 
-```
-profile_enrichment_job — 686
+```text
+profile_enrichment_job — table #686
 ```
 
-The job ledger. One row per launch: `job_id`, `request_type` (`person` | company), `master_person_id` / `master_company_id`, the outbound `data` payload, `processing` flag, and — after callbacks — `llm_response`, full `response`, or `error`. The response preserves `provider_callback_payload`, `provider_attempt_payloads`, `provider_payload_validation`, `payload_audit`, and `retry_history`. `processing = true` rows older than the runner's normal turnaround are the stuck-job queue.
+The job and reservation ledger. Important fields:
+
+| Field | Meaning |
+| --- | --- |
+| `job_id` | Cloud Run job ID; empty until launch succeeds |
+| `processing` | Whether this Deep Bio job remains active |
+| `data` | Provider request plus launch, scope, identity, and payload audit |
+| `llm_response` | Exact canonical provider JSON committed for terminal materialization |
+| `response` | Callback, validation, repair, retry, receipt, and terminal audit |
+| `provider_attempt_count` | Monotonic provider-attempt count |
+| `logical_job_key` | Lifetime automatic single-flight key; retained after terminal close |
+| `active_person_key` | Concurrent person lock; cleared at terminal transition |
+| `deep_bio_launch_mode` | `automatic`, `explicit`, `retry`, or `operator_replay` |
+| `deep_bio_request_id` | Stable same-row request identity sent to Cloud Run |
+| `provider_last_activity_at` | Liveness timestamp for stale-active recovery |
 
 </Card>
 
-## The webhook
+<Card icon="list-check">
+
+```text
+person_terminal_stage — table #761
+```
+
+The idempotent checkpoint/lease ledger. Deep Bio uses receipts such as `ingress`, `provider_processing`, `provider_payload_committed`, `terminal_materialization`, and `barrier`. Each run/pipeline/stage tuple is unique and carries status, attempt budget, retry time, heartbeat, opaque lease token, expiry, error, result, and contract metadata.
+
+</Card>
+
+<Card icon="box-archive">
+
+```text
+profile_enrichment_log — table #770
+```
+
+The callback archive added July 28. Webhook #8303 inserts every raw callback body here before job lookup or disposition, including unknown/late job IDs.
+
+</Card>
+
+## Callback ingress and worker
 
 <Card icon="globe">
 
-```
-webhooks/enrich-profile — 8303   (POST, api group 346, canonical nFBFWRKy)
-```
-
-**The active callback.** Receives the runner's result keyed on `job_id` (raw-input JSON, no auth — the obscure job ID is the correlation key). The full callback body is preserved with its digest and character count before any disposition is chosen.
-
-- **Provider error path:** preserves the callback and same-row attempt history. A retryable outcome stays on the same job; terminal exhaustion closes `processing`, stores the error, and performs no downstream writes.
-- **Person success validation:** accepts a JSON object, complete JSON string, or harmless preamble/code fence around one complete JSON object. It requires the expected subject (or a verified alias), a non-empty string-only `biography[]`, at least 120 biography characters, and no provider meta-commentary or JSON/code fragments. Truncated JSON, identity mismatch, short/empty output, and raw prose are rejected before provider success is committed.
-- **Invalid payload path:** preserves the complete callback and validation audit in `provider_attempt_payloads`, increments the same-job retry history, and returns `retrying` while attempts remain. Exhaustion records an error `provider_payload_committed` receipt and closes the job without materialization.
-- **Validated success path:** stores `llm_response`, validation/audit data, and a successful `provider_payload_committed` receipt containing the payload SHA-256. It then leases and dispatches `mvp/enrich/run-person-callback-terminal` (13208). That runner independently revalidates `llm_response`, requires the webhook and receipt digests to agree, and only then writes `master_person.deep_bio` and downstream surfaces.
-</Card>
-
-### Functions the webhook calls
-
-After independent callback-runner validation, the success path fans out to the following writers in order:
-
-<Card icon="wrench">
-
-```
-mvp/bios/add-person-biography
+```text
+webhooks/enrich-profile — API #8303 v2.0
+POST /api:nFBFWRKy/enrich-profile
 ```
 
-Stores the joined biography text as a biography **source row** for the person (the raw-material record the bio pipeline reads from).
+The active callback is deliberately small. It:
+
+1. reads the raw JSON body;
+2. appends it to `profile_enrichment_log`; and
+3. calls `ingest-deep-bio-provider-callback` #13296.
+
+The endpoint has `auth=false`. `job_id` is the correlation key, not authentication.
 
 </Card>
 
-<Card icon="play">
+<Card icon="inbox">
 
-```
-mvp/bios/create-llm-person-bios
+```text
+mvp/enrich/ingest-deep-bio-provider-callback — #13296
 ```
 
-Regenerates the person's derived LLM bios (e.g. `bio_500`) now that the deep-research material exists.
+For cutover person jobs, ingress verifies the launch-time Person UUID, hashes the callback and its `result`, commits an immutable `ingress` receipt, claims a random 10-minute `provider_processing` lease, dispatches #13295 asynchronously, and returns `accepted`. Duplicate delivery acknowledges without replacing the canonical ingress payload.
+
+Unknown or superseded `job_id` values are acknowledged as ignored. Non-cutover jobs route to the legacy processor #13293.
 
 </Card>
 
-<Card icon="cloud-arrow-up">
+<Card icon="gears">
 
-```
-mvp/social/social-insights/get-social-insights
+```text
+mvp/enrich/run-person-deep-bio-provider-worker — #13295
 ```
 
-Refreshes the person's social-insights extraction with the enriched context.
+The isolated worker rechecks job/person identity, lifecycle readiness, ingress existence, and exact lease ownership before invoking #13294. It records success or a retryable stage error in `person_terminal_stage`; Deep Bio worker failures are explicitly excluded from Core Person failure ownership.
 
 </Card>
 
-<Card icon="wrench">
+## Validation and repair
 
-```
-mvp/node/update-person-node — 2758
+<Card icon="shield-check">
+
+```text
+mvp/enrich/process-deep-bio-provider-callback — #13294 v1.62
+mvp/bios/validate-deep-research-payload — #13209 v6.3
 ```
 
-Syncs the refreshed person properties + embeddings onto the FalkorDB `Person` node (OpenAI `name_embedding` + Gemini `embeddings` dual-write).
+The processor is the payload trust boundary. It accepts an object, complete JSON string, or a complete JSON object wrapped in a harmless preamble/code fence. Wrapped valid payloads are canonicalized before commit; the raw callback remains in the audit.
+
+For a person result, validator-v6 requires:
+
+- the expected subject or a verified alias;
+- a non-empty string-only `biography[]`;
+- at least 120 joined biography characters;
+- no truncated JSON, JSON/code fragments, or provider meta-commentary inside the biography;
+- current-role claims that match the settled current-position allowlist or meet the evidence-repair contract; and
+- exact payload, allowlist, validator-version, and SHA-256 evidence for the terminal materializer.
 
 </Card>
 
-<Card icon="filter">
+### Unsupported-current-role repair
 
-```
-mvp/expertise/llm-identify-person-expertise — 12666
+When the sole blocking class is `unsupported_current_role`, #13294 uses this order:
+
+1. **LLM repair first — #13278 v1.6.** Up to two surgical attempts. Primary model `moonshotai/kimi-k2.6` (temperature 0, reasoning disabled, 24,000 tokens, 240-second timeout); fallback `qwen/qwen3.7-plus` (16,000 tokens, 150-second timeout).
+2. **Evidence decision.** A claim supported by one HIGH or two independent MEDIUM in-payload citations remains current and is added to `evidence_authorized_positions`. Citation-backed evidence that an allowlisted role ended produces `evidence_ended_positions` and past-tense prose.
+3. **Deterministic fallback — #13218 v2.0.** If the LLM attempts do not pass, remove or align only the validator-identified unsupported claim and retain it in the unverified audit.
+4. **Validator-v6 recheck.** Every repaired/canonicalized payload must pass again, then pass a fixed-point serialization/digest check before `llm_response` is committed.
+
+No repair may invent an organization, citation, role, title, date, or URL. Semantic/content failures that still do not pass are terminal on the same profile job; Cloud Run research is not rerun for them.
+
+### Provider and parse retries
+
+- Retryable provider errors retain the same job and provider-attempt history, with a maximum of three provider attempts.
+- A JSON `parse_error` is classified as transport truncation and records `status=retrying` on the same job while the attempt budget remains.
+- Other validation failures go through the local repair chain and then close terminally if still invalid.
+
+<Warning>
+  **Current cutover gap:** API #8303 acknowledges immediately after immutable
+  ingress and the heavy processor runs asynchronously. Therefore #13294's
+  `retrying` result is persisted inside Xano but is not returned synchronously
+  to Cloud Run by the callback HTTP response. No Xano task or function currently
+  drives the Deep Bio sweeper #13297. Do not assume a stored retry disposition
+  guarantees another provider attempt.
+</Warning>
+
+## Terminal materialization
+
+<Card icon="flag-checkered">
+
+```text
+mvp/enrich/run-person-callback-terminal — #13208
 ```
 
-**Expertise re-run (added v1.1, 2026-07-02).** Re-extracts the person's domains of expertise now that the deep-research material exists, feeding the resolver `resolve-person-expertise-v2` (12926). Because the resolver chain is fully idempotent (exact-name guard, `HAS_EXPERTISE` MERGE aggregation, `person_has_expertise` dedupe), a person whose expertise was already resolved gets their edges **updated** — max confidence, strongest depth, distinct new evidence appended — and newly surfaced areas added, never duplicated. Runs in its own `try_catch` (logged to `log_crash` phase `webhook_post_process`, success and failure), so an expertise hiccup never blocks the rest of the fan-out.
+Only the owner of the exact terminal-materialization lease may write. Before any person or graph mutation, #13208:
+
+- hashes the exact stored `llm_response` bytes;
+- independently reruns validator-v6;
+- verifies parity with the immutable provider validation envelope and committed receipts; and
+- evaluates current live role compatibility separately from the immutable provider proof.
+
+It then writes `master_person.deep_bio = biography[]`.
+
+Citation-backed structured-role drift is **signal-only**. Missing-current-role and ended-role evidence, including `SQL_STALE_ROLE_ENDED:` markers, produces deduplicated rows in `human_review_required` **#757**. Deep Bio never automatically edits `work_experience`, `current_title`, or the selected company from those signals.
+
+Deep-research credentials remain narrative context. This chain does **not** materialize education rows, school/company nodes, or `ATTENDED` edges from `extracted_entities.credentials`.
 
 </Card>
 
-## Deprecated: the original webhook
+### Supplemental fan-out
+
+For an ordinary supplemental launch, #13208 runs:
+
+1. `mvp/bios/add-person-biography` **#2536** — stores the joined biography as a source row.
+2. `mvp/bios/create-llm-person-bios` **#2537** — regenerates derived bios such as `bio_500`.
+3. `mvp/social/social-insights/get-social-insights` **#12669** — refreshes social insights.
+4. `mvp/enrich/process-person-phase-8` **#12829** — reruns expertise extraction and terminal recency/table-graph verification.
+5. `mvp/enrich/kickoff-cross-waterfalls-from-expertise` **#13185** — starts the verified MusicBrainz/IMDb bridges indicated by settled expertise.
+6. `mvp/person/select-verified-alias-candidates` **#13202** → `upsert-person-alias` **#13187** — persists HIGH-confidence, conflict-free name aliases and synchronizes them to the graph.
+7. `mvp/node/update-person-node` **#2758** — performs the final Person node/property and embedding sync.
+
+For `branch_scope=deep_bio_descendant_optional`, #13208 stores `deep_bio`, review signals, and its terminal audit but skips this fan-out. That prevents an IMDb/C-suite/founder descendant from rewriting core bios, work, expertise, graph state, or `full_enrich`.
+
+After materialization, #13208 commits the Deep Bio `barrier` receipt and calls `transition-person-deep-bio-job-terminal` **#13305**. The shared transition makes terminal state monotonic, sets `processing=false`, and releases `active_person_key` in the same write while retaining the lifetime `logical_job_key`.
+
+## Deprecated original webhook
 
 <Card icon="globe">
 
-```
-webhooks/deep-research-bio-webhook — 3082   (POST — tagged depreciated)
+```text
+webhooks/deep-research-bio-webhook — API #3082
 ```
 
-The first-generation callback (Dec 2025 – Apr 2026), keyed on the older **`deep_biography` (591)** table's `job_id`. On success it wrote `deep_biography.biography` + `master_person.deep_bio` and called **two** functions — `mvp/bios/create-llm-person-bios` and `mvp/node/update-person-node`. Superseded by `enrich-profile` + `profile_enrichment_job`. The endpoint is still routable but nothing launches jobs against it; `deep_biography` is retained as historical data. Its historical plain-text tolerance must not be copied into the active callback.
+The first-generation callback, keyed on `deep_biography` table **#591**, is tagged deprecated and remains routable only for historical compatibility. Nothing in the active launch path targets it. Its permissive plain-text behavior must not be copied into the current callback chain.
 
 </Card>
 
 ## Operational notes
 
-- **Non-blocking by design:** the orchestrator treats a deep-research launch failure as a warning, not a pipeline failure — `full_enrich` reflects required-phase health only.
-- **Datasource propagation:** the callback URL carries `?x-data-source=<datasource>` from launch time, so sandbox launches write back to sandbox.
-- **Provider retry boundary:** Cloud Run owns external provider execution, while Xano owns acceptance at the callback boundary. Every callback attempt remains attached to the original job row and is auditable; a separate job row is not a clean retry.
-- **Stuck jobs:** a job that never calls back leaves `profile_enrichment_job.processing = true` with no `response` — there is no timeout sweeper; check the ledger when `deep_bio` seems missing.
-- **Output contract:** raw prose and malformed JSON never land. Terminal success additionally requires `deep_bio` to remain a non-empty string array with at least 120 joined characters, a validated provider receipt, and the final semantic table/graph readback.
-- **QA evidence:** compare `data._payload_audit.request_sha256`, `response.payload_audit.callback_sha256`, `response.provider_payload_validation.input_sha256`, the callback receipt digest, and the callback runner's independent validation. Use counts/digests and a bounded tail preview in reports; retain full payloads only in a protected temporary artifact.
+- **Datasource propagation:** #12747 refuses a blank ambient datasource and embeds the current datasource in the callback URL.
+- **Automatic jobs are lifetime single-flight:** a terminal automatic job is not relaunched just because it failed. A sanctioned replay must set `explicit_operator_authorized=true`; a different `launch_mode` label alone does not bypass the lifetime key.
+- **Callback evidence:** start with `profile_enrichment_log` #770, then correlate `profile_enrichment_job.deep_bio_request_id`, `job_id`, the `_payload_audit` request digest, callback/result digests, the validation envelope, and `person_terminal_stage` receipts.
+- **Recovery function exists but is undriven:** `sweep-person-deep-bio-retries` **#13297 v1.2** can reclaim due `provider_processing` and `terminal_materialization` receipts, close active jobs after four hours without provider activity, and park repeated no-progress failures as `deep_bio_needs_intervention`. Live Xano has no task and no function caller for it.
+- **Stuck-job check:** inspect `processing=true`, `active_person_key`, `provider_last_activity_at`, and the latest Deep Bio stage receipt. Do not look only for a missing webhook `response`.
+- **Core isolation:** Deep Bio errors are job-bound. The root person semantic finalizer remains `require_deep_bio=false`.
+- **Sensitive payloads:** callbacks and research payloads can contain substantial personal data. Use hashes, counts, validation summaries, and bounded previews in ordinary QA reports; keep full payloads in protected artifacts.

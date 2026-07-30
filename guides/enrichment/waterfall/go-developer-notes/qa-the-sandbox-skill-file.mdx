@@ -139,6 +139,33 @@ not as a global prohibition across every person discovered by the waterfall.
 - A Deep Bio launch with neither an enabled seed flag nor verified
   C-suite/founder provenance is a dispatch-gating regression. Do not infer
   provenance from the existence of a job alone.
+- **A Deep Bio job with an empty `job_id` is a silent permanent loss — check it
+  explicitly on every run.** `mvp/enrich/deep-research-person-or-company`
+  (`12747`, despite the launcher being referred to elsewhere as
+  `start-person-deep-bio`) gates its success path on
+  `$apiFailed == false && $jobId not empty`. A Xano `api.request` that fails at
+  transport level **returns without throwing**, carrying
+  `response.status: 0` and no `result.job_id`, so `$apiFailed` stays `false`,
+  the else branch runs, and the reservation is closed terminally with
+  `error=orbiter-enrich API returned no job_id`,
+  `response.reason=provider_launch_failed`, `processing=false`, and
+  `active_person_key=null`. There is **no `next_attempt_at`, backoff, or retry
+  anywhere on that path**, and because the job dies before ingress it owns no
+  `deep_bio` receipt, so retry sweeper `13297` — which recovers only
+  `provider_processing` and `terminal_materialization` — can never see it. The
+  person permanently has `deep_bio: []`.
+  Detection, because none of the standing checks catch this: the swallowed row
+  is logged `qa_passed: true` with note `WARN: optional deep research API
+  response missing job_id`, so log-health, receipt status, parity, and
+  settlement all stay green on a run that lost the root's biography. For every
+  person with Deep Bio requested, assert `profile_enrichment_job.job_id` is
+  non-empty and group receipts by `master_person_id` before crediting a Deep Bio
+  pass — descendant receipts (`deep-bio-person-N-job-N`) are routinely mistaken
+  for the root's. Report `DEEP BIO = FAIL (launch)` for the affected person.
+  Distinguish transport from refusal using `data.api_status`: `0` with
+  `api_failed: false` is an unretried transport failure and is intermittent
+  (a sibling launch minutes later on the same run can succeed), not a provider
+  rejection.
 - Continue to require the complete non-biography waterfall: structured source
   capture, current-company selection, all allowed resolver phases, table/graph
   materialization, UUID/date/tense parity, queue policy, lifecycle cleanup, and
@@ -158,7 +185,7 @@ Use these known IDs first. Only call workspace context, broad schema discovery, 
 | Branch | `v1` |
 | Sandbox data source | `sandbox` |
 | Graph QA API group | `QA` group `209` |
-| Graph connected endpoint | API `8840`, `GET /api:ewwK9hZc/graph-connected-subgraph-readonly` |
+| Graph connected endpoint | API `8840`, `GET /api:ewwK9hZc/graph-connected-subgraph-readonly`; #13177 v2.0 multi-hop envelope (fingerprint/counts/duplicates/min_hops 0-2, q2_capped/q3_capped) |
 | Graph connected function | `qa/falkor/connected-subgraph-readonly` function `13177` |
 | Ad-hoc read-only graph probe | API `8954`, `POST /api:ewwK9hZc/sandbox-cypher-read`; sandbox-forced, rejects any query containing a write clause. Use for anomaly checks the fixed helper `8840` cannot answer — e.g. counting nodes by label, or finding a node by name when you have no UUID. Keep the projection scalar and bounded; never return `properties()` or `*_embedding`. This exists because the MCP direct-function executor cannot resolve the nested `mvp/falkor/send-cypher` (`2815`) and fails with `Function does not exist: function:2815` — a registered API runs the same function correctly, so treat that message as a harness limitation and reach for an endpoint. |
 | Table-vs-graph company count check | Compare `MATCH (c:Company) RETURN count(c)` against `master_company` `itemsTotal`. A shortfall localises a company row whose graph node was never created — which then trips several unrelated terminal gates (certification issuer projection, terminal company LinkedIn projection) one after another. Diagnose the missing node before patching each gate to tolerate it. |
@@ -184,6 +211,7 @@ Use these known IDs first. Only call workspace context, broad schema discovery, 
 | Expertise array projector | `mvp/expertise/project-person-expertise-array` function `13306`; exact direct `HAS_EXPERTISE` graph UUID set must equal `person_has_expertise.expertise_node_uuid` before writing the table-only denormalized `master_person.expertise` array. Do not write or require an `expertise` property on the graph Person node. Sandbox smoke API `8951`, `POST /api:ewwK9hZc/project-person-expertise-array` |
 | Expertise retained repair | API `8950`, `POST /api:ewwK9hZc/repair-person-expertise-recency-and-array`; sandbox-only exact person/UUID wrapper around reconciler `13192` and projector `13306` |
 | Error scalarizer | `system/error-to-text` function `13299`; use for durable audit text when a caught error may be an object |
+| Degree-family/blocklist drift tripwire | API `8967`, `POST /api:ewwK9hZc/degree-family-drift-tripwire`; function `13316`; code-level read of the nine live degreeFamily copies (2788, 12560 x3, 1898, 12971, 13192, 13194, 13289) + five placeholder-blocklist copies (12562 x3, 13191 x2) + 12558 array form via Metadata API (`$env.XANO_META_TOKEN`); normalizes the two intentional differences (13192 `''` fallback, 1898 NFKC); fails with per-function token diffs; needs NO sandbox header; ~20s, retry once on transient 502; proven able to fail (mutated-copy test 2026-07-29). Fixture 13213's sim matcher deliberately out of registry. |
 | Education identity regression fixture | API `8884`, `POST /api:ewwK9hZc/person-education-identity-regression-fixture`; function `13213` |
 | Post-company-merge education dedup fixture | API `8902`, `POST /api:ewwK9hZc/education-company-dedup-regression-fixture`; self-cleaning sandbox fixture for production helper `12971` |
 | School company identity reconciler | `mvp/education/reconcile-school-company-identity` function `13264`; both-school only, exact canonical LinkedIn or normalized legal/name alias plus exact full host; domain-only matching is prohibited; delegates audited writes to `merge/company-v2` |
@@ -752,6 +780,24 @@ Correlate records by `node_uuid`, master IDs, queue IDs, run/request IDs, data s
   start time plus matching entity IDs/inputs; requests from earlier sandbox
   runs do not prove that a child ran in the current waterfall. Compare
   timestamps and inputs when retries or callbacks overlap.
+- **A killed C-suite LEAF frame strands its person with NOTHING sweepable.**
+  The v3.76 pre-phase-7 reservation is gated to ROOT runs only
+  (`cascade_depth==0 && !current_company_only` in #13040), so a leaf killed
+  after the v3.21 safety-close presents as: person stuck `full_enrich=false`
+  while every OTHER person's receipts are all success and none are
+  pending/running; `Master Person Enrich` history `processing=false`,
+  `enrich_success=false`, `reason=terminal_semantic_verification_pending`;
+  usually one source history (e.g. ScrapeCreators Linkedin) stuck
+  `processing=true`; ZERO log rows and zero receipts for that person. Task 193
+  cannot recover it — there is no receipt to sweep. Verified live 2026-07-30
+  (Bill Dally, NVIDIA leaf, wiped Kerris re-run). Recovery: throwaway
+  sandbox-forced endpoint dispatching #13040 async-shared with the leaf's
+  ORIGINAL parameters plus force_run
+  (`{master_person_id, cascade_depth: 1, current_company_only: true,
+  deep_research: false, force_run: true}`) — completes in minutes and closes
+  the SAME history row as success (no duplicate history). Release the orphaned
+  source-history row afterward (PUT processing=false with an audit note).
+  Open follow-up: extend the reservation (or a #13260 watchdog) to leaves.
 - **A killed Xano request writes no request-history row at all.** Absence of a
   completion row for the *parent* is therefore positive evidence of an
   uncatchable mid-flight death, not missing instrumentation. Treat this as the
@@ -984,6 +1030,14 @@ Correlate records by `node_uuid`, master IDs, queue IDs, run/request IDs, data s
   error is a failure even when the person or company row was created by an
   earlier phase. Read back fields owned by that job, such as `deep_bio`, so a
   nominally successful callback cannot hide missing downstream materialization.
+- `subject_identity_mismatch` is retryable exactly ONCE per logical job
+  (#13294 v1.62, 2026-07-29): the callback returns `status="retrying"` with
+  `semantic_retry_guidance.subject_anchors` (canonical name, LinkedIn URL,
+  current title/company) and the runner re-researches on the same job row;
+  a SECOND mismatch closes terminally exactly like pre-v1.62 (response carries
+  `validation_retry_class_budget_ok=false`). Expect at most two provider
+  attempts for this class, both in `provider_attempt_payloads`/`retry_history`
+  on one row. parse_error retries keep their separate retryCount<3 bound.
 - For Cloud Run deep-research callbacks, treat the external runner as the
   owner of provider retries within one logical `job_id`. A malformed, empty, or
   truncated provider response is retryable only when the callback explicitly
@@ -1945,6 +1999,37 @@ When a person is enriched, distinguish raw experience capture from graph/company
   fields must settle to one canonical table row. Also include the negative
   same-provider concrete-month conflict. Graph-level edge grouping is not a
   substitute for these relational assertions.
+- **The fingerprint of a real cross-provider dedup miss is an audit that calls the
+  pair neither duplicate nor landed.** `mvp/resolve/resolve-edges-education` can
+  fail with "Education rows remained unresolved, semantically duplicated, or lost
+  captured source values after all fallbacks" while its payload reports
+  `duplicate_pairs: []` and `duplicate_total: 0` **and** a non-zero
+  `captured_value_miss_total`. That combination means the matcher did not
+  recognise the rows as duplicates *or* reconcile them to their source values —
+  suspect degree-family normalization, not the data. Verified live: the same
+  doctorate at one school arrived as `degree_family: "doctorate"` (PDL,
+  `end_month: null`) and `"ph d"` (Enrich Layer, `end_month: 12`), and a second
+  school arrived as `BE` versus `bachelor of engineering` with **byte-identical**
+  months; neither pair collapsed. Confirm on settled rows before calling it —
+  print `start_month`/`end_month`/`source`/`degree_name` per candidate — then
+  fail it: cross-provider plus compatible months must collapse. Note the failure
+  cascades into a phase-7 crash and `completed with phase failures; full_enrich
+  not marked`, so a single descendant can fail the whole-run gate while the root
+  path is clean; always attribute these rows to their `master_person_id`.
+  Degree-family normalization was fixed 2026-07-29 (#12560 v2.13 + lockstep
+  copies). The SAME signature with **matching** `degree_family` values on both
+  misses means a school-identity mismatch instead: read the miss's implied
+  `sameSchool` inputs. Verified variant: both providers reported the UT Austin
+  LinkedIn slug with a trailing hyphen while the settled row's URL had been
+  canonicalized without it, and pre-v2.14 `sameSchool` treated URL inequality as
+  a veto (no domain/name fallback) — the backfill skipped the provider merge and
+  the audit reported both items never-landed on correctly-collapsed rows. Fixed
+  in #12560 v2.14 (equality sufficient, mismatch falls through to domain then
+  name). Residual benign twins: compact tokens the vocabulary deliberately does
+  not family (`JD`, `DBA` — professional doctorates) or does not yet know
+  (`MSEE`, `BSEE`) produce two same-school rows sharing one ATTENDED edge; both
+  the matcher and audit agree they are distinct, so nothing crashes — report as
+  residue, not as the collapse defect.
 - If education skip logs contain `reason: [{}]`, an empty object, an array-like reason, or another non-human guard reason, treat that as a likely malformed resolver guard/lambda return rather than valid source-data evidence. Inspect `mvp/resolve/resolve-edges-education` for `api.lambda` `code`/`timeout` shape and how `$educationSchoolGuard.should_resolve`/`reason` are read.
 - When `mvp/get-add/master-company-new` intentionally returns no `master_company_id` for a company-shaped education row, `mvp/resolve/resolve-edges-education` should log a clean skip (`qa_passed=true`) and leave `education_experience.master_company_id`/`edge_uuid` empty. Treat `Unable to locate var: getMasterCompany.master_company_id` in this path as a resolver bug, not a source-data failure.
 - After any school/company dedupe or merge, audit canonical-ID propagation before
@@ -2641,6 +2726,17 @@ When recommending or later verifying a XanoScript fix, remember that a successfu
   bounded lambda or only after a non-empty guard. Inspect the failing function's
   nested callees as well as its parent; a parent lifecycle error may be emitted
   after the company/row writer itself returned success.
+- The XanoScript catch-block error envelope is `{code, message, name, result}`:
+  a thrown precondition's `payload` lands at **`$error.result`** and survives the
+  `function.run` boundary intact (verified live 2026-07-29). Read it with DIRECT
+  property access only (`$error.result`, like the ubiquitous `$error.message`).
+  The serializer mangles every other form: `$error|get:"result"` republishes as
+  `$error.|get:...` and a bare `var $x { value = $error }` republishes as
+  `$error[""]` — both fetch back looking almost right and neither is trustworthy
+  at runtime. Preconditions that omit `payload =` still produce `result: ""`,
+  so `data.error_payload` can be legitimately empty for those child throws
+  (e.g. #12560's terminal education audit throws payload-less; #13191 attaches
+  its conflict lists).
 - In particular, verify `api.lambda.timeout` sits outside the lambda `code` string. If `timeout = 5` appears inside the JavaScript payload or a stray quote delimiter appears inside the code, the function may publish but still return malformed values at runtime.
 - For Cypher property rewrites, do not derive one property from another property assigned earlier in the same `SET` clause. FalkorDB may evaluate the derived expression against the pre-update value. Derive both values from the authoritative source row/parameters or split them into ordered clauses, then re-read the committed properties. Require the replay path to update existing relationships as well as newly created ones.
 - In a Falkor write query, insert an explicit `WITH` boundary before introducing
@@ -2923,6 +3019,75 @@ Corollary: `log_crash.phase` is still a strict enum (docs trap #10), so a genuin
 writing an unlisted phase fails the logger itself and leaves **no** row. Absence of rows is
 therefore not proof of health either — cross-check terminal receipt statuses and
 `enrich_success` rather than relying on this table alone.
+
+## Stale company single-flight ghost (2026-07-29, Kerris run 4 — FIXED same day)
+
+A person run that stalls with persons=1, **all receipts success/pending, zero
+crashes**, dependency row `pending`, and no new `#12992` requests is not a
+sweeper problem — check for a dead company dispatch. The selected-company
+single-flight is `enrich_history_company` (table **404**): a row with
+`source="Base Company Enrich"` and `processing=true` blocks every dispatch of
+that company while "active".
+
+**Fixed 2026-07-29** (`#12992` v4.49 + `#13235` v1.38): the open row now
+carries `data.lease_token` / `lease_expires_at` (10 minutes, heartbeat-extended
+after the LLM step, per C-suite candidate, and before the phase chain). The
+reuse guard defers only while the lease is unexpired and otherwise supersedes
+the row (`reason=expired_company_writer_lease`) and proceeds. `#13235`'s
+deferred path runs a stale-pending watchdog: a core dependency pending >10 min
+with no live company lease and unchanged selection is re-dispatched at depth 0
+with the same `terminal_dependency_id` (3 attempts max, 10-min spacing,
+bookkeeping in `resolver_data.context.redispatch_count/last_redispatch_at`;
+QA can pass `watchdog_probe=true` to get the decision without a dispatch).
+Rows created before v4.49 carry no lease data and keep the legacy **2-hour**
+`created_at` floor, so the manual recovery below still applies to them:
+release with `PUT /api:meta/workspace/3/table/404/content/{id}` body
+`{"processing": false}` — **PATCH silently no-ops on this route; use PUT** —
+then redispatch through a throwaway sandbox-forced QA endpoint calling
+`mvp/enrich/enrich-master-company` with `runtime_mode="async-shared"` and the
+exact `{master_company_id, cascade_depth: 0, terminal_dependency_id}`.
+Detection of a pre-v4.49 ghost: two fast (<2s, `output: null`) `#12992`
+attempts with the correct `terminal_dependency_id`, then silence, while
+sibling source-history rows all closed successfully.
+
+Standing control: API `8963`,
+`POST /api:ewwK9hZc/company-singleflight-lease-reclaim-fixture` (function
+`13312`, `fixture_key=company_singleflight_lease_v1`, 18 checks, self-cleaning,
+run twice). It exercises legacy fail-closed, active-lease reuse, expired-lease
+reclaim-to-completion on a real settled company, and the four watchdog probe
+outcomes. It re-enriches one settled (school) company synchronously, so run it
+on a quiet sandbox, not mid-run.
+
+Two traps this shipped past:
+- `person_terminal_company_dependency` (760) had `UNIQUE(profile_enrichment_job_id)`,
+  so the core sentinel `0` allowed only ONE core dependency per datasource —
+  a second root person's #13040 pre-phase-7 reservation would have crashed
+  uncatchably. Replaced 2026-07-29 with
+  `UNIQUE(profile_enrichment_job_id, master_person_id)` (index `0e4d4708`;
+  schema byte-verified unchanged). Indexes are workspace-level, so this covers
+  live/staging too.
+- Do NOT "reconcile first" by calling `#13199` with just
+  `{master_company_id, master_person_id}` on a stale pending dependency whose
+  company has only an OLD terminal success: it transitions the row pending ->
+  `error` (`company_success_missing_fresh_terminal_commit`), which parks it
+  outside both the watchdog (pending-only) and `#12992`'s pending-only
+  dependency gate. The re-dispatched run's own closeout resolver is the
+  authoritative settle path.
+
+API `8840` envelope: RESTORED 2026-07-29 (#13177 v2.0, item 6 of the
+pipeline-hardening queue). It again returns the multi-hop envelope described
+in Graph/Cypher QA — `fingerprint` (sha256 over sorted node/edge identity,
+stable across identical reads), `counts.nodes/edges/nodes_by_label/
+edges_by_type`, `duplicates.nodes` (natural_key collisions) and
+`duplicates.edges` (same type|from->to signature under distinct uuids),
+`nodes[].natural_key/min_hops` (root 0, neighbors 1, bounded descendants 2),
+and `edges[].edge_key/from_key/to_key/from_uuid/to_uuid` via
+startNode/endNode — plus the legacy `node_count`/`edge_count` and one-hop
+scalar fields unchanged. `q2_capped`/`q3_capped` expose LIMIT truncation:
+if either is true, re-fetch with a higher `limit` before trusting totals.
+Aliases are still not projected (use the bounded fallback for those), and
+`8954` remains the tool for graph-WIDE label/type counts (8840 is
+root-scoped).
 
 ## Lessons from the 2026-07-25 IMDb queue campaign (10 wipe-and-rerun cycles)
 
@@ -3361,4 +3526,73 @@ workspace-level in Xano — created on live, they carry through to sandbox and s
 **not** index `canonical_identity_key` alone: it is the graph MERGE key for
 `Film_TV_Award`, so co-nominees deliberately share it, and enforcing uniqueness on it alone
 would fragment one award into N nodes.
+
+## 2026-07 Certification Campaign Updates (2026-07-30)
+
+Operational learnings from the July 2026 certification campaign (8/8 fixtures passing;
+results: docs `guides/enrichment/waterfall/qa-smoke-tests/certification-2026-07`).
+These amend the procedures above wherever they conflict.
+
+### Crash-log reads MUST paginate
+
+`log_crash` (542) exceeds 400 rows on any multi-person run (measured 505 on a 5-person
+run, with the only red row at position 420). A single page-1 read is blind past row 400
+and produces false-clean verdicts. Always `per_page <= 400` (the API errors above ~500
+and the error object reads as zero rows) and follow `nextPage` to exhaustion.
+`~/work/qa-scripts/qa_snapshot.py` and `run_subject.py` paginate correctly now.
+
+### Two gate contracts — enriched vs parked
+
+- **Enriched contract** (`qa_snapshot.py <LABEL>`): full_enrich=true + health passed +
+  zero real crashes + all receipts success/superseded. Exit code is the verdict; never
+  pipe through `tee`.
+- **Parked contract** (`qa_snapshot_parked.py <LABEL>`): a person whose identity
+  resolution exhausted honestly (PDL miss + Exa `fiber_email_not_resolved`) is PARKED by
+  design (#13039 v1.28+): full_enrich stays false and there are ZERO receipts. Score:
+  named person (derived name allowed) + `identity_unresolved` park telemetry + zero real
+  crashes + zero receipts. Parked persons NEVER settle under the enriched contract — do
+  not report that as a failure.
+- A gate occasionally false-fails on an empty API fetch (`receipts: 0` while the poller
+  just saw them; health flags None). Re-run the gate once before diagnosing.
+
+### Email-only runs
+
+- Seeds with only an email take 2+ minutes server-side: the Exa fiber now polls to the
+  agent run's TERMINAL state (#13179, 60x5s cap). A client-side seed timeout is expected
+  and is NOT a dedup no-op — `run_subject.py` detects the live run and continues.
+- `run_subject.py "<name-or-empty>" "<linkedin-or-empty>" "<email>"` — the third
+  positional arg seeds email; linkedin_url is always sent (even empty) so the QA
+  endpoint's Chia default cannot leak in.
+- No-name email seeds derive full_name from the email local part (#13039 v1.27:
+  `evanson@orbiter.io` -> "Evanson").
+- Caller-provided emails qualify for the domain-employer fallback with a review flag:
+  expect a `human_review_required` (757) row `kind=email_domain_fallback_unverified`
+  alongside the WORKS_AT edge (#13304 v1.1).
+- Probe a fiber run directly (read-only): `POST api:ewwK9hZc/exa-agent-run-poll`
+  `{run_id}` (endpoint 8961).
+
+### Wipe / rerun hygiene
+
+- Server-side runs OUTLIVE local pollers. `pkill` of `run_subject.py` stops polling
+  only; sweeper retries, deep-bio callbacks, and Cloud Run jobs keep writing. Before a
+  back-to-back rerun, either wait for the terminal receipt to park/settle or accept that
+  the wipe certifier may abort with `verification-residue` — that abort is CORRECT
+  (fail-closed); quiesce ~5-8 min and relaunch.
+- Quoted `pkill -f 'x "y"'` patterns never match (argv has no quotes). Use unquoted
+  substrings.
+
+### Verdict-reading updates
+
+- Verification blobs may now carry `verified_excluding_tense` and `tense_adjudication`
+  (#13194/#13289): regex tense hits are ADJUDICATED by #13311
+  (`mvp/bios/adjudicate-tense-violations`, downgrade-only, fail-closed) before going
+  red, but only when tense is the sole blocker. Adjudication telemetry rows log under
+  that function name with per-candidate verdicts and reasons.
+- A red row whose `master_person_id` no longer exists usually means person-resolution
+  MERGED the subject away mid-run; post-#13040-v3.86 these classify as
+  `person_merged_away` telemetry — a legacy-shaped red there means the write predated
+  the classification, not a live defect.
+- `city_name_alias` (771) is consulted by the city writers and is per-datasource
+  (sandbox + live both seeded; survives the sandbox wipe — it is outside the truncation
+  groups).
 ````

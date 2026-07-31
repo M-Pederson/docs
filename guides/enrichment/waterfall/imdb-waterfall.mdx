@@ -7,10 +7,10 @@ sidebarTitle: "Overview"
 Queue-driven IMDB (Film & TV) enrichment with a tiered cascade, depth cap, loop prevention, and full credit-edge \+ expertise wiring. This page is the architecture spec: source contract, depth model, tiers, seed flows, loop prevention, and the implementation invariants. The live function inventory, table schemas, and graph node \+ edge references live on the companion pages below.
 
 <Note>
-  **Last reviewed & updated: 2026-07-09** — audited against live XanoScript (workspace 3 `OrbiterV2`, branch `v1`).
+  **Last reviewed & updated: 2026-07-31** — audited against live XanoScript (workspace 3 `OrbiterV2`, branch `v1`). This pass updated the award-graph path (durable queue \+ live drain Task 191) and the queue-upsert promotion semantics (2026-07-25 refactor).
 </Note>
 
-The full waterfall is live in Xano workspace 3 (OrbiterV2) — the function inventory with per-function version history is on [IMDB Waterfall Functions](/guides/enrichment/waterfall/imdb-functions). **Both queue crons are `active = false`** — flip them in the Xano UI before enabling production enrichment.
+The full waterfall is live in Xano workspace 3 (OrbiterV2) — the function inventory with per-function version history is on [IMDB Waterfall Functions](/guides/enrichment/waterfall/imdb-functions). **The person \+ title queue crons (Tasks 159 / 160) are `active = false`** — flip them in the Xano UI before enabling production enrichment. **The award-graph drain (Task 191) IS live** — it processes up to 20 durable `queue_imdb_award_graph` jobs every 60 s via `mvp/queue/process-imdb-award-graph` #13245.
 
 <CardGroup cols={2}>
   <Card title="IMDB Waterfall Entry Points" icon="play" href="/guides/enrichment/waterfall/imdb-entry-points">
@@ -34,7 +34,7 @@ The full waterfall is live in Xano workspace 3 (OrbiterV2) — the function inve
   </Card>
 
   <Card title="Build Drain Crons — IMDB" icon="clock-rotate-left" href="/guides/enrichment/waterfall/enrichment-crons#build-drain-crons">
-    The queue-drain crons — Task #159 (person) and Task #160 (title), single-row ticks every 600 s — plus the UTA seeder and poster-backfill tasks. All inactive.
+    The queue-drain crons — Task #159 (person) and Task #160 (title), single-row ticks every 600 s, plus the UTA seeder and poster-backfill tasks: all inactive. Task #191 (award-graph drain, 20 jobs / 60 s) is **active**.
   </Card>
 </CardGroup>
 
@@ -124,10 +124,12 @@ from film_tv.json:
 
 ### Upsert on duplicate
 
-When the same `imdb_url` is discovered twice (e.g., an actor appears on two seed titles), the queue entry is upserted:
+When the same `imdb_url` is discovered twice (e.g., an actor appears on two seed titles), the queue entry is upserted (`upsert-imdb-person` #12871 v2.2 / `upsert-imdb-title` #12872 v2.4, 2026-07-25 refactor):
 
 - `count` is incremented
-- `priority_tier` is **upgraded** to the new (lower = better) value if applicable
+- a genuine re-discovery **promotes the row one step toward tier 0** — debounced to at most once per 30-minute window (`last_promoted_at`), because a single enrichment run mechanically re-upserts the same row 4–60 times and unthrottled promotion flattened all banding to tier 0 (measured on a Ryan Reynolds run)
+- an explicitly lower incoming tier still wins (clamped to 0–4)
+- title \+ award tiers are **symmetrically equalized** — shared tier = min(title, all its award rows), written to both sides (#12872 v2.4)
 - No duplicate scrape is scheduled
 
 ---
@@ -156,7 +158,7 @@ When the same `imdb_url` is discovered twice (e.g., an actor appears on two seed
     `mvp/imdb/add-credit-edges-from-person` (#13013). Writes `(Person)-[:WORKED_ON]->(Film_TV)` edges — `uuid` \+ description stamped at write time — for every credit whose film's `node_uuid` is already stamped, and `imdb_credit_join` rows (pending `edge_created: false` for stub-only films).
   </Step>
   <Step title="Awards (P5)">
-    `add-award-records-from-imdb-person` (#12887) — scrape `{imdb_url}/awards/`, LLM extract, write `film_tv_award` rows. Passes `cascade_depth` through. Bulk award **graph** writes are deferred to `tool/backfill-award-edges-imdb` #13014 batches (v1.1p).
+    `add-award-records-from-imdb-person` (#12887) — scrape `{imdb_url}/awards/`, LLM extract, write `film_tv_award` rows. Passes `cascade_depth` through. Award **graph** writes run as a bounded inline batch via `tool/backfill-award-edges-imdb` #13014, with every remainder durably queued to `queue_imdb_award_graph` via `upsert-imdb-award-graph` #13244 — drained by #13245 (Task 191, live, 20 jobs / 60 s).
   </Step>
   <Step title="Cascades (P6)">
     `cascade-credits-from-person` (with `sync_top_credits: 5`), then a #13013 replay so sync-created titles get their `WORKED_ON` edges immediately (v1.9), then `cascade-awards-from-person`.
@@ -182,7 +184,7 @@ When the same `imdb_url` is discovered twice (e.g., an actor appears on two seed
     `mvp/imdb/add-credit-edges-from-title` (#13015). Writes `(Person)-[:WORKED_ON {role}]->(Film_TV)` edges — `uuid` \+ description stamped at write time — for every cast/crew member whose `imdb_person.node_uuid` is already stamped, plus `imdb_credit_join` rows.
   </Step>
   <Step title="Awards (P5)">
-    `add-award-records-from-title` (#12879) — optional scrape of `{imdb_url}/awards/` with `soft_fail: true`; visible Winner/Nominee rows parse deterministically, the LLM (`deepseek/deepseek-v4-flash`) only cleans up (v1.15). Writes `film_tv_award` rows; resolves `primary_nominee_imdb_url` via `get-add/imdb-person` at T2/depth\+1. Bulk award **graph** writes are deferred to #13014 batches (v1.17).
+    `add-award-records-from-title` (#12879) — optional scrape of `{imdb_url}/awards/` with `soft_fail: true`; visible Winner/Nominee rows parse deterministically, the LLM (`deepseek/deepseek-v4-flash`) only cleans up (v1.15). Writes `film_tv_award` rows; resolves `primary_nominee_imdb_url` via `get-add/imdb-person` at T2/depth\+1. Award **graph** writes: bounded inline batch via #13014, remainder durably queued to `queue_imdb_award_graph` via #13244 (drained by #13245 / Task 191).
   </Step>
   <Step title="Cascades (P6)">
     `cascade-crew-from-title` \+ `cascade-awards-from-title` (seed ids validated first, v1.14).
@@ -240,7 +242,9 @@ Depth 0: seed person (imdb_url, cascade_depth: 0, queue: false)
     ├── P5  awards — add-award-records-from-imdb-person #12887
     │       (cascade_depth passed through)
     │       → Firecrawl {imdb_url}/awards/ → LLM extract → film_tv_award rows
-    │       (bulk award graph writes deferred to backfill-award-edges-imdb #13014)
+    │       (award graph: bounded inline batch via backfill-award-edges-imdb
+    │       #13014, remainder queued to queue_imdb_award_graph via #13244,
+    │       drained by #13245 / Task 191 — live, 20 jobs per 60 s)
     ├── P6  cascades (pure dispatchers; each get-add call try_catch → log_crash)
     │   ├── cascade-credits-from-person (sync_top_credits: 5)
     │   │   ├── per credit → title stub via get-add (imdb_url + title only,
@@ -292,7 +296,7 @@ External calls by depth (Firecrawl scrapes \+ LLM extracts):
 ## Loop prevention (five layers)
 
 1. **Dedup gate in `get-add`:** person side — `imdb_url` already in `imdb_person` with `enriched_at` within 30 days → return existing, no scrape. Title side — **any** existing enriched `film_tv` row dedups (sparse stubs fall through for queue repair / sync-enrich; `refresh: true` bypasses).
-2. **Queue upsert:** duplicate `imdb_url` in queue → `count++`, tier upgrade. Single row per URL.
+2. **Queue upsert:** duplicate `imdb_url` in queue → `count++`, one-step tier promotion debounced to once per 30 min (2026-07-25). Single row per URL.
 3. **Depth cap:** depth 2 scrape happens but no cascade. Depth 3 never queued.
 4. **Tier cap at depth ≥ 1:** only T1–T2 discoveries are queued at depth 2 (T3–T4 discarded).
 5. **Kill switch:** zero-API blocker flippable manually via `check-kill-switch-imdb`.
@@ -314,7 +318,7 @@ External calls by depth (Firecrawl scrapes \+ LLM extracts):
 - **Cron single-row tick pattern:** modeled on `process-person-queue` **#126** / `process-company-queue` **#127**. Lock-on-pick, `try_catch` around orchestrator, release lock on failure. Priority pick order: `priority_tier` asc, `cascade_depth` asc, `id` asc.
 - **Missing-stub guard:** if the queue row's `imdb_person_id` / `film_tv_id` is 0, write `log_crash` and `db.del` the queue row — prevents a bad row from monopolizing the lock forever.
 - **Symmetric credit-edge writers:** #13013 (person side) and #13015 (title side) write graph edges only when both endpoint UUIDs exist, stamping `uuid` \+ a description at write time (shared helper #13181) and mirroring resolved edges into `imdb_credit_join`. #13013 also materializes pending `imdb_credit_join` rows for credit-derived `film_tv` stubs with `edge_created: false`, then flips them to true on a later resolved pass. No reconciler cron needed.
-- **Award graph writes are deferred:** the award scrapers (#12887 / #12879) persist `film_tv_award` rows and log `award_graph_deferred`; `tool/backfill-award-edges-imdb` #13014 drives #2334 in bounded batches so high-award people can't time out on hundreds of inline graph writes.
+- **Award graph writes are bounded-inline \+ durably queued:** the award scrapers (#12887 / #12879) persist `film_tv_award` rows, materialize a bounded inline batch through `tool/backfill-award-edges-imdb` #13014 (which drives #2334), and durably queue every remainder to `queue_imdb_award_graph` via `upsert-imdb-award-graph` #13244 — so high-award people can't time out on hundreds of inline graph writes. `mvp/queue/process-imdb-award-graph` #13245 (Task 191, **active**, 2026-07-18) drains up to 20 jobs per 60 s tick.
 - **Honorary awards have no `Film_TV` anchor:** `#2334 v1.5` handles `film_tv_id == null` by gating the `Film_TV` MERGE on `hasFilm` and swapping the `Film_TV_Award` MERGE key from `film_tv_imdb_url` → `person_uuid` so honoraries remain unique per-person. Since v1.7, title-level rows with no linked person also materialize their award node \+ `HAS_AWARD` edge.
 - **`node_registry` registration:** #2320 and #2334 register stamped `Film_TV` / `Film_TV_Award` UUIDs in `node_registry` (2026-07-09) using linked table names — the live type column is spelled `entitiy_type`.
 

@@ -9,7 +9,7 @@ Queue-driven MusicBrainz enrichment with a tiered cascade, depth cap, loop preve
 It mirrors the [IMDB Waterfall](/guides/enrichment/waterfall/imdb-waterfall) — queue tables, depth-capped cascade, priority tiers, upsert dedup — with two structural differences: MusicBrainz is a **structured JSON API** (no HTML scrape, no LLM extraction in the structural path), and it enforces a **hard 1 request/second global limit**, which becomes the central design constraint.
 
 <Note>
-  **Last reviewed & updated: 2026-07-09** — audited against live XanoScript (workspace 3 `OrbiterV2`, branch `v1`).
+  **Last reviewed & updated: 2026-07-31** — audited against live XanoScript (workspace 3 `OrbiterV2`, branch `v1`). This pass updated the drain mechanics (lease tokens, execution scopes, catalog_preview — the 2026-07-20→28 hardening series), the artist cascade numbers, the retry backoff, and the lifecycle-epoch / tier-floor callouts.
 </Note>
 
 The tables and the forward function layer are live in Xano workspace 3 (OrbiterV2), branch `v1`, tagged `musicbrainz` — the full inventory is on [Music Waterfall Functions](/guides/enrichment/waterfall/music-functions). **We designed first, then built** — all six open design questions were resolved before build (see [Resolved design decisions](#resolved-design-decisions-2026-06-11)); node/edge specs were derived from real API responses (Nirvana / _Nevermind_ / Sub Pop / Reading Festival 1992). The unified drain cron (Task 180) and person-resolution cron (Task 182) are **INACTIVE** — pausing/leaving them off is the manual kill.
@@ -46,7 +46,9 @@ The tables and the forward function layer are live in Xano workspace 3 (OrbiterV
   - **`SAME_AS` identity weight is fixed-forward.** Lower weight = stronger, `0` is disallowed, and identity uses the floor **`1`**. Live #13091, #13121, and the reverse-bridge writers (#13170 / #13172) write `SAME_AS.weight = 1` for the label→Company and Music\_Artist→master-person bridges.
   - **Three documented edge types are allowlisted but unwired:** `COLLABORATED_WITH`, `SUPPORTING_MUSICIAN_FOR`, and `TRIBUTE_TO` have no live writer. They remain design/deferred entries until a writer lands.
   - **Generated node descriptions cover only three node types:** `Recording`, `Music_Group`, and `Music_Artist`. The other music node types get dual vectors from `name + disambiguation`; forward writers stamp `description = null` / `description_generated_at = null` semantically on create.
-  - **Edge description envelope is fixed-forward.** Forward edge writers stamp `description = null` / `description_generated_at = null` on create; every orchestrator then describes its pending edges in-band via #13158, with the sandbox safety-net cron (#181) as async fallback.
+  - **Edge description envelope is fixed-forward.** Forward edge writers stamp `description = null` / `description_generated_at = null` on create; every orchestrator then describes its pending edges in-band via #13158, with the safety-net cron (Task 181, **active**) as async fallback.
+  - **Lifecycle-epoch fencing (2026-07-20).** Queue writers and orchestrators verify the `pipeline_lifecycle_epoch` row for `musicbrainz` and **fail closed while the lifecycle rotates** — a caller carrying a stale epoch cannot write queue rows or claim terminal success across a wipe/reset boundary.
+  - **Artist tier floor (2026-07-23, #13081 v1.9).** Non-root artist discoveries enter the queue at tier ≥ 1, fail-closed; **only the sanctioned catalog planner** (the #13094 catalog plan) may place a row in the tier-0 drain lane. Duplicate-discovery promotion still runs, but it cannot cross that floor for artists.
   - **Recording credit edges are type-aware.** `PLAYED_ON` / `PRODUCED` / `ENGINEERED` can originate from `Music_Group` as well as `Person:Music_Artist` (#13100 splits by the MusicBrainz `artist.type`).
   - **Remaining forward-path gap:** `FROM_AREA` geography edges are graph-derived outside the audited ingest path while sweeps are excluded.
 </Warning>
@@ -76,12 +78,13 @@ The defining constraint — **the 1 req/s ceiling is global, not per-cron**. Ind
 
 - **`mb/rate-limit/acquire` (13079)** — the fail-open token gate backed by the singleton `mb_rate_limit` row (#736).
 - **`mb/api/request` (13080)** — the single choke-point for every MusicBrainz call: pacing via `acquire`, canonical `User-Agent`, `fmt=json`, the [retry policy](#retry-policy) below. Orchestrators never call `api.request` directly.
-- **`mb/queue/process-next` (13102) \+ Task 180** — **one unified cron**, not six. Each `process-next` call selects the single best pending **tier-0** row across all six queues (order `cascade_depth ASC, entity_rank ASC, id ASC`; nonzero tiers wait for [duplicate-discovery promotion](#priority-tiers)), locks it, dispatches the matching orchestrator, deletes on success. Task 180 runs every **60 s and makes up to 10 such calls per tick** (Xano cron granularity is 60 s; the design's ~2 s tick — see [deviations](/guides/enrichment/waterfall/music-functions#deviations--deferrals)). A unified cron makes the global 1 req/s trivially enforceable; parallel crons would not.
+- **`mb/queue/process-next` (13102) \+ Task 180** — **one unified cron**, not six. Each `process-next` call selects the single best pending **tier-0** row across all six queues (order `cascade_depth ASC, entity_rank ASC, id ASC`, gated on `next_attempt_at`; nonzero tiers wait for [duplicate-discovery promotion](#priority-tiers)), **lease-locks it with a lease token**, dispatches the matching orchestrator, and deletes the row only on **lease-token-verified terminal proof**. Task 180 runs every **60 s and makes up to 10 such calls per tick** (Xano cron granularity is 60 s; the design's ~2 s tick — see [deviations](/guides/enrichment/waterfall/music-functions#deviations--deferrals)). A unified cron makes the global 1 req/s trivially enforceable; parallel crons would not.
+- **Leases, scopes, and the catalog continuation (v2.2–v2.9, 2026-07-20→28).** Rows hold a bounded lease (events use a 180 s lease with a 60 s first retry; other entities a 10-minute lease with 5-minute backoff) so a dead frame can't monopolize a row. Artist work is **staged by `execution_scope`**: `core` materializes verified identity (node, `SAME_AS`, aliases/dates) first; `catalog_preview` is the bounded post-core continuation that enriches the committed catalog slice under the same lease-owned plan; `cascade_only` requires verified core identity. Interrupted rows close from durable current-epoch terminal proof instead of repeating provider work, and retry exhaustion at 5 failures drops the row.
 
 Behavioral detail (sleep timings, retry internals, drain backoff): [Foundation](/guides/enrichment/waterfall/music-functions#foundation) and [Unified queue drain](/guides/enrichment/waterfall/music-functions#unified-queue-drain).
 
 <Warning>
-  **Throughput is intentionally low.** At ~1 entity / 3–6 s, a depth-0 artist with its top recordings \+ albums \+ members takes minutes, and a deep cascade takes hours — by design. The depth cap (2), tier caps, and per-entity caps (20 albums, 50 recordings, 3 browse pages) keep total work bounded so the queue drains in finite time rather than fanning out to the full ~30 M-entity database.
+  **Throughput is intentionally low.** At ~1 entity / 3–6 s, a depth-0 artist with its top recordings \+ albums \+ members takes minutes, and a deep cascade takes hours — by design. The depth cap (2), tier caps, and per-entity caps (20 albums, 20 recordings, 3 browse pages) keep total work bounded so the queue drains in finite time rather than fanning out to the full ~30 M-entity database.
 </Warning>
 
 ## API errors, retries & rate limits
@@ -117,7 +120,7 @@ terminal       = {400, 404}                     # never retried
 on_exhaustion  = release lock · log_crash phase="api_exhausted" · re-queue one tier lower
 ```
 
-- **Live implementation uses bounded sleeps inside the API helper.** `mb/rate-limit/acquire` sleeps when the global 1 req/s floor has not elapsed, and `mb/api/request` sleeps between its internal retry attempts. Queue-level failures use `next_attempt_at`, so the unified cron skips rows whose enrich retry window is in the future (5 min × retries; dropped after 5 failures).
+- **Live implementation uses bounded sleeps inside the API helper.** `mb/rate-limit/acquire` sleeps when the global 1 req/s floor has not elapsed, and `mb/api/request` sleeps between its internal retry attempts — **linear `attempts × 2` seconds (2 s → 4 s → 6 s → 8 s), not the design's exponential curve, and no jitter** (#13080 v1.4, 2026-07-30, fixed a `util.sleep`-is-seconds unit bug that had the v1.3 "millisecond" values sleeping 33–100 minutes per retry). Queue-level failures use `next_attempt_at`, so the unified cron skips rows whose enrich retry window is in the future (5 min × retries generally; events retry after 60 s first; preview-deferral rechecks at 120 s; dropped after 5 failures).
 - **Backoff is per-entity; pacing is global.** The 1 req/s token bucket governs _spacing_ between any two calls; the API retry backoff governs _re-attempts_ of one failed HTTP call; the queue backoff governs failed enrich rows. All three invariants hold simultaneously.
 - **Retries are idempotent.** Every write is `MERGE`-based with `coalesce`d `created_at`, so re-running a partially-applied enrich never duplicates nodes or edges.
 
@@ -154,7 +157,7 @@ Identical to IMDB — hard cap at depth 2.
 | **3\+** | Never queued | Hard cap |
 
 <Check>
-  **Why cap at 2?** MusicBrainz is ~2.5 M artists / ~30 M recordings. One prolific artist → ~20 albums → ~250 recordings → each recording → 1 work \+ ~5 credited people → thousands of entities at depth 2. Combined with the 1 req/s limit, an uncapped cascade would never drain. Depth 2 \+ tier caps \+ per-entity caps (20 albums, 50 recordings) keep a seed's full expansion in the low thousands of API calls.
+  **Why cap at 2?** MusicBrainz is ~2.5 M artists / ~30 M recordings. One prolific artist → ~20 albums → ~250 recordings → each recording → 1 work \+ ~5 credited people → thousands of entities at depth 2. Combined with the 1 req/s limit, an uncapped cascade would never drain. Depth 2 \+ tier caps \+ per-entity caps (20 albums, 20 recordings) keep a seed's full expansion in the low thousands of API calls.
 </Check>
 
 ## Priority tiers
@@ -162,7 +165,7 @@ Identical to IMDB — hard cap at depth 2.
 <Note>
   **Tier 0 is the reserved bootstrap lane** ([decision 5](#resolved-design-decisions-2026-06-11)) — manual seed batches queue at `priority_tier = 0` and drain ahead of all cascade traffic. The tiers below (1–4) apply to cascade-discovered entities.
 
-  **Drain eligibility is tier-0-only (v1.2, 2026-07-01).** The unified drain (13102) picks only `priority_tier = 0` rows. Cascade rows enter at tiers 1–4 and are **promoted one step toward 0 on each duplicate discovery** (`priority_tier = max(0, min(existing_tier, incoming_tier) - 1)`), so repeatedly-referenced entities earn their drain slot. Tier assignment below still determines how fast that happens.
+  **Drain eligibility is tier-0-only (v1.2, 2026-07-01).** The unified drain (13102) picks only `priority_tier = 0` rows. Cascade rows enter at tiers 1–4 and are **promoted one step toward 0 on each duplicate discovery** (`priority_tier = max(0, min(existing_tier, incoming_tier) - 1)`), so repeatedly-referenced entities earn their drain slot. Tier assignment below still determines how fast that happens. **Exception (2026-07-23): artist rows floor at tier 1** — only the sanctioned #13094 catalog plan may place an artist row at tier 0.
 </Note>
 
 ### `queue_mb_artist` (1 = highest)
@@ -194,15 +197,15 @@ Identical to IMDB — hard cap at depth 2.
 
 ### Cascade filter — artist seed
 
-Since #13094 v1.8 (2026-07-09) the artist cascade is **signal-scored with inline anchors**: children are ranked by MusicBrainz search score \+ rating \+ vote volume \+ tags \+ date/title quality, a small top slice is **enriched inline** at root/depth-safe time, and the rest queue with graded tiers.
+Since #13094 v1.8 (2026-07-09) the artist cascade is **signal-scored with inline anchors**: children are ranked by MusicBrainz search score \+ rating \+ vote volume \+ tags \+ date/title quality, a small top slice is **enriched inline** at root/depth-safe time, and the rest queue with graded tiers. The v3.x series (2026-07-21→28) split the artist run into **execution modes**: verified root artists materialize `core` identity first, then a **`catalog_preview` continuation** enriches exactly the **top 3 release-groups \+ top 5 recordings inline** and queues the **committed 17 / 15 remainder** into the tier-0 drain lane under one immutable, lease-owned catalog plan (full success stamps only after committed readback). Catalog truncation is reported as telemetry, not hidden.
 
 ```text
-from artist lookup + browse (signal-scored):
+from artist lookup + browse (signal-scored, catalog plan committed under lease):
     member of band (each)                          → T1 (artist)
     release-groups: top 20 kept —
-        top 3 enriched inline · next 5 → T1 · rest → T2   (release-group)
-    recordings: top 50 kept —
-        top 2 enriched inline · next 13 → T1 · rest → T2  (recording)
+        top 3 enriched inline · next 17 queued     (release-group)
+    recordings: top 20 kept —
+        top 5 enriched inline · next 15 queued     (recording)
     events (depth-0 seeds only, recency-sorted):
         top 2 enriched inline · next 3 → T2 · rest → T3   (event)
     collaborator / supporting musician             → deferred to v2
@@ -283,10 +286,10 @@ Depth 0: seed artist (mbid)
 │       where the finalizer applies
 ├── Membership: each "member of band" rel
 │   → MEMBER_OF edge (instruments/dates/original) + member artist queued at T1
-├── Cascade fanout (browse, throttled, paginated; signal-scored, v1.8;
-│   each child via get-add at depth+1)
-│   ├── release-groups top 20: top 3 INLINE · next 5 T1 · rest T2
-│   ├── recordings top 50:     top 2 INLINE · next 13 T1 · rest T2
+├── Cascade fanout (browse, throttled, paginated; signal-scored;
+│   catalog plan committed under lease, v3.x; each child via get-add at depth+1)
+│   ├── release-groups top 20: top 3 INLINE · next 17 queued
+│   ├── recordings top 20:     top 5 INLINE · next 15 queued
 │   ├── events (depth-0 seeds only, recency-sorted):
 │   │                          top 2 INLINE · next 3 T2 · rest T3
 │   └── collaborator / supporting musician           → deferred to v2, not queued
@@ -302,9 +305,13 @@ Unified drain — Task 180 (every 60 s, ≤ 10 process-next calls/tick; ships IN
 │    identity-rich entities ahead of bulk catalog)
 ├── cascade rows enter at T1–T4 and wait for duplicate-discovery promotion:
 │   each re-discovery → count++ + priority_tier = max(0, min(existing, incoming) - 1)
-│   (one row per MBID, enforced by a unique index)
-└── lock (processing: true) → dispatch the matching orchestrator at the row's
-    cascade_depth → delete row on success
+│   (one row per MBID, enforced by a unique index; artists floor at T1 —
+│    only the sanctioned catalog plan places artist rows at tier 0)
+└── lease-lock (token + bounded lease: events 180 s / others 10 min)
+    → dispatch the matching orchestrator at the row's cascade_depth and
+    execution_scope (core → catalog_preview → cascade) → delete row only on
+    lease-token-verified terminal proof (interrupted rows close from durable
+    current-epoch proof instead of repeating provider work)
 
 Depth 1: queued discovery (e.g. a T1 band member)
 ├── full lookup + node + edges (all phases run)
@@ -322,7 +329,7 @@ Depth 2: transitive stub
 - Every MusicBrainz call in this tree passes through the global 1 req/s token bucket (`mb/rate-limit/acquire` \+ the single unified cron), so total throughput never exceeds 1 req/s no matter how many queue rows are pending.
 - One artist \+ two browse pages ≈ 3 requests ≈ 3 seconds — effective throughput is ~1 entity / 3–6 s.
 - That is why a depth-0 artist with its top recordings \+ albums \+ members takes **minutes**, and a deep cascade takes **hours** — by design.
-- The depth cap (2), tier caps, and per-entity caps (20 albums, 50 recordings, 3 browse pages) keep a seed's total work bounded so the queue drains in finite time rather than fanning out to the full ~30 M-entity database.
+- The depth cap (2), tier caps, and per-entity caps (20 albums, 20 recordings, 3 browse pages) keep a seed's total work bounded so the queue drains in finite time rather than fanning out to the full ~30 M-entity database.
 
 ## Loop prevention (six layers)
 

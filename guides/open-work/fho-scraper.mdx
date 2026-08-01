@@ -1,0 +1,203 @@
+---
+title: "FHO Scraper"
+description: "Autonomous family-office research swarm in Xano — shard queue → Kimi search workers → K3 validator → master_family_office. Built and smoke-passed 2026-08-01; launch is two task switches."
+icon: "landmark"
+---
+
+<Info>
+  **Status:** Built and smoke-tested end-to-end on 2026-08-01. Both background tasks exist and are **INACTIVE** — nothing runs until they are switched on. Launch = activate tasks `196` + `197` (Section [Launch](#launch-runbook)). Kill switch = deactivate the same two tasks.
+</Info>
+
+## What it is
+
+An autonomous pipeline that compiles a verified database of US family offices (name, domain, HQ, principal family, office email/phone/address when publicly available, sources) into the `master_family_office` table. Kimi models via OpenRouter do the reading and judging; Serper.dev executes the actual web searches; Xano orchestrates everything on cron. No human in the loop after launch.
+
+Original build spec: `~/Downloads/fo-swarm-claude-code-plan.md` (Mark's machine). XanoScript sources + launch notes: `~/xano-fo-swarm/`.
+
+## Architecture
+
+```
+queue_fo_shard  ──▶  fo/run_search_worker (task_fo_search, every 1 min)
+                        │  OpenRouter (kimi-k2.6:exacto) tool loop, max 8 turns
+                        │  web_search tool calls executed by Xano → Serper.dev
+                        │  directory pages found → re-queued as "lead" shards
+                        ▼
+                  fo_candidate  ──▶  fo/run_validator (task_fo_validate, every 2 min)
+                                        │  Xano fetches homepage + source URL,
+                                        │  OpenRouter (kimi-k3) one-shot judgment
+                                        ▼
+                                  master_family_office
+```
+
+- **Worker** — pops the oldest pending shard (attempts < 3), runs a fresh Kimi mini-agent that issues `web_search` tool calls (3–6 per shard). Only entities with a real source URL + verbatim evidence snippet survive server-side parsing into `fo_candidate` (dedup on normalized name and on domain). A janitor step reclaims shards stuck `running` > 15 min.
+- **Lead flywheel** — any directory/list page a search surfaces ("Top 50 family offices in Texas") is queued as a new `lead` shard and mined on a later tick. This is where most volume comes from.
+- **Validator** — takes 3 `new` candidates per tick, itself fetches the claimed homepage and first source URL (with a User-Agent header — Xano's default UA gets blocked by Wikipedia and others), and has K3 confirm, correct, or reject. Confirmed entities upsert into `master_family_office` keyed on server-side `name_norm` (never the model's own normalization), merging URLs/confidence/provenance into existing rows.
+
+## Xano components (workspace 3, branch v1)
+
+<Card icon="database">
+
+```
+queue_fo_shard — 772
+```
+
+Shard queue. `kind` = `source` | `geo` | `surname` | `lead`; `query_seed` is the dedup key (indexed, plus `status`). Lifecycle: `pending → running → done | failed`, 3 attempts max, 15-min janitor reclaim.
+
+</Card>
+
+<Card icon="database">
+
+```
+fo_candidate — 773
+```
+
+Raw extracted candidates awaiting validation. Indexed on `name_norm`, `domain`, `status` (`new → validated | rejected`). Every row carries `source_urls` (json array) + verbatim `evidence` — the grounding gate drops anything without both — plus `email` / `phone` / `address` when a search result showed them. `validator_notes` holds K3's verdict reasoning.
+
+</Card>
+
+<Card icon="database">
+
+```
+master_family_office — 774
+```
+
+**The deliverable.** Validated US family offices, unique index on `name_norm`. Fields include office `email` / `phone` / `address` — the validator verifies the worker's values against the fetched homepage/source text and fills them in when the pages show them (never invented; empty when unverified). Re-validations merge (fill blank fields, union source URLs to 10, keep best confidence) and append provenance to `candidate_ids`.
+
+</Card>
+
+<Card icon="play">
+
+```
+fo/run_search_worker — 13324
+```
+
+One run = one shard. Janitor → pop+lock → 8-turn OpenRouter tool loop with Serper-backed `web_search` → parse/normalize/dedup into `fo_candidate` → queue leads → mark shard done. On the final turn the request forces `tool_choice: "none"` so the model must emit its findings instead of searching past the budget. Returns `{blocked: ...}` without touching the queue if no Serper/OpenRouter key resolves.
+
+</Card>
+
+<Card icon="play">
+
+```
+fo/run_validator — 13325
+```
+
+One run = up to 3 candidates. Homepage + source fetch → K3 JSON-mode verdict (no sampling params — K3 has fixed sampling) → reject with reason, or master upsert + `validated`. Transient LLM/HTTP failures leave the candidate `new` with a note, so the next tick retries; per-candidate try/catch stops one bad row from blocking the batch.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+fo/seed_shards — 13323
+```
+
+Seeder, idempotent on `query_seed`. Builds 12 curated source-list queries + 100 state phrasings + 20 metros, plus one `"<name> family office"` shard per surname passed in the optional `surnames` json input. Safe to re-run any time with a new surname batch — only new seeds insert.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+fo/env_check — 13322
+```
+
+Preflight. Reports which config the fo/* functions resolve (booleans + env var *names* only — never values) and `ready.worker` / `ready.validator` flags. Run this first if anything looks blocked.
+
+</Card>
+
+<Card icon="clock-rotate-left">
+
+```
+task_fo_search — 196
+```
+
+Worker driver, every 60s, one shard per tick. **Created inactive.** Scale-up: duplicate the `function.run` step 2–3× inside the task for parallel shards (each call pops its own shard).
+
+</Card>
+
+<Card icon="clock-rotate-left">
+
+```
+task_fo_validate — 197
+```
+
+Validator driver, every 120s, 3 candidates per tick (≈90/hr). **Created inactive.** At high worker yield this is the bottleneck — raise the batch size in `fo/run_validator` or add a second `function.run` here.
+
+</Card>
+
+## Config resolution
+
+No env setup is required to launch — every value resolves through fallbacks at runtime via `util.get_env`. Create the spec-named var only when you want to override.
+
+| Spec env var | Fallback | Effective default |
+|---|---|---|
+| `SERPER_API_KEY` | existing `SERPER_DEV` | ✅ present, verified live |
+| `OPENROUTER_API_KEY` | existing `openRouter` | ✅ present, verified live |
+| `OPENROUTER_BASE` | — | `https://openrouter.ai/api/v1` |
+| `FO_MODEL_SEARCH` | — | `moonshotai/kimi-k2.6:exacto` |
+| `FO_MODEL_VALIDATE` | — | `moonshotai/kimi-k3` (slug verified live) |
+
+Workspace env vars are **UI-only** (Settings → Environment Variables) — the Metadata API has no workspace-env endpoints, which is why the functions carry fallbacks instead of requiring new vars.
+
+## Launch runbook
+
+<Steps>
+  <Step title="Preflight (optional)">
+    Run & Debug `fo/env_check` → expect `ready.worker: true` and `ready.validator: true`.
+  </Step>
+  <Step title="Add surname shards (recommended before launch)">
+    Run & Debug `fo/seed_shards` with `{"surnames": ["Walton", "Koch", "Mars", ...]}` — Forbes-400-type family names. Biggest single lever for coverage: SFOs are named after families. Idempotent.
+  </Step>
+  <Step title="One visible worker run (optional)">
+    Run & Debug `fo/run_search_worker` once and eyeball the returned `{shard, entities, leads}` plus the new `fo_candidate` rows.
+  </Step>
+  <Step title="Flip the two switches">
+    Background Tasks → activate `task_fo_search` (196) and `task_fo_validate` (197). That's launch.
+  </Step>
+  <Step title="Monitor">
+    Task history shows a `debug.log` JSON line per tick (`{idle}`, `{blocked}`, or `{shard, entities, leads}` / `{processed, validated, rejected}`). Watch `queue_fo_shard` counts by status, `fo_candidate` backlog (`status = "new"`), and `master_family_office` growth.
+  </Step>
+</Steps>
+
+## Throughput, cost, expected yield
+
+| Setting | Default | Effect |
+|---|---|---|
+| Worker cadence | 1 shard/min | 132 seeds drain in ~2¼ h; leads keep the queue fed for a day or two |
+| Validator batch | 3 per 2 min | ≈90 candidates/hr — the bottleneck once directory leads start yielding |
+| Worker cost (k2.6) | ~$0.01–0.03 / shard | |
+| Validator cost (K3) | ~$0.01–0.05 / candidate | Downgrade `FO_MODEL_VALIDATE` to k2.6 if spend matters |
+| Serper | 2,500 queries free | ~3–6 queries per shard, then ~$0.30–1 / 1k |
+
+Realistic converged output per the spec: **1,500–2,500 validated US family offices** for roughly $30–100 total.
+
+## Smoke test results (2026-08-01)
+
+<Accordion title="Worker — Dell shard → DFO Management, LLC (80.6s)">
+  Shard #1 `"Dell family office"` (surname) → `done`, 1 attempt. Produced `fo_candidate` #2:
+
+  - **DFO Management, LLC** — `dellfamilyoffice.com`, SFO, New York NY, principal family "Dell family (Michael S. Dell)", confidence high
+  - Sources: dellfamilyoffice.com, en.wikipedia.org/wiki/DFO_Management, linkedin.com/company/dfo-management
+  - Evidence (verbatim): "Established in 1998, exclusively manages the assets of Michael S. Dell and his family."
+  - Plus 3 harvested lead shards: an SWF Institute profile, Dakota's "Top 10 family offices in NYC 2026" list, an ALTSS MSD Capital profile
+
+  Validator then confirmed in 8.3s — K3's notes verified the 550 Madison Avenue HQ and independently caught the 2022 MSD Capital → DFO Management rebrand. Master row #2, confidence high.
+</Accordion>
+
+<Accordion title="Validator — planted Soros candidate, degraded vs healthy paths">
+  Run 1 (36.8s, before the User-Agent fix): homepage fetch returned empty and the Wikipedia fetch failed → K3 correctly nulled the domain per rules and capped confidence at low rather than trusting the claim. Run 2 (15.8s, after adding the UA header): real homepage text ("SFM is a family office and does not seek… investors that are not eligible family clients") + Wikipedia corroboration → confidence upgraded to high, domain restored, and the merge path updated the existing master row in place (`candidate_ids [1,1]`). Run 3 (24s, after the contact-fields change): K3 filled `address: "250 West 55th Street, New York, NY"` from the fetched page text via the merge path — email/phone stayed empty because Soros doesn't publish them, which is the intended "when available" behavior.
+</Accordion>
+
+<Accordion title="Honest zero — SEC EDGAR seed yields nothing (by design)">
+  Shard #2 `SEC EDGAR 13F filers "family office" list` finalized with 0 entities across 8 search turns, twice. SEC full-text-search snippets don't name concrete offices, and the grounding rules forbid the model from answering out of memory — so an empty result is correct behavior, not a failure. Expect the handful of SEC-flavored seeds to under-yield; directory- and press-flavored seeds plus the lead flywheel carry the volume. (Before the final-turn force-output fix this same shard ended with `max turns reached without final output`; now it concludes cleanly.)
+</Accordion>
+
+Master rows 1–2 (Soros, DFO) are smoke data — safe to delete before launch, or leave them; the unique `name_norm` index means the swarm merges into them rather than duplicating.
+
+## Known limitations & v2 ideas
+
+- **The worker is search-only** — it reads Serper snippets, never full pages, so a 100-name directory page yields only what snippets expose. The validator does fetch full pages. Natural v2: add a `fetch_page` tool to the worker (one more External API step, same pattern as `web_search`).
+- **Contact coverage is partial by design** — search snippets rarely show emails/phones, so most contact data comes from the validator reading the office's homepage. Offices without a public site (or that don't publish contacts) land with empty contact fields. A v2 `fetch_page` worker tool and/or a dedicated contact-page pass (`/contact`, `/about`) would raise coverage.
+- **Re-validating a candidate re-appends its id to `candidate_ids`** (spec behavior) — provenance can hold duplicates like `[1,1]`. Cosmetic; dedupe in the merge lambda if it bothers anyone.
+- **Lambdas are deliberately regex-free** — backslash character classes silently corrupt inside XanoScript triple-quoted strings in this workspace. Keep it that way when editing (token sets, `indexOf`/`substring`, char-walks).
+- **Empty `catch {}` blocks get silently dropped by the XanoScript compiler** — every catch in these functions carries a real statement. Preserve that when editing.

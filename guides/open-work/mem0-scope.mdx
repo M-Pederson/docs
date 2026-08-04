@@ -438,7 +438,7 @@ Every entry point below is a **writer** and follows one shape. Treat this as the
 6. **Update semantics.** Same `canonical_memory_hash`, changed content → mark the old row `superseded`, update/delete its mem0 projection via `mem0_memory_id`, insert the new row, re-project.
 7. **Failure.** Record `error` on the row, leave `route_status` as-is; every writer must be re-run-safe end to end.
 
-Rules that never bend: `occurred_at` is **domain time** (when the thing happened), never ingest time. User-derived content never writes to the shared banks. `expiration_date` only on upcoming-event memories. Each environment uses its own Mem0 project key.
+Rules that never bend: `occurred_at` is **domain time** (when the thing happened), never ingest time. User-derived content never writes to the shared banks. `expiration_date` only on meeting-prep pack memories. Each environment uses its own Mem0 project key.
 
 | # | Entry point | Writes to | Owner (GCP) | Status |
 | --- | --- | --- | --- | --- |
@@ -453,6 +453,7 @@ Rules that never bend: `occurred_at` is **domain time** (when the thing happened
 | 9 | Create Contact Company (ensure \+ bootstrap) | Both company tiers | mirrors entry 1 | To design |
 | 10 | Edge-description updates (shared-bank sync) | Shared bank | hooks in the Go enrichment edge writers | To build |
 | 11 | Outcomes / Leverage Loops / Manual Notes | Contact, company, user scopes | Go product-event router | Archived spec; re-spec on ledger rails |
+| 12 | Meeting artifacts (transcripts & summaries) | Contact threads \+ meeting chain | Go worker off the APIANT webhook | To design |
 
 ### 1. Create Contact Person
 
@@ -502,7 +503,7 @@ Optional sent-email tone stage (Claude Opus 4.8) writes `email_draft_tone`, **ou
 2. Drop non-signal: canceled, user-declined, all-day holidays/system calendars, private events (configurable), generic holds ("busy", "focus time"), events with no contact participation.
 3. Resolve attendees to `contacts_id` / `master_person_id` → related-people metadata. **Never auto-create contacts from attendees.**
 4. Build candidates: event start = `occurred_at` / `memory_date`; use resolved participant names when the title is generic ("\+ 2 others").
-5. Past events → memories. Upcoming events: only when relationship-useful, and they may set Mem0 `expiration_date` = event end — the one sanctioned use of expiration.
+5. Past events → memories. **Upcoming events write nothing** (decided 2026-08-04 — the future lives in the event tables, "what's next with X" is a deterministic table query; the lookahead window serves prep candidate listing only, never memories).
 6. Ledger → project, identical to entry 3.
 
 ### 5. Add Important Date (two directions)
@@ -524,9 +525,9 @@ Optional sent-email tone stage (Claude Opus 4.8) writes `email_draft_tone`, **ou
 
 **Trigger:** event created / updated / canceled / attendee change, via webhook → `calendar_event_activity` → worker. **Owner (proposed): Go.** **To design.**
 
-- **Create:** run the entry-4 pipeline for the single event.
-- **Update:** recompute hashes; if changed → supersede the old row, update/delete its mem0 projection via `mem0_memory_id`, insert \+ project the new version (writer-contract step 6).
-- **Cancel:** supersede \+ remove the projection; write a "the planned meeting was canceled" memory only when the cancellation itself is relationship-useful.
+- **Create / update / cancel of future events:** table maintenance only — **no mem0 writes for meetings that have not happened** (decided 2026-08-04). Cancellation of a future event is therefore a mem0 no-op: nothing was written, nothing to un-write.
+- **Post-event pass:** when a signal-worthy event completes, run the entry-4 pipeline for that single event — the attended memory, the meeting chain's _happened_ phase.
+- **Late edits to past events:** recompute hashes; if changed → supersede the old row, update/delete its mem0 projection via `mem0_memory_id`, insert \+ project the new version (writer-contract step 6).
 - **Series:** cadence memory at series level; per-occurrence memories only when an occurrence has distinct context.
 
 ### 8. How I Know X (manual chat entry, contact panel)
@@ -554,6 +555,16 @@ Optional sent-email tone stage (Claude Opus 4.8) writes `email_draft_tone`, **ou
 ### 11. Product writers (Outcomes, Leverage Loops, Manual Notes)
 
 **Triggers:** `suggestion_request` submitted (Outcomes — durable goals, user scope); loop activated (Loops — `for_master_person_id` resolved to `contacts_id` server-side, contact scope); note created/updated/deleted (person / company / general scope — **full Tiptap content**, never the 80-char preview). All flow through one router (the `sync-product-event-memory` pattern): resolve subject → extract → ledger → project. Note update = supersede \+ re-project; note delete = supersede \+ remove projection. Deep spec: [full-scope → Source ingestion](/guides/open-work/mem0/full-scope#source-ingestion-strategy) (archived reference — re-spec here when built).
+
+### 12. Meeting artifacts (transcripts & summaries)
+
+**Trigger:** a transcript/summary lands — `integration_meeting` (718, APIANT-normalized Google Meet / Granola / Zoom meetings with participants and artifacts) or `meeting_transcriptions` (698). **Owner:** Go worker consuming the APIANT webhook. **To design.**
+
+1. Match the recording to the calendar event: `integration_meeting.calendar_match` / `calendar_match_hints` (`ical_uid`, conference url) → `events.id`. Unmatched recordings still process, keyed to participants only.
+2. Resolve participants — the recording's own participant list (with `speaking_time_sec`) merged with the event's resolved contacts.
+3. Run extraction over the summary (and transcript where needed) — the **same versioned contract** as the email extractor: candidates with `fact_class`, companion rule, memory-rail defaults. Transcripts are extraction-rich: commitments, introductions, dates, role changes — graph-bound candidates go `pending` → the [modal](#the-proposal-surface--confirm-relations--events-modal).
+4. Ledger → project: per-participant contact-thread memories (cross-tagged with company ids) \+ **one distilled meeting-summary memory appended to the meeting chain** (`metadata.event_id`) — completing the chain's _recorded_ phase (see the [meeting chain](/guides/open-work/tanstack-ai-chat-mem0#the-meeting-chain--prep-is-one-phase)).
+5. `occurred_at` = meeting start; idempotency by the artifact's canonical hash — re-delivered webhooks are no-ops.
 
 ## Retrieval — the GET contract
 
@@ -589,7 +600,7 @@ The facts that shape implementation, from the current v3 API (`POST /v3/memories
 2. **One memory, one user scope** — no cross-user visibility; shared tiers must be synthetic entities (as built).
 3. **`infer=false` is verbatim \+ synchronous** — no semantic dedup or consolidation; Orbiter owns idempotency via hashes. Mixing `infer` modes in one scope risks duplicates (the reason entry 8 migrates).
 4. **`timestamp` backdates `created_at`** — pass it on historical imports.
-5. **`expiration_date` hides, never deletes** — recoverable via `show_expired=true`; use only for upcoming-event memories, never for `valid_to`.
+5. **`expiration_date` hides, never deletes** — recoverable via `show_expired=true`; use only for meeting-prep pack memories, never for `valid_to`.
 6. **Graph Memory is always-on** — an invisible ranking boost, no typed edges; FalkorDB remains the only graph of record.
 7. **Webhooks are project-scoped** (`memory_add/update/delete/categorize`, `ingest_job_*`) — the hook for keeping the ledger's projection refs in sync without polling; no signature verification documented, so handlers must be idempotent.
 8. **No batch-add endpoint, no documented rate limits** — `infer=true` adds are async (poll `GET /v1/event/{event_id}/`); verify the ingest-job surface before the whole-book backfill.

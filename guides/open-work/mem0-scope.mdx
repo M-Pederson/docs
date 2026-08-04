@@ -1,0 +1,437 @@
+---
+title: "mem0 Scope"
+sidebarTitle: "mem0 Scope"
+description: "How Orbiter uses mem0: the extraction ledger, routing model, memory tiers, entry points, and the retrieval contract"
+icon: "brain"
+---
+
+<Info>
+  **Working spec — decisions locked 2026-08-04.** This page states how mem0 is deployed in Orbiter going forward. The workshop that produced it (the memories-vs-edges fork, option analysis, corpus reconciliation) lives in the git history of [PR #157](https://github.com/M-Pederson/docs/pull/157). Implementation detail for the live functions stays current on [mem0 Functions](/guides/open-work/mem0/functions); the pre-consolidation Mem0 corpus (full-scope, two-tier blueprint, Zep chat-migration plans, email POC) is archived under Guides → Archive → Mem0.
+</Info>
+
+## How Orbiter uses mem0 now
+
+mem0 does exactly **two jobs**:
+
+1. **AI-chat memory** — what the user and the AI said, remembered across sessions (outcome interviews, leverage-loop conversations, copilot chats). Spec home: [Tanstack AI Chat mem0](/guides/open-work/tanstack-ai-chat-mem0) (placeholder).
+2. **The user's private context of a contact or company** — the _content_ of their relationship: what was said, shared, asked, promised, preferred. Extracted from email, calendar, notes, and How I Know; retrieved semantically and merged with GraphRAG context in LLM prompts.
+
+mem0 is deliberately **not** three other things:
+
+- **Not the source of truth.** The extraction ledger (below) is. mem0 is a disposable, regenerable projection of it — which is what makes merge handling (wipe and re-process) and any future architecture change cheap.
+- **Not the graph.** Enrichment facts ("Richard is CMO at NVIDIA") are already edges before any memory system runs, and interaction _structure_ (that emails/meetings happened — evidence, counts, strength scores) belongs to the Known model. mem0 carries only the third rail:
+
+| Rail | What | Where it lives |
+| --- | --- | --- |
+| Fact rail | Enrichment-derived facts (roles, education, investments) | Graph edges (master) |
+| Structure rail | _That_ interactions happened: evidence, counts, scores | Known model (graph) |
+| Content rail | _What_ was said/learned/promised in those interactions | **mem0** (via the ledger) |
+
+- **Not a memory-intelligence black box.** Every writer uses `infer=false`: Orbiter owns extraction, hashes, and dates; mem0 provides hosted hybrid retrieval (semantic \+ BM25 \+ entity) and structural per-user privacy scoping. Thin usage by policy — it keeps the store portable.
+
+## The extraction ledger
+
+**One rule governs every write:** every extracted or user-added item lands in the **`extraction_ledger`** first. The **default destination is the user's private mem0 scope**. Content routes _out_ to the graph or a structured table **only when it matches a system that already exists** — the graph never receives free-form prose.
+
+```text
+email / calendar / note / How I Know / chat-extracted durable fact
+        |   extractor LLM emits: atomic text + fact_class + confidence + dates
+        v
+extraction_ledger row (route_status: pending)      <- the source of record
+        |   deterministic route by fact_class
+        |-- memory classes ----------------> mem0 write, infer=false --> projected
+        |-- introduction / declared fact --> user confirm -> Known ----> confirmed
+        |-- enrichment signal -------------> enrichment queue ---------> confirmed
+        '-- date --------------------------> user confirm -> contacts_date -> confirmed
+```
+
+### The table
+
+A first-party **AlloyDB table in the Orbiter backend**, superseding full-scope's `mem0_memory_index` bookkeeping design. Identity columns are logical FKs mirroring Xano ids — the same pattern as `contacts_interaction_log` — and the Xano-era writers (`#13148`/`#13149`) reach it through the backend until the extractors themselves move to GCP:
+
+| Column group | Fields (sketch) |
+| --- | --- |
+| Identity | `id`, `user_id`, `contacts_id`, `master_person_id` / `my_company_id` / `master_company_id` |
+| The fact | `extracted_text` (atomic sentence), `fact_class`, `confidence`, `sensitivity` |
+| Routing | `route` (mem0 / known\_introduction / known\_facet / enrichment\_queue / contacts\_date / commitments), `route_status` (pending / projected / confirmed / rejected / superseded) |
+| Provenance | `source_type`, `source_platform`, `source_id`, `occurred_at` (domain time), `extractor_version` |
+| Idempotency | `memory_hash`, `canonical_memory_hash` — unique per user \+ canonical hash, replacing the per-memory mem0 search-before-write |
+| Projection refs | `mem0_memory_id` / `mem0_event_id`, `promoted_ref` (contacts\_date row id / Introduction uuid / queue item id) |
+
+<Accordion title="extraction_ledger — full AlloyDB table spec" icon="database">
+  ```sql
+  CREATE TABLE extraction_ledger (
+    id                    BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    row_kind              TEXT NOT NULL DEFAULT 'extraction'
+                          CHECK (row_kind IN ('extraction', 'shared_seed')),
+  
+    -- identity: logical FKs mirroring Xano ids (no hard FK constraints,
+    -- same pattern as contacts_interaction_log)
+    user_id               BIGINT,             -- NULL on shared_seed rows
+    contacts_id           BIGINT,
+    master_person_id      BIGINT,
+    my_company_id         BIGINT,
+    master_company_id     BIGINT,
+  
+    -- the fact
+    extracted_text        TEXT NOT NULL,      -- the atomic sentence
+    fact_class            TEXT NOT NULL CHECK (fact_class IN (
+                            'interaction_event', 'preference', 'narrative',
+                            'user_goal', 'commitment', 'chat_memory',
+                            'introduction', 'declared_relationship',
+                            'enrichment_signal', 'date', 'graph_edge_seed')),
+    confidence            NUMERIC(3,2),       -- 0.00-1.00 from the extractor
+    sensitivity           TEXT NOT NULL DEFAULT 'none'
+                          CHECK (sensitivity IN ('none', 'sensitive', 'secret')),
+  
+    -- routing (route is derived from fact_class by the deterministic map in code)
+    route                 TEXT NOT NULL CHECK (route IN (
+                            'mem0', 'known_introduction', 'known_facet',
+                            'enrichment_queue', 'contacts_date', 'commitments')),
+    route_status          TEXT NOT NULL DEFAULT 'pending' CHECK (route_status IN (
+                            'pending', 'projected', 'confirmed',
+                            'rejected', 'superseded')),
+    routed_at             TIMESTAMPTZ,        -- when projection/confirmation completed
+    confirmed_at          TIMESTAMPTZ,        -- user tap on confirm-first routes
+  
+    -- provenance
+    source_type           TEXT NOT NULL,      -- email_thread | calendar_event | manual_user_note
+                                              -- | how_i_know | chat | graph_edge
+    source_platform       TEXT,               -- nylas | orbiter_notes | orbiter_outcomes | falkordb
+    source_id             TEXT,               -- thread id / event id / note id / edge uuid
+    occurred_at           TIMESTAMPTZ,        -- domain time (event date), never ingest time
+    valid_from            DATE,               -- graph seeds only
+    valid_to              DATE,               -- graph seeds only
+    extractor_version     TEXT NOT NULL,      -- e.g. 'mem0_13149_extractor_v3'
+  
+    -- idempotency
+    canonical_memory_hash TEXT NOT NULL,      -- source-level dedupe key
+    memory_hash           TEXT NOT NULL,      -- write key (canonical + subject scope)
+  
+    -- projection refs
+    mem0_memory_id        TEXT,               -- set when route_status = projected
+    mem0_event_id         TEXT,               -- async add event id, when applicable
+    promoted_ref          JSONB,              -- {"table": "contacts_date", "id": 123} on confirmed routes
+  
+    -- audit
+    error                 TEXT,               -- last projection error preview
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  
+    CHECK (
+      (row_kind = 'extraction' AND user_id IS NOT NULL)
+      OR (row_kind = 'shared_seed' AND user_id IS NULL
+          AND (master_person_id IS NOT NULL OR master_company_id IS NOT NULL))
+    )
+  );
+  
+  -- idempotency: one fact per subject scope
+  CREATE UNIQUE INDEX uq_ledger_user_canonical
+    ON extraction_ledger (user_id, canonical_memory_hash)
+    WHERE row_kind = 'extraction';
+  CREATE UNIQUE INDEX uq_ledger_seed_canonical
+    ON extraction_ledger (COALESCE(master_person_id, 0),
+                          COALESCE(master_company_id, 0),
+                          canonical_memory_hash)
+    WHERE row_kind = 'shared_seed';
+  CREATE INDEX ix_ledger_memory_hash    ON extraction_ledger (memory_hash);
+  
+  -- the projector's work queue
+  CREATE INDEX ix_ledger_pending        ON extraction_ledger (route, route_status)
+    WHERE route_status = 'pending';
+  
+  -- reads: contact-panel provenance, seeded-bank audit, webhook reconciliation
+  CREATE INDEX ix_ledger_contact        ON extraction_ledger (contacts_id, route_status);
+  CREATE INDEX ix_ledger_seed_person    ON extraction_ledger (master_person_id)
+    WHERE row_kind = 'shared_seed';
+  CREATE INDEX ix_ledger_source         ON extraction_ledger (source_type, source_id);
+  CREATE INDEX ix_ledger_mem0_id        ON extraction_ledger (mem0_memory_id)
+    WHERE mem0_memory_id IS NOT NULL;
+  ```
+
+  Notes:
+
+  - **Two row kinds, one table.** `extraction` rows are the source of record for user-derived content. `shared_seed` rows are audit-only projections of `#13148` seeds — their source of record stays the graph. The check constraint enforces the identity shape of each kind.
+  - **Idempotency is per subject scope**: `(user_id, canonical_memory_hash)` for user content, `(master_person_id | master_company_id, canonical_memory_hash)` for seeds. Re-runs upsert against these; the per-memory mem0 search-before-write goes away.
+  - **`route` is stored, not computed** — the deterministic `fact_class` → `route` map lives in code, and re-routing after a map change is an `UPDATE` over existing rows followed by re-projection. No re-extraction.
+  - **The seeded-bank check** stays `master_person.mem0_seeded_at` in Xano (O(1), race-guarded); `ix_ledger_seed_person` backs the audit view and can rebuild the stamp if it is ever lost.
+  - **Webhook sync**: Mem0 `memory_update` / `memory_delete` events resolve back to rows via `ix_ledger_mem0_id` and keep projection refs honest.
+  - Deliberately absent in v1: retry counters (re-runs are idempotent), soft deletes (`route_status = 'superseded'` covers it), and hard FKs (cross-system ids are logical, per the interaction-log precedent).
+</Accordion>
+
+Write order matters: ledger row first (`pending`), then project — a crash between the two steps is re-runnable from the ledger, idempotent via the hash unique index. Two row kinds share the table: **user-derived extraction rows** (ledger = source of record) and **shared-bank seed rows** (audit only — their source of record stays the graph; they also back the fast seeded-bank check in the ensure flow).
+
+### Who judges
+
+**The extractor classifies; deterministic code routes; the user judges graph writes.** No second LLM judge:
+
+- The extractor (already an LLM — DeepSeek in `#13149`) reads the source once and already emits confidence and dates; a `fact_class` field on its output contract is near-zero marginal cost.
+- Routing is a **deterministic map** from `fact_class` → destination — auditable, and revisable by changing the map and re-routing existing ledger rows _without re-extracting anything_.
+- Graph-bound rows are **confirm-first** (the 2026-07-16 dates rule, generalized): one tap approves an Introduction, a declared facet, or a conversational date before any row or edge exists. Deterministic paths (imports, system dates) skip confirmation.
+
+**How a promotion actually happens:**
+
+1. **Users never approve memories.** The memory rail is fully automatic — the star-shaped majority of extractions project to mem0 with no human in the loop. The tap exists _only_ for the graph-bound slice, which is a handful of proposals per parse, not dozens. If the proposal queue ever feels like homework, the routing map is misclassifying.
+2. The extractor emits a graph-bound `fact_class` (`introduction`, `declared_relationship`, conversational `date`). The ledger row lands `pending` and **stops — nothing is written to the graph, Known, or any table.** The pending row _is_ the proposal.
+3. The app surfaces pending rows as one-tap proposals with two actions (decided 2026-08-04): **Confirm** → the route's promotion writer creates the artifact — Known `Introduction` node, declared facet (`known/helpers/create_facet` `#12771`), or `contacts_date` row (`dates/upsert-contact-date` `#13226`) — and stamps `confirmed` \+ `promoted_ref` \+ `confirmed_at`. **Ignore** → maps to `rejected` under the hood: nothing written, and the hash index prevents re-proposal on the next parse (split an `ignored` status out of `rejected` later only if extractor-quality analytics need the distinction). Proposals the user never actions simply stay `pending` indefinitely, harmlessly. **"Confirm" defined:** an authenticated call — `POST /extractions/{ledger_id}/confirm` or `/reject` — that verifies the caller owns the row, runs the promotion writer, and flips `route_status`. A user-authorized state transition on one ledger row; never an LLM, never automatic. The proposal card shows the claim, its source ("from email · Jul 9"), and **Confirm / Ignore**. **Surface TBD at build**, three candidates: contact side panel inline prompt (the How I Know pattern), a review queue / suggestions inbox (proposals batch after bootstrap parses), or in-chat via the copilot (a "yes" counts as the tap). Same decision carries proposal discovery, batch confirm ("confirm all 12 from this import"), and the rule that only the owning user can confirm. **Discovery is passive-first:** a badge on the review queue plus inline prompts when viewing the contact; a single digest after large parses (the whole-book backfill may yield hundreds of proposals at once); the copilot may raise a pending proposal when the contact comes up in conversation. **Never per-proposal push notifications** — a 500-contact import must not fire 500 alerts.
+4. Two routes skip the tap: `enrichment_signal` (the enrichment pipeline is the judge — it verifies before writing fact-rail edges) and deterministic paths (imports, system dates — mechanical, not LLM claims).
+5. **Pending never hides content.** Compound sentences produce multiple ledger rows — "Ray introduced Mark to Sandra" yields a narrative/event row that projects to mem0 immediately _plus_ the structural `introduction` row that waits for the tap. Confirmation adds structure; it never gates retrieval.
+
+<Accordion title="Worked example — a memory that promotes to the graph" icon="diagram-project">
+  The email parse hits a thread where Mark wrote _"Thanks Ray for connecting me with Sandra — we're meeting Thursday."_ The extractor emits one sentence, two facts, two ledger rows:
+
+  ```text
+  -- Row A: the content (memory rail — projected automatically, no judge)
+  extracted_text : "Ray Deck introduced Mark to Sandra Lee over email on July 9, 2026."
+  fact_class     : interaction_event        route: mem0
+  route_status   : projected                mem0_memory_id: mem_8f3a…
+  -- retrievable in meeting prep / copilot within seconds
+  
+  -- Row B: the structure (graph rail — waits for the user)
+  extracted_text : "Ray Deck introduced Mark to Sandra Lee."
+  fact_class     : introduction             route: known_introduction
+  confidence     : 0.93                     occurred_at: 2026-07-09
+  related ids    : master_person_id (Sandra), related_master_person_ids: Ray
+  route_status   : pending                  <- nothing written anywhere yet
+  ```
+
+  The app surfaces Row B as a one-tap proposal: **"Add introduction? Ray Deck introduced you to Sandra Lee — Jul 9, 2026 · from email."** On confirm, the promotion writer creates the Known artifacts (an `Introduction` is a node, not an edge — intros are N-ary, per the [Known schema](/guides/known/schema-design/nodes)):
+
+  ```text
+  (:Introduction {uuid: 'intro_7c2…', occurred_at: '2026-07-09',
+                  source: 'declared'})            // user-confirmed; email provenance stays on the ledger row
+  (ray:Person)-[:MADE_INTRODUCTION]->(intro)
+  (intro)-[:CONNECTS]->(mark:Person)
+  (intro)-[:CONNECTS]->(sandra:Person)
+  // intro.resulting_knows_uuid -> the Mark–Sandra KNOWS edge,
+  // which picks up the introduction as evidence via Known ingest
+  ```
+
+  The ledger row closes the loop: `route_status: confirmed`, `confirmed_at: 2026-08-04T…`, `promoted_ref: {"store": "falkordb", "node": "Introduction", "uuid": "intro_7c2…"}`. Had Mark tapped Ignore instead: `rejected` under the hood, nothing written, and the canonical hash blocks the same proposal from re-appearing on the next parse. Either way, Row A's memory keeps the story retrievable.
+</Accordion>
+
+### The routing map
+
+Not a database table — this is the human-readable reference for the **deterministic map that lives in code**: `fact_class` → `route`, applied at write time and stamped onto each ledger row's `route` column. Changing it is a code change plus an `UPDATE` \+ re-projection over existing rows.
+
+| Content | Example | Destination |
+| --- | --- | --- |
+| Interaction events (email/calendar extraction) | "Shared Orbiter.io materials with Richard" | **mem0** — contact thread |
+| Preferences & subjective nuance | "Prefers short email asks" | **mem0** — contact thread |
+| How I Know narrative | "Met at State Change; superpower is distilling chaos" | **mem0** — contact thread |
+| Manual notes (person / company / general) | "Best person for climate-fintech intro feedback" | **mem0** — contact / company / user scope |
+| User goals & constraints (Outcomes, Loops) | "Wants to buy a house in Costa Rica" | **mem0** — user scope |
+| AI-chat conversation memory | interview turns, loop context | **mem0** — chat memory |
+| Commitments / open loops | "Richard owes user stories for the demo" | **mem0** today → structured commitments row if that feature ships |
+| Introductions | "Ray introduced Mark to Sandra" | **Graph** — Known `Introduction` node (confirm-first) |
+| Declared relationship facts | "He's actually my brother-in-law" | **Graph** — Known declared facet (confirm-first) |
+| Role/company change spotted before enrichment | "Richard just became CMO at NVIDIA" (from a thread) | **Enrichment queue** signal → becomes a fact-rail edge via enrichment |
+| Dates | "Her birthday is March 3" | **`contacts_date`** row (confirm-first when conversational) → synced back into mem0 |
+
+### Guardrails
+
+- **Ledger first, always** — mem0 and the graph are both projections of the first-party extraction record; routing can be revised later without re-extracting anything.
+- **User-derived content never writes to the shared banks** — `master_person:{id}` / `master_company:{id}` hold enrichment-derived facts only.
+- **The graph never receives prose** — only content that resolves to an existing typed structure (Known, enrichment, dates). If it doesn't match one, it's a memory.
+
+## Memory tiers and entity model
+
+**The orbit gate:** the Universe enrichment engine mints people and companies at graph scale, and the overwhelming majority sit in nobody's contacts — they get **no mem0 memories at all**. Memory banks exist only for entities inside at least one user's orbit; contact creation is the moment an entity earns a memory footprint.
+
+| Tier | Mem0 entity | Created when | Created how many times | Seeded from |
+| --- | --- | --- | --- | --- |
+| **Shared master-person bank** | `user_id = "master_person:{master_person_id}"` (synthetic) | The **first time any user anywhere** adds this person as a contact | **Exactly once**, ever | Graph **edge descriptions** \+ their temporal parameters (`valid_from` / `valid_to`) |
+| **Private contact thread** | `user_id = user.workos_id`, scoped by `metadata.contacts_id` | Every time **this user** creates the contact | Once per user-contact pair | The user's own material via the ledger: historical email/calendar parse, How I Know, notes, dates, ongoing interactions |
+
+Companies mirror persons: a **private company thread** (`metadata.my_company_id`) for every note and interaction the user has with that company — including interactions with people _at_ the company, cross-tagged via `related_master_company_ids` — and a **shared master-company bank** (`user_id = "master_company:{master_company_id}"`) seeded on first orbit entry from company edges and enrichment facts.
+
+| Mem0 field | Use | Status |
+| --- | --- | --- |
+| `user_id = user.workos_id` | The privacy boundary — all private memories (contact threads, company threads, user-self memories) | Live |
+| `user_id = "master_person:{id}"` | Shared master-person bank | Live (`#13148`) |
+| `user_id = "master_company:{id}"` | Shared master-company bank | To build |
+| `metadata.contacts_id` | Primary retrieval key for a contact thread | Live |
+| `metadata.master_person_id` | Links private memories to the shared person; filter key for the shared bank | Live |
+| `metadata.my_company_id` / `metadata.master_company_id` | Company equivalents | To build |
+| `run_id = memory_hash` | Idempotency key on write | Live |
+
+Standing rules:
+
+- **Separate Mem0 projects per environment** (staging/prod) — synthetic IDs would collide in a shared project, and webhooks \+ custom instructions are project-scoped anyway.
+- **Metadata stays flat** — Mem0 filters reach top-level metadata keys only. Full schema in the accordion below.
+- **Temporal handling:** carry `valid_from` **and `valid_to`** as metadata on seeded memories (`#13148` currently drops `valid_to` — add it), and pass Mem0's native `timestamp` (epoch) alongside `memory_date` metadata so platform temporal features work. **Never** map `valid_to` to `expiration_date` — expiration hides memories from search, and "worked at X until 2019" must stay retrievable forever.
+- **Merges are wipe-and-re-key**, triggered by the identity resolver: delete the loser's synthetic scope, ensure the winner is seeded, re-project affected contact threads from the ledger.
+
+<Accordion title="Mem0 metadata schema — full reference" icon="brackets-curly">
+  Every write carries flat metadata (top-level keys only — that is all Mem0 filters can reach). Absorbed from the archived full-scope page; `schema_version` bumps when the ledger ships, and `fact_class` joins the schema then (mirroring the ledger column).
+
+  ```json
+  {
+    "schema_version": "2026-06-23",
+    "scope": "contact",
+    "memory_scope": "mailbox_owner_private",
+    "fact_class": "interaction_event",
+    "contacts_id": "12345",
+    "self_contacts_id": "99999",
+    "master_person_id": "67890",
+    "my_company_id": "555",
+    "master_company_id": "777",
+    "source_type": "email_thread",
+    "source_platform": "nylas",
+    "source_id": "nylas_thread_abc",
+    "source_record_id": "xano_row_123",
+    "suggestion_request_id": "456",
+    "my_note_id": "123",
+    "copilot_mode": "outcome",
+    "outcome_class": "make_purchase",
+    "source_timestamp": "2026-06-23T14:00:00Z",
+    "valid_from": "2017-03-01",
+    "valid_to": "2021-06-30",
+    "related_contact_ids_csv": "222,333",
+    "related_master_person_ids_csv": "444,555",
+    "related_company_ids_csv": "888",
+    "related_master_company_ids_csv": "999",
+    "related_people_count": "2",
+    "memory_hash": "sha256:...",
+    "canonical_memory_hash": "sha256:...",
+    "run_id": "sha256:...",
+    "visibility": "private_user",
+    "confidence": "high",
+    "evidence_url": "/internal/source/...",
+    "created_by": "orbiter.mem0.email_extractor.v1"
+  }
+  ```
+
+  `scope` values: `contact` (private, keyed `contacts_id`) · `master_person` (shared bank) · `user` (private user memory) · `company` (private, keyed `my_company_id`) · `contact_inferred` (from user-owned source data) · `contact_claim` (user-authored, lower confidence until corroborated).
+
+  `source_type` values: `graph_edge` · `email_thread` · `calendar_event` · `how_i_know` · `outcome_request` · `leverage_loop_request` · `chat_outcome` · `manual_user_note` · `manual_company_note` · `imported_contact_note`.
+
+  `memory_scope` values: `mailbox_owner_private` · `global_master_person` · `user_private` · `company_private`. Not every key appears on every memory — identity keys match the subject, `valid_from`/`valid_to` appear on graph seeds, product keys (`suggestion_request_id`, `my_note_id`, `copilot_mode`, `outcome_class`) appear on their writers only.
+</Accordion>
+
+## Contact creation — the ensure flow
+
+<Steps>
+  <Step title="Contact row created">
+    A `contacts` row is created or attached (outbound-only). Resolve `contacts.master_person_id`, then enqueue the memory bootstrap as a background bundle — contact creation stays fast, and the UI can show "building memories…" from the bundle status.
+  </Step>
+  <Step title="Ensure the shared bank — create once, ever">
+    Check `master_person.mem0_seeded_at` (the Xano stamp is the seeded-bank check and the race guard — two users adding the same person concurrently must not double-seed). If unseeded, run [`mem0/create-master-person-memories` (#13148)](/guides/open-work/mem0/functions#mem0-create-master-person-memories-13148): one-hop FalkorDB edges from `master_person.node_uuid`, one memory per `rel.description` / `rel.fact`, `infer=false`, then stamp. If seeded, skip — never re-seed here.
+  </Step>
+  <Step title="Bootstrap the private thread">
+    Write the **bootstrap memory** from the contact-add event itself (_"Mark added Grady Anderson as a contact on 2026-08-04, source: LinkedIn import"_ — mem0 entities are implicit, so this guarantees the thread exists and is never empty). Then run [`mem0/create-memories-from-contact-id-v2` (#13149)](/guides/open-work/mem0/functions#mem0-create-memories-from-contact-id-v2-13149) for historical email \+ calendar extraction — through the ledger.
+  </Step>
+  <Step title="Backfill contact-gated projections">
+    CREATE-CONTACTS also backfills projections that were suppressed while the entity was outside every orbit (e.g. enrichment-date memories).
+  </Step>
+</Steps>
+
+## Entry points — every place a memory is saved
+
+| # | Entry point | Writes to | Status |
+| --- | --- | --- | --- |
+| 1 | Create Contact Person (ensure \+ bootstrap) | Both tiers | Built, unwired |
+| 2 | Master-person seed from edge descriptions | Shared bank | Live fn (`#13148`), no trigger |
+| 3 | Historical Email Parse | Contact thread | Live fn (`#13149` email stage), no trigger |
+| 4 | Historical Calendar Parse | Contact thread | Live fn (`#13149` calendar stage), no trigger |
+| 5 | Add Important Date | Contact thread \+ shared tier | Reference spec archived; re-spec on ledger rails |
+| 6 | New Email CRON | Contact thread | To design |
+| 7 | Calendar Event Webhook | Contact thread | To design |
+| 8 | How I Know X (manual chat entry) | Contact thread | Live (`#8583`) — migrating to `infer=false` |
+| 9 | Create Contact Company (ensure \+ bootstrap) | Both company tiers | To design |
+| 10 | Edge-description updates (shared-bank sync) | Shared bank | To build (writer hooks) |
+| 11 | Outcomes / Leverage Loops / Manual Notes | Contact, company, user scopes | Spec'd in [full-scope §5–8](/guides/open-work/mem0/full-scope#source-ingestion-strategy) |
+
+### 1. Create Contact Person
+
+**Trigger:** a `contacts` row is created (import, GET-ADD, manual add). The anchor entry point — runs the ensure flow above as an enqueued bundle: seeded check → seed if missing → bootstrap memory → historical parses → contact-gated backfills.
+
+### 2. Master-person seed from edge descriptions
+
+**Trigger:** called by entry 1 when `mem0_seeded_at` is empty. Live as `#13148`: one-hop edges via `mvp/falkor/send-cypher`, keeps only edges with `rel.description` / `rel.fact` (descriptionless edges are skipped), deterministic hashes, `infer=false`. **Required updates:** carry `valid_to`, pass native `timestamp`, write seed-audit rows to the ledger, stamp `mem0_seeded_at`.
+
+### 3. Historical Email Parse
+
+**Trigger:** part of the contact bootstrap, continuation-cursor batched. Live as the email stage of `#13149`: Nylas threads → DeepSeek V4 Flash prefilter → DeepSeek V4 Flash extraction (English-only, at most 5 candidates per thread, `event_date` required) → `infer=false`. Optional sent-email tone profile (Claude Opus 4.8) → `email_draft_tone`, outside mem0. **Required updates:** ledger-first writes, `fact_class` added to the extractor output contract. TBD: bulk-backfill mechanics for whole-book imports (verify Mem0's ingest-job surface first).
+
+### 4. Historical Calendar Parse
+
+**Trigger:** same bootstrap, after the email stage. Live as the calendar stage of `#13149`: 3650d lookback / 365d lookahead, resolved participant names over generic titles, event start → `memory_date`. Upcoming-event memories only when relationship-useful; `expiration_date` is legitimate **here** ("meeting scheduled for July 2" may expire after it happens) and nowhere else.
+
+### 5. Add Important Date
+
+**Trigger:** `contacts_date` row created/updated. The prior spec (`dates/sync-dates-to-mem0`) lives on the archived [Important Dates & mem0](/guides/open-work/important-dates-mem0) page as reference; re-spec it as a ledger route: user dates → contact tier, enrichment dates → shared tier once, `natural_key` in metadata so re-syncs update instead of duplicate, and the loop guard (rows that _came from_ a memory never echo back).
+
+### 6. New Email CRON
+
+**Trigger:** ongoing — new mail lands. **To design.** Reuses the `#13149` extraction contract through the ledger; the ledger's hash index guarantees the CRON never re-writes what the historical parse already stored. TBD: topology — ride the webhook-fed activity tables ([interaction-log](/guides/open-work/contacts-interaction-log) pattern, Nylas-free) vs a Nylas message webhook direct; Xano vs Go given the GCP build-least-in-Xano constraint; cadence (nightly per-contact digest vs per-message).
+
+### 7. Calendar Event Webhook
+
+**Trigger:** ongoing — event created/updated/canceled, attendee changes. **To design** as the incremental mode of the calendar writer: recompute `memory_hash` on title/time/attendee change and update via the ledger; cancellations convert or delete only when relationship-useful; series-level cadence memories over per-occurrence noise.
+
+### 8. How I Know X (manual chat entry, contact panel)
+
+**Trigger:** interview completes with a `relationship_summary`. Live (`#8583` write / `#8581` read) but it is the last `infer=true` writer — and mixed `infer` modes in one scope don't dedupe against each other. **Planned migration:** send the structured `relationship_nuggets` as atomic `infer=false` writes through the ledger ("mem0 should get the facts you highlighted, not the chat"), and clean up the stale `subject_contact_id` comment while in there.
+
+### 9. Create Contact Company
+
+**Trigger:** a company enters the user's orbit (employed-or-tracked). **To design**, mirroring entry 1: shared `master_company:{id}` bank seeded from company edges \+ enrichment facts; private company thread bootstrapped from notes, company-scoped outcomes, and cross-tagged interactions with people at the company.
+
+### 10. Edge-description updates (shared-bank sync)
+
+**Trigger:** an edge writer (enrichment, resolvers, back-fills) creates or updates a description on a node whose shared bank exists. **To build:** writer hooks check `mem0_seeded_at` and upsert the one affected memory (same `canonical_memory_hash` contract). Only seeded persons — the small, orbit-gated subset — ever trigger work. Keep this machinery minimal; the graph remains the source of truth for freshness.
+
+### 11. Product writers (Outcomes, Leverage Loops, Manual Notes)
+
+Specced in [full-scope → Source ingestion](/guides/open-work/mem0/full-scope#source-ingestion-strategy) (archived reference — re-spec here when built); unchanged except they now write through the ledger. Notes use full Tiptap content, not the 80-char preview; loops resolve `for_master_person_id` to `contacts_id` server-side.
+
+## Retrieval — the GET contract
+
+The app calls Orbiter endpoints, never Mem0 directly (privacy checks, joins, redaction stay first-party), and every read merges the tiers. Retrieval output is combined with GraphRAG cypher context in LLM prompts: graph for structure, mem0 for content.
+
+**Live today:** `mem0/get-contacts-memories` (`#13147`) — resolves the owner's `workos_id` \+ linked `master_person`, reads the private scope (match on `contacts_id` OR `master_person_id`) and the shared bank, dedupes by hash/id/text, returns one array sorted by `memory_date`. This is the Contact Side Panel / Timeline read.
+
+| Endpoint | Serves | Mem0 calls |
+| --- | --- | --- |
+| `GET /contacts/{contacts_id}/memories` | Side Panel Memories tab, Timeline | get-all on both tiers (backed by `#13147`) |
+| `POST /contacts/{contacts_id}/memories/search` | Question-shaped contact context | v3 search ×2 (private \+ shared), `rerank=true` |
+| `GET /me/memories` | User's own goals/preferences view | get-all, `memory_scope=user_private` |
+| `GET /companies/{my_company_id}/memories` | Company tab | get-all private company \+ shared company bank |
+
+The surfaces these feed:
+
+| Surface | Question it asks | Tiers | Shape |
+| --- | --- | --- | --- |
+| Copilot / AI chat context injection | "What do I know about the people in this conversation?" | Private \+ shared, per resolved entity | v3 search per entity, low `top_k`, merged with GraphRAG context |
+| Meeting prep pack | "What changed since we last met? Open loops?" | Private first, shared for bio | search with `reference_date`, recency-weighted |
+| Email compose / reply assist | "Tone, history, commitments with this recipient" | Private thread (plus `email_draft_tone`) | search filtered `contacts_id` |
+| How I Know interviewer | "What do I already know? Don't re-ask." | Private \+ shared | `#8581`'s fan-out \+ the shared-bank branch |
+| Discover / collection questions | "Who do I know that …?" | **Cross-contact**: whole private scope | v3 search on `user_id` alone — fused semantic \+ BM25 \+ entity scoring |
+| Company view | "Everything with this company, incl. its people" | Company thread \+ cross-tagged person memories \+ shared bank | get-all with `my_company_id` OR `related_master_company_ids` |
+
+The cross-contact Discover case is why `contacts_id` lives in metadata rather than the entity key — one search over the user's whole memory space is a native query, not a 2,000-way fan-out. Keep the endpoints thin search-and-merge so they port to GCP cleanly (where they ultimately live is TBD with the GCP migration).
+
+## Mem0 platform constraints (verified 2026-08-04)
+
+The facts that shape implementation, from the current v3 API (`POST /v3/memories/add/`, `/v3/memories/search/`, `/v3/memories/` get-all; deletes still v1):
+
+1. **Entities are implicit** — no create, rename, or **merge**. Merges are client-side re-adds (get-all loser → re-add winner with original `timestamp` → filtered delete), matching our wipe-and-re-key posture.
+2. **One memory, one user scope** — no cross-user visibility; shared tiers must be synthetic entities (as built).
+3. **`infer=false` is verbatim \+ synchronous** — no semantic dedup or consolidation; Orbiter owns idempotency via hashes. Mixing `infer` modes in one scope risks duplicates (the reason entry 8 migrates).
+4. **`timestamp` backdates `created_at`** — pass it on historical imports.
+5. **`expiration_date` hides, never deletes** — recoverable via `show_expired=true`; use only for upcoming-event memories, never for `valid_to`.
+6. **Graph Memory is always-on** — an invisible ranking boost, no typed edges; FalkorDB remains the only graph of record.
+7. **Webhooks are project-scoped** (`memory_add/update/delete/categorize`, `ingest_job_*`) — the hook for keeping the ledger's projection refs in sync without polling; no signature verification documented, so handlers must be idempotent.
+8. **No batch-add endpoint, no documented rate limits** — `infer=true` adds are async (poll `GET /v1/event/{event_id}/`); verify the ingest-job surface before the whole-book backfill.
+9. **Filtered delete is async** (`DELETE /v1/memories/` with entity/metadata filters and `*` wildcards) — the primitive behind wipe-and-re-process. Criteria retrieval has disappeared from current docs; treat as unavailable.
+
+## Build plan
+
+1. **`extraction_ledger` table** \+ refactor `#13148`/`#13149` to ledger-first writes; add `fact_class` to the extractor contract; add `valid_to` \+ native `timestamp` to the seed.
+2. **Wire entry 1**: enqueued ensure-and-bootstrap bundle behind CREATE-CONTACTS, `mem0_seeded_at` stamp, bootstrap memory, bundle status for the UI.
+3. **Backfill inside the orbit**: seed shared banks for every master person already in at least one orbit; historical parses for existing contacts (after verifying Mem0's bulk-ingest surface).
+4. **Migrate How I Know** to `infer=false` nuggets through the ledger — closes the mixed-infer risk while surface area is small.
+5. **Incremental writers**: email CRON \+ calendar webhook (entries 6–7), then the dates route re-specced on the same rails (entry 5).
+6. **Company tiers** (entry 9) once person-side wiring is proven.
+7. **Context GET endpoints** for copilot, meeting prep, and Discover — thin search-and-merge, GCP-portable.

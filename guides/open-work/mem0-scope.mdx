@@ -47,7 +47,7 @@ extraction_ledger row (route_status: pending)      <- the source of record
 
 ### The table
 
-A first-party **AlloyDB table in the Orbiter backend**, superseding full-scope's `mem0_memory_index` bookkeeping design. Identity columns are logical FKs mirroring Xano ids — the same pattern as `contacts_interaction_log` — and the Xano-era writers (`#13148`/`#13149`) reach it through the backend until the extractors themselves move to GCP:
+A first-party **AlloyDB table in the Orbiter backend**, superseding full-scope's `mem0_memory_index` bookkeeping design. Identity columns are logical FKs — the `contacts_interaction_log` pattern — and every writer is a GCP-side Go service with direct AlloyDB access. The numbered function references on this page (`#13147`–`#13152`, `#8583`, `#12771`, `#13226`) are prototype implementations documented on [mem0 Functions](/guides/open-work/mem0/functions); the Go services port their logic:
 
 | Column group | Fields (sketch) |
 | --- | --- |
@@ -65,7 +65,7 @@ A first-party **AlloyDB table in the Orbiter backend**, superseding full-scope's
     row_kind              TEXT NOT NULL DEFAULT 'extraction'
                           CHECK (row_kind IN ('extraction', 'shared_seed')),
   
-    -- identity: logical FKs mirroring Xano ids (no hard FK constraints,
+    -- identity: logical FKs (no hard FK constraints,
     -- same pattern as contacts_interaction_log)
     user_id               BIGINT,             -- NULL on shared_seed rows
     contacts_id           BIGINT,
@@ -154,7 +154,7 @@ A first-party **AlloyDB table in the Orbiter backend**, superseding full-scope's
   - **Two row kinds, one table.** `extraction` rows are the source of record for user-derived content. `shared_seed` rows are audit-only projections of `#13148` seeds — their source of record stays the graph. The check constraint enforces the identity shape of each kind.
   - **Idempotency is per subject scope**: `(user_id, canonical_memory_hash)` for user content, `(master_person_id | master_company_id, canonical_memory_hash)` for seeds. Re-runs upsert against these; the per-memory mem0 search-before-write goes away.
   - **`route` is stored, not computed** — the deterministic `fact_class` → `route` map lives in code, and re-routing after a map change is an `UPDATE` over existing rows followed by re-projection. No re-extraction.
-  - **The seeded-bank check** stays `master_person.mem0_seeded_at` in Xano (O(1), race-guarded); `ix_ledger_seed_person` backs the audit view and can rebuild the stamp if it is ever lost.
+  - **The seeded-bank check** is `master_person.mem0_seeded_at` on the Universe row in AlloyDB (O(1), race-guarded); `ix_ledger_seed_person` backs the audit view and can rebuild the stamp if it is ever lost.
   - **Webhook sync**: Mem0 `memory_update` / `memory_delete` events resolve back to rows via `ix_ledger_mem0_id` and keep projection refs honest.
   - Deliberately absent in v1: retry counters (re-runs are idempotent), soft deletes (`route_status = 'superseded'` covers it), and hard FKs (cross-system ids are logical, per the interaction-log precedent).
 </Accordion>
@@ -285,7 +285,7 @@ Companies mirror persons: a **private company thread** (`metadata.my_company_id`
 | Mem0 field | Use | Status |
 | --- | --- | --- |
 | `user_id = user.workos_id` | The privacy boundary — all private memories (contact threads, company threads, user-self memories) | Live |
-| `user_id = "master_person:{id}"` | Shared master-person bank | Live (`#13148`) |
+| `user_id = "master_person:{id}"` | Shared master-person bank | Prototyped (`#13148`) |
 | `user_id = "master_company:{id}"` | Shared master-company bank | To build |
 | `metadata.contacts_id` | Primary retrieval key for a contact thread | Live |
 | `metadata.master_person_id` | Links private memories to the shared person; filter key for the shared bank | Live |
@@ -316,7 +316,7 @@ Standing rules:
     "source_type": "email_thread",
     "source_platform": "nylas",
     "source_id": "nylas_thread_abc",
-    "source_record_id": "xano_row_123",
+    "source_record_id": "backend_row_123",
     "suggestion_request_id": "456",
     "my_note_id": "123",
     "copilot_mode": "outcome",
@@ -353,13 +353,57 @@ Standing rules:
     A `contacts` row is created or attached (outbound-only). Resolve `contacts.master_person_id`, then enqueue the memory bootstrap as a background bundle — contact creation stays fast, and the UI can show "building memories…" from the bundle status.
   </Step>
   <Step title="Ensure the shared bank — create once, ever">
-    Check `master_person.mem0_seeded_at` (the Xano stamp is the seeded-bank check and the race guard — two users adding the same person concurrently must not double-seed). If unseeded, run [`mem0/create-master-person-memories` (#13148)](/guides/open-work/mem0/functions#mem0-create-master-person-memories-13148): one-hop FalkorDB edges from `master_person.node_uuid`, one memory per `rel.description` / `rel.fact`, `infer=false`, then stamp. If seeded, skip — never re-seed here.
+    The seeded check and the race guard are one statement on the Universe `master_person` row (AlloyDB):
+
+    ```sql
+    UPDATE master_person
+    SET    mem0_seeded_at = now()
+    WHERE  id = $1 AND mem0_seeded_at IS NULL;
+    ```
+
+    One row affected → this worker seeds. Zero rows → the bank already exists or another worker claimed it — skip, never re-seed here. When claimed: read the person's one-hop edges from FalkorDB (keep only edges carrying `rel.description` / `rel.fact`), write `shared_seed` ledger rows, then project each fact to the shared bank:
+
+    ```json
+    POST https://api.mem0.ai/v3/memories/add/
+    Authorization: Token {MEM0_PROJECT_KEY}      // per-environment project
+    
+    {
+      "user_id": "master_person:1",
+      "run_id": "sha256:<memory_hash>",
+      "infer": false,
+      "timestamp": 1488326400,                   // valid_from as epoch, when present
+      "messages": [
+        { "role": "user",
+          "content": "Grady Anderson was VP Engineering at Vambus from 2017 to 2021." }
+      ],
+      "metadata": {
+        "schema_version": "2026-08-04",
+        "scope": "master_person",
+        "memory_scope": "global_master_person",
+        "fact_class": "graph_edge_seed",
+        "master_person_id": "1",
+        "source_type": "graph_edge",
+        "source_platform": "falkordb",
+        "edge_type": "WORKED_AT",
+        "source_id": "edge_5f2c...",
+        "valid_from": "2017-03-01",
+        "valid_to": "2021-06-30",
+        "memory_date": "2017-03-01",
+        "canonical_memory_hash": "sha256:...",
+        "memory_hash": "sha256:...",
+        "visibility": "global_objective",
+        "created_by": "universe.mem0.seed.v1"
+      }
+    }
+    ```
+
+    `infer=false` responds synchronously — stamp each ledger row `projected` with the returned memory id. Full walkthrough: [entry 2](#2-master-person-seed-from-edge-descriptions).
   </Step>
   <Step title="Bootstrap the private thread">
-    Write the **bootstrap memory** from the contact-add event itself (_"Mark added Grady Anderson as a contact on 2026-08-04, source: LinkedIn import"_ — mem0 entities are implicit, so this guarantees the thread exists and is never empty). Then run [`mem0/create-memories-from-contact-id-v2` (#13149)](/guides/open-work/mem0/functions#mem0-create-memories-from-contact-id-v2-13149) for historical email \+ calendar extraction — through the ledger.
+    Write the **bootstrap memory** from the contact-add event itself (_"Mark added Grady Anderson as a contact on 2026-08-04, source: LinkedIn import"_ — mem0 entities are implicit, so this guarantees the thread exists and is never empty). Then run the Go extraction service ([reference `#13149`](/guides/open-work/mem0/functions#mem0-create-memories-from-contact-id-v2-13149)) for historical email \+ calendar extraction — through the ledger.
   </Step>
   <Step title="Create the KNOWS edge">
-    Write `(user)-[:KNOWS]->(person)` — deterministic bookkeeping from the contact-add event, not an extractor claim: no ledger row, no confirmation. Properties: `origination` = the bootstrap-memory text ("Mark added Grady Anderson as a contact on 2026-08-04, source: LinkedIn import"), `origination_source`, an **initial strength** (higher = stronger) — **100** user-added via the Add Contact modal, **75** discovered via historical email/calendar, **40** LinkedIn import (proposed value — LinkedIn connection is a weak indicator, per Mark 2026-08-04; the ratio mirrors Known's weak-evidence = half-of-strong weighting) — adjusted from there by interaction counts — plus a derived `weight` for path traversal (**lower = stronger**, committed KNOWS formula, range 25–60: 100 → 25, 75 → ≈34, 40 → 46), and `created_at` / `updated_at` timestamps. Memories do **not** live on the edge (note below).
+    Write `(user)-[:KNOWS]->(person)` — deterministic bookkeeping from the contact-add event, not an extractor claim: no ledger row, no confirmation. Properties: `origination` = the bootstrap-memory text ("Mark added Grady Anderson as a contact on 2026-08-04, source: LinkedIn import"), `origination_source`, an **initial strength** (higher = stronger) — **100** user-added via the Add Contact modal, **75** discovered via historical email/calendar, **40** LinkedIn import (ratified 2026-08-04 — LinkedIn connection is a weak indicator; the ratio mirrors Known's weak-evidence = half-of-strong weighting) — adjusted from there by interaction counts — plus a derived `weight` for path traversal (**lower = stronger**, committed KNOWS formula, range 25–60: 100 → 25, 75 → ≈34, 40 → 46), and `created_at` / `updated_at` timestamps. Memories do **not** live on the edge (note below).
   </Step>
   <Step title="Backfill contact-gated projections">
     CREATE-CONTACTS also backfills projections that were suppressed while the entity was outside every orbit (e.g. enrichment-date memories).
@@ -396,19 +440,19 @@ Every entry point below is a **writer** and follows one shape. Treat this as the
 
 Rules that never bend: `occurred_at` is **domain time** (when the thing happened), never ingest time. User-derived content never writes to the shared banks. `expiration_date` only on upcoming-event memories. Each environment uses its own Mem0 project key.
 
-| # | Entry point | Writes to | Owner today → target | Status |
+| # | Entry point | Writes to | Owner (GCP) | Status |
 | --- | --- | --- | --- | --- |
-| 1 | Create Contact Person (ensure \+ bootstrap) | Both tiers \+ KNOWS edge | unwired → backend enqueue \+ Go bundle worker | Built, unwired |
-| 2 | Master-person seed from edge descriptions | Shared bank | Xano `#13148` → Go with the enrichment move | Live fn, no trigger |
-| 3 | Historical Email Parse | Contact thread | Xano `#13149` email stage → Go for bulk backfill | Live fn, no trigger |
-| 4 | Historical Calendar Parse | Contact thread | Xano `#13149` calendar stage → same | Live fn, no trigger |
-| 5 | Add Important Date | Contact thread \+ shared tier | hook on `#13226` (backend) | To build |
+| 1 | Create Contact Person (ensure \+ bootstrap) | Both tiers \+ KNOWS edge | backend enqueue \+ Go bundle worker | To build |
+| 2 | Master-person seed from edge descriptions | Shared bank | Go seed service (ref `#13148`) | Prototyped, no trigger |
+| 3 | Historical Email Parse | Contact thread | Go extraction service (ref `#13149` email stage) | Prototyped, no trigger |
+| 4 | Historical Calendar Parse | Contact thread | Go extraction service (ref `#13149` calendar stage) | Prototyped, no trigger |
+| 5 | Add Important Date | Contact thread \+ shared tier | hook in the Go dates writer (ref `#13226`) | To build |
 | 6 | New Email CRON | Contact thread | Go cron (proposed) | To design |
 | 7 | Calendar Event Webhook | Contact thread | Go worker off activity tables (proposed) | To design |
-| 8 | How I Know X (manual chat entry) | Contact thread | Xano `#8583`, migrating in place | Live — migrating to `infer=false` |
+| 8 | How I Know X (manual chat entry) | Contact thread | Go writer (ref `#8583`) | Rebuild on ledger rails (`infer=false`) |
 | 9 | Create Contact Company (ensure \+ bootstrap) | Both company tiers | mirrors entry 1 | To design |
-| 10 | Edge-description updates (shared-bank sync) | Shared bank | hooks in edge writers (Xano now, Go later) | To build |
-| 11 | Outcomes / Leverage Loops / Manual Notes | Contact, company, user scopes | product-event router | Archived spec; re-spec on ledger rails |
+| 10 | Edge-description updates (shared-bank sync) | Shared bank | hooks in the Go enrichment edge writers | To build |
+| 11 | Outcomes / Leverage Loops / Manual Notes | Contact, company, user scopes | Go product-event router | Archived spec; re-spec on ledger rails |
 
 ### 1. Create Contact Person
 
@@ -416,9 +460,9 @@ Rules that never bend: `occurred_at` is **domain time** (when the thing happened
 
 1. On insert, enqueue `{contacts_id}` and return — **no inline memory work**; contact creation stays fast. A bundle-status record drives the "building memories…" UI state.
 2. Worker loads the contact → `user_id`, `master_person_id`.
-3. **Ensure the shared bank (atomic claim):** `UPDATE master_person SET mem0_seeded_at = now() WHERE id = $1 AND mem0_seeded_at IS NULL`. One row affected → this worker runs entry 2. Zero rows → already seeded or claimed, skip. Crash mid-seed: the `shared_seed` ledger rows are the audit, and the orbit-backfill sweep re-runs incomplete seeds.
+3. **Ensure the shared bank (atomic claim on the Universe `master_person` row, AlloyDB):** `UPDATE master_person SET mem0_seeded_at = now() WHERE id = $1 AND mem0_seeded_at IS NULL`. One row affected → this worker runs entry 2. Zero rows → already seeded or claimed, skip. Crash mid-seed: the `shared_seed` ledger rows are the audit, and the orbit-backfill sweep re-runs incomplete seeds.
 4. **Bootstrap memory:** one `extraction` row, `fact_class = interaction_event` — `"{user} added {person} as a contact on {date} (source: import | manual | get-add)"` — projected immediately. Guarantees the thread is never empty.
-5. **Create the KNOWS edge:** `(user)-[:KNOWS]->(person)` via canonicalized `MERGE` — repeat adds update, never duplicate. Deterministic bookkeeping, not an extractor claim: no ledger row, no modal. Properties: `origination` = the step-4 memory text; `origination_source` ∈ `user_add | linkedin_import | email_history | calendar_history`; **initial strength** by source, higher = stronger — `user_add` **100**, `email_history` / `calendar_history` **75**, `linkedin_import` **40** (proposed — Mark 2026-08-04: LinkedIn is _not_ a strong indicator; the value mirrors Known's weak-evidence = half-of-strong ratio and matches Known classing `linkedin_connection` weak while `email_direct` / `calendar_meeting` / `manual_user_add` are strong) — adjusted thereafter by interaction counts; `created_at` \+ `updated_at` (touched by every subsequent adjustment); `last_interaction_at` for traversal-time recency filters. **Counts never live on the edge** — the nightly scoring pass reads `contacts_interaction_log`, recomputes `strength`, and updates the edge only on material change (recompute-not-increment). **Resolved 2026-08-04 (Mark): two fields, both written at create.** `strength` is human-intuitive (higher = stronger — the values above). `weight` is the **path-traversal cost — lower = stronger**, per the committed graph convention — derived at write by the committed KNOWS formula `weight = 25 + 35 × (1 − strength/100)` (range 25–60): `user_add` → **25**, `email_history` / `calendar_history` → **≈34**, `linkedin_import` → **46**. Traversal queries consume `weight`; the scoring pass updates `strength` and recomputes `weight` together. When Known's `create_knows_edge` ships this slots in unchanged, and the contact-add event maps to `manual_user_add` strong evidence.
+5. **Create the KNOWS edge:** `(user)-[:KNOWS]->(person)` via canonicalized `MERGE` — repeat adds update, never duplicate. Deterministic bookkeeping, not an extractor claim: no ledger row, no modal. Properties: `origination` = the step-4 memory text; `origination_source` ∈ `user_add | linkedin_import | email_history | calendar_history`; **initial strength** by source, higher = stronger — `user_add` **100**, `email_history` / `calendar_history` **75**, `linkedin_import` **40** (ratified 2026-08-04 — LinkedIn is _not_ a strong indicator; the value mirrors Known's weak-evidence = half-of-strong ratio and matches Known classing `linkedin_connection` weak while `email_direct` / `calendar_meeting` / `manual_user_add` are strong) — adjusted thereafter by interaction counts; `created_at` \+ `updated_at` (touched by every subsequent adjustment); `last_interaction_at` for traversal-time recency filters. **Counts never live on the edge** — the nightly scoring pass reads `contacts_interaction_log`, recomputes `strength`, and updates the edge only on material change (recompute-not-increment). **Resolved 2026-08-04 (Mark): two fields, both written at create.** `strength` is human-intuitive (higher = stronger — the values above). `weight` is the **path-traversal cost — lower = stronger**, per the committed graph convention — derived at write by the committed KNOWS formula `weight = 25 + 35 × (1 − strength/100)` (range 25–60): `user_add` → **25**, `email_history` / `calendar_history` → **≈34**, `linkedin_import` → **46**. Traversal queries consume `weight`; the scoring pass updates `strength` and recomputes `weight` together. When Known's `create_knows_edge` ships this slots in unchanged, and the contact-add event maps to `manual_user_add` strong evidence.
 6. Run entry 3, then entry 4, looping continuation cursors until exhausted.
 7. Run contact-gated backfills (entry 5's sync, once built).
 8. Close the bundle status; the count of new `pending` proposals feeds the post-bootstrap digest.
@@ -427,19 +471,19 @@ Rules that never bend: `occurred_at` is **domain time** (when the thing happened
 
 ### 2. Master-person seed from edge descriptions
 
-**Trigger:** entry 1 step 3, and the orbit-backfill job. **Owner:** `#13148` today; Go when the enrichment engine moves. Reads **only the graph** — never user data.
+**Trigger:** entry 1 step 3, and the orbit-backfill job. **Owner:** the Go seed service (reference implementation: `#13148`). Reads **only the graph** — never user data.
 
 1. Load `master_person`. If `node_uuid` is missing: stamp and return — entry 10's hooks pick up edges that arrive later.
-2. One-hop Cypher from `node_uuid` (via `mvp/falkor/send-cypher` today; direct FalkorDB read in Go). Keep only edges with `rel.description` / `rel.fact`; descriptionless edges are skipped.
+2. One-hop Cypher from `node_uuid` (direct FalkorDB read). Keep only edges with `rel.description` / `rel.fact`; descriptionless edges are skipped.
 3. Per edge: `canonical_memory_hash` = hash(graph root, edge identity, from/to node identity, edge type, description); `memory_hash` = hash(canonical \+ `master_person_id`).
 4. Ledger rows: `row_kind = shared_seed`, `fact_class = graph_edge_seed`, `route = mem0`, `valid_from` / `valid_to` columns populated.
 5. Project to `user_id = "master_person:{id}"`, metadata `memory_scope = global_master_person` \+ `valid_from` / `valid_to` \+ graph provenance; native `timestamp` = `valid_from` epoch when present.
 
-**Required updates to `#13148`:** carry `valid_to`, pass native `timestamp`, write the ledger rows, honor the claim/stamp protocol.
+**Deltas vs the `#13148` reference:** carry `valid_to`, pass native `timestamp`, write the ledger rows, honor the claim/stamp protocol.
 
 ### 3. Historical Email Parse
 
-**Trigger:** bundle step 5, batched by continuation cursor (`max_threads_per_batch` 20). **Owner:** `#13149` email stage; the whole-book bulk backfill is a Go job feeding the same contract.
+**Trigger:** bundle step 5, batched by continuation cursor (`max_threads_per_batch` 20). **Owner:** the Go extraction service (reference: `#13149` email stage); the whole-book bulk backfill is a batch mode of the same service.
 
 1. Load the contact's active emails (`my_person_email_join` / `master_email`), the user's active Nylas grants, and the known-contact directory (for participant resolution).
 2. List threads involving the contact. Per thread (≤50 messages, cleaned transcript ≤30k chars): prefilter LLM (high-recall, **non-authoritative** — only obvious bulk/receipt/automation/calendar-forward noise is dropped) → extraction LLM.
@@ -452,7 +496,7 @@ Optional sent-email tone stage (Claude Opus 4.8) writes `email_draft_tone`, **ou
 
 ### 4. Historical Calendar Parse
 
-**Trigger:** bundle, after the email stage. **Owner:** `#13149` calendar stage.
+**Trigger:** bundle, after the email stage. **Owner:** the Go extraction service (reference: `#13149` calendar stage).
 
 1. List Nylas events including the contact: 3650d lookback / 365d lookahead, ≤100 per batch.
 2. Drop non-signal: canceled, user-declined, all-day holidays/system calendars, private events (configurable), generic holds ("busy", "focus time"), events with no contact participation.
@@ -463,7 +507,7 @@ Optional sent-email tone stage (Claude Opus 4.8) writes `email_draft_tone`, **ou
 
 ### 5. Add Important Date (two directions)
 
-**Sync in (structured → mem0) — to build:** trigger = `contacts_date` insert/update through the choke-point writer `dates/upsert-contact-date` (`#13226`). The hook emits a ledger row directly — `fact_class = date`, `route = mem0`, **no LLM** (already structured), text rendered from a per-descriptor template. Metadata carries the row's `natural_key` \+ provenance, so a re-sync supersedes and re-projects instead of duplicating. **Loop guard:** rows with `origin = memory` are skipped — they came _from_ a memory. Enrichment dates project **once** to the shared tier; user dates to the contact thread.
+**Sync in (structured → mem0) — to build:** trigger = `contacts_date` insert/update through the Go dates writer (reference: `dates/upsert-contact-date` `#13226`). The hook emits a ledger row directly — `fact_class = date`, `route = mem0`, **no LLM** (already structured), text rendered from a per-descriptor template. Metadata carries the row's `natural_key` \+ provenance, so a re-sync supersedes and re-projects instead of duplicating. **Loop guard:** rows with `origin = memory` are skipped — they came _from_ a memory. Enrichment dates project **once** to the shared tier; user dates to the contact thread.
 
 **Promotion out (extracted → structured):** extractors (entries 3/6/8) emit `fact_class = date` candidates → `pending` → modal Confirm → `#13226` creates the row with `origin = memory` \+ `origin_ref.memory_id` — which the loop guard then keeps out of the sync direction. Deep reference: the archived [dates page](/guides/open-work/important-dates-mem0).
 
@@ -487,12 +531,12 @@ Optional sent-email tone stage (Claude Opus 4.8) writes `email_draft_tone`, **ou
 
 ### 8. How I Know X (manual chat entry, contact panel)
 
-**Today:** `#8583` writes the prose `relationship_summary` with `infer=true` — the last mixed-mode writer. **Migration (planned, in place in Xano):**
+**Reference:** `#8583` writes the prose `relationship_summary` with `infer=true` — the last mixed-mode writer. **Rebuild (Go, on ledger rails):**
 
 1. On `interview_complete`, take the structured `relationship_nuggets` (how\_met / superpower / kryptonite / cadence / trust / milestones) — not the chat transcript.
 2. Ledger rows per nugget: narrative/preference classes project `infer=false` (workos \+ `contacts_id` \+ `master_person_id`).
 3. `declared_relationship` and `date` candidates go `pending` → modal — **yes, even though the user said it in the interview**: conversational extraction is confirm-first (2026-07-16 rule) because the extractor can misread prose.
-4. Retire the `infer=true` path; fix the stale `subject_contact_id` comment while in there.
+4. Retire the `infer=true` path when the Go writer takes over.
 
 ### 9. Create Contact Company
 
@@ -500,7 +544,7 @@ Optional sent-email tone stage (Claude Opus 4.8) writes `email_draft_tone`, **ou
 
 ### 10. Edge-description updates (shared-bank sync)
 
-**Trigger:** any edge writer — enrichment functions today, Go enrichment later — creates, updates, or invalidates a description on a person's edges. **Contract for the hook (to build):**
+**Trigger:** any of the Go enrichment engine's edge writers creates, updates, or invalidates a description on a person's edges. **Contract for the hook (to build):**
 
 1. `mem0_seeded_at IS NULL` → return immediately. Unseeded persons cost one indexed read — the orbit gate keeps this cheap at enrichment scale.
 2. New description → new `shared_seed` row \+ project. Changed description (same canonical identity) → supersede \+ re-project.
@@ -515,11 +559,11 @@ Optional sent-email tone stage (Claude Opus 4.8) writes `email_draft_tone`, **ou
 
 The app calls Orbiter endpoints, never Mem0 directly (privacy checks, joins, redaction stay first-party), and every read merges the tiers. Retrieval output is combined with GraphRAG cypher context in LLM prompts: graph for structure, mem0 for content.
 
-**Live today:** `mem0/get-contacts-memories` (`#13147`) — resolves the owner's `workos_id` \+ linked `master_person`, reads the private scope (match on `contacts_id` OR `master_person_id`) and the shared bank, dedupes by hash/id/text, returns one array sorted by `memory_date`. This is the Contact Side Panel / Timeline read.
+**Reference implementation** (the Go context service ports this read): `mem0/get-contacts-memories` (`#13147`) — resolves the owner's `workos_id` \+ linked `master_person`, reads the private scope (match on `contacts_id` OR `master_person_id`) and the shared bank, dedupes by hash/id/text, returns one array sorted by `memory_date`. This is the Contact Side Panel / Timeline read.
 
 | Endpoint | Serves | Mem0 calls |
 | --- | --- | --- |
-| `GET /contacts/{contacts_id}/memories` | Side Panel Memories tab, Timeline | get-all on both tiers (backed by `#13147`) |
+| `GET /contacts/{contacts_id}/memories` | Side Panel Memories tab, Timeline | get-all on both tiers (ports `#13147`) |
 | `POST /contacts/{contacts_id}/memories/search` | Question-shaped contact context | v3 search ×2 (private \+ shared), `rerank=true` |
 | `GET /me/memories` | User's own goals/preferences view | get-all, `memory_scope=user_private` |
 | `GET /companies/{my_company_id}/memories` | Company tab | get-all private company \+ shared company bank |
@@ -535,7 +579,7 @@ The surfaces these feed:
 | Discover / collection questions | "Who do I know that …?" | **Cross-contact**: whole private scope | v3 search on `user_id` alone — fused semantic \+ BM25 \+ entity scoring |
 | Company view | "Everything with this company, incl. its people" | Company thread \+ cross-tagged person memories \+ shared bank | get-all with `my_company_id` OR `related_master_company_ids` |
 
-The cross-contact Discover case is why `contacts_id` lives in metadata rather than the entity key — one search over the user's whole memory space is a native query, not a 2,000-way fan-out. Keep the endpoints thin search-and-merge so they port to GCP cleanly (where they ultimately live is TBD with the GCP migration).
+The cross-contact Discover case is why `contacts_id` lives in metadata rather than the entity key — one search over the user's whole memory space is a native query, not a 2,000-way fan-out. The endpoints are GCP-side, thin search-and-merge.
 
 ## Mem0 platform constraints (verified 2026-08-04)
 
@@ -553,10 +597,10 @@ The facts that shape implementation, from the current v3 API (`POST /v3/memories
 
 ## Build plan
 
-1. **`extraction_ledger` table** \+ refactor `#13148`/`#13149` to ledger-first writes. Extend the extractor output contract with `fact_class`: closed enum matching the ledger CHECK, per-class definitions and examples in the prompt, **default to memory-rail when uncertain**, and the companion rule (every graph-bound fact ships its `interaction_event` sibling). Add `valid_to` \+ native `timestamp` to the seed.
+1. **`extraction_ledger` table** \+ the Go seed and extraction services, ledger-first, porting the `#13148`/`#13149` logic. Extend the extractor output contract with `fact_class`: closed enum matching the ledger CHECK, per-class definitions and examples in the prompt, **default to memory-rail when uncertain**, and the companion rule (every graph-bound fact ships its `interaction_event` sibling). Add `valid_to` \+ native `timestamp` to the seed.
 2. **Wire entry 1**: enqueued ensure-and-bootstrap bundle behind CREATE-CONTACTS, `mem0_seeded_at` stamp, bootstrap memory, bundle status for the UI.
 3. **Backfill inside the orbit**: seed shared banks for every master person already in at least one orbit; historical parses for existing contacts (after verifying Mem0's bulk-ingest surface).
 4. **Migrate How I Know** to `infer=false` nuggets through the ledger — closes the mixed-infer risk while surface area is small.
 5. **Incremental writers**: email CRON \+ calendar webhook (entries 6–7), then the dates route re-specced on the same rails (entry 5).
 6. **Company tiers** (entry 9) once person-side wiring is proven.
-7. **Context GET endpoints** for copilot, meeting prep, and Discover — thin search-and-merge, GCP-portable.
+7. **Context GET endpoints** for copilot, meeting prep, and Discover — thin search-and-merge, in GCP.

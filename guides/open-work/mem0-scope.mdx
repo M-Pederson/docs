@@ -47,7 +47,7 @@ extraction_ledger row (route_status: pending)      <- the source of record
 
 ### The table
 
-A first-party Xano table (Backend-tier home at split time), superseding full-scope's `mem0_memory_index` bookkeeping design:
+A first-party **AlloyDB table in the Orbiter backend**, superseding full-scope's `mem0_memory_index` bookkeeping design. Identity columns are logical FKs mirroring Xano ids — the same pattern as `contacts_interaction_log` — and the Xano-era writers (`#13148`/`#13149`) reach it through the backend until the extractors themselves move to GCP:
 
 | Column group | Fields (sketch) |
 | --- | --- |
@@ -57,6 +57,107 @@ A first-party Xano table (Backend-tier home at split time), superseding full-sco
 | Provenance | `source_type`, `source_platform`, `source_id`, `occurred_at` (domain time), `extractor_version` |
 | Idempotency | `memory_hash`, `canonical_memory_hash` — unique per user \+ canonical hash, replacing the per-memory mem0 search-before-write |
 | Projection refs | `mem0_memory_id` / `mem0_event_id`, `promoted_ref` (contacts\_date row id / Introduction uuid / queue item id) |
+
+<Accordion title="extraction_ledger — full AlloyDB table spec" icon="database">
+  ```sql
+  CREATE TABLE extraction_ledger (
+    id                    BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    row_kind              TEXT NOT NULL DEFAULT 'extraction'
+                          CHECK (row_kind IN ('extraction', 'shared_seed')),
+  
+    -- identity: logical FKs mirroring Xano ids (no hard FK constraints,
+    -- same pattern as contacts_interaction_log)
+    user_id               BIGINT,             -- NULL on shared_seed rows
+    contacts_id           BIGINT,
+    master_person_id      BIGINT,
+    my_company_id         BIGINT,
+    master_company_id     BIGINT,
+  
+    -- the fact
+    extracted_text        TEXT NOT NULL,      -- the atomic sentence
+    fact_class            TEXT NOT NULL CHECK (fact_class IN (
+                            'interaction_event', 'preference', 'narrative',
+                            'user_goal', 'commitment', 'chat_memory',
+                            'introduction', 'declared_relationship',
+                            'enrichment_signal', 'date', 'graph_edge_seed')),
+    confidence            NUMERIC(3,2),       -- 0.00-1.00 from the extractor
+    sensitivity           TEXT NOT NULL DEFAULT 'none'
+                          CHECK (sensitivity IN ('none', 'sensitive', 'secret')),
+  
+    -- routing (route is derived from fact_class by the deterministic map in code)
+    route                 TEXT NOT NULL CHECK (route IN (
+                            'mem0', 'known_introduction', 'known_facet',
+                            'enrichment_queue', 'contacts_date', 'commitments')),
+    route_status          TEXT NOT NULL DEFAULT 'pending' CHECK (route_status IN (
+                            'pending', 'projected', 'confirmed',
+                            'rejected', 'superseded')),
+    routed_at             TIMESTAMPTZ,        -- when projection/confirmation completed
+    confirmed_at          TIMESTAMPTZ,        -- user tap on confirm-first routes
+  
+    -- provenance
+    source_type           TEXT NOT NULL,      -- email_thread | calendar_event | manual_user_note
+                                              -- | how_i_know | chat | graph_edge
+    source_platform       TEXT,               -- nylas | orbiter_notes | orbiter_outcomes | falkordb
+    source_id             TEXT,               -- thread id / event id / note id / edge uuid
+    occurred_at           TIMESTAMPTZ,        -- domain time (event date), never ingest time
+    valid_from            DATE,               -- graph seeds only
+    valid_to              DATE,               -- graph seeds only
+    extractor_version     TEXT NOT NULL,      -- e.g. 'mem0_13149_extractor_v3'
+  
+    -- idempotency
+    canonical_memory_hash TEXT NOT NULL,      -- source-level dedupe key
+    memory_hash           TEXT NOT NULL,      -- write key (canonical + subject scope)
+  
+    -- projection refs
+    mem0_memory_id        TEXT,               -- set when route_status = projected
+    mem0_event_id         TEXT,               -- async add event id, when applicable
+    promoted_ref          JSONB,              -- {"table": "contacts_date", "id": 123} on confirmed routes
+  
+    -- audit
+    error                 TEXT,               -- last projection error preview
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  
+    CHECK (
+      (row_kind = 'extraction' AND user_id IS NOT NULL)
+      OR (row_kind = 'shared_seed' AND user_id IS NULL
+          AND (master_person_id IS NOT NULL OR master_company_id IS NOT NULL))
+    )
+  );
+  
+  -- idempotency: one fact per subject scope
+  CREATE UNIQUE INDEX uq_ledger_user_canonical
+    ON extraction_ledger (user_id, canonical_memory_hash)
+    WHERE row_kind = 'extraction';
+  CREATE UNIQUE INDEX uq_ledger_seed_canonical
+    ON extraction_ledger (COALESCE(master_person_id, 0),
+                          COALESCE(master_company_id, 0),
+                          canonical_memory_hash)
+    WHERE row_kind = 'shared_seed';
+  CREATE INDEX ix_ledger_memory_hash    ON extraction_ledger (memory_hash);
+  
+  -- the projector's work queue
+  CREATE INDEX ix_ledger_pending        ON extraction_ledger (route, route_status)
+    WHERE route_status = 'pending';
+  
+  -- reads: contact-panel provenance, seeded-bank audit, webhook reconciliation
+  CREATE INDEX ix_ledger_contact        ON extraction_ledger (contacts_id, route_status);
+  CREATE INDEX ix_ledger_seed_person    ON extraction_ledger (master_person_id)
+    WHERE row_kind = 'shared_seed';
+  CREATE INDEX ix_ledger_source         ON extraction_ledger (source_type, source_id);
+  CREATE INDEX ix_ledger_mem0_id        ON extraction_ledger (mem0_memory_id)
+    WHERE mem0_memory_id IS NOT NULL;
+  ```
+
+  Notes:
+
+  - **Two row kinds, one table.** `extraction` rows are the source of record for user-derived content. `shared_seed` rows are audit-only projections of `#13148` seeds — their source of record stays the graph. The check constraint enforces the identity shape of each kind.
+  - **Idempotency is per subject scope**: `(user_id, canonical_memory_hash)` for user content, `(master_person_id | master_company_id, canonical_memory_hash)` for seeds. Re-runs upsert against these; the per-memory mem0 search-before-write goes away.
+  - **`route` is stored, not computed** — the deterministic `fact_class` → `route` map lives in code, and re-routing after a map change is an `UPDATE` over existing rows followed by re-projection. No re-extraction.
+  - **The seeded-bank check** stays `master_person.mem0_seeded_at` in Xano (O(1), race-guarded); `ix_ledger_seed_person` backs the audit view and can rebuild the stamp if it is ever lost.
+  - **Webhook sync**: Mem0 `memory_update` / `memory_delete` events resolve back to rows via `ix_ledger_mem0_id` and keep projection refs honest.
+  - Deliberately absent in v1: retry counters (re-runs are idempotent), soft deletes (`route_status = 'superseded'` covers it), and hard FKs (cross-system ids are logical, per the interaction-log precedent).
+</Accordion>
 
 Write order matters: ledger row first (`pending`), then project — a crash between the two steps is re-runnable from the ledger, idempotent via the hash unique index. Two row kinds share the table: **user-derived extraction rows** (ledger = source of record) and **shared-bank seed rows** (audit only — their source of record stays the graph; they also back the fast seeded-bank check in the ensure flow).
 

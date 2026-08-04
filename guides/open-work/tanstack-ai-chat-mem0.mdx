@@ -1,24 +1,76 @@
 ---
 title: "Tanstack AI Chat mem0"
 sidebarTitle: "Tanstack AI Chat mem0"
-description: "Placeholder: mem0 job 1 — AI-chat memory for the Tanstack chat build, re-specced on the extraction-ledger rails"
+description: "mem0 flows for the Tanstack chat surfaces — Meeting Prep, Leverage Loop, and Outcomes — on the extraction-ledger rails, built in GCP"
 icon: "comments"
 ---
 
-<Warning>
-  **Placeholder — created 2026-08-04, nothing specced yet.** This page is the future home of **mem0 job 1: AI-chat memory** for the Tanstack AI Chat build. The prior Zep → Mem0 chat plans ([Migration Plan](/guides/open-work/mem0/migration-plan), [Current Implementation](/guides/open-work/mem0/current-implementation)) were archived 2026-08-04 with the rest of the pre-consolidation corpus — they are reference input, not direction. Everything here gets specced against [mem0 Scope](/guides/open-work/mem0-scope) (the working spec) and its extraction ledger.
-</Warning>
+<Info>
+  **Working page — started 2026-08-04.** The chat-surface mem0 flows for the Tanstack AI Chat build, specced against [mem0 Scope](/guides/open-work/mem0-scope) (the ledger, routing map, tiers, and GET contract). Built in GCP: Go services on AlloyDB. Meeting Prep is being specced now; Leverage Loop and Outcomes are outlined, to be filled in.
+</Info>
 
-## What this page will cover
+## Meeting Prep
 
-- **Chat session memory model** — how Tanstack AI Chat conversations persist and recall context across sessions: entity scoping (`user_id = workos_id`, session `run_id`), what is remembered verbatim vs distilled, and retention.
-- **The ledger boundary** — conversational continuity writes directly to mem0 (job 1), but **durable facts surfaced in chat go through the extraction ledger** like every other source: `fact_class = chat_memory` stays memory-rail; introductions, declared relationship facts, and dates spoken in chat route out confirm-first per the [routing map](/guides/open-work/mem0-scope#the-routing-map).
-- **Per-surface behavior** — Outcomes, Leverage Loops, Meeting Prep, and How I Know as they move onto the Tanstack chat: what each surface writes, when (submit/activate, not per-turn), and what each injects at prompt time.
-- **Context injection contract** — how chat prompts combine job-1 session memory with job-2 contact/company context and GraphRAG output (the [GET contract](/guides/open-work/mem0-scope#retrieval--the-get-contract) demand-side table).
-- **Migration from Zep** — what happens to the existing Zep-backed OpenUI05 dispatch path, and the cutover order relative to the AI SDK migration.
+**The flow:** when meeting prep is initiated for a specific meeting — check whether mem0 already holds prep memories for that meeting. If it does, serve and refresh them. If it does **not**, build the prep from the meeting's participants.
 
-## References
+<Steps>
+  <Step title="Prep initiated for a specific meeting">
+    The user (or the pre-meeting trigger) opens prep for one calendar event.
+  </Step>
+  <Step title="Check for existing meeting memories">
+    Search the user's private mem0 scope filtered on the meeting key: `filters: {AND: [{user_id}, {metadata: {event_id}}]}`. Hit → serve the existing pack, refresh anything stale. Miss → build.
+  </Step>
+  <Step title="Resolve the participants">
+    Read the resolved participants from `calendar_event_activity`, and the complete attendee list from `events.event_data` (see the options table below). Resolve any not-yet-resolved attendee emails through the standard chain (master\_email → master\_person → contacts).
+  </Step>
+  <Step title="Build the pack from two-tier context per participant">
+    For each resolved participant, run the meeting-prep read from the [GET contract](/guides/open-work/mem0-scope#retrieval--the-get-contract): private contact thread \+ shared bank, `reference_date` = event start, recency-weighted ("what changed since we last met, open loops"). Unresolved attendees appear as name/email lines only. Merge with GraphRAG context per the standard prompt assembly.
+  </Step>
+  <Step title="Write the pack back as meeting-scoped memories">
+    The assembled prep pack lands through the ledger (`fact_class = chat_memory`, memory rail) tagged with the meeting key \+ participant ids — so the next prep for the same meeting is a warm hit, and post-meeting surfaces can reference what prep knew. Upcoming-pack memories may set `expiration_date` = event end (the sanctioned use — a stale pack should vanish from search after the meeting; durable facts learned in the meeting arrive later via the extractors, not the pack).
+  </Step>
+</Steps>
 
-- [mem0 Scope](/guides/open-work/mem0-scope) — the working spec: ledger, routing map, tiers, entry points, retrieval contract
-- [mem0 Functions](/guides/open-work/mem0/functions) — live Xano function reference
-- Archived corpus (reference only): [Migration Plan](/guides/open-work/mem0/migration-plan) · [Current Implementation](/guides/open-work/mem0/current-implementation)
+### What ID identifies the meeting?
+
+Open question raised 2026-08-04, with a lean. The candidates, from the actual `events` schema (table 221):
+
+| Candidate | What it is | Fit |
+| --- | --- | --- |
+| `events.id` | Orbiter's internal row id — one row per event occurrence in the **user's own** calendar mirror | **Lean: use this as `metadata.event_id`.** Internal, stable, joins to `calendar_event_activity.event_id` directly, and per-user scoping matches mem0's privacy model (prep memories are the user's) |
+| `events.external_id` | The provider (Nylas) event id | Grant-scoped; carry in metadata as `source_id` for provider round-trips, don't key on it |
+| `ical_uid` (inside `events.event_data`) | Cross-provider, cross-attendee stable id — every attendee's copy of the meeting shares it | Not a column today; carry in metadata when present for cross-user correlation later |
+| `events.master_event_id` (→ table 222) | The recurring-series master | Prep targets an **occurrence** (`events.id` is already occurrence-grain); carry the series id in metadata for cadence context ("you meet monthly") |
+
+Lean: **`metadata.event_id = events.id`**, with `source_id` (provider id), `ical_uid`, and `master_event_id` carried alongside in metadata.
+
+### Where participants come from (verified against schemas, 2026-08-04)
+
+Both sources are mirrored to AlloyDB (the interaction-log architecture), so the Go prep service reads them there:
+
+| Source | What it gives | Notes |
+| --- | --- | --- |
+| `calendar_event_activity` (598) | **One row per resolved contact per event**: `my_person_id` → contacts, `interlocutor_email` → master\_email, `event_id` → 221, `participant_count`, `grant_id`, `status` | The fast pre-resolved path: `SELECT my_person_id WHERE event_id = $1 AND user_id = $2`. Only participants who are resolved contacts appear here |
+| `events.event_data` (221, JSON) | The **complete raw attendee list** — every name/email/RSVP from the provider payload, resolved or not — plus `organize` (user is organizer), `provider`, `url` | The full-fidelity source; the only place unresolved external attendees exist. Resolve their emails at prep time through the standard chain |
+| Live provider fetch (Nylas, by `external_id`) | Freshest state — late adds, RSVP changes since the last webhook | Fallback only, when the mirror is suspected stale |
+| Reference implementation: `classify-participants-get-context` (`#13070`) | The existing prototype that classifies a meeting's participants and pulls their context | The Go prep service ports its classification logic |
+
+**Open questions:** does the prep trigger fire on demand only, or also on a pre-meeting schedule (T-24h)? Does a rebuilt pack supersede the previous pack's memories or version them? Both decide at build.
+
+## Leverage Loop (specific)
+
+**To spec.** The purpose-specific loop ("help this person with X"). Skeleton, per [mem0 Scope entry 11](/guides/open-work/mem0-scope#11-product-writers-outcomes-leverage-loops-manual-notes) and the routing map:
+
+- **At loop start:** inject the target contact's two-tier context (thread \+ shared bank) plus the user's goal memories — the loop chat opens already knowing the relationship.
+- **Session continuity:** the loop conversation itself is chat memory (job 1) — session-scoped via `run_id`, user-scoped via `workos_id`.
+- **On activation:** one durable contact-scope memory through the ledger ("user wants to help {person} with {x}") — `for_master_person_id` resolved to `contacts_id` server-side; never per-turn writes.
+- **Durable facts surfaced in the loop chat** (an introduction offered, a date mentioned) ride the normal extraction routing — pending → [Confirm Relations & Events](/guides/open-work/mem0-scope#the-proposal-surface--confirm-relations--events-modal) where graph-bound.
+
+## Outcomes
+
+**To spec.** The general outcome interview ("buy a house in Costa Rica"). Skeleton, same sources:
+
+- **At interview start:** inject the user's existing goal/preference memories (user scope) so the interviewer never re-asks what it already knows.
+- **Session continuity:** interview turns are chat memory — `run_id` per interview, `workos_id` scope.
+- **On submit** (`suggestion_request` leaves draft): durable user-scope goal memories through the ledger — goals, constraints, geography, timing, durable negative preferences. Never raw ranking results, prompt scaffolding, or transient reasoning.
+- **Resubmit** of a completed outcome = a new `suggestion_request` → update-or-supersede the goal memories via the hash contract.

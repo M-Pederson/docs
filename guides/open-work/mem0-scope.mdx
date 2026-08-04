@@ -365,63 +365,133 @@ Standing rules:
 
 ## Entry points — every place a memory is saved
 
-| # | Entry point | Writes to | Status |
-| --- | --- | --- | --- |
-| 1 | Create Contact Person (ensure \+ bootstrap) | Both tiers | Built, unwired |
-| 2 | Master-person seed from edge descriptions | Shared bank | Live fn (`#13148`), no trigger |
-| 3 | Historical Email Parse | Contact thread | Live fn (`#13149` email stage), no trigger |
-| 4 | Historical Calendar Parse | Contact thread | Live fn (`#13149` calendar stage), no trigger |
-| 5 | Add Important Date | Contact thread \+ shared tier | Reference spec archived; re-spec on ledger rails |
-| 6 | New Email CRON | Contact thread | To design |
-| 7 | Calendar Event Webhook | Contact thread | To design |
-| 8 | How I Know X (manual chat entry) | Contact thread | Live (`#8583`) — migrating to `infer=false` |
-| 9 | Create Contact Company (ensure \+ bootstrap) | Both company tiers | To design |
-| 10 | Edge-description updates (shared-bank sync) | Shared bank | To build (writer hooks) |
-| 11 | Outcomes / Leverage Loops / Manual Notes | Contact, company, user scopes | Spec'd in [full-scope §5–8](/guides/open-work/mem0/full-scope#source-ingestion-strategy) |
+### The writer contract (developers: read this first)
+
+Every entry point below is a **writer** and follows one shape. Treat this as the interface; the per-entry sections only vary the source and the subject.
+
+1. **Resolve the subject.** `contacts_id` → owning `user_id` \+ `master_person_id` (company writers: `my_company_id` \+ `master_company_id`); verify the source row belongs to that user.
+2. **Extract or receive facts.** LLM extractors emit per candidate: `{extracted_text, fact_class, confidence, sensitivity, event_date}` — closed `fact_class` enum, default to memory-rail when uncertain, every graph-bound fact ships its companion `interaction_event`. Structured sources (dates, notes) skip the LLM and carry their class directly.
+3. **Ledger first.** Upsert into AlloyDB `extraction_ledger` with `ON CONFLICT` on the per-scope unique hash index `DO NOTHING`. Nothing is sent to mem0 before its ledger row exists — a crash after this step is recovered by re-running the projector over `pending` rows.
+4. **Project memory classes.** `POST https://api.mem0.ai/v3/memories/add/`, `infer=false`, `run_id = memory_hash`, entity id per tier (`user.workos_id` private / `master_person:{id}` shared), flat metadata per the schema accordion, native `timestamp` = `occurred_at` epoch. Then stamp `route_status = 'projected'` \+ `mem0_memory_id`.
+5. **Leave graph-bound rows `pending`.** The [Confirm Relations & Events modal](#the-proposal-surface--confirm-relations--events-modal) owns them. **A writer never creates graph artifacts.**
+6. **Update semantics.** Same `canonical_memory_hash`, changed content → mark the old row `superseded`, update/delete its mem0 projection via `mem0_memory_id`, insert the new row, re-project.
+7. **Failure.** Record `error` on the row, leave `route_status` as-is; every writer must be re-run-safe end to end.
+
+Rules that never bend: `occurred_at` is **domain time** (when the thing happened), never ingest time. User-derived content never writes to the shared banks. `expiration_date` only on upcoming-event memories. Each environment uses its own Mem0 project key.
+
+| # | Entry point | Writes to | Owner today → target | Status |
+| --- | --- | --- | --- | --- |
+| 1 | Create Contact Person (ensure \+ bootstrap) | Both tiers | unwired → backend enqueue \+ Go bundle worker | Built, unwired |
+| 2 | Master-person seed from edge descriptions | Shared bank | Xano `#13148` → Go with the enrichment move | Live fn, no trigger |
+| 3 | Historical Email Parse | Contact thread | Xano `#13149` email stage → Go for bulk backfill | Live fn, no trigger |
+| 4 | Historical Calendar Parse | Contact thread | Xano `#13149` calendar stage → same | Live fn, no trigger |
+| 5 | Add Important Date | Contact thread \+ shared tier | hook on `#13226` (backend) | To build |
+| 6 | New Email CRON | Contact thread | Go cron (proposed) | To design |
+| 7 | Calendar Event Webhook | Contact thread | Go worker off activity tables (proposed) | To design |
+| 8 | How I Know X (manual chat entry) | Contact thread | Xano `#8583`, migrating in place | Live — migrating to `infer=false` |
+| 9 | Create Contact Company (ensure \+ bootstrap) | Both company tiers | mirrors entry 1 | To design |
+| 10 | Edge-description updates (shared-bank sync) | Shared bank | hooks in edge writers (Xano now, Go later) | To build |
+| 11 | Outcomes / Leverage Loops / Manual Notes | Contact, company, user scopes | product-event router | Archived spec; re-spec on ledger rails |
 
 ### 1. Create Contact Person
 
-**Trigger:** a `contacts` row is created (import, GET-ADD, manual add). The anchor entry point — runs the ensure flow above as an enqueued bundle: seeded check → seed if missing → bootstrap memory → historical parses → contact-gated backfills.
+**Trigger:** a `contacts` row is created — CREATE-CONTACTS, GET-ADD attach, import processors. **Owner:** the backend enqueues; a **Go bundle worker** executes.
+
+1. On insert, enqueue `{contacts_id}` and return — **no inline memory work**; contact creation stays fast. A bundle-status record drives the "building memories…" UI state.
+2. Worker loads the contact → `user_id`, `master_person_id`.
+3. **Ensure the shared bank (atomic claim):** `UPDATE master_person SET mem0_seeded_at = now() WHERE id = $1 AND mem0_seeded_at IS NULL`. One row affected → this worker runs entry 2. Zero rows → already seeded or claimed, skip. Crash mid-seed: the `shared_seed` ledger rows are the audit, and the orbit-backfill sweep re-runs incomplete seeds.
+4. **Bootstrap memory:** one `extraction` row, `fact_class = interaction_event` — `"{user} added {person} as a contact on {date} (source: import | manual | get-add)"` — projected immediately. Guarantees the thread is never empty.
+5. Run entry 3, then entry 4, looping continuation cursors until exhausted.
+6. Run contact-gated backfills (entry 5's sync, once built).
+7. Close the bundle status; the count of new `pending` proposals feeds the post-bootstrap digest.
+
+**Idempotency:** the whole bundle is re-runnable — every downstream write is hash-guarded.
 
 ### 2. Master-person seed from edge descriptions
 
-**Trigger:** called by entry 1 when `mem0_seeded_at` is empty. Live as `#13148`: one-hop edges via `mvp/falkor/send-cypher`, keeps only edges with `rel.description` / `rel.fact` (descriptionless edges are skipped), deterministic hashes, `infer=false`. **Required updates:** carry `valid_to`, pass native `timestamp`, write seed-audit rows to the ledger, stamp `mem0_seeded_at`.
+**Trigger:** entry 1 step 3, and the orbit-backfill job. **Owner:** `#13148` today; Go when the enrichment engine moves. Reads **only the graph** — never user data.
+
+1. Load `master_person`. If `node_uuid` is missing: stamp and return — entry 10's hooks pick up edges that arrive later.
+2. One-hop Cypher from `node_uuid` (via `mvp/falkor/send-cypher` today; direct FalkorDB read in Go). Keep only edges with `rel.description` / `rel.fact`; descriptionless edges are skipped.
+3. Per edge: `canonical_memory_hash` = hash(graph root, edge identity, from/to node identity, edge type, description); `memory_hash` = hash(canonical \+ `master_person_id`).
+4. Ledger rows: `row_kind = shared_seed`, `fact_class = graph_edge_seed`, `route = mem0`, `valid_from` / `valid_to` columns populated.
+5. Project to `user_id = "master_person:{id}"`, metadata `memory_scope = global_master_person` \+ `valid_from` / `valid_to` \+ graph provenance; native `timestamp` = `valid_from` epoch when present.
+
+**Required updates to `#13148`:** carry `valid_to`, pass native `timestamp`, write the ledger rows, honor the claim/stamp protocol.
 
 ### 3. Historical Email Parse
 
-**Trigger:** part of the contact bootstrap, continuation-cursor batched. Live as the email stage of `#13149`: Nylas threads → DeepSeek V4 Flash prefilter → DeepSeek V4 Flash extraction (English-only, at most 5 candidates per thread, `event_date` required) → `infer=false`. Optional sent-email tone profile (Claude Opus 4.8) → `email_draft_tone`, outside mem0. **Required updates:** ledger-first writes, `fact_class` added to the extractor output contract. TBD: bulk-backfill mechanics for whole-book imports (verify Mem0's ingest-job surface first).
+**Trigger:** bundle step 5, batched by continuation cursor (`max_threads_per_batch` 20). **Owner:** `#13149` email stage; the whole-book bulk backfill is a Go job feeding the same contract.
+
+1. Load the contact's active emails (`my_person_email_join` / `master_email`), the user's active Nylas grants, and the known-contact directory (for participant resolution).
+2. List threads involving the contact. Per thread (≤50 messages, cleaned transcript ≤30k chars): prefilter LLM (high-recall, **non-authoritative** — only obvious bulk/receipt/automation/calendar-forward noise is dropped) → extraction LLM.
+3. Extraction returns ≤5 candidates per thread with the full candidate shape (contract step 2). English-only enforced; drop `confidence < 0.75` and `sensitive` / `secret`; companion rule enforced.
+4. Ledger rows: `occurred_at` = `event_date`, falling back to the latest normalized evidence date from the messages.
+5. Project memory classes (workos scope, `contacts_id` \+ `master_person_id` \+ related-people metadata). Graph-bound rows stay `pending`.
+6. Return the continuation cursor; the bundle loops.
+
+Optional sent-email tone stage (Claude Opus 4.8) writes `email_draft_tone`, **outside** mem0 and the ledger. **Idempotency:** re-parsing a thread re-derives identical hashes — conflicts are no-ops.
 
 ### 4. Historical Calendar Parse
 
-**Trigger:** same bootstrap, after the email stage. Live as the calendar stage of `#13149`: 3650d lookback / 365d lookahead, resolved participant names over generic titles, event start → `memory_date`. Upcoming-event memories only when relationship-useful; `expiration_date` is legitimate **here** ("meeting scheduled for July 2" may expire after it happens) and nowhere else.
+**Trigger:** bundle, after the email stage. **Owner:** `#13149` calendar stage.
 
-### 5. Add Important Date
+1. List Nylas events including the contact: 3650d lookback / 365d lookahead, ≤100 per batch.
+2. Drop non-signal: canceled, user-declined, all-day holidays/system calendars, private events (configurable), generic holds ("busy", "focus time"), events with no contact participation.
+3. Resolve attendees to `contacts_id` / `master_person_id` → related-people metadata. **Never auto-create contacts from attendees.**
+4. Build candidates: event start = `occurred_at` / `memory_date`; use resolved participant names when the title is generic ("\+ 2 others").
+5. Past events → memories. Upcoming events: only when relationship-useful, and they may set Mem0 `expiration_date` = event end — the one sanctioned use of expiration.
+6. Ledger → project, identical to entry 3.
 
-**Trigger:** `contacts_date` row created/updated. The prior spec (`dates/sync-dates-to-mem0`) lives on the archived [Important Dates & mem0](/guides/open-work/important-dates-mem0) page as reference; re-spec it as a ledger route: user dates → contact tier, enrichment dates → shared tier once, `natural_key` in metadata so re-syncs update instead of duplicate, and the loop guard (rows that _came from_ a memory never echo back).
+### 5. Add Important Date (two directions)
+
+**Sync in (structured → mem0) — to build:** trigger = `contacts_date` insert/update through the choke-point writer `dates/upsert-contact-date` (`#13226`). The hook emits a ledger row directly — `fact_class = date`, `route = mem0`, **no LLM** (already structured), text rendered from a per-descriptor template. Metadata carries the row's `natural_key` \+ provenance, so a re-sync supersedes and re-projects instead of duplicating. **Loop guard:** rows with `origin = memory` are skipped — they came _from_ a memory. Enrichment dates project **once** to the shared tier; user dates to the contact thread.
+
+**Promotion out (extracted → structured):** extractors (entries 3/6/8) emit `fact_class = date` candidates → `pending` → modal Confirm → `#13226` creates the row with `origin = memory` \+ `origin_ref.memory_id` — which the loop guard then keeps out of the sync direction. Deep reference: the archived [dates page](/guides/open-work/important-dates-mem0).
 
 ### 6. New Email CRON
 
-**Trigger:** ongoing — new mail lands. **To design.** Reuses the `#13149` extraction contract through the ledger; the ledger's hash index guarantees the CRON never re-writes what the historical parse already stored. TBD: topology — ride the webhook-fed activity tables ([interaction-log](/guides/open-work/contacts-interaction-log) pattern, Nylas-free) vs a Nylas message webhook direct; Xano vs Go given the GCP build-least-in-Xano constraint; cadence (nightly per-contact digest vs per-message).
+**Trigger:** ongoing — new mail. **Owner (proposed): Go cron**, nightly per-contact batches. **To design.**
+
+- **Watermark** from the webhook-fed `email_activity` tables (the [interaction-log](/guides/open-work/contacts-interaction-log) pattern): which contacts have new messages since the last run.
+- **Content access is the open question:** activity tables identify new messages but do not carry full bodies — the extractor needs transcripts, so either bodies get stored on ingest or the cron does a targeted Nylas fetch per new thread (a sanctioned deviation from the Nylas-free pattern; decide at build).
+- Extraction is **the same versioned contract as entry 3** — same prompt family, same candidate shape, same ledger flow. The hash index guarantees the cron never re-writes what the historical parse already stored.
+- New `pending` proposals accumulate silently; discovery stays passive (badge, digest).
 
 ### 7. Calendar Event Webhook
 
-**Trigger:** ongoing — event created/updated/canceled, attendee changes. **To design** as the incremental mode of the calendar writer: recompute `memory_hash` on title/time/attendee change and update via the ledger; cancellations convert or delete only when relationship-useful; series-level cadence memories over per-occurrence noise.
+**Trigger:** event created / updated / canceled / attendee change, via webhook → `calendar_event_activity` → worker. **Owner (proposed): Go.** **To design.**
+
+- **Create:** run the entry-4 pipeline for the single event.
+- **Update:** recompute hashes; if changed → supersede the old row, update/delete its mem0 projection via `mem0_memory_id`, insert \+ project the new version (writer-contract step 6).
+- **Cancel:** supersede \+ remove the projection; write a "the planned meeting was canceled" memory only when the cancellation itself is relationship-useful.
+- **Series:** cadence memory at series level; per-occurrence memories only when an occurrence has distinct context.
 
 ### 8. How I Know X (manual chat entry, contact panel)
 
-**Trigger:** interview completes with a `relationship_summary`. Live (`#8583` write / `#8581` read) but it is the last `infer=true` writer — and mixed `infer` modes in one scope don't dedupe against each other. **Planned migration:** send the structured `relationship_nuggets` as atomic `infer=false` writes through the ledger ("mem0 should get the facts you highlighted, not the chat"), and clean up the stale `subject_contact_id` comment while in there.
+**Today:** `#8583` writes the prose `relationship_summary` with `infer=true` — the last mixed-mode writer. **Migration (planned, in place in Xano):**
+
+1. On `interview_complete`, take the structured `relationship_nuggets` (how\_met / superpower / kryptonite / cadence / trust / milestones) — not the chat transcript.
+2. Ledger rows per nugget: narrative/preference classes project `infer=false` (workos \+ `contacts_id` \+ `master_person_id`).
+3. `declared_relationship` and `date` candidates go `pending` → modal — **yes, even though the user said it in the interview**: conversational extraction is confirm-first (2026-07-16 rule) because the extractor can misread prose.
+4. Retire the `infer=true` path; fix the stale `subject_contact_id` comment while in there.
 
 ### 9. Create Contact Company
 
-**Trigger:** a company enters the user's orbit (employed-or-tracked). **To design**, mirroring entry 1: shared `master_company:{id}` bank seeded from company edges \+ enrichment facts; private company thread bootstrapped from notes, company-scoped outcomes, and cross-tagged interactions with people at the company.
+**Trigger:** a company enters the user's orbit (employed-or-tracked — confirm at build). **To design; build after person-side wiring proves out.** Mirrors entry 1: atomic claim on `master_company.mem0_seeded_at` → seed `master_company:{id}` from company edges \+ enrichment facts (founded, funding rounds; acquisition/IPO once extraction exists) → bootstrap the private company thread (`my_company_id` metadata) from notes and company-scoped outcomes. Person interactions cross-tag via `related_master_company_ids` so the company view aggregates them.
 
 ### 10. Edge-description updates (shared-bank sync)
 
-**Trigger:** an edge writer (enrichment, resolvers, back-fills) creates or updates a description on a node whose shared bank exists. **To build:** writer hooks check `mem0_seeded_at` and upsert the one affected memory (same `canonical_memory_hash` contract). Only seeded persons — the small, orbit-gated subset — ever trigger work. Keep this machinery minimal; the graph remains the source of truth for freshness.
+**Trigger:** any edge writer — enrichment functions today, Go enrichment later — creates, updates, or invalidates a description on a person's edges. **Contract for the hook (to build):**
+
+1. `mem0_seeded_at IS NULL` → return immediately. Unseeded persons cost one indexed read — the orbit gate keeps this cheap at enrichment scale.
+2. New description → new `shared_seed` row \+ project. Changed description (same canonical identity) → supersede \+ re-project.
+3. Edge invalidated (`valid_to` set) → **update** the memory's text/metadata — historical facts stay retrievable; never delete, never `expiration_date`.
+4. Edge hard-deleted (the dedupe cron's literal-duplicate case only) → supersede the row \+ delete the mem0 projection.
 
 ### 11. Product writers (Outcomes, Leverage Loops, Manual Notes)
 
-Specced in [full-scope → Source ingestion](/guides/open-work/mem0/full-scope#source-ingestion-strategy) (archived reference — re-spec here when built); unchanged except they now write through the ledger. Notes use full Tiptap content, not the 80-char preview; loops resolve `for_master_person_id` to `contacts_id` server-side.
+**Triggers:** `suggestion_request` submitted (Outcomes — durable goals, user scope); loop activated (Loops — `for_master_person_id` resolved to `contacts_id` server-side, contact scope); note created/updated/deleted (person / company / general scope — **full Tiptap content**, never the 80-char preview). All flow through one router (the `sync-product-event-memory` pattern): resolve subject → extract → ledger → project. Note update = supersede \+ re-project; note delete = supersede \+ remove projection. Deep spec: [full-scope → Source ingestion](/guides/open-work/mem0/full-scope#source-ingestion-strategy) (archived reference — re-spec here when built).
 
 ## Retrieval — the GET contract
 

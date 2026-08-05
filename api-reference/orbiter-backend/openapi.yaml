@@ -3677,6 +3677,66 @@ paths:
           $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/Internal'
+  /log-and-parse/runs:
+    post:
+      tags:
+        - Imports
+      summary: Start a mailbox log-and-parse run
+      description: |
+        Kicks off a per-user parse of all the caller's connected email
+        accounts. Sweeps messages + calendar events once, discovers the
+        people the user actually knows, and writes one email_account_import
+        row per eligible person. Runs asynchronously; poll the run for status.
+      operationId: startLogParseRun
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartRunRequest'
+      responses:
+        '202':
+          description: Run accepted and queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LogParseRunEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /log-and-parse/runs/{run_id}:
+    get:
+      tags:
+        - Imports
+      summary: Get a log-and-parse run
+      operationId: getLogParseRun
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: The run and its counters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LogParseRunEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
   /travels:
     get:
       tags:
@@ -6978,6 +7038,283 @@ paths:
           $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/Internal'
+  /files:
+    get:
+      tags:
+        - Files
+      summary: Retrieve the caller's files by filter
+      description: |
+        One endpoint for every retrieval. Filters combine, and the response shape
+        depends on which are present:
+
+        - `q` — text search. Without `semantic`, matches `file_name` /
+          `display_name` with a case-insensitive substring match; costs no
+          embedding call, so it is safe for type-ahead. With `semantic=true` the
+          query is embedded and files are ranked by how close their nearest chunk
+          sits to it. Returns one row PER FILE either way, so a document with
+          many matching passages does not crowd out the rest. Ranked, so no
+          cursor is returned.
+        - `ids` — batch read of specific files, for polling upload progress in
+          one request instead of one per file. Ids the caller cannot see are
+          omitted rather than erroring.
+        - `contact_id` / `company_contact_id` — that one contact's files.
+        - `scope` — `mine` (the caller's uploads), `contacts` (every file across
+          all the caller's contacts), or `all` (default, both). Ignored when a
+          contact is pinned.
+
+        Every variant is scoped to the caller: files they own, or files linked to
+        a contact they own. Soft-deleted files are never returned.
+      operationId: listUserFiles
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: q
+          schema:
+            type: string
+          description: Search text. Matched against file names unless `semantic=true`.
+        - in: query
+          name: semantic
+          schema:
+            type: boolean
+            default: false
+          description: |
+            Rank by meaning instead of matching names. Costs a live embedding
+            call, so it is opt-in rather than the default.
+        - in: query
+          name: ids
+          schema:
+            type: string
+          description: Comma-separated file ids. Use for upload-progress polling.
+        - in: query
+          name: scope
+          schema:
+            type: string
+            default: all
+          description: One of `mine`, `contacts`, `all`. Ignored when a contact is pinned.
+        - in: query
+          name: contact_id
+          schema:
+            type: string
+            format: uuid
+        - in: query
+          name: company_contact_id
+          schema:
+            type: string
+            format: uuid
+        - in: query
+          name: classification
+          schema:
+            type: string
+          description: Narrow to one LLM-assigned file type, e.g. `pitch_deck`.
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - in: query
+          name: cursor
+          schema:
+            type: string
+          description: Opaque cursor from a prior page. Not used by `q` or `ids`.
+      responses:
+        '200':
+          description: |
+            A page of files, or ranked search hits when `q` is present.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/ListFilesResponseEnvelope'
+                  - $ref: '#/components/schemas/SearchFilesEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /files/upload:
+    post:
+      tags:
+        - Files
+      summary: Upload one or many files
+      description: |
+        Stores each file in GCS, records its row, and publishes `files.uploaded`
+        per file, so every uploaded file independently runs the whole pipeline
+        (extract → classify → chunk → embed). Returns immediately with
+        `status=pending` for each; poll `GET /v1/files?ids=…` for progress.
+
+        IMPORTANT — part ordering: send every text field BEFORE the file parts.
+        Each file streams straight to GCS as it is reached, so `contact_id` and
+        `company_contact_id` must already be known and verified by then.
+
+        Byte-transfer progress is a client-side concern (`XMLHttpRequest.upload.
+        onprogress`); the server cannot report it sooner than the client knows it.
+
+        This route does not accept pre-extracted markdown — it is asynchronous
+        and the worker extracts every file. Use the deprecated
+        `/ingestion/files/upload-file-markdown` if you must supply markdown.
+
+        Files are independent: one failure neither fails the request nor undoes
+        its siblings. `201` when all succeeded, `207` when some failed (per-file
+        `error` in the array), and an error envelope only when none succeeded.
+        Max body size 100 MB across all files.
+      operationId: uploadFiles
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/UploadFilesRequest'
+      responses:
+        '201':
+          description: Every file was stored and queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadFilesEnvelope'
+        '207':
+          description: |
+            Some files were stored and queued; others failed. Inspect each
+            element's `error`. `meta.uploaded` / `meta.failed` carry the counts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadFilesEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: A supplied contact_id / company_contact_id is not the caller's.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /files/{id}:
+    get:
+      tags:
+        - Files
+      summary: Get one of the caller's files
+      description: |
+        Returns a file the caller owns or that is linked to one of their
+        contacts; anything else is a 404 rather than a 403, so the endpoint
+        reveals nothing about other users' files.
+
+        `include_markdown` is opt-in because markdown is the whole extracted
+        document and routinely megabytes.
+      operationId: getUserFile
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - in: query
+          name: include_markdown
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: The file, with markdown when requested.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/FileResponseEnvelope'
+                  - $ref: '#/components/schemas/UploadFileResponseEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    delete:
+      tags:
+        - Files
+      summary: Delete one of the caller's files
+      description: |
+        Soft delete. The row, its GCS blob, and its embeddings all survive, so
+        the file stays restorable and a restore costs no re-extraction. The
+        deletion timestamp is cascaded onto the file's contact links in the same
+        transaction, so the file disappears from every contact listing at once.
+
+        Returns 200 with a null payload, per the house convention that deletes
+        are not 204.
+      operationId: deleteUserFile
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: File soft-deleted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmptyEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /files/{id}/rename:
+    post:
+      tags:
+        - Files
+      summary: Rename one of the caller's files
+      description: |
+        Sets `display_name`. The upload-time `file_name` is never overwritten:
+        the extraction worker owns it, and other consumers (activities, email
+        attachments, the Xano `files.completed` webhook) read it as the original
+        name. Clients should render `display_name ?? file_name`.
+      operationId: renameUserFile
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RenameFileRequest'
+      responses:
+        '200':
+          description: The renamed file.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileResponseEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
   /ingestion/files:
     post:
       tags:
@@ -7057,6 +7394,7 @@ paths:
         and must be sent **last**, after all text fields, so the server can
         process it in a single pass without buffering it in memory.
       operationId: uploadFileMarkdown
+      deprecated: true
       security:
         - bearerAuth: []
       requestBody:
@@ -7100,6 +7438,7 @@ paths:
         IMPORTANT — part ordering: send the `file` part **last**, after all
         text fields, so they are known when the file part is reached.
       operationId: uploadFileRaw
+      deprecated: true
       security:
         - bearerAuth: []
       requestBody:
@@ -7471,6 +7810,82 @@ paths:
                         type: string
         '401':
           $ref: '#/components/responses/Unauthorized'
+  /persons/url-lookup:
+    post:
+      operationId: lookupPerson
+      tags:
+        - Persons
+      summary: Look up a person by unique signal
+      description: |
+        Resolve a person from any provided unique signal (LinkedIn URL, email, or phone). At least one is required; the first match wins (no priority order). On a miss, third-party enrichment is requested and the response is pending_enrichment.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PersonLookupRequest'
+      responses:
+        '200':
+          description: Lookup result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/PersonLookup'
+                  error:
+                    type:
+                      - object
+                      - 'null'
+                  meta:
+                    type: object
+                    properties:
+                      request_id:
+                        type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /person-financials:
+    get:
+      operationId: getPersonFinancials
+      tags:
+        - Persons
+      summary: Get a person's investor profile and investment history
+      description: |
+        Powers the person sheet's Financials tab. Returns the person's investor
+        profile plus their investment history split three ways.
+
+        `exits` is DERIVED, not stored: a round counts as an exit when the funded
+        company was acquired or went public, and it appears in `exits` instead of
+        `angel_investments` / `institutional_investments`. All three arrays are
+        always present. Amounts inside `money_raised` are in **millions**.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: person_id
+          in: query
+          required: true
+          description: The person whose financials to return.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: The person's investor profile and investments.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PersonFinancialsEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
   /persons/{person_id}:
     get:
       operationId: getPerson
@@ -7743,7 +8158,7 @@ paths:
             type: string
         - name: node_uuid
           in: query
-          description: Exact match on the company's graph node id (`graph_node_id`). Lets graph surfaces resolve a node to its master company.
+          description: Exact match on the company's graph node id (`graph.company_nodes.node_uuid`). Lets graph surfaces resolve a node to its master company.
           schema:
             type: string
         - name: sort
@@ -7794,6 +8209,45 @@ paths:
                         type: string
         '401':
           $ref: '#/components/responses/Unauthorized'
+  /companies/url-lookup:
+    post:
+      operationId: lookupCompany
+      tags:
+        - Companies
+      summary: Look up a company by unique signal
+      description: |
+        Resolve a company from any provided unique signal (LinkedIn URL, domain, email, or phone). At least one is required; the first match wins (no priority order). On a miss, third-party enrichment is requested and the response is pending_enrichment.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompanyLookupRequest'
+      responses:
+        '200':
+          description: Lookup result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CompanyLookup'
+                  error:
+                    type:
+                      - object
+                      - 'null'
+                  meta:
+                    type: object
+                    properties:
+                      request_id:
+                        type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
   /companies/{company_id}:
     get:
       operationId: getCompany
@@ -7833,6 +8287,45 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+  /company-financials:
+    get:
+      operationId: getCompanyFinancials
+      tags:
+        - Companies
+      summary: Get a company's financial data and funding rounds
+      description: |
+        Powers the company sheet's Financials tab. Returns the company's
+        financial record plus every funding round with its investors and, for
+        institutional investors, the named partners at the investing firm.
+
+        `financial_data` is null until the company has a financial record;
+        `funding` is always an array. Monetary amounts inside `money_raised` are
+        denominated in **millions** (1 = $1M, 0.5 = $500K). Note that
+        `funding_total_value` / `funding_total_value_usd` on `financial_data` are
+        in **whole units**, not millions — the two scales differ.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: company_id
+          in: query
+          required: true
+          description: The company whose financials to return.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: The company's financial data and funding rounds.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompanyFinancialsEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
   /company-contacts:
     get:
       operationId: listCompanyContacts
@@ -7906,6 +8399,64 @@ paths:
                         type: string
         '401':
           $ref: '#/components/responses/Unauthorized'
+    post:
+      operationId: addCompanyContact
+      tags:
+        - Company Contacts
+      summary: Add a company to contacts
+      description: |
+        Creates the caller's company contact and copies the company's public detail records (emails, links, addresses, phones) into the contact join tables. Idempotent: re-adding returns 200 with contact_added=false.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompanyAddContactRequest'
+      responses:
+        '200':
+          description: Company contact already existed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CompanyAddContact'
+                  error:
+                    type:
+                      - object
+                      - 'null'
+                  meta:
+                    type: object
+                    properties:
+                      request_id:
+                        type: string
+        '201':
+          description: Company contact created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CompanyAddContact'
+                  error:
+                    type:
+                      - object
+                      - 'null'
+                  meta:
+                    type: object
+                    properties:
+                      request_id:
+                        type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
   /company-contacts/clone:
     post:
       operationId: cloneCompanyContacts
@@ -10544,8 +11095,10 @@ components:
         - nylas_grant_id
         - email
         - enabled
+        - error
         - threads
-      description: One Nylas grant's thread list, optionally with a next page cursor.
+      description: |
+        One Nylas grant's thread list, optionally with a next page cursor. A grant whose upstream fetch failed (e.g. provider rate limit) is returned with enabled=false, error set, and empty threads — one throttled account never fails the whole response.
       properties:
         nylas_grant_id:
           type: string
@@ -10554,6 +11107,10 @@ components:
           format: email
         enabled:
           type: boolean
+        error:
+          type:
+            - string
+            - 'null'
         next_cursor:
           type: string
         threads:
@@ -11031,6 +11588,22 @@ components:
           type: boolean
         parsed:
           type: boolean
+        seven_day_parsed:
+          type: boolean
+        history_complete:
+          type: boolean
+        parse_status:
+          type: string
+        earliest_interaction_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        last_parsed_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
         oldest_sync:
           type:
             - string
@@ -11430,8 +12003,11 @@ components:
         - name
         - is_primary
         - event_widget_preference
+        - enabled
+        - error
         - events
-      description: A calendar paired with its enriched events for the requested range.
+      description: |
+        A calendar paired with its enriched events for the requested range. A calendar whose upstream fetch failed (e.g. provider rate limit) is returned with enabled=false, error set, and empty events instead of being silently dropped.
       properties:
         id:
           type: string
@@ -11445,6 +12021,12 @@ components:
           type: boolean
         event_widget_preference:
           type: boolean
+        enabled:
+          type: boolean
+        error:
+          type:
+            - string
+            - 'null'
         events:
           type: array
           items:
@@ -11735,6 +12317,104 @@ components:
       properties:
         data:
           $ref: '#/components/schemas/ListImportRowsResponse'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+    StartRunRequest:
+      type: object
+      required:
+        - depth
+        - grant_id
+      properties:
+        depth:
+          type: string
+          description: Processing scope — "7d" or "all". Not enforced as an enum server-side.
+          example: 7d
+        grant_id:
+          type: string
+          description: Required Nylas grant id — a run parses exactly one connected account.
+    LogParseRunResponse:
+      type: object
+      required:
+        - id
+        - grant_id
+        - depth
+        - status
+        - messages_seen
+        - events_seen
+        - nylas_requests
+        - addresses_written
+        - gmail_quota_units
+        - provider_requests_email
+        - provider_requests_event
+        - throttle_wait_ms
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        grant_id:
+          type: string
+        depth:
+          type: string
+        status:
+          type: string
+          description: pending | sweeping | completed | failed | grant_error | rate_limited
+        messages_seen:
+          type: integer
+        events_seen:
+          type: integer
+        nylas_requests:
+          type: integer
+        addresses_written:
+          type: integer
+        gmail_quota_units:
+          type: integer
+          description: Gmail quota units consumed (Nylas-Gmail-Quota-Usage header, email endpoints).
+        provider_requests_email:
+          type: integer
+        provider_requests_event:
+          type: integer
+        throttle_wait_ms:
+          type: integer
+          description: Total ms self-throttled under the Gmail unit budget.
+        window_start:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        window_end:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        started_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        completed_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        error:
+          type:
+            - string
+            - 'null'
+        created_at:
+          type: string
+          format: date-time
+    LogParseRunEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          $ref: '#/components/schemas/LogParseRunResponse'
         error:
           type: 'null'
         meta:
@@ -15750,7 +16430,7 @@ components:
       description: |
         One of the authenticated user's computed graph paths to a node's entity
         (graph.node_path), with its ordered hops. target_node_uuid is the node's
-        person / company graph_node_id.
+        graph id — persons.graph_node_id or graph.company_nodes.node_uuid.
       properties:
         id:
           type: string
@@ -15971,6 +16651,13 @@ components:
         classification:
           type: string
           description: LLM-assigned file type (e.g. pitch_deck, term_sheet).
+        display_name:
+          type:
+            - string
+            - 'null'
+          description: |
+            The user's rename, null until renamed. file_name keeps the
+            upload-time name; clients render display_name ?? file_name.
         status:
           type: string
           description: |
@@ -16016,6 +16703,201 @@ components:
           type: 'null'
         meta:
           $ref: '#/components/schemas/Meta'
+    FileMatch:
+      type: object
+      required:
+        - id
+        - file_name
+        - gcs_uri
+        - status
+        - match_type
+      description: |
+        One search hit. `snippet` and `distance` are non-null only for a semantic
+        match, where the ranking came from a chunk rather than the name.
+      properties:
+        id:
+          type: string
+          format: uuid
+        file_name:
+          type: string
+        display_name:
+          type:
+            - string
+            - 'null'
+        gcs_uri:
+          type: string
+        classification:
+          type:
+            - string
+            - 'null'
+        status:
+          type: string
+        match_type:
+          type: string
+          description: '`name` or `semantic`.'
+        snippet:
+          type:
+            - string
+            - 'null'
+          description: The nearest matching chunk's text.
+        distance:
+          type:
+            - number
+            - 'null'
+          description: Cosine distance of the nearest chunk; smaller is closer.
+    SearchFilesResponse:
+      type: object
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/FileMatch'
+    SearchFilesEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          $ref: '#/components/schemas/SearchFilesResponse'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+    UploadFilesRequest:
+      type: object
+      required:
+        - file
+      description: |
+        Multi-file upload body. Send all text fields FIRST, then one `file` part
+        per file. No markdown field: the worker extracts every file.
+      properties:
+        file_source:
+          type: string
+          maxLength: 255
+          description: Free-form source label. Defaults to `user-upload`.
+        contact_id:
+          type: string
+          format: uuid
+          description: |
+            Attach every file in this request to this contact. Must be one of the
+            caller's own contacts, else 404. May be combined with
+            `company_contact_id`: a deck can belong to a person and their company.
+        company_contact_id:
+          type: string
+          format: uuid
+          description: Attach every file to this company contact. Must be the caller's.
+        file:
+          type: array
+          items:
+            type: string
+            format: binary
+          description: |
+            One or more file parts, each named `file`. Send them LAST, after
+            every text field.
+    UploadedFile:
+      type: object
+      required:
+        - name
+      description: |
+        One element of an upload result. Either the success fields or `error` is
+        populated, never both.
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          description: The file's name; the rename if one exists, else the uploaded name.
+        path:
+          type: string
+          description: Public GCS URL of the stored object.
+        status:
+          type: string
+          description: Always `pending` here; the pipeline runs asynchronously.
+        error:
+          type:
+            - object
+            - 'null'
+          description: Present only for a file that failed.
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+    UploadFilesEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/UploadedFile'
+        error:
+          type: 'null'
+        meta:
+          allOf:
+            - $ref: '#/components/schemas/Meta'
+            - type: object
+              properties:
+                uploaded:
+                  type: integer
+                failed:
+                  type: integer
+    FileResponseEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          $ref: '#/components/schemas/FileResponse'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+    UploadFileResponse:
+      description: |
+        FileResponse plus the document markdown — extracted synchronously by
+        the raw endpoint, or echoed from the supplied value by the markdown
+        endpoint. List/get responses omit markdown to stay lean.
+      allOf:
+        - $ref: '#/components/schemas/FileResponse'
+        - type: object
+          required:
+            - markdown
+          properties:
+            markdown:
+              type: string
+    UploadFileResponseEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          $ref: '#/components/schemas/UploadFileResponse'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+    RenameFileRequest:
+      type: object
+      required:
+        - file_name
+      properties:
+        file_name:
+          type: string
+          maxLength: 255
+          description: The new display name. Stored in `display_name`.
     CreateFileRequest:
       type: object
       required:
@@ -16056,19 +16938,6 @@ components:
             - 'null'
           format: int64
           description: Xano suggestion-request id (only set for suggestion-flow ingestions).
-    FileResponseEnvelope:
-      type: object
-      required:
-        - data
-        - error
-        - meta
-      properties:
-        data:
-          $ref: '#/components/schemas/FileResponse'
-        error:
-          type: 'null'
-        meta:
-          $ref: '#/components/schemas/Meta'
     UploadFileRawRequest:
       type: object
       required:
@@ -16114,32 +16983,6 @@ components:
             markdown:
               type: string
               description: Pre-extracted document markdown.
-    UploadFileResponse:
-      description: |
-        FileResponse plus the document markdown — extracted synchronously by
-        the raw endpoint, or echoed from the supplied value by the markdown
-        endpoint. List/get responses omit markdown to stay lean.
-      allOf:
-        - $ref: '#/components/schemas/FileResponse'
-        - type: object
-          required:
-            - markdown
-          properties:
-            markdown:
-              type: string
-    UploadFileResponseEnvelope:
-      type: object
-      required:
-        - data
-        - error
-        - meta
-      properties:
-        data:
-          $ref: '#/components/schemas/UploadFileResponse'
-        error:
-          type: 'null'
-        meta:
-          $ref: '#/components/schemas/Meta'
     EventTypesResponse:
       type: object
       required:
@@ -16462,6 +17305,189 @@ components:
           oneOf:
             - $ref: '#/components/schemas/Connection'
             - type: 'null'
+    PersonLookupRequest:
+      type: object
+      description: |
+        Unique signals for POST /persons/url-lookup. At least one must be set.
+      properties:
+        linkedin_url:
+          type: string
+        email:
+          type: string
+        phone:
+          type: string
+    PersonLookupResult:
+      type: object
+      description: Lean person returned when a lookup matches.
+      properties:
+        id:
+          type: string
+          format: uuid
+        full_name:
+          type: string
+        avatar:
+          type:
+            - string
+            - 'null'
+        current_title:
+          type:
+            - string
+            - 'null'
+        bio:
+          type:
+            - string
+            - 'null'
+    PersonLookup:
+      type: object
+      description: Result of POST /persons/url-lookup.
+      properties:
+        found:
+          type: boolean
+        status:
+          type: string
+          description: found | pending_enrichment
+        person:
+          oneOf:
+            - $ref: '#/components/schemas/PersonLookupResult'
+            - type: 'null'
+    PersonInvestment:
+      type: object
+      description: |
+        One round the person participated in. `firm_*` is populated only for
+        institutional investments. `money_raised` amounts are in MILLIONS.
+      required:
+        - funding_round_id
+        - funding_type
+        - company_id
+        - company_name
+        - is_lead_investor
+        - acquired
+      properties:
+        funding_round_id:
+          type: string
+          format: uuid
+        funding_type:
+          type: string
+        money_raised:
+          description: '{value, currency, value_usd} in millions, or null.'
+        announced_date:
+          type:
+            - string
+            - 'null'
+          format: date
+        description:
+          type:
+            - string
+            - 'null'
+        is_lead_investor:
+          type: boolean
+        company_id:
+          type: string
+          format: uuid
+        company_name:
+          type: string
+        company_logo:
+          type:
+            - string
+            - 'null'
+        firm_company_id:
+          type:
+            - string
+            - 'null'
+          format: uuid
+        firm_name:
+          type:
+            - string
+            - 'null'
+        firm_logo:
+          type:
+            - string
+            - 'null'
+        acquired:
+          type: boolean
+        ipo_status:
+          type:
+            - string
+            - 'null'
+    PersonFinancials:
+      type: object
+      description: |
+        The investor profile fields are flattened onto this object. They are
+        zero/null when the person has no investor profile yet; the arrays still
+        render.
+      required:
+        - investor_type
+        - angel_investments
+        - institutional_investments
+        - exits
+      properties:
+        investor_type:
+          type: string
+        llm_investor_summary:
+          type:
+            - string
+            - 'null'
+        active_in_sector:
+          type:
+            - string
+            - 'null'
+        location:
+          type:
+            - string
+            - 'null'
+        investment_range:
+          type:
+            - string
+            - 'null'
+        investment_sweet_spot:
+          type:
+            - string
+            - 'null'
+        sectors_stages:
+          type:
+            - string
+            - 'null'
+        investments:
+          type:
+            - string
+            - 'null'
+          description: Unnormalised pipe-delimited upstream blob, e.g. "Acme | EQUITY | 2026".
+        exits_summary:
+          type:
+            - string
+            - 'null'
+        derived_thesis_summary:
+          type:
+            - string
+            - 'null'
+        angel_investments:
+          type: array
+          description: Rounds the person invested in directly, excluding exits.
+          items:
+            $ref: '#/components/schemas/PersonInvestment'
+        institutional_investments:
+          type: array
+          description: Rounds where the person was the named partner at an investing firm.
+          items:
+            $ref: '#/components/schemas/PersonInvestment'
+        exits:
+          type: array
+          description: Investments whose company was acquired or went public.
+          items:
+            $ref: '#/components/schemas/PersonInvestment'
+    PersonFinancialsEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          $ref: '#/components/schemas/PersonFinancials'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
     UserRef:
       type: object
       properties:
@@ -16811,6 +17837,49 @@ components:
           oneOf:
             - $ref: '#/components/schemas/CompanyContactNested'
             - type: 'null'
+    CompanyLookupRequest:
+      type: object
+      description: |
+        Unique signals for POST /companies/url-lookup. At least one must be set.
+      properties:
+        linkedin_url:
+          type: string
+        domain:
+          type: string
+        email:
+          type: string
+        phone:
+          type: string
+    CompanyLookupResult:
+      type: object
+      description: Lean company returned when a lookup matches.
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        logo:
+          type:
+            - string
+            - 'null'
+        domain:
+          type:
+            - string
+            - 'null'
+    CompanyLookup:
+      type: object
+      description: Result of POST /companies/url-lookup.
+      properties:
+        found:
+          type: boolean
+        status:
+          type: string
+          description: found | pending_enrichment
+        company:
+          oneOf:
+            - $ref: '#/components/schemas/CompanyLookupResult'
+            - type: 'null'
     Employees:
       type: object
       properties:
@@ -17078,6 +18147,237 @@ components:
         funding:
           type: array
           items: {}
+    FinancialData:
+      type: object
+      description: |
+        A company's financial record. `acquired` and `ipo_status` are not display
+        fields — the person sheet derives its exits list from them.
+      properties:
+        id:
+          type: string
+          format: uuid
+        company_id:
+          type: string
+          format: uuid
+        company_type:
+          type:
+            - string
+            - 'null'
+        yc_batch:
+          type:
+            - string
+            - 'null'
+        is_public:
+          type: boolean
+        went_public_on:
+          type:
+            - string
+            - 'null'
+          format: date
+        stock_label:
+          type:
+            - string
+            - 'null'
+        ticker:
+          type:
+            - string
+            - 'null'
+        primary_exchange:
+          type:
+            - string
+            - 'null'
+        stock_link:
+          type:
+            - string
+            - 'null'
+        funding_summary:
+          type:
+            - string
+            - 'null'
+        funding_total_value:
+          type:
+            - number
+            - 'null'
+          description: Whole units, not millions.
+        funding_total_currency:
+          type:
+            - string
+            - 'null'
+        funding_total_value_usd:
+          type:
+            - number
+            - 'null'
+          description: Whole units, not millions.
+        total_rounds_raised:
+          type: integer
+        revenue:
+          description: Upstream revenue object, or null.
+        acquired:
+          type: boolean
+        acquired_by_permalink:
+          type:
+            - string
+            - 'null'
+        acquirer_company_id:
+          type:
+            - string
+            - 'null'
+          format: uuid
+        acquirer_name:
+          type:
+            - string
+            - 'null'
+        acquirer_logo:
+          type:
+            - string
+            - 'null'
+        acquisition_price:
+          description: Upstream price object, or null.
+        operating_status:
+          type:
+            - string
+            - 'null'
+        ipo_status:
+          type:
+            - string
+            - 'null'
+    RoundPartner:
+      type: object
+      description: The named partner at an investing firm, credited on its investment.
+      required:
+        - id
+      properties:
+        id:
+          type: string
+          format: uuid
+        person_id:
+          type:
+            - string
+            - 'null'
+          format: uuid
+        name:
+          type:
+            - string
+            - 'null'
+        avatar_url:
+          type:
+            - string
+            - 'null'
+    RoundInvestor:
+      type: object
+      description: |
+        One participant in a round. `company_id` / `person_id` are null when the
+        investor has no local master row; `name` is then the upstream label and
+        `image_url` is null.
+      required:
+        - id
+        - kind
+        - is_lead_investor
+        - partners
+      properties:
+        id:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          description: institutional (an investing firm) or angel (an individual).
+        is_lead_investor:
+          type: boolean
+        name:
+          type:
+            - string
+            - 'null'
+        image_url:
+          type:
+            - string
+            - 'null'
+          description: The linked company's logo or person's avatar.
+        company_id:
+          type:
+            - string
+            - 'null'
+          format: uuid
+        person_id:
+          type:
+            - string
+            - 'null'
+          format: uuid
+        partners:
+          type: array
+          items:
+            $ref: '#/components/schemas/RoundPartner'
+    FundingRound:
+      type: object
+      description: |
+        One funding round. `money_raised` mirrors the upstream object
+        `{value, currency, value_usd}`; amounts are in MILLIONS.
+      required:
+        - id
+        - funding_type
+        - investors
+      properties:
+        id:
+          type: string
+          format: uuid
+        round_permalink:
+          type:
+            - string
+            - 'null'
+        funding_type:
+          type: string
+          description: Round stage, e.g. SEED, SERIES_A, DEBT_FINANCING, GRANT.
+        money_raised:
+          description: '{value, currency, value_usd} in millions, or null.'
+        announced_date:
+          type:
+            - string
+            - 'null'
+          format: date
+        description:
+          type:
+            - string
+            - 'null'
+        long_description:
+          type:
+            - string
+            - 'null'
+        extension:
+          type: boolean
+          description: An extension of a prior round.
+        pre:
+          type: boolean
+          description: A pre-<stage> round.
+        investors:
+          type: array
+          items:
+            $ref: '#/components/schemas/RoundInvestor'
+    CompanyFinancials:
+      type: object
+      required:
+        - financial_data
+        - funding
+      properties:
+        financial_data:
+          oneOf:
+            - $ref: '#/components/schemas/FinancialData'
+            - type: 'null'
+        funding:
+          type: array
+          items:
+            $ref: '#/components/schemas/FundingRound'
+    CompanyFinancialsEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          $ref: '#/components/schemas/CompanyFinancials'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
     CompanyNested:
       type: object
       description: The company object nested in a company-contact item.
@@ -17124,6 +18424,28 @@ components:
           $ref: '#/components/schemas/CompanyNested'
         contact_count:
           type: integer
+    CompanyAddContactRequest:
+      type: object
+      required:
+        - company_id
+      properties:
+        company_id:
+          type: string
+          format: uuid
+    CompanyAddContact:
+      type: object
+      description: Result of POST /company-contacts.
+      properties:
+        company_contact_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        company_id:
+          type: string
+          format: uuid
+        contact_added:
+          type: boolean
     CloneCompanyContactsResult:
       type: object
       properties:

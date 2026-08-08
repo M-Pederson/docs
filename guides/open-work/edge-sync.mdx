@@ -1,0 +1,169 @@
+---
+title: "Edge Sync"
+description: "Propagating new Universe graph edges to every user graph that holds both endpoint nodes — verified constraints, all options, and the recommended outbox architecture"
+icon: "share-nodes"
+---
+
+## Purpose
+
+Working page for the **Universe → user-graph edge fan-out** problem. It answers the "Enrichment-update fan-out to user graphs" open question on [Universe &lt;&gt; Backend Sync](/guides/open-work/universe-backend-sync) and takes a position on the "copy vs reference" question there.
+
+Status: **recommendation, not committed design** *(researched 2026-08-07)*. The machinery described here targets **GCP / Go / AlloyDB — not Xano**.
+
+## The problem
+
+User graphs copy nodes from the Universe graph. Copied nodes carry the universal identifiers (`node_uuid`, plus `master_person_id` / `master_company_id`) that key into both Universe and Backend tables.
+
+Universe keeps growing after the copy. Example: Grady Anderson and Orbiter exist as nodes in Universe **and** in user Njogu's graph. Enrichment later creates a new `(Grady)-[WORKS_AT]->(Orbiter)` edge in Universe. Njogu's graph — and every other user graph holding both nodes — is now stale.
+
+Constraints:
+
+- Tens of thousands of user graphs; any given node pair exists in an unknown subset of them.
+- An edge is only meaningful in a user graph when **both** endpoints are present there.
+- Users keep adding people over time, so "which graphs hold node X" changes continuously.
+
+## Verified constraints
+
+These were verified against FalkorDB docs/tracker and Google Cloud docs on 2026-08-07. They bound every option below.
+
+| # | Fact | Consequence |
+|---|---|---|
+| 1 | FalkorDB has **no triggers, no CDC, no event hooks**. Keyspace notifications never fire on `GRAPH.QUERY` writes ([issue #1514](https://github.com/FalkorDB/FalkorDB/issues/1514); the unmerged PR #1515 would add a key-level "graph dirty" flag only, and PR #1631 shows emitting from the write thread crashes Redis 8.x). | Change capture must live in **our own write path**. "A function triggered by edge creation" can only mean our writer service, never the database. |
+| 2 | **No cross-graph Cypher** — one query targets exactly one graph ([multigraph article](https://www.falkordb.com/news-updates/multigraph-topology-isolation-linear-scale/)). `GRAPH.COPY` clones whole graphs into a must-not-exist key — no subset copy, no merge-into-existing. | A reference model pays an app-layer two-query merge on every read. Incremental propagation must be per-edge `MERGE`, not a graph primitive. |
+| 3 | Concurrency is a **per-graph reader-writer lock**: writes to the same graph serialize FIFO; writes to different graphs run in parallel up to `THREAD_COUNT` ([concurrency docs](https://docs.falkordb.com/design/concurrency.html)). Multi-tenancy at &gt;10k graphs is the endorsed pattern. | Fan-out writes across thousands of user graphs parallelize well. The engine is not the bottleneck; orchestration is. Use one parameterized `UNWIND $edges … MERGE` template so the plan cache is shared across all graphs. |
+| 4 | Membership ("which users hold node X") must be answered **relationally, never by querying graphs**. Asking 40,000 graphs per edge event is 40,000 queries; an indexed AlloyDB join table answers it in one. | A `user_contact(user_id, node_uuid)` table indexed in both directions is the load-bearing piece of the whole design. The both-endpoints check is one query with two joins. |
+| 5 | AlloyDB supports logical decoding (`alloydb.logical_decoding`, pgoutput/wal2json) and Datastream accepts AlloyDB as a CDC source — but Datastream only delivers to BigQuery/GCS, and a self-managed replication slot that goes abandoned **retains WAL indefinitely** (disk-fill outage risk on the source database). | CDC is possible but is not the safest backbone when we own every write path. The transactional outbox gives the same guarantee without slot-lifecycle risk. |
+| 6 | Pub/Sub ordering keys guarantee order per key at ≤1 MBps/key; exactly-once applies to pull subscribers only; dead-letter delivery counts are best-effort. Cloud Tasks adds per-queue rate caps (500/s) and task-name dedup (~24h), but is capped at 1,000 queues/region. | Every layer is at-least-once. Graph writes must be **idempotent** (`MERGE` on edge `uuid`). Shard users across a fixed queue set — never queue-per-user. |
+
+## Options considered
+
+| # | Option | Verdict |
+|---|---|---|
+| 1 | Synchronous fan-out inline at edge creation | Rejected |
+| 2 | Transactional outbox → async fan-out | **Recommended core** |
+| 3 | CDC / WAL-tailing from AlloyDB | Possible, strictly worse than 2 |
+| 4 | Cron-only batch reconciliation | Backstop yes, primary no |
+| 5 | Lazy catch-up on read (login sync) | **Recommended companion** |
+| 6 | Reference, don't copy | Eliminates the problem for whatever is referenced — see prerequisite decision |
+
+### 1. Synchronous inline fan-out
+
+The edge-creating service resolves affected users and writes all their graphs before returning. Immediately consistent, but enrichment creates edges in bulk, a popular node pair can touch thousands of graphs, and one slow or failed tenant write blocks or poisons the Universe write. No failure isolation, no retry story. Rejected.
+
+### 2. Transactional outbox → async fan-out (recommended core)
+
+Every Universe edge write also inserts a `graph_change_event` row **in the same AlloyDB transaction** — event type (`create` / `update` / `delete` / `merge`), edge `uuid`, both endpoint `node_uuid`s, a per-node sequence number. A small Go relay polls with `FOR UPDATE SKIP LOCKED` and publishes to Pub/Sub; a resolver runs the membership-intersection query and emits one apply message per affected user; apply workers run the idempotent `MERGE`.
+
+Delivery is guaranteed (the event commits or the edge doesn't), freshness is seconds-level, tenant failures are isolated and retryable, and replays are no-ops because `MERGE` keys on the edge `uuid`.
+
+`LISTEN/NOTIFY` works on AlloyDB as a latency-killing wake-up signal for the relay — but requires a session-mode connection (transaction-mode pooling does not support `LISTEN`), and the poller remains the source of truth.
+
+### 3. CDC / WAL-tailing
+
+Tail `pgoutput` from Go (`jackc/pglogrepl`) so nobody can forget the outbox row. The price is the worst failure mode in the design: an abandoned replication slot fills the source database's disk. Since all edge writes will funnel through our own Go graph-writer service anyway, the outbox delivers the same guarantee without that risk. Skip for v1; revisit only if write paths ever multiply beyond our control.
+
+### 4. Cron-only reconciliation
+
+Cloud Scheduler → Cloud Run job walks a watermark over `graph_change_event` (or diffs Universe edges directly), recomputes membership, applies in shards. Simplest possible system, trivially self-healing — but freshness equals the cron period, and every sweep re-pays membership computation for the whole window. Defensible as the *only* mechanism only if next-day freshness is acceptable product behavior.
+
+As a **nightly backstop under option 2 it is non-negotiable**: it is what makes at-least-once delivery and best-effort DLQ semantics acceptable, and it catches anything a bug ever drops. Cloud Run jobs support 7-day timeouts and 10,000 parallel tasks — one job array-sharded over user partitions fits easily.
+
+### 5. Lazy catch-up on read (recommended companion)
+
+Keep a `last_applied_event_seq` cursor per user graph. When a user's session opens (or their graph is next loaded), replay all events past their cursor where both endpoints are in their membership set.
+
+This is the answer to the "tens of thousands of users" number: most of those graphs belong to people who won't log in this week. Combined with option 2 it becomes the cost optimizer — **eager fan-out only to warm graphs (active in the last N days), cursor catch-up for cold ones** — so write amplification tracks *active* users, not registered users. The outbox event log is exactly the replay source; this is nearly free to add.
+
+### 6. Reference, don't copy
+
+Don't sync shared edges at all: the user graph holds only user-private data (KNOWS edges, notes, Known-model state) plus node stubs; shared Universe edges are read live through a gateway and merged app-side. Eliminates fan-out, storage multiplication, staleness, and merge-repointing for everything referenced. The price is constraint 2: every read pays a two-query app-layer merge. See the prerequisite decision below — this is not either/or.
+
+## Recommended architecture
+
+```mermaid
+flowchart TB
+    W["Go graph-writer service<br/>(all Universe edge writes funnel here)"]
+    W -->|"one AlloyDB tx:<br/>edge write + graph_change_event row"| OB[("AlloyDB<br/>graph_change_event")]
+    OB -->|"Go relay<br/>FOR UPDATE SKIP LOCKED<br/>(NOTIFY as wake-up)"| PS["Pub/Sub<br/>edge-events topic"]
+    PS --> R["Resolver<br/>membership intersection:<br/>users holding BOTH endpoints"]
+    R -->|"per-user apply messages<br/>ordering key = user graph id"| AW["Apply workers<br/>UNWIND $edges MERGE …<br/>idempotent on edge uuid"]
+    AW --> UG[("Warm user graphs<br/>user_{id}")]
+    OB -.->|"cursor replay<br/>at login"| CG[("Cold user graphs")]
+    SCHED["Cloud Scheduler<br/>nightly"] --> JOB["Cloud Run job<br/>reconciliation sweep<br/>(sharded)"] -.-> UG
+```
+
+1. **Outbox** — Universe edge write + `graph_change_event` row in one AlloyDB transaction: event type, edge `uuid`, both endpoint `node_uuid`s, per-node sequence number.
+2. **Relay** — Go poller, `FOR UPDATE SKIP LOCKED` (two replicas for HA), `NOTIFY` wake-up on a dedicated session-mode connection. Publishes to Pub/Sub.
+3. **Resolver** — one indexed AlloyDB query: intersection of the membership sets for the two endpoints. Emits one apply message per user holding both, ordering key = user graph ID.
+4. **Apply workers** — batched `UNWIND $edges AS e MATCH (a {uuid: e.src}), (b {uuid: e.dst}) MERGE (a)-[r:REL {uuid: e.uuid}]->(b) SET …` per user graph. Insert a Cloud Tasks stage (hashed task names `hash(edge_uuid:user_id)`, sharded queue set) only if FalkorDB needs rate protection or storm dedup.
+5. **Warm/cold split** — eager fan-out only to graphs active in the last N days; cold graphs catch up at login via the per-graph cursor over the event log.
+6. **Reconciliation** — nightly Cloud Scheduler → Cloud Run job diffs and repairs in shards. This backstop is what makes at-least-once acceptable everywhere else.
+
+## Required regardless of option
+
+<Card icon="rotate-left">
+
+**Add-time edge backfill — the mirror of this whole page**
+
+The fan-out handles "edge created after both nodes were copied." The mirror case: a user adds Grady *after* the Grady↔Orbiter edge already exists. CREATE-CONTACTS must therefore also copy all Universe edges between the incoming node and nodes **already in that user's graph** (one query: Universe edges where the other endpoint is in the user's membership set). Without this, fan-out keeps existing users fresh while every late adder is permanently missing edges. Same membership machinery run in reverse — build them together.
+
+</Card>
+
+<Card icon="code-merge">
+
+**Both-endpoints semantics**
+
+User holds Grady but not Orbiter: default is skip (no dangling endpoints). Decide explicitly whether any edge types instead *pull in* the missing node as a stub — that changes the resolver from an intersection to a union with side effects.
+
+</Card>
+
+<Card icon="clock-rotate-left">
+
+**Updates, deletes, and merges ride the same log**
+
+Edge property updates (`description`, `valid_from` / `valid_to` invalidations), deletions, and Universe merge events (which must repoint copies via the loser → winner merge log) are all event types on `graph_change_event`. The per-node sequence number also resolves the push-vs-merge ordering race flagged on [Universe &lt;&gt; Backend Sync](/guides/open-work/universe-backend-sync).
+
+</Card>
+
+<Card icon="fire">
+
+**The hot-node problem**
+
+Fan-out cost per edge = users holding both endpoints. For typical contacts that is small. For a celebrity node held by 5,000 users, one enrichment run touching them means 5,000 × edges written. Mitigations: batch per user graph (one `UNWIND` per user per relay cycle, not per edge), and consider routing very-high-degree public entities to the reference model — a per-node-type or per-degree policy rather than one global answer.
+
+</Card>
+
+## Prerequisite decision: copy narrowly, reference broadly
+
+Two pages currently hold positions in deliberate tension:
+
+- [Universe &lt;&gt; Backend Sync](/guides/open-work/universe-backend-sync): CREATE-CONTACTS **copies** the person's nodes/edges into the user's graph — which makes fan-out mandatory (this page).
+- [Orbiter Universe Standalone](/guides/open-work/orbiter-univers-standalone) Decision 5: user graphs use a **hybrid read model** — App-backend projections for stable fields, a Universe graph gateway for live paths and public context, hot snippets materialized into local caches only when needed — explicitly *without* copying the whole public graph per tenant.
+
+These reconcile into the recommended posture: **copy narrowly, reference broadly.** Copy into user graphs only what the product must traverse locally and fast (the contact's immediate neighborhood, edges feeding Known scoring); read the long tail through the gateway. The outbox pipeline then only fans out the *copied* slice — which shrinks the hot-node problem and the storage bill proportionally. The narrower the copy boundary, the cheaper every part of this page gets, so **draw that boundary first**.
+
+## Current state (migration notes)
+
+Verified against the live Xano workspace 2026-08-07:
+
+- There are **no per-user FalkorDB graphs today** — everything lives in the single `live` graph (one row in `environmental_variables_falkordb`, table 508); per-user graph naming is net-new.
+- All Xano → FalkorDB traffic funnels through `mvp/falkor/send-cypher` (fn 2815) and its variants; ~25 edge-composing functions call it. The Go graph-writer service inherits this single-choke-point shape — which is exactly what makes the outbox reliable.
+- The current "add person" flow (`POST /my-persons` → fn 1855) inserts membership rows only — it performs **zero graph writes**. Subgraph copy machinery is entirely net-new.
+- Membership is already relational: `contacts` (table 128: `user_id` + `master_person_id`, indexed both directions) and `my_company` (table 149). The AlloyDB `user_contact` table keyed by `node_uuid` is the successor of this shape. `node_registry` (758) holds 106 rows today — not a usable mirror yet.
+
+Because copy machinery, per-user graphs, and fan-out are all net-new, they can be designed as one coherent Go service from day one — there is no legacy sync behavior to migrate.
+
+## Open questions
+
+- **Copy-boundary definition.** Exactly which node types / edge types / hop depth constitute the copied "immediate neighborhood" vs gateway-read territory. This is the prerequisite decision above, restated as scope.
+- **Warm/cold threshold.** What counts as a warm graph (last login? last N days? subscription tier?), and whether cold catch-up runs at login (blocking spinner) or on first graph read (lazy).
+- **Stub pull-in edge types.** Which edge types, if any, justify pulling a missing endpoint in as a stub rather than skipping.
+- **Hot-node policy.** The degree/holder-count threshold above which an entity switches from copy to reference, and whether that switch is retroactive.
+- **Event retention.** How long `graph_change_event` rows live — the cold-graph cursor replay needs history at least as old as the oldest cold graph, or cold graphs must fall back to a full re-copy.
+- **Membership index consistency.** `user_contact` must be updated in the same transaction as (or reliably before) any subgraph copy, or the resolver misses users mid-add.
+
+## Related work
+
+- [Universe &lt;&gt; Backend Sync](/guides/open-work/universe-backend-sync) — the parent workshop; this page answers its fan-out open question
+- [Orbiter Universe Standalone](/guides/open-work/orbiter-univers-standalone) — Decision 5's hybrid read model is the "reference broadly" half of the posture here
+- [Contacts Interaction Log](/guides/open-work/contacts-interaction-log) — the existing AlloyDB-table + Go-cron pattern this page's reconciliation job mirrors

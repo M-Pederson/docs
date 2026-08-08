@@ -103,6 +103,17 @@ The org graph is an **employer container** — membership in the workspace is me
 
 </Card>
 
+<Card icon="circle-check">
+
+**Event retention: validate-at-login is the mechanism; retention is ops convenience** *(decided 2026-08-08)*
+
+- **Outbox event rows live 90 days** *(launch default, tunable)* — ample for the live pipeline, the nightly reconcile, and incident replay.
+- **Warm graphs** consume merge/node events in near-real-time via the channel; the nightly reconcile backstops.
+- **Cold graphs repair at login**: one indexed query validates all of the user's stub `node_uuid`s against the `node_registry` mirror; any miss resolves loser → winner in the **permanent merge log** and repoints. Bounded by the user's graph size, not elapsed time — works even if every event row has been purged, and self-heals any warm-path delivery that ever slipped.
+- **The merge log is never pruned** — it is the recovery root (reaffirming the parent-page decision).
+
+</Card>
+
 ## How nodes enter a user graph
 
 Two entry points — and only two — add nodes to a user graph:
@@ -135,20 +146,95 @@ graph LR
 
 Everything else stays in Universe, readable at compose time but never materialized: the ten historical employers, and his 7 DomainExpertise / 10 SubDomainExpertise nodes. Day-one graph: **5 nodes, 4 edges.** The point of materializing the current core: these stubs join the **anchor set**, so alma-mater paths ("you and this founder both attended USC") and colleague paths start from Kyle's own graph like every other anchor. From there the star grows through the entry points above — his first outbound email adds a KNOWS person, his first note adds a Note node ABOUT its subject.
 
-### Notes and documents — nodes, not edges *(updated 2026-08-08 — note text in-node per workshop; confirm to lock)*
+## Notes
 
-The test: **an edge connects exactly two things and has no independent lifecycle; anything with its own identity, its own timeline, or more than one subject is a node.** A note about a meeting with two people has two subjects; a note is created, edited, and deleted independently of the relationship it describes; one contact can carry many notes. So:
+**The model** *(decided 2026-08-08)*: notes are **nodes, not edges** — the test being that an edge connects exactly two things and has no independent lifecycle, while a note can have multiple subjects, its own timeline, and many siblings per contact. Notes **carry their text in the node** (~2KB cap, truncation flag beyond): most notes are short, and in-node text makes "everything I know about X" a single 1-hop traversal with no hydration round-trip. AlloyDB remains the **system of record** (edit UI, exports, backups); the node text is a denormalized copy — write AlloyDB in the transaction, idempotent `MERGE` upsert keyed on `note_id`, nightly reconcile heals drift. **Embeddings never enter the graph**: notes join the shared **files search index** in AlloyDB (locked standard: gemini-embedding-001 · 3072 · cosine · ScaNN — a vector is ~40× the note it embeds), as single-chunk rows carrying `kind: note`, `source_id`, and the `entity_uuids` of their subjects, so "search my notes about Sam" is a filtered vector query.
+
+### Flow — Mark creates a note on Knock.app
+
+1. **Intent check**: if Knock.app is not yet in Mark's graph, creating a note on it is **manual-add intent** — CREATE-CONTACT-COMPANY runs first: `(Mark)-[:FOLLOWS {source: "note_created", created_at}]->(Knock.app)`.
+2. **AlloyDB**: the notes row is written (system of record), transaction-first.
+3. **User graph**:
 
 ```cypher
-(User)-[:CREATED]->(:Note {note_id, text, created_at, updated_at})-[:ABOUT]->(Person | Company)
-(User)-[:UPLOADED]->(:Document {doc_id, name, mime, description})-[:ATTACHED_TO]->(Person | Company)
+(Mark)-[:CREATED {created_at}]->(:Note {note_id, text: "Met the founders at the AI infra dinner…",
+        visibility: "private", created_at, updated_at})
+(:Note)-[:ABOUT {created_at}]->(:Company {node_uuid: knock_uuid})   // Knock.app stub
 ```
 
-**Notes carry their text in the node.** Most notes are short (hundreds of bytes); even a power user's notes cost single-digit megabytes of graph memory, and in exchange the most common retrieval — "everything I know about Sam" — returns usable content in one 1-hop traversal with no hydration round-trip. Node text is capped (~2KB, truncation flag beyond); AlloyDB remains the **system of record** (edit UI, exports, backups) and the node text is a denormalized copy: write AlloyDB in the transaction, idempotent `MERGE` upsert of the node keyed on `note_id`, nightly reconcile heals drift.
+4. **Files index**: one row — `kind: note`, `source_id: note_id`, `entity_uuids: [knock_uuid]`, embedding.
 
-**Embeddings do not go in the graph — notes join the files search index** *(decided 2026-08-08)*. The locked embedding standard (gemini-embedding-001 · 3072 · cosine · AlloyDB ScaNN) puts all content vectors in AlloyDB — at 3072 dims a vector is ~12KB, roughly 40× the note it embeds. Notes and documents share **one search index**: the files/documents embedding table in AlloyDB, where documents land as chunked extracted-text rows and notes as single-chunk rows. Each row carries a `kind` discriminator (`note` | `document`), a `source_id` (`note_id` / `doc_id`) for hydration from the right home, and the `entity_uuids` from its ABOUT/ATTACHED_TO edges — so "search my notes about Sam" is a filtered vector query, not a post-join. The notes table remains system of record for text; a note edit re-embeds and upserts its index row. One query surface covers "search across my notes and files"; results map back into the graph by `source_id`.
+A note about a *meeting* works identically with two ABOUT edges — one per participant.
 
-**Documents are id + description only.** Name, mime, and a short generated description on the node (traversal-time context and RAG summaries without touching bytes); bytes in GCS; extracted text chunked into the shared search index above.
+### Flow — Mark shares the note
+
+Sharing is **explicit** and comes in two scopes. In both, AlloyDB's `note_shares` table is the ACL truth, and the owner's node flips `visibility`.
+
+**Direct share to a connected user (Sarah):**
+
+```cypher
+// Mark's graph — visibility property updates, nothing else changes
+(:Note {note_id, visibility: "shared_direct", …})
+
+// Sarah's graph — she receives a holder node with denormalized text
+(Sarah)-[:RECEIVED {from_user_uuid: mark_uuid, shared_at}]->(:Note {note_id,
+        text, origin: "shared", entity_uuids: [knock_uuid], created_at, updated_at})
+```
+
+- **Edits propagate**: Mark's future edits fan out by `note_id`-keyed `MERGE` to every holder's graph (the share list is small and known from `note_shares`).
+- **Receiving is not entity intent**: if Knock.app is *not* in Sarah's graph, no company stub and no FOLLOWS is created — her note node carries `entity_uuids` as a property, and the ABOUT edge **materializes lazily** if Knock.app ever enters her graph through her own intent. Compose-time reads still resolve the company from Universe by uuid.
+- Sarah gets her own files-index row, so the note is in *her* search.
+
+**Team share (company mode):** **one** note node is written to the **org graph** — not N copies into members' graphs:
+
+```cypher
+// org graph
+(:Note {note_id, text, contributor_user_id: mark_uuid, shared_at})
+      -[:ABOUT]->(:Company {node_uuid: knock_uuid})   // org-graph stub, created if absent, contributor-tagged
+```
+
+Members see it in company mode because the org graph is a query source — the reference principle again: shared once, read by all, no copies to reconcile. Explicit team-sharing is the sanctioned exception to the org tier's "derived signals only" rule: the user chose to give the team this content.
+
+## Files
+
+**The model** *(decided 2026-08-08)*: a file is a **Document node carrying id + name + mime + a short generated description** — traversal-time context and RAG summaries without touching bytes. Bytes live in **GCS**; metadata in AlloyDB; extracted text lands **chunked** in the shared files search index (`kind: document`, `source_id: doc_id`, `entity_uuids`).
+
+### Flow — Mark uploads a file and attaches it to Knock.app
+
+1. **Intent check**: attaching to an entity not yet in the graph is manual-add intent — CREATE-CONTACT-* runs first (same rule as notes).
+2. **GCS**: bytes stored. **AlloyDB**: documents row. **Index**: chunked extracted-text rows.
+3. **User graph**:
+
+```cypher
+(Mark)-[:UPLOADED {source: "manual", uploaded_at}]
+      ->(:Document {doc_id, name: "knock-pitch.pdf", mime: "application/pdf",
+                    description: "Seed pitch deck, 18 slides, GTM focus", content_hash})
+      -[:ATTACHED_TO {attached_at}]->(:Company {node_uuid: knock_uuid})
+```
+
+### Flow — an email attachment from Sam Seely is parsed and saved
+
+The log-parse pipeline extracts qualifying attachments automatically. The gate is the intent system again: **auto-capture only from senders who are already KNOWS contacts** — an attachment from an unknown inbound sender saves nothing, ever. Launch-default filters *(tunable)*: document-type mime allowlist (pdf, docx, xlsx, pptx, …), minimum size, no inline images. **Dedupe by `content_hash` per user** — the same attachment re-sent creates no new node (a new ATTACHED_TO edge only if it arrives in the context of a different entity).
+
+```cypher
+(Mark)-[:SAVED {source: "email_attachment", interaction_id, saved_at}]
+      ->(:Document {doc_id, name: "knock-overview.pdf", mime: "application/pdf",
+                    description: "Company overview one-pager", origin: "email", content_hash})
+      -[:ATTACHED_TO {via: "email_attachment", attached_at}]->(:Person {node_uuid: sam_uuid})
+```
+
+The provenance is legible in the edge types alone: `UPLOADED` = the user placed it; `SAVED` = the system captured it from an interaction, with the `interaction_id` linking back to the exact email. Both satisfy the star rule (direct user edge) and both land in the files index the same way.
+
+### Edge-type summary
+
+| Edge | From → To | Key properties |
+|---|---|---|
+| `CREATED` | User → Note | `created_at` |
+| `RECEIVED` | User → Note (shared in) | `from_user_uuid`, `shared_at` |
+| `ABOUT` | Note → Person/Company | `created_at` (lazily materialized for received notes) |
+| `UPLOADED` | User → Document | `source: "manual"`, `uploaded_at` |
+| `SAVED` | User → Document | `source: "email_attachment"`, `interaction_id`, `saved_at` |
+| `ATTACHED_TO` | Document → Person/Company | `via`, `attached_at` |
 
 ## Worked example — Discover search to connection paths
 
@@ -193,7 +279,7 @@ Verified against FalkorDB docs/tracker and Google Cloud docs, 2026-08-07. These 
 
 3. **CREATE-CONTACT-PERSON / CREATE-CONTACT-COMPANY.** The two node entry points (see "How nodes enter a user graph"): stub + user edge + membership row (+ mem0 kickoff on the person side) — idempotent on `(user_id, node_uuid)`. No subgraph copy exists; the flow is identical for brand-new and fully-enriched people. Includes the self-enrichment hook that materializes the user's current companies and education.
 
-4. **Merge/node-event channel.** Transactional outbox in AlloyDB written by the Universe graph-writer (merge and node-lifecycle events only) → Go relay (`FOR UPDATE SKIP LOCKED`) → repoint workers that update affected user/org graphs via the membership index, applying the loser → winner mapping. Nightly Cloud Scheduler → Cloud Run reconciliation sweep; registry-miss → merge-log lookup as the recovery path.
+4. **Merge/node-event channel.** Transactional outbox in AlloyDB written by the Universe graph-writer (merge and node-lifecycle events only, 90-day retention) → Go relay (`FOR UPDATE SKIP LOCKED`) → repoint workers that update affected user/org graphs via the membership index, applying the loser → winner mapping. Nightly Cloud Scheduler → Cloud Run reconciliation sweep for warm graphs; **validate-stubs-at-login** for cold graphs (registry check → permanent merge log → repoint).
 
 5. **Organization graph tier.** Company-mode second private tier per the governance decision: mailbox-provenance contribution filter, org-edge upserts carrying identity + materialized strength (pushed from the contributor's Known recompute), the `visible | private` per-contact enum, full-rolodex search surfacing with details-via-holder, `contributor_user_id`-tagged edges with delete-on-departure, workspace-membership admin. *Governance decided 2026-08-08 — buildable.*
 
@@ -219,9 +305,10 @@ Because the user-graph layer, composition service, and event channel are all net
 - ~~**Read-service merge contract details.**~~ **Decided 2026-08-08** — closed by the SLO/degradation decision: private-first ladder defines the degraded modes; every response carries tier provenance and degraded responses state what's missing.
 - ~~**Universe read SLO / degraded mode.**~~ **Decided 2026-08-08** — separate private-tier deployment, private-first ladder, replica-first reads, 99.9% target with per-tier budgets; see the Decision card.
 - **Hot-node query cost.** A very-high-degree target makes the composed path query's traversal frontier large. Re-benchmark as Universe grows; define frontier caps or precomputation for celebrity-class nodes.
-- **Merge/node-event retention.** Retention must cover the oldest dormant user's catch-up cursor, or the registry-miss → merge-log recovery path is the defined fallback.
+- ~~**Merge/node-event retention.**~~ **Decided 2026-08-08** — validate-at-login for cold graphs + 90-day event retention; see the Decision card.
+- **Team-shared notes on leaver.** Org governance says delete-by-contributor-tag on departure — but a note explicitly shared to the team may be expected to persist (Slack-message norm). Decide: consistent delete vs persist-for-team.
 - **Membership index write timing.** `user_contact` drives merge repointing and org-tier resolution — it must be written transactionally with (or reliably before) stub creation.
-- **Notes/documents model confirmation.** The amended model above (nodes not edges; note text in-node with AlloyDB as system of record; vectors in AlloyDB ScaNN per the locked embedding standard; documents as id + description) — confirm, then it moves into the Decision card.
+- ~~**Notes/documents model confirmation.**~~ **Locked 2026-08-08** — fully specified in the Notes and Files sections (flows, edge types, properties, sharing mechanics).
 
 ## Related work
 

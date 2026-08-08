@@ -56,6 +56,47 @@ Consequences: the edge fan-out problem that originally motivated this page is de
 
 </Card>
 
+## How nodes enter a user graph
+
+Two entry points — and only two — add nodes to a user graph:
+
+- **CREATE-CONTACT-PERSON** — the sole way a person node enters. Triggered by user intent: outbound email (via the three-tier lookup / GET-ADD), a vCard/CSV/LinkedIn import, or a manual add. Creates the person stub + `(User)-[KNOWS]->(Person)` + the membership row + the mem0 kickoff.
+- **CREATE-CONTACT-COMPANY** — the sole way a company node enters. Triggered by user↔company-domain interaction *(gated on the seeding-gate decision below)*, a manual add or import, or the user's own enrichment (below). Creates the company stub + `(User)-[FOLLOWS]->(Company)` — or `WORKS_AT` when it is the user's own employer.
+
+**The user-rooted star rule:** every node in a user graph has a **direct edge to the user's person node** — people via KNOWS, companies via FOLLOWS/WORKS_AT, schools via ATTENDED, notes via CREATED, documents via UPLOADED. Leaf-to-leaf *context* edges (a note ABOUT a person, a document ATTACHED_TO a person) are allowed between nodes already in the star; no node exists without its user edge.
+
+### The user's own enrichment
+
+When the user's own person node completes enrichment, their professional core lands in their graph automatically: every **current** company (present employment, not historical) and their education, as stubs with the respective edges. Example — Mark, fully enriched:
+
+```cypher
+(Mark)-[:WORKS_AT {current: true}]->(:Company {node_uuid: "…", name: "Orbiter"})
+(Mark)-[:ATTENDED {end_year: 2004}]->(:School {node_uuid: "…", name: "University of Minnesota"})
+```
+
+```mermaid
+graph LR
+    M((Mark)) -->|WORKS_AT current| O[Orbiter]
+    M -->|ATTENDED| U[U. of Minnesota]
+    M -->|KNOWS strength 87| S[Sam Seely]
+    M -->|FOLLOWS| K[Knock.app]
+    M -->|CREATED| N1[Note stub]
+    N1 -->|ABOUT| S
+```
+
+Historical employers stay in Universe — readable at compose time, never materialized. The point of materializing the current core: these stubs join the **anchor set**, so alma-mater paths ("you and this founder both attended…") and colleague paths start from the user's own graph like every other anchor.
+
+### Notes and documents — nodes, not edges *(recommended 2026-08-08 — confirm to lock)*
+
+The test: **an edge connects exactly two things and has no independent lifecycle; anything with its own identity, its own timeline, or more than one subject is a node.** A note about a meeting with two people has two subjects; a note is created, edited, and deleted independently of the relationship it describes; one contact can carry many notes. So:
+
+```cypher
+(User)-[:CREATED]->(:Note {note_id, created_at})-[:ABOUT]->(Person | Company)
+(User)-[:UPLOADED]->(:Document {doc_id, mime, name})-[:ATTACHED_TO]->(Person | Company)
+```
+
+**Content never lives in the graph.** The graph node is a stub — ids, timestamps, an embedding pointer at most. Note text lives in Backend (AlloyDB); document bytes live in GCS. FalkorDB is in-memory: the graph stays an index of relationships, and stubs resolve to content at hydration time. The payoff is graph-RAG retrieval: "everything I know about Sam" is a single 1-hop traversal — KNOWS edge, notes ABOUT him, documents ATTACHED_TO him — with each stub hydrated from its home store.
+
 ## Worked example — Discover search to connection paths
 
 Discover search: **"what is Knock.app"**, people filter open. Mark has emailed with Sam Seely, so his user graph holds `(Mark)-[KNOWS]->(Sam)` — and that is Sam's *only* edge in Mark's graph.
@@ -93,11 +134,11 @@ Verified against FalkorDB docs/tracker and Google Cloud docs, 2026-08-07. These 
 
 ## Scope to build
 
-1. **User-graph provisioning and schema.** Per-user FalkorDB graphs (net-new — see current state): thin stub nodes carrying `node_uuid` + entity type, KNOWS / FOLLOWS / WORKS_AT edges with strength properties, private overlay attachments. Graph naming + per-user ACLs (the existing `user:<workos_id>:*` keyspace convention and the tech-debt ACL work fold in here).
+1. **User-graph provisioning and schema.** Per-user FalkorDB graphs (net-new — see current state): thin stub nodes carrying `node_uuid` + entity type, KNOWS / FOLLOWS / WORKS_AT / ATTENDED edges with strength properties, Note and Document stub nodes with CREATED/ABOUT and UPLOADED/ATTACHED_TO edges, all under the user-rooted star rule. Graph naming + per-user ACLs (the existing `user:<workos_id>:*` keyspace convention and the tech-debt ACL work fold in here).
 
 2. **Graph composition read service (Go).** The front door for every card, path, Discover, and RAG read: mode-aware source selection (personal = user + Universe; company = user + org + Universe), direct-hit short-circuit, anchor-decomposition path queries against Universe, app-side merge with `node_uuid` dedupe and per-tier precedence (Universe wins public properties, user graph wins private), blended ranking, per-tier degraded modes. Every Universe query carries a **server-side timeout** so a runaway query can never degrade the shared graph.
 
-3. **CREATE-CONTACTS v2.** Stub + KNOWS edge + membership row + mem0 kickoff — idempotent on `(user_id, node_uuid)`. No subgraph copy exists; the flow is identical for brand-new and fully-enriched people.
+3. **CREATE-CONTACT-PERSON / CREATE-CONTACT-COMPANY.** The two node entry points (see "How nodes enter a user graph"): stub + user edge + membership row (+ mem0 kickoff on the person side) — idempotent on `(user_id, node_uuid)`. No subgraph copy exists; the flow is identical for brand-new and fully-enriched people. Includes the self-enrichment hook that materializes the user's current companies and education.
 
 4. **Merge/node-event channel.** Transactional outbox in AlloyDB written by the Universe graph-writer (merge and node-lifecycle events only) → Go relay (`FOR UPDATE SKIP LOCKED`) → repoint workers that update affected user/org graphs via the membership index, applying the loser → winner mapping. Nightly Cloud Scheduler → Cloud Run reconciliation sweep; registry-miss → merge-log lookup as the recovery path.
 
@@ -127,6 +168,7 @@ Because the user-graph layer, composition service, and event channel are all net
 - **Hot-node query cost.** A very-high-degree target makes the composed path query's traversal frontier large. Re-benchmark as Universe grows; define frontier caps or precomputation for celebrity-class nodes.
 - **Merge/node-event retention.** Retention must cover the oldest dormant user's catch-up cursor, or the registry-miss → merge-log recovery path is the defined fallback.
 - **Membership index write timing.** `user_contact` drives merge repointing and org-tier resolution — it must be written transactionally with (or reliably before) stub creation.
+- **Notes/documents model confirmation.** The nodes-not-edges stub model above is recommended, not yet locked — confirm, then it moves into the Decision card.
 
 ## Related work
 

@@ -13,13 +13,13 @@ icon: "route"
 The scenario that tests the whole model: the user is connected to Ian Andes **only** in their private graph (`CONNECTED_ON_ORBITER`); Ian's `WORKS_AT → NVIDIA` edge exists **only** in Universe; NVIDIA is not in the user's graph, and Universe holds no path from the *user* to NVIDIA. The user searches "Nvidia."
 
 1. **Search** — "Nvidia" runs against both graphs (all granted tiers, per the [query execution model](/guides/open-work/edge-sync#query-execution-model-decided-2026-08-08)): the user graph has nothing; Universe returns the NVIDIA node (`uuid N`). One merged candidate.
-2. **Anchors** — the service loads the user's **anchor set** (below). Ian (`uuid I`) is in it — **the anchor set is edge-type-agnostic**: a `CONNECTED_ON_ORBITER`-only relationship anchors exactly like a strong KNOWS; it just ranks lower.
+2. **Anchors** — the service loads the user's **anchor set** (below). Ian (`uuid I`) is in it — **the anchor set is edge-type-agnostic**: an `orbiter_connect`-origin relationship (strength 50) anchors exactly like a strength-90 KNOWS; it just ranks lower.
 3. **Continuation** — Universe is asked one question, and it is *not* "path from user to NVIDIA": it is **"traverse outward from NVIDIA ≤k hops; which endpoints are in this anchor list?"** It finds `NVIDIA ←WORKS_AT— Ian`, matches `uuid I`, and returns the path *segment*. The user's own presence in Universe is never consulted — paths start at anchors, not at the user.
 4. **Stitch** — concatenate at the shared uuid:
 
 ```text
-(User)-[CONNECTED_ON_ORBITER · KNOWS w≈100]->(Ian, uuid I)     ← user graph
-(Ian, uuid I)-[WORKS_AT {current: true}]->(NVIDIA, uuid N)     ← Universe
+(User)-[CONNECTED_ON_ORBITER · KNOWS strength 50 / w43]->(Ian, uuid I)   ← user graph
+(Ian, uuid I)-[WORKS_AT {current: true, weight: 20}]->(NVIDIA, uuid N)   ← Universe
 ```
 
 Each hop renders with its tier and evidence ("connected on Orbiter, no interaction history yet" → "currently works at NVIDIA").
@@ -30,7 +30,7 @@ In **company mode**, the same assembly runs with the org tier in the middle: the
 
 ## Execution timeline — the Ian example, expanded
 
-What actually runs, in order. Standing state: Mark's graph holds `(Mark)-[:KNOWS {weight: 98}]->(Ian)` + `CONNECTED_ON_ORBITER`; his anchor set has 212 rows; Universe holds `(Ian)-[:WORKS_AT {current: true, weight: 20}]->(NVIDIA)`; NVIDIA is not in Mark's graph.
+What actually runs, in order. Standing state: Mark's graph holds `(Mark)-[:KNOWS {strength: 50, weight: 43}]->(Ian)` + `CONNECTED_ON_ORBITER` (orbiter_connect origin, no interaction since); his anchor set has 212 rows; Universe holds `(Ian)-[:WORKS_AT {current: true, weight: 20}]->(NVIDIA)`; NVIDIA is not in Mark's graph.
 
 | T | Step | What happens |
 |---|---|---|
@@ -40,8 +40,8 @@ What actually runs, in order. Standing state: Mark's graph holds `(Mark)-[:KNOWS
 | T3 | Await all | Per-tier budgets (Universe 300ms; the SQL ~10ms) |
 | T4 | Merge & dedupe | By `node_uuid`; NVIDIA not in membership → no direct-hit short-circuit |
 | T5 | **Continuation query** | Second Universe query, target-out: traverse from NVIDIA ≤k hops, match endpoints against the anchor list → returns the segment `(Ian I)-[WORKS_AT w20]->(NVIDIA N)`. Mark appears nowhere in this query. |
-| T6 | **Stitch** (pure Go) | Look up `uuid I` in the loaded anchor rows → prepend `Mark -[KNOWS w98 · CONNECTED_ON_ORBITER]-> Ian` |
-| T7 | Rank | Per the **ranking spec below** — strengths `s = (101−w)/100`; this path carries s₁ = 0.03, s₂ = 0.81, weakest link 0.03 → a weak but real person-mediated path |
+| T6 | **Stitch** (pure Go) | Look up `uuid I` in the loaded anchor rows → prepend `Mark -[KNOWS strength 50 · CONNECTED_ON_ORBITER]-> Ian` |
+| T7 | Rank | Per the **ranking spec below** — s₁ = strength/100 = 0.50 (private hop), s₂ = (101−20)/100 = 0.81 (Universe hop); weakest link 0.50 → a moderate declared-connection path |
 | T8 | Hydrate & respond | Display data from projections; per-hop tier labels: *"via Ian Andes — connected on Orbiter; Ian currently works at NVIDIA"* |
 
 **The path exists nowhere until T6** — one private fact (anchor row) plus one public segment, joined on `uuid I`. Two Universe queries total (search + continuation); zero Cypher against the private graph in the hot loop — its contribution rides through the AlloyDB projections, while the graph itself serves private-context retrieval (notes, 1-hop "everything about Ian").
@@ -64,7 +64,7 @@ Expected anchor counts: **average 3,000–5,000 contacts per user, up to ~20,000
 **Definition:** the anchor set is the per-user list of every `node_uuid` the user has a **relationship edge** to, with the metadata pathfinding needs to rank hop 1:
 
 ```text
-anchor := { node_uuid, entity_type, edge_types[], weight, updated_at }
+anchor := { node_uuid, entity_type, edge_types[], strength, weight, updated_at }
 ```
 
 It is the *only* thing the private graph contributes to a Universe continuation query — the seed list — and the private half of every assembled path.
@@ -93,7 +93,7 @@ Context edges are ranking and retrieval signals, not path anchors — a city can
 | **CREATE-CONTACT-PERSON / -COMPANY** (any of the twelve entry points) | Row upserted with the new edge type, same transaction as the contact row |
 | **Imports** (LinkedIn, contacts) | Row with `CONNECTED_ON_*` + weakest-weight KNOWS |
 | **FOLLOWS derivation** | Company row when contacts cross the seeding threshold |
-| **Known-score recompute** (15-min cadence) | `weight` refreshed on affected rows |
+| **Known-score recompute** (nightly scoring pass) | `strength` recomputed from `contacts_interaction_log`; `weight` re-derived; anchor rows refreshed |
 | **Edge deletion** | `edge_types[]` shrinks; row removed when no relationship edge remains |
 | **Merge/node-event channel** | `node_uuid` rewritten loser → winner (same repoint event, same transaction) |
 
@@ -103,7 +103,7 @@ Context edges are ranking and retrieval signals, not path anchors — a city can
 
 **Rule #1 — pathfinding never re-derives relationship strength; it consumes the Known score, period.** The Known model already encodes evidence, recency, peaks, and hysteresis into the edge weight (1–100, lower = stronger). Ranking adds no recency or frequency terms of its own — the anchor row's `weight` is the single source of relationship truth, and ranking's only job is to *combine* weights across hops and tiers. (This also keeps the scoring internals out of public documentation: this page specifies the combination; the Known internals stay closed.)
 
-**Strength conversion, once:** `s = (101 − w) / 100` ∈ (0, 1] — a w=15 close friend is s ≈ 0.86; a w≈100 declared-only connection is s ≈ 0.01. Universe edges carry the same weight convention, so every hop of a stitched path gets an `s`.
+**Normalization, once per hop:** private-tier hops carry the two-field KNOWS model, so **`s = strength / 100`** directly — a strength-85 close friend is s = 0.85; a LinkedIn-only import is s = 0.15. Universe hops carry only the ontology `weight` (1–100, lower = stronger), normalized `s = (101 − weight) / 100`. Every hop of a stitched path gets an `s` ∈ (0, 1].
 
 **Result tiers, before any scoring:**
 
@@ -117,9 +117,9 @@ Context edges are ranking and retrieval signals, not path anchors — a city can
 2. **Secondary: product of hop strengths** — rewards uniformly strong chains and naturally penalizes length (every hop multiplies by ≤ 1).
 3. **Tertiary: fewer hops.**
 
-The ordering this buys, deliberately: a 2-hop path through your w=15 close friend (min s ≈ 0.86) **beats** the 1-hop w≈100 declared connection (min s ≈ 0.01) — the case a naive shortest-path ranker gets exactly backwards.
+The ordering this buys, deliberately: a 2-hop path through your strength-85 close friend (min s = 0.85) **beats** the 1-hop LinkedIn-only connection (s = 0.15) — the case a naive shortest-path ranker gets exactly backwards.
 
-**Declared-only connections** (`CONNECTED_ON_*` with the weakest-weight KNOWS) floor near the bottom of the person tier — present and labeled *"no interaction history yet,"* never outranking evidenced relationships. A platform edge that corroborates an evidenced KNOWS acts as a **tiebreaker only**, never a score input.
+**Declared-only connections** (`origination_source: linkedin_import` at strength 15, `orbiter_connect` at 50, with no interaction since) floor the person tier — present and labeled *"no interaction history yet,"* sitting below the evidenced tier (75+). A platform edge that corroborates an evidenced KNOWS contributes through the **scoring formula** (a small strength bonus applied by the nightly pass once interaction evidence exists) — never directly at the ranking layer, which consumes `strength` alone.
 
 **Company mode:** via-colleague chains score with the same weakest-link rule across both private hops — your strength to the colleague × the colleague's materialized strength to the target — and **interleave with your own paths by score** (a strong colleague chain deserves to beat your own weak 2-hop), carrying the org-of-origin label and the ask-for-intro step. The active-org ranking boost from the union decision **nudges ties only** — it never overturns strength.
 
@@ -131,8 +131,8 @@ All numeric boundaries (tier floors, corroboration tiebreak, active-org nudge) a
 
 Standing state:
 
-- Mark's personal graph: no Stripe, no one at Stripe with interaction history — only `(Mark)-[:CONNECTED_ON_LINKEDIN · KNOWS w≈100]->(Priya)`, a Stripe PM he imported and never spoke to. His KNOWS to his co-founder: `(Mark)-[:KNOWS {weight: 35}]->(Jason)`.
-- **Orbiter.io org graph** (mailbox-provenance contributions): `(Jason)-[shared, weight: 22]->(Patrick, uuid P)` — Jason's strong relationship, shared as a derived signal with Jason's identity attached. Josh has shared nothing relevant to Stripe.
+- Mark's personal graph: no Stripe, no one at Stripe with interaction history — only `(Mark)-[:CONNECTED_ON_LINKEDIN · KNOWS strength 15]->(Priya)`, a Stripe PM he imported and never spoke to. His KNOWS to his co-founder: `(Mark)-[:KNOWS {strength: 72, weight: 35}]->(Jason)`.
+- **Orbiter.io org graph** (mailbox-provenance contributions): `(Jason)-[shared, strength: 78]->(Patrick, uuid P)` — Jason's strong relationship, shared as a materialized strength signal with Jason's identity attached. Josh has shared nothing relevant to Stripe.
 - Universe: `(Patrick, uuid P)-[:WORKS_AT {current: true, weight: 20}]->(Stripe, uuid S)`; also `(Priya)-[:WORKS_AT {current: true}]->(Stripe)`.
 
 **Execution** (the same T0–T8 pipeline, team-mode sources):
@@ -144,15 +144,15 @@ Standing state:
 
 ```text
 Path A  (via colleague):
-Mark -[KNOWS w35]-> Jason -[org-shared w22 (Orbiter.io)]-> Patrick -[WORKS_AT current]-> Stripe
-        s=0.66            s=0.79                                  s=0.81      → weakest link 0.66
+Mark -[KNOWS strength 72]-> Jason -[org-shared strength 78 (Orbiter.io)]-> Patrick -[WORKS_AT w20]-> Stripe
+        s=0.72                    s=0.78                                          s=0.81   → weakest link 0.72
 
 Path B  (own, declared-only):
-Mark -[CONNECTED_ON_LINKEDIN · KNOWS w≈100]-> Priya -[WORKS_AT current]-> Stripe
-        s=0.01                                       s=0.81                → weakest link 0.01
+Mark -[CONNECTED_ON_LINKEDIN · KNOWS strength 15]-> Priya -[WORKS_AT w20]-> Stripe
+        s=0.15                                             s=0.81          → weakest link 0.15
 ```
 
-5. **Rank** — weakest-link-first: **Path A wins decisively** (0.66 vs 0.01), even though Path B is shorter and personally held — exactly the ordering the ranking spec buys. Path B still shows, floored and labeled *"your LinkedIn connection — no interaction history yet."*
+5. **Rank** — weakest-link-first: **Path A wins decisively** (0.72 vs 0.15), even though Path B is shorter and personally held — exactly the ordering the ranking spec buys. Path B still shows, floored and labeled *"your LinkedIn connection — no interaction history yet."*
 
 **What Mark sees:** the Stripe card (public facts from projections), then:
 

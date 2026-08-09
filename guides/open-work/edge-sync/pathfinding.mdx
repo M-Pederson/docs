@@ -1,0 +1,74 @@
+---
+title: "Pathfinding"
+description: "How paths are assembled across graphs — the stitching algorithm, and the anchor set that seeds it"
+icon: "route"
+---
+
+## The core claim
+
+**Neither graph ever produces a path.** The user's private graph holds only their own edges; Universe holds only public topology; no single query in either can return *user → Ian → NVIDIA*. Paths are **assembled by the read service**, and the join key is the shared `node_uuid`. This page specifies the two halves of that assembly: the **stitching algorithm** and the **anchor set** that seeds it.
+
+## Path stitching — the Ian Andes case
+
+The scenario that tests the whole model: the user is connected to Ian Andes **only** in their private graph (`CONNECTED_ON_ORBITER`); Ian's `WORKS_AT → NVIDIA` edge exists **only** in Universe; NVIDIA is not in the user's graph, and Universe holds no path from the *user* to NVIDIA. The user searches "Nvidia."
+
+1. **Search** — "Nvidia" runs against both graphs (all granted tiers, per the [query execution model](/guides/open-work/edge-sync#query-execution-model-decided-2026-08-08)): the user graph has nothing; Universe returns the NVIDIA node (`uuid N`). One merged candidate.
+2. **Anchors** — the service loads the user's **anchor set** (below). Ian (`uuid I`) is in it — **the anchor set is edge-type-agnostic**: a `CONNECTED_ON_ORBITER`-only relationship anchors exactly like a strong KNOWS; it just ranks lower.
+3. **Continuation** — Universe is asked one question, and it is *not* "path from user to NVIDIA": it is **"traverse outward from NVIDIA ≤k hops; which endpoints are in this anchor list?"** It finds `NVIDIA ←WORKS_AT— Ian`, matches `uuid I`, and returns the path *segment*. The user's own presence in Universe is never consulted — paths start at anchors, not at the user.
+4. **Stitch** — concatenate at the shared uuid:
+
+```text
+(User)-[CONNECTED_ON_ORBITER · KNOWS w≈100]->(Ian, uuid I)     ← user graph
+(Ian, uuid I)-[WORKS_AT {current: true}]->(NVIDIA, uuid N)     ← Universe
+```
+
+Each hop renders with its tier and evidence ("connected on Orbiter, no interaction history yet" → "currently works at NVIDIA").
+
+**This is the normal case, not an edge case**: hop 1 exists only privately and hops 2+ exist only publicly for essentially every path the product computes. The shared `node_uuid` is the entire join — which is why the merge-repoint invariant (the merge/node-event channel) is load-bearing for pathfinding, not just for data hygiene.
+
+In **company mode**, the same assembly runs with the org tier in the middle: the private prefix may be two hops (*user → colleague → colleague's contact*) with the colleague's shared edge coming from an org graph, before the Universe continuation — each hop still labeled with its tier and org of origin.
+
+## The anchor set *(specified 2026-08-09 — net-new artifact, does not exist yet)*
+
+**Definition:** the anchor set is the per-user list of every `node_uuid` the user has a **relationship edge** to, with the metadata pathfinding needs to rank hop 1:
+
+```text
+anchor := { node_uuid, entity_type, edge_types[], weight, updated_at }
+```
+
+It is the *only* thing the private graph contributes to a Universe continuation query — the seed list — and the private half of every assembled path.
+
+**What's in / what's out:**
+
+| In (relationship edges) | Out (context edges) |
+|---|---|
+| `KNOWS` → Person | `LOCATED_IN` → City |
+| `CONNECTED_ON_ORBITER` / `CONNECTED_ON_LINKEDIN` → Person | `COLLECTED` → any entity |
+| `FOLLOWS` → Company | Note / File nodes (`CREATED`/`RECEIVED`/`UPLOADED`/`SAVED`) |
+| `WORKS_AT` / `FOUNDED` / … → Company | |
+| `ATTENDED` → School | |
+
+Context edges are ranking and retrieval signals, not path anchors — a city cannot make an introduction.
+
+**Where it lives — the membership index, enriched.** The anchor set is **not a new store**: it is the already-decided membership index (`user_contact(user_id, node_uuid)`, written in the same AlloyDB transaction as the contact row, before any graph write) **extended with the anchor payload columns**: `entity_type`, `edge_types[]`, `weight`. One artifact, two roles — merge repointing and path seeding — inheriting the decided write-ordering guarantee for free. The read service loads it by `user_id` (indexed, one query, no graph round-trip) and may hot-cache it per session.
+
+**It is derived, never authoritative.** The user graph is the source of truth; the anchor set is a projection of its relationship edges. A full rebuild is a 1-hop scan of the user's star — milliseconds — and the validate-at-login sweep (registry check for merge repoints) doubles as anchor validation.
+
+**When it is written:**
+
+| Trigger | Effect on anchor set |
+|---|---|
+| **Sign-up full 1-hop copy** | Rows for every copied company / school (employment history, education) |
+| **CREATE-CONTACT-PERSON / -COMPANY** (any of the twelve entry points) | Row upserted with the new edge type, same transaction as the contact row |
+| **Imports** (LinkedIn, contacts) | Row with `CONNECTED_ON_*` + weakest-weight KNOWS |
+| **FOLLOWS derivation** | Company row when contacts cross the seeding threshold |
+| **Known-score recompute** (15-min cadence) | `weight` refreshed on affected rows |
+| **Edge deletion** | `edge_types[]` shrinks; row removed when no relationship edge remains |
+| **Merge/node-event channel** | `node_uuid` rewritten loser → winner (same repoint event, same transaction) |
+
+**Org extension at query time:** in company mode, the anchor set is extended per query with the org graphs' shared edges (colleague-held contacts, with the contributor's materialized strength). Org anchors are **not** materialized into the user's anchor rows — they are read from the org tier and carry their org-of-origin label, so leaver revocation stays complete by construction.
+
+## Related
+
+- [Edge Sync](/guides/open-work/edge-sync) — the parent build scope: schema box, entry points, query execution model
+- [Knows Edge](/guides/open-work/edge-sync/knows-edge) — the evidence-based relationship spine that ranks hop 1

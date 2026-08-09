@@ -1,0 +1,63 @@
+---
+title: "Knows CRON"
+description: "The nightly KNOWS scoring pass — preliminary spec for adjusting strength from combined interaction logs"
+icon: "clock-rotate-left"
+---
+
+<Warning>
+**Preliminary spec — not complete.** This page scopes the working model for the nightly KNOWS scoring job. The functional shapes below are proposed; every named coefficient is a **data-gated tuning item** in the [Known planned-work queue](/guides/known#planned-work-queue) and ships as a flagged launch default. Nothing here is ratified except what links back to already-decided pages.
+</Warning>
+
+## Purpose
+
+The one job that keeps every KNOWS edge honest: read the interaction record, recompute `strength`, re-derive `weight`, and propagate — **recompute-not-increment** (counts never live on the edge), per the [two-field model](/guides/ontology/edges#user-graph-edges). Origination sets a KNOWS edge's *initial* strength; this cron owns every value after that.
+
+## Trigger, cadence, shape
+
+**Cloud Scheduler → Cloud Run job, nightly**, sharded per user. Reads AlloyDB (`contacts_interaction_log`, `account_coverage`, platform-edge facts); writes AlloyDB first (anchor rows), then the user's graph (batched `UNWIND … MERGE` per graph, server-side timeout) — the house write-ordering. Idempotent end to end; a rerun converges to the same values.
+
+## The model — strength from combined interaction logs
+
+**1. Evidence-weighted events.** Each interaction contributes a base value by type *(launch defaults, tunable)*:
+
+| Event (from `contacts_interaction_log`) | Base value |
+|---|---|
+| Meeting attended (small-meeting) | 3.0 |
+| Email sent by user | 1.0 |
+| Email received from contact | 0.8 |
+| Thread with ≥3 alternating replies (per thread bonus) | +1.0 |
+
+**2. Recency decay — relative to the pair's own rhythm.** Each event decays as `value × 0.5^(age_days / H_pair)`, where `H_pair` comes from `compute_decay_half_life`: a relationship with a quarterly cadence decays slower than a daily-cadence pair gone quiet. Silence is measured against *expected gap*, not the calendar.
+
+**3. Reciprocity multiplier.** `compute_reciprocity` over directional counts: balanced ≈ 1.0, one-way heavily damped (broadcast ≠ relationship), `NULL` → 0.5 neutral (per the queue's open tuning item).
+
+**4. Channel diversity.** A small multiplier when evidence spans channels (email *and* meetings) — diversity is harder to fake than volume.
+
+**5. Saturating curve to strength.** `interaction_strength = 100 × E / (E + k)` — the first interactions move the score fast, the hundredth barely moves it. `k` is the half-saturation constant *(data-gated)*.
+
+**6. Blend with the origination prior.** `strength = max(floors, blend(origination_prior, interaction_strength))` where the prior's confidence **decays as evidence accumulates and time passes** — Dana's `user_add` 100 erodes if no interaction ever follows; Jordan's `calendar_history` 75 hands over to his real interaction record within weeks. (Bayesian shrinkage in spirit; exact prior-decay schedule data-gated.)
+
+**7. Corroboration factors** *(decided)*: with interaction evidence present, `CONNECTED_ON_LINKEDIN` / `CONNECTED_ON_ORBITER` add a small bonus — the [LinkedIn factor rule](/guides/open-work/edge-sync/connected-on-linkedin-in-user-graph).
+
+**8. Coverage-aware absence** *(decided — per-account coverage)*: no evidence where `account_coverage` says we *couldn't see* means **no decay below the origination-derived value**; absence only counts against the score where coverage was `full` for the accounts that plausibly would have evidenced the pair.
+
+**9. Floors, watermarks, hysteresis** *(existing spec, unchanged)*: presence floor 8, historical floor 15, `update_peak_watermarks`, BONDED hysteresis 70/55, `apply_freeze_if_deceased`.
+
+## Outputs — the propagation point for everything derived
+
+1. **The edge**, only on material change (`|Δstrength| ≥ 2` or tier crossing — write-storm gate, tunable): `strength`, re-derived `weight = 25 + 35 × (1 − strength/100)`, `updated_at`.
+2. **Anchor rows** (`user_contact` payload columns) — same values, AlloyDB-first.
+3. **Org-graph shared edges** — the contributor's materialized strengths push to their org edges (the one sanctioned private→org copy, per governance).
+4. **FOLLOWS re-aggregation** — affected companies' derived FOLLOWS strengths recompute (`min` of contributing KNOWS weights).
+5. **`last_interaction_at`** refresh for traversal-time recency filters.
+
+## Explicitly out of scope (for now)
+
+Notes/files counts as scoring signals, mem0-derived signals, and the LLM sentiment multiplier — each may join the model later as a distinct factor; the additive-factor shape above is designed so they bolt on without rework.
+
+## Related
+
+- [Knows Edge](/guides/open-work/edge-sync/knows-edge) — origination ladder and creation examples
+- [Known — scoring scope](/guides/known/scope/scoring) — the committed function specs this job implements
+- [Contacts Interaction Log](/guides/open-work/contacts-interaction-log) — the input table
+- [Pathfinding](/guides/open-work/edge-sync/pathfinding) — the anchor rows this job refreshes

@@ -28,6 +28,37 @@ Each hop renders with its tier and evidence ("connected on Orbiter, no interacti
 
 In **company mode**, the same assembly runs with the org tier in the middle: the private prefix may be two hops (*user → colleague → colleague's contact*) with the colleague's shared edge coming from an org graph, before the Universe continuation — each hop still labeled with its tier and org of origin.
 
+## Execution timeline — the Ian example, expanded
+
+What actually runs, in order. Standing state: Mark's graph holds `(Mark)-[:KNOWS {weight: 98}]->(Ian)` + `CONNECTED_ON_ORBITER`; his anchor set has 212 rows; Universe holds `(Ian)-[:WORKS_AT {current: true, weight: 20}]->(NVIDIA)`; NVIDIA is not in Mark's graph.
+
+| T | Step | What happens |
+|---|---|---|
+| T0 | Request | `{query: "Nvidia", user_id: mark, mode: personal}` |
+| T1 | Embed once | One 3072-dim vector (locked standard) |
+| T2 | **Parallel dispatch** | **(a)** Universe search on the replica — vector KNN on `:Entity` + exact name → candidates `[{uuid N, NVIDIA}, {uuid J, Jensen Huang}, …]` · **(b)** user-tier search — SQL, not Cypher: membership intersection of the candidates + user-scoped files index · **(c)** anchor-set load — the **full set**, `WHERE user_id = mark` (212 rows) |
+| T3 | Await all | Per-tier budgets (Universe 300ms; the SQL ~10ms) |
+| T4 | Merge & dedupe | By `node_uuid`; NVIDIA not in membership → no direct-hit short-circuit |
+| T5 | **Continuation query** | Second Universe query, target-out: traverse from NVIDIA ≤k hops, match endpoints against the anchor list → returns the segment `(Ian I)-[WORKS_AT w20]->(NVIDIA N)`. Mark appears nowhere in this query. |
+| T6 | **Stitch** (pure Go) | Look up `uuid I` in the loaded anchor rows → prepend `Mark -[KNOWS w98 · CONNECTED_ON_ORBITER]-> Ian` |
+| T7 | Rank | Hop-1 ranking model *(being workshopped)* — strengths `s = (101−w)/100`; the path carries s₁ = 0.03, s₂ = 0.81 |
+| T8 | Hydrate & respond | Display data from projections; per-hop tier labels: *"via Ian Andes — connected on Orbiter; Ian currently works at NVIDIA"* |
+
+**The path exists nowhere until T6** — one private fact (anchor row) plus one public segment, joined on `uuid I`. Two Universe queries total (search + continuation); zero Cypher against the private graph in the hot loop — its contribution rides through the AlloyDB projections, while the graph itself serves private-context retrieval (notes, 1-hop "everything about Ian").
+
+### The anchor-set load is unconditional — full set, never filtered by search results
+
+The anchor set is **a query parameter, not a lookup result**. Which of the 212 anchors connects to NVIDIA is precisely what the continuation query *discovers* — Ian's employment is invisible in Mark's data until Universe reveals it, so pre-filtering anchors by search relevance would require knowing the answer first. The full set also keeps T2 fully parallel and is session-cacheable (invalidated by the seven anchor write triggers), which collapses the membership intersection into an in-memory map lookup — one table, one load per session, three roles (direct-hit check, continuation parameter, stitch metadata).
+
+## Scale *(validated shape + tripwire, 2026-08-09)*
+
+Expected anchor counts: **average 3,000–5,000 contacts per user, up to ~20,000**; team searches union org-shared edges — a 50-member org sharing ~3k each is **~60–100k deduped org anchors**.
+
+- **Loads and caches are indifferent to these numbers**: 20k anchor rows ≈ 1.2MB, milliseconds to load, session-cached; the org anchor map (~6MB at 100k) is **cached at the org level** — computed once, shared by all members' sessions, invalidated by org-edge writes.
+- **The continuation query has two modes.** *IN-list mode* (anchor uuids as a query parameter) is the benchmarked shape at 300–1,000 anchors — fine to ~2k. Above that, *frontier-return mode*: the target-out query returns its (frontier-capped) endpoint uuids, the service intersects against the in-memory anchor map in Go, and paths are fetched only for the matches. Intersection is **O(frontier), independent of anchor count** — 20k personal or 100k org anchors cost the same.
+- **Per-graph memory**: a 20k-stub user graph is tens of MB; the private-tier deployment shards users across instances, and per-graph `NODE_CREATION_BUFFER` should be lowered from its 16,384 default for small-graph density.
+- **Tripwire extension**: the hot-node re-benchmark (~500k Universe nodes or target degree > 1,000) gains an anchor-count dimension — validate frontier-return mode at 20k personal / 100k org anchors before those numbers are real.
+
 ## The anchor set *(specified 2026-08-09 — net-new artifact, does not exist yet)*
 
 **Definition:** the anchor set is the per-user list of every `node_uuid` the user has a **relationship edge** to, with the metadata pathfinding needs to rank hop 1:

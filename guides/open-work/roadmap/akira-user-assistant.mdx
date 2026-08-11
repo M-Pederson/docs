@@ -1,0 +1,163 @@
+---
+title: "Akira User Assistant"
+sidebarTitle: "Akira User Assistant"
+description: 'Workshop: making Akira — the TanStack AI "ask anything, do anything" agent — uniquely learn each user through three memory layers, eager behavioral edges on the User graph, confidence-gated mem0 promotion, and per-user learned skills.'
+icon: "robot"
+---
+
+<Info>
+  **Workshop page — opened 2026-08-11.** We are scoping here. Nothing is locked except items marked **Decided**; everything else is a fork point listed under [Open questions](#open-questions-the-workshop). When the forks resolve, this page graduates to a working spec.
+</Info>
+
+## What Akira is
+
+Akira is Orbiter's general-purpose AI agent. Where Copilot is a scoped in-app chat surface, Akira is the **"ask anything, do anything"** agent: grounded in tools for the things the platform can already do (send email, look up people and companies, draft intros, calendar), it should handle open-ended requests end to end.
+
+The scope of this workshop is the differentiator: Akira should **uniquely learn each user** — who they are, and what they are trying to do most often on the platform — so the harness itself gets smarter per user, not just the prompt.
+
+Two capability tracks, in tension worth naming:
+
+1. **Static capability** — shared tool \+ skill definitions every user gets. Table stakes; inventoried below.
+2. **Learned capability** — per-user memory and per-user compiled workflows. The novel part, and the bulk of this page.
+
+Before either track, though, there is a question that gates the whole design: **where does Akira run, and who pays for its tokens?**
+
+## Question 0 — delivery model & token economics
+
+<Warning>
+  **The fork that gates everything else.** An in-app agent means Orbiter pays OpenRouter for every orchestration token, and "users want to do everything in Akira" (open-ended web research, long agentic loops) becomes an uncapped cost line that scales with engagement. We already know we want an MCP — the open question is whether an in-app Akira exists at all at v1, and how leashed it is.
+</Warning>
+
+### Option A — in-app agent (Orbiter-paid orchestration)
+
+Akira lives in the Orbiter app (TanStack AI). Full control of harness, model, system prompt, and generative UI — but Orbiter pays for every token of every agentic loop. The failure mode is being a **subsidized Perplexity**: generic "search the web and research X" sessions have nothing to do with the graph, burn the most tokens, and are exactly what users will reach for first.
+
+### Option B — MCP-only (host-paid orchestration)
+
+Akira ships as an **Orbiter MCP server**; users connect it to Claude, ChatGPT, or any MCP host they already pay for. The host model does the orchestration — reasoning tokens, long contexts, agentic loops — **billed to the user's own Claude/ChatGPT plan**. Orbiter pays only for **tool execution**: Xano compute, LLM calls inside tools, paid data APIs. Every unit of Orbiter cost is a discrete, meterable tool call.
+
+Bonus: Claude and ChatGPT both have **native web search**. MCP-only means we never ship a `web_search` tool at all — the host does open-web research on its own dime, and Orbiter tools only fire when the request actually touches Orbiter data or actions.
+
+What it costs us: no control of the model or system prompt, no generative UI (the OpenUI renderer plan doesn't apply to external hosts), per-host behavior variance, onboarding friction for non-technical users (mitigated by the Claude/ChatGPT connector directories), and the engagement flywheel partly living outside the app.
+
+### Option C — hybrid (working recommendation)
+
+- **MCP is the "do anything" power surface.** Unbounded requests, open-ended research, long loops — on the user's host plan.
+- **In-app chat stays Copilot: scoped and leashed.** Outcome-focused tool set, cheaper models, capped loop iterations, no generic web search. In-app is where generative UI and guided flows shine; it is not where unbounded agentic work should be subsidized.
+- One backend serves both: the same tool layer, the same memory, the same learning loop — two front doors with different cost profiles.
+
+### What survives MCP-only, per memory layer
+
+The learning loop does not die under MCP-only — it reshapes. One layer is a casualty, one is unchanged, one arguably improves:
+
+| Layer | In-app | MCP-only |
+| --- | --- | --- |
+| Declarative profile block | Injected into the system prompt at session start | Exposed as an MCP **resource** \+ a `get_user_profile` tool; tool descriptions instruct the host to load it first |
+| Behavioral telemetry | Tool-call logs | **Unchanged.** Tool calls hit our server either way — behavioral edges and priors are derived entirely from tool telemetry |
+| Transcript distillation | Post-session job over full transcripts | **The casualty** — we never see the conversation. Replacements: explicit memory tools (`remember_preference`, `recall_memory`) that host models call when tool descriptions ask them to; inference from tool arguments; possibly MCP **sampling** (server-requested completions billed to the host — support is uneven across hosts, verify) |
+| Procedural learned skills | Per-user skill files in our harness | **Arguably better:** a repeated tool sequence compiles into a **server-side composite tool** (e.g. `find_warm_intros_and_draft`) exposed only to that user. Works identically on every host, and collapses N host round-trips into one call |
+| Router priors / prefetch | Bias the TanStack AI router | The server controls each user's tool list and descriptions per OAuth identity — per-user tool curation _is_ the routing prior; prefetch happens inside tool execution |
+
+### Cost containment (applies under every option)
+
+- **Never ship generic web search.** In-app, route research-shaped requests to scoped enrichment tools; on MCP, the host's native search covers it. Shipping our own makes us the search backend.
+- **Meter tool execution.** Per-user / per-plan quotas on expensive tools (enrichment waterfalls, LLM-backed drafting, Serper/Exa-backed lookups); usage credits above the included line. Tool calls are discrete and attributable — this is easy metering, unlike streaming chat tokens.
+- **Leash the in-app surface.** Cheaper router model with escalation, iteration caps, scoped tool set. The in-app agent's job is outcomes, not open-ended research.
+
+## Framework: three memory types
+
+Split the "learn the user" problem into three memory classes — they need different mechanisms and have different costs.
+
+### 1. Declarative memory — who the user is
+
+Mostly free. The user is already a person node in `user_{userId}` with persona narratives from our own enrichment. Akira's context gets a compact **profile block** assembled per user at session start: persona summary, org, role, top relationships. (In-app: system prompt. MCP: resource \+ `get_user_profile` tool.)
+
+Zero new learning infrastructure required for day one — render what the graph already knows about them.
+
+### 2. Preference \+ behavioral memory — what they do most
+
+A **programmatically updated profile doc** (~1–2K tokens, always injected), plus mem0 for the long tail. Two update paths, and we use both:
+
+- **Async distillation** — post-session, a small model (Flash-Lite class) extracts durable facts and preferences from the transcript ("prefers bullet drafts," "always CCs Josh," "working on the seed close") and merges them into the profile doc with dedup \+ newest-wins conflict resolution. Never inline during the conversation — latency and prompt complexity aren't worth it. _Under MCP-only this path is replaced by memory tools \+ tool-arg inference (see Question 0 table)._
+- **Telemetry aggregation, no LLM** — a cron over Akira's tool-call logs produces an intent distribution (which outcome types, which tools, which contacts) rendered into a **behavioral priors** section of the profile doc. This is the [Intelligence Engine](/guides/open-work/intelligence-engine) concept applied at the User-graph level — same machinery, new layer. _Surface-independent: works identically under MCP._
+
+Long-tail episodic memories do **not** go in the profile doc. They live in mem0 (Akira sessions are exactly the **AI-chat memory** rail that [mem0 Scope](/guides/open-work/mem0-scope) already assigns to mem0) with a `recall_memory` tool for retrieval.
+
+### 3. Procedural memory — the harness itself gets smarter
+
+The genuinely novel layer. When a user repeats a multi-step tool sequence successfully (e.g. _find warm intros to X → draft email → check calendar_), distill it into a **per-user skill / macro** Akira can invoke as one step next time.
+
+- Static skills = shared capability definitions. Learned skills = per-user compiled workflows. A Voyager-style skill library, per tenant.
+- Under MCP-only, a learned skill materializes as a **server-side composite tool** exposed only to that user — host-agnostic and cheaper than replaying the sequence step by step.
+- Side benefit: **tool-routing priors** — bias tool selection toward what this user historically wants, and pre-fetch likely context (a user who is 80% investor-outcome queries gets Investor Intelligence context warmed at session start).
+
+## Storage: mem0 AND User-graph edges
+
+<Note>
+  **Decided 2026-08-11:** we use both. mem0 is the fast, fuzzy conversational-recall layer and the capture buffer; the User graph is the curated, structured, load-bearing store. The write path splits by **edge class**.
+</Note>
+
+### Behavioral (factual) edges — written eagerly, event-driven
+
+Tool invocations, outcome-type requests, emails drafted/sent, profiles viewed — facts with zero interpretation risk, so there is no reason to wait for a distillation pass. But never synchronous with the action: the action emits an event and a consumer writes the edge (the existing Pub/Sub → Cloud Run pattern from the avatar pipeline). An action must never fail or slow down because FalkorDB hiccuped.
+
+Two implementation rules:
+
+- **Aggregate, don't accumulate.** No 500 raw `INVOKED` edges per user. Raw events land in an AlloyDB event table; the graph gets upserted **aggregate** edges — `(:User)-[:USES {count, first_seen, last_seen}]->(:OutcomeType)`, `(:User)-[:ATTENDS_TO {weight, last_seen}]->(:Person|:Org)`. MERGE-based upserts, idempotent consumer (Pub/Sub is at-least-once).
+- **The real payoff is beyond Akira.** Attention edges written as actions happen feed straight into the affinity metric family — a user repeatedly drafting emails to someone or invoking investor outcomes is a live signal for leverage-loop and outcome ranking, not just Akira context. Inline behavioral edges make the whole scoring system smarter, which is why they are worth doing eagerly.
+
+### Interpretive edges — written lazily, confidence-gated
+
+Preferences, goals, traits ("prefers terse drafts," "actively raising") require an LLM judgment, and low-confidence judgments must not become graph truth mid-conversation. Two async paths in:
+
+- **mem0 promotion job** — mem0 already extracts memories from Akira sessions; treat it as the capture buffer and run a sync job that promotes memories to graph edges only when confidence is high **or** the same fact recurs N times.
+- **Bitemporal semantics on change** — when a preference shifts, close the old edge (`valid_to = now`) and open a new one rather than mutating. Preference drift is exactly what the bitemporal ontology models, and it keeps the temporally-aware-graph patent story coherent.
+
+### Proposed new edge types
+
+Roughly four new edge types on top of the existing ontology:
+
+| Edge | Class | Shape | Purpose |
+| --- | --- | --- | --- |
+| `USES` | Behavioral | `(:User)-[:USES {count, first_seen, last_seen}]->(:OutcomeType\|:Tool)` | Feature / tool affinity — feeds routing priors |
+| `ATTENDS_TO` | Behavioral | `(:User)-[:ATTENDS_TO {weight, last_seen}]->(:Person\|:Org)` | Entity attention — feeds affinity metrics \+ leverage loop |
+| `PREFERS` | Interpretive | `(:User)-[:PREFERS {confidence, valid_from, valid_to}]->(:Preference)` | Distilled preferences, bitemporal |
+| `PURSUING` | Interpretive | `(:User)-[:PURSUING {confidence, valid_from, valid_to}]->(:Objective)` | Active objectives — the most bitemporal-heavy of the four |
+
+Add TTL / decay on the behavioral weights so a hiring sprint from March doesn't still bias ranking in August.
+
+## Guardrails
+
+<Note>
+  **Decided** — these ship with v1, not after.
+</Note>
+
+- **User-visible, user-editable memory.** The profile doc is inspectable and correctable by the user (trust \+ SOC 2 / DSAR posture).
+- **TTL / decay on behavioral priors** so stale patterns don't fossilize.
+- **Write filtering.** Never persist instructions that would degrade the agent's honesty or safety ("always agree with me").
+- **Instrumentation.** Memory hit/miss and whether personalization changed the outcome, tracked in Phoenix — so we can prove the loop works.
+
+## Open questions — the workshop
+
+Numbered so we can resolve them one at a time on this page.
+
+1. **Delivery model.** Is there an in-app Akira at all at v1, or MCP-first with Copilot as the only in-app chat (the hybrid above)? Sub-questions: which hosts support MCP sampling (for host-billed distillation); onboarding friction for non-technical users; how much per-host behavior variance we can tolerate; whether learned composite tools need user approval before appearing in their tool list.
+2. **Profile doc schema \+ home.** Exact sections (identity block, preferences, behavioral priors, active objectives?), token budget, and where it lives — Xano table vs AlloyDB. Versioned or overwrite-in-place?
+3. **Distillation path.** In-app: which model, what trigger, the extraction prompt, dedup / conflict-resolution rules (newest-wins is the starting position). MCP: which memory tools we expose and how tool descriptions coax hosts into calling them reliably.
+4. **Telemetry pipeline.** Which Akira events get logged, where the event table lives, cron cadence, and the decay half-life for behavioral weights.
+5. **mem0 promotion job.** Confidence threshold, the N for recurrence, sync cadence, and how promotion dedupes against edges that already exist.
+6. **Learned-skill representation.** How repeated tool sequences are detected, how a learned skill materializes (server-side composite tool is the working answer), and whether the user reviews/approves a skill before it activates.
+7. **Static tool inventory.** Which app functions get tools first — send email, entity lookup, calendar, warm-intro pathfinding, what else? Explicitly **not** generic web search.
+8. **Metering \+ quotas.** Per-plan quotas on expensive tools, usage credits, and where enforcement lives (tool layer, not chat layer).
+9. **Relationship to Copilot / AI SDK migration.** Under the hybrid, Copilot stays the in-app surface — does the AI SDK Migration scope change, and does Akira's tool layer become the shared backend for both?
+10. **Privacy \+ compliance.** DSAR export of the profile doc \+ memories; delete cascade = mem0 wipe \+ bitemporal edge close; OAuth scopes for the MCP server.
+11. **Evals.** The Phoenix metrics that prove personalization changed outcomes — what's the control?
+
+## Next steps
+
+- [ ] Resolve Question 0 (delivery model) — it gates the distillation path, UI plans, and cost model.
+- [ ] Inventory the static tool surface (question 6) against what the app can already do server-side.
+- [ ] Confirm where Akira tool-call events can be emitted today (question 3 depends on it).
+- [ ] Draft the profile doc schema (question 1) — it unblocks 2 and 3.
+- [ ] Draft the mem0 promotion job spec.
+- [ ] When forks are resolved, promote this page to a working spec and move the workshop history to the PR.

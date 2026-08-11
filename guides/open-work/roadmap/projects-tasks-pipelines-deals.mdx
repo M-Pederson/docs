@@ -1,0 +1,176 @@
+---
+title: "Projects, Tasks, Pipelines & Deals"
+sidebarTitle: "Projects, Tasks, Pipelines & Deals"
+description: "Workshop scope for user-created Projects (nestable), Tasks (assignable to teammates, with a personal to-do placeholder), Pipelines with custom stages, and Deals as the individual pipeline records for a project — starting from the v1 table design."
+icon: "diagram-project"
+---
+
+<Note>
+**Status: workshop — scope not locked.** This page cuts a buildable v1 from the full Deal Flow design. Prior art: [Deal Flow](/guides/open-work/roadmap/deal-flow) (product framing) and the [29-table backend design](/guides/open-work/deal-flow) (`df_*` data model, verified against live Xano workspace 3). This workshop does not re-open that design's locked contracts — it selects the v1 subset and resolves the deltas the simpler project-centric model introduces. Suggested decisions are marked **Δ** and collected in [Open questions](#open-questions).
+</Note>
+
+## The model in one example
+
+> **Project** = "Seed Round" · **Pipeline** = "Investors" · **Deals** = one card per investor firm moving through the stages.
+
+| Stage | `category` (immutable) | Suggested `probability` |
+|---|---|---|
+| Candidate | `backlog` | 5 |
+| Outreach | `started` | 10 |
+| Discovery Meeting | `started` | 25 |
+| Additional Meeting | `started` | 40 |
+| Diligence | `started` | 60 |
+| Investment | `done` | 100 |
+| **Δ Passed** *(suggested addition)* | `canceled` | 0 |
+
+**Δ Suggestion:** every pipeline needs at least one `canceled`-category stage. The example stage list has no exit for an investor who passes — without a "Passed" stage, dead deals either rot in Diligence or get deleted and lose their history. Seed it into the Investor template by default.
+
+A deal in this pipeline anchors to the firm (`master_company_id` → graph node) and carries the partner running the process as a stakeholder (`df_deal_association`, role `decision_maker` or `champion`). Angel investors are people, not firms — see [Q3](#open-questions).
+
+## Concepts
+
+| Concept | Definition | Key rule |
+|---|---|---|
+| **Project** | User-created container of work ("Seed Round", "Q4 Sales Push"). | Projects can be **branches of projects** — arbitrary nesting via self-FK ("Seed Round" can sit under "Fundraising"). |
+| **Task** | Atomic unit of work, assignable to team members. | A task has a project **or** lands in the user's non-project placeholder ("Mark's To-Dos"). |
+| **Pipeline** | A named, fully customizable stage sequence (Investors, Sales, Partnerships, Hiring). | Pipelines are org-level definitions, reusable across projects. Stages are **rows, never enums** — rename/recolor/reorder with zero migrations. |
+| **Stage** | One column of a pipeline, with an immutable semantic `category` (`backlog / unstarted / started / done / canceled`). | Renames never break analytics — rollups key off `category`. |
+| **Deal** | The individual pipeline-based record for a project — one opportunity at one stage of one pipeline. | Anchors to graph nodes (`master_company` / `master_person`), never shadow contacts. |
+
+## Relationship to the Deal Flow backend design
+
+The [backend design](/guides/open-work/deal-flow) already specifies 29 core + 14 AI-layer `df_*` tables. This workshop proposes shipping **8 of them** as v1 and defers the rest. Contracts preserved as-is:
+
+- `df_` namespace; polymorphic `resource_type` values use table-name strings.
+- Statuses/stages are first-class rows with an **immutable `category`** enum.
+- All user-reorderable lists use **LexoRank text** `position` columns.
+- Everything scoped to `organization_id` (→ `organization` 695); soft-delete via `deleted_at`.
+- Deals and stakeholders anchor to `master_company` (142) / `master_person` (139) — no shadow contact records.
+- Build prerequisite: composite btree on `organization_membership` (696) `(user_id, organization_id, status)`.
+
+**Deferred out of v1** (unchanged in the backend design, built later): custom fields (5 tables), sharing/grants/multiplayer layer (9 tables), automation + forecasting + templates (4 tables), the AI layer (14 tables), multi-home tasks, task dependencies, recurrence, reminders, and project sections.
+
+**Δ v1 access model:** with the grant layer deferred, v1 visibility is simply "every accepted member of the org sees the org's projects/pipelines/deals; personal to-dos (`df_project_id = null`) are visible only to their creator." All reads still filter on `organization_id` — Xano has no RLS safety net.
+
+## v1 table design (first pass — 8 tables)
+
+Column lists below are the v1 cut; full field-by-field specs live on the [backend design](/guides/open-work/deal-flow). **Δ** marks a delta against that spec.
+
+### `df_project`
+
+Hierarchical container. Unchanged from the backend design.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id`, `created_at`, `updated_at`, `deleted_at` | — | standard; `deleted_at` = soft delete |
+| `organization_id` | `int → organization` | tenant scope, NOT NULL |
+| `user_id` | `int → user` | owner/creator |
+| `parent_df_project_id` | `int → df_project` | nullable self-FK; **null = root, set = branch** |
+| `path` / `depth` | `text` / `int` | materialized ancestor chain (`/12/40/91/`) for O(1) subtree reads — Xano has no recursive CTEs |
+| `title`, `description`, `icon_name`, `project_color` | `text` | container shape mirrors `team` (613) |
+| `lifecycle_state` | `enum[planned,started,paused,completed,canceled]` | project state lives here in v1, not in `df_status` |
+| `lead_user_id`, `start_date`, `target_date` | — | nullable |
+| `position` | `text` | LexoRank among siblings |
+| `is_archived` | `bool` | default false; `first_notnull` on read |
+
+### `df_task`
+
+One entity for tasks, subtasks, and personal to-dos.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id`, `created_at`, `updated_at`, `deleted_at` | — | standard |
+| `organization_id` | `int → organization` | NOT NULL |
+| `user_id` | `int → user` | creator |
+| `df_project_id` | `int → df_project` | **NULLABLE — null = personal to-do** ("Mark's To-Dos" is a saved view over these rows, not a table — see Q4) |
+| `parent_task_id` | `int → df_task` | nullable self-FK; subtasks; acyclicity guarded on write |
+| `status_id` | `int → df_status` | trigger enforces `status.scope = 'task'` |
+| `title`, `description` | `text` | title full-text indexed |
+| `priority` | `int` | 0–4 |
+| `start_date`, `due_date` | `timestamp` | nullable; `due_date` drives My-Tasks sort |
+| `started_at`, `completed_at`, `canceled_at` | `timestamp` | stamped on category transitions — cycle-time analytics from day one |
+| `position` | `text` | LexoRank |
+| `is_archived` | `bool` | default false |
+
+**Δ Cut for v1:** `section_id`, `remind_at`, `recurrence_rule`, `recurrence_parent_task_id`, `estimate` — all additive later via the safe incremental column-add route (`POST /table/{id}/schema/type/{type}`).
+
+### `df_task_assignee`
+
+Join table — multiple assignees per task, never a scalar FK. `(df_task_id, user_id)` unique; `(organization_id, user_id)` btree powers the My-Tasks fan-in. Unchanged from the backend design.
+
+### `df_pipeline`
+
+Org-level, reusable stage-sequence definition. Unchanged from the backend design: container shape (`title`, `description`, `icon_name`, `pipeline_color`), `kind` enum (`fundraising / sales / partnerships / custom`), `currency` (ISO-4217 default for its deals), `is_default`, `is_archived`, LexoRank `position`, soft delete, org-scoped.
+
+### `df_status`
+
+The unified status/stage engine for tasks **and** deals. Unchanged from the backend design: `scope` enum (`task / deal`), `df_pipeline_id` (set when `scope = deal`), user-renamable `name`, **immutable `category`**, `color`, LexoRank `position`, `is_default`, `probability` (0–100 forecast weight), `rotting_days`. A table trigger enforces that a deal's stage belongs to the deal's pipeline.
+
+**Δ Seeding without `df_template`:** the backend design ships default pipelines via `df_template` (deferred). For v1, seed the starter pipelines (Investors, Sales) in the create-org / first-run function directly. `df_template` arrives later without migration.
+
+### `df_deal`
+
+The individual pipeline record for a project.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id`, `created_at`, `updated_at`, `deleted_at` | — | standard |
+| `organization_id` | `int → organization` | NOT NULL |
+| `df_project_id` | `int → df_project` | **Δ REQUIRED in this model** (backend design had it nullable) — a deal is always "for a project". See Q1. |
+| `df_pipeline_id` | `int → df_pipeline` | owning pipeline |
+| `df_status_id` | `int → df_status` | current stage; trigger enforces pipeline match + `scope = 'deal'` |
+| `master_company_id` | `int → master_company` | nullable; primary target company (graph node) |
+| `master_person_id` | `int → master_person` | **Δ NEW** — nullable; person-target deals (angels, individual buyers). Fn-layer rule: at least one of company / person / association target. See Q3. |
+| `title` | `text` | full-text indexed |
+| `owner_user_id` | `int → user` | deal owner |
+| `value`, `currency` | `decimal`, `text` | nullable; currency defaults from pipeline |
+| `status` | `enum[open,won,lost]` | derived cache from `stage.category` — never user-edited |
+| `expected_close_date`, `won_at`, `lost_at`, `lost_reason` | — | nullable |
+| `last_stage_change_at` | `timestamp` | rotting anchor |
+| `board_position` | `text` | LexoRank within stage column |
+| `is_archived` | `bool` | default false |
+
+**Δ Cut for v1:** `value_base`, `weighted_value` (FX normalization + weighted rollups arrive with forecasting/`df_target`). Additive columns later.
+
+### `df_deal_association`
+
+Labeled many-to-many stakeholders on a deal → `master_person` / `master_company`, with role enum (`champion / decision_maker / influencer / blocker`). This is how the partner at a firm, a co-investor, or a blocker gets attached. Unchanged from the backend design.
+
+### `df_event`
+
+Append-only timeline: `resource_type` + `resource_id`, `actor_user_id`, `actor_type` (`user / system`), `verb`, JSON payload. **Δ Keep this in v1** even though the AI layer is deferred — stage-move and assignment history is cheap to write from day one, impossible to reconstruct later, and it is the substrate every deferred layer (notifications, automation, agent suggestions) reads. Writing it costs one `db.add` per mutation.
+
+## Suggestions
+
+1. **Ship the v1 cut, not a rival design.** Everything above is a strict subset of the locked backend design plus three deltas (required `df_project_id`, new `master_person_id`, no `df_template` seeding). One namespace, one spine, no throwaway tables.
+2. **Pipelines are org-level definitions; the project↔pipeline link lives on the deal.** "Seed Round" doesn't own the Investors pipeline — its deals reference it. A project's board = its deals grouped by pipeline + stage. This keeps pipelines reusable (the Series A project reuses Investors, with all stage tuning intact) and avoids a `df_project_pipeline` join until board curation actually needs one.
+3. **Seed a `canceled` stage into every template** (the "Passed" row above) and let `rotting_days` flag stalled deals — the two together are what keep boards honest.
+4. **"Mark's To-Dos" is a view, not a row.** Null `df_project_id` = personal to-do; the placeholder is the default name of an auto-provisioned saved view per user (rename-able). No ghost project rows polluting project pickers, no special-casing in project queries.
+5. **Branch projects with `parent_df_project_id` + materialized `path`** exactly as specced — and enforce a sane depth cap (e.g. 5) in the create/move function rather than the schema.
+6. **Keep `df_task_assignee` as a join from day one** even if the UI starts single-assignee — it's the difference between a UI constraint and a schema migration.
+7. **Build order:** tables + indexes sandbox-first → seed function (starter pipelines + statuses) → CRUD endpoints (project, task, pipeline/status, deal) → stage-move endpoint writing `df_event` → My-Tasks + project-board + pipeline-board read endpoints. Frontend follows the [Deal Flow build sequence](/guides/open-work/roadmap/deal-flow#build-sequence) steps 1–6; the AI steps (7–10) wait for the deferred layers.
+
+## Non-goals (v1)
+
+- Custom fields, saved-view persistence beyond the My-Tasks default, and formula/rollup fields.
+- Sharing grants, share links, comments, attachments, followers, presence — v1 is org-visible (see access model above).
+- Automation rules, forecasting targets, FX normalization, `df_template`.
+- The entire AI layer — suggestions, health scores, focus lane, agent grants. `df_event` is the only concession to it.
+- Task recurrence, reminders, dependencies, multi-home, project sections.
+
+## Open questions
+
+| # | Question | Suggested answer |
+|---|---|---|
+| Q1 | Is `df_deal.df_project_id` **required** (this page) or nullable (backend design)? Required matches "deals are the pipeline records **for a project**" — a standalone pipeline just gets a project created for it. Nullable matches classic CRM where a pipeline exists without any project. | Required. One less null-state; "quick add" flows can drop deals into an auto-created default project per pipeline. |
+| Q2 | Do pipelines stay org-level (reusable across projects) or can a project own private pipelines? | Org-level only in v1 (suggestion 2). Revisit if two projects need divergent stage tuning of the "same" pipeline. |
+| Q3 | Person-target deals: add `df_deal.master_person_id`, or force person targets through `df_deal_association` only? | Add the column. Angels/individual buyers are first-class deal targets, and the card needs one primary anchor to render from without a join. |
+| Q4 | Is the personal placeholder a saved view (suggestion 4) or a real auto-provisioned "personal project" row per user? | Saved view. A real row leaks into org project lists or needs a `is_personal` filter on every query forever. |
+| Q5 | Task statuses: one org-wide default `df_status` set (`scope = task`) in v1, or per-project override sets from day one? | One org-wide set in v1. The schema already supports per-project sets (`df_status.df_project_id`) — turn it on when a project actually asks. |
+| Q6 | When an Investor deal hits the `done` stage (Investment), does anything downstream fire — e.g. link into the investor/thesis infrastructure (table 709)? | Out of scope for v1; record the `won_at` stamp and `df_event` row so a later hook has everything it needs. |
+
+## Related
+
+- [Deal Flow](/guides/open-work/roadmap/deal-flow) — product framing, surfaces, agent-ready scope.
+- [Deal Flow backend design](/guides/open-work/deal-flow) — the full 29-table `df_*` spec this v1 is cut from.
+- [Planned Work](/guides/open-work/roadmap) — parent index.

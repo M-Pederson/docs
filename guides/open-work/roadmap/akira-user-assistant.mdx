@@ -163,7 +163,7 @@ Zero new learning infrastructure required for day one — render what the graph 
 A **programmatically updated profile doc** ([schema below](#profile-doc-schema-—-question-1-v0-draft)), plus mem0 for the long tail. Two update paths, and we use both:
 
 - **Async distillation** — post-session, a small model (Flash-Lite class) extracts durable facts and preferences from the transcript ("prefers bullet drafts," "always CCs Josh," "working on the seed close") and merges them into the profile doc with dedup \+ newest-wins conflict resolution. Never inline during the conversation — latency and prompt complexity aren't worth it. _On the MCP surface this path is replaced by memory tools \+ tool-arg inference (see Question 0 table)._
-- **Telemetry aggregation, no LLM** — a cron over Akira's tool-call logs produces an intent distribution (which outcome types, which tools, which contacts) rendered into a **behavioral priors** section of the profile doc. This is the [Intelligence Engine](/guides/open-work/intelligence-engine) concept applied at the User-graph level — same machinery, new layer. _Surface-independent: works identically under MCP._
+- **Telemetry aggregation, no LLM** — the [telemetry pipeline below](#telemetry-pipeline-—-question-3-v0-draft) produces an intent distribution (which outcome types, which tools, which contacts) rendered into a **behavioral priors** section of the profile doc. This is the [Intelligence Engine](/guides/open-work/intelligence-engine) concept applied at the User-graph level — same machinery, new layer. _Surface-independent: works identically under MCP._
 
 Long-tail episodic memories do **not** go in the profile doc. They live in mem0 (Akira sessions are exactly the **AI-chat memory** rail that [mem0 Scope](/guides/open-work/mem0-scope) already assigns to mem0) with a `recall_memory` tool for retrieval.
 
@@ -178,7 +178,7 @@ The genuinely novel layer. When a user repeats a multi-step tool sequence succes
 ## Profile doc schema — Question 1 (v0 draft)
 
 <Note>
-  **Draft for review — 2026-08-11.** The structural decisions (two stores, section contracts, precedence rules) are ready to settle; the budget numbers and the storage-home sub-fork are still open below.
+  **Draft for review — 2026-08-11.** The structural decisions (two stores, section contracts, precedence rules) are ready to settle. The storage-home sub-fork is **resolved with Question 3** below; budget numbers still need validation.
 </Note>
 
 ### Two stores, one rendered block
@@ -192,7 +192,7 @@ The profile doc is a **regenerable projection** — every section can be rebuilt
 
 Overwrite-in-place with a version counter, no version history table: every rendered doc is logged to Phoenix per session anyway, so debugging history lives in traces, not rows.
 
-**Storage-home sub-fork (open):** working recommendation is `profile_overrides` in the app backend (Xano — that's where the settings UI that edits it lives) and `profile_doc` in AlloyDB jsonb (next to the telemetry aggregates that feed it, rebuilt by a nightly Go cron on the contacts-interaction-log pattern). Alternative: both in Xano, rebuilt by a Xano task. Decide with Question 3, since the telemetry table's home is the deciding factor.
+**Storage home — resolved 2026-08-11 with Question 3:** `profile_doc` lives in AlloyDB jsonb, rebuilt by the same nightly Go cron that computes behavioral priors (everything feeding the doc's machine-written sections is already in AlloyDB). `profile_overrides` lives in Xano beside the settings UI that edits it; the cron reads overrides through the existing internal API at render time.
 
 ### Structured JSON (stored shape)
 
@@ -268,7 +268,7 @@ Every interpretive entry carries `source` (`explicit` | `distilled`), `confidenc
 
 ### Remaining sub-forks (Question 1)
 
-- Storage home: overrides in Xano \+ doc in AlloyDB (working rec) vs both in Xano — decide together with Question 3.
+- ~~Storage home~~ — **resolved with Question 3**: overrides in Xano, doc in AlloyDB.
 - Tombstone/dedup key: text hash vs embedding similarity.
 - Does behavioral cadence (active hours / days) earn its tokens in `behavioral_priors`? Starting position: no.
 - Validate the token budgets against real persona summaries.
@@ -285,7 +285,7 @@ Tool invocations, outcome-type requests, emails drafted/sent, profiles viewed �
 
 Two implementation rules:
 
-- **Aggregate, don't accumulate.** No 500 raw `INVOKED` edges per user. Raw events land in an AlloyDB event table; the graph gets upserted **aggregate** edges — `(:User)-[:USES {count, first_seen, last_seen}]->(:OutcomeType)`, `(:User)-[:ATTENDS_TO {weight, last_seen}]->(:Person|:Org)`. MERGE-based upserts, idempotent consumer (Pub/Sub is at-least-once).
+- **Aggregate, don't accumulate.** No 500 raw `INVOKED` edges per user. Raw events land in the [`akira_event` table](#telemetry-pipeline-—-question-3-v0-draft); the graph gets upserted **aggregate** edges — `(:User)-[:USES {count, first_seen, last_seen}]->(:OutcomeType)`, `(:User)-[:ATTENDS_TO {weight, last_seen}]->(:Person|:Org)`. MERGE-based upserts, idempotent consumer (Pub/Sub is at-least-once).
 - **The real payoff is beyond Akira.** Attention edges written as actions happen feed straight into the affinity metric family — a user repeatedly drafting emails to someone or invoking investor outcomes is a live signal for leverage-loop and outcome ranking, not just Akira context. Inline behavioral edges make the whole scoring system smarter, which is why they are worth doing eagerly.
 
 ### Interpretive edges — written lazily, confidence-gated
@@ -308,6 +308,82 @@ Roughly four new edge types on top of the existing ontology:
 
 Add TTL / decay on the behavioral weights so a hiring sprint from March doesn't still bias ranking in August.
 
+## Telemetry pipeline — Question 3 (v0 draft)
+
+<Note>
+  **Draft for review — 2026-08-11.** One emission point, one pipe, two consumers — and no LLM anywhere in it. This section also resolves the Question 1 storage-home fork.
+</Note>
+
+### One emission point, one pipe
+
+The shared tool layer is the single choke point: every Akira call on both surfaces passes through it, which is the same property that makes metering easy — telemetry is complete by construction, no client instrumentation on any host.
+
+After a tool executes, the gateway emits **one event** to a Pub/Sub topic (`akira-events`), fire-and-forget — the avatar-pipeline pattern. A telemetry hiccup must never slow or fail a tool call; this is the same rule as the edge writes because this pipe _is_ the edge-write feed.
+
+### Event taxonomy
+
+| Event | Emitted when | Feeds |
+| --- | --- | --- |
+| `tool_invoked` | Every tool call, success or error (error class in payload) | Behavioral priors, `USES`, metering audit |
+| — entity refs | Stamped inside `tool_invoked`: master person / company IDs extracted from args \+ results at emit time | `ATTENDS_TO` |
+| `quota_denied` | A P/L-class call blocked by quota | Unmet-demand signal — logged, **not** weighted into priors at v1 |
+| `memory_write` | `remember_preference`, pinned add, tombstone | Audit trail for the profile doc |
+| `skill_invoked` | A learned composite tool call | Procedural-layer detection (Question 5) |
+
+**Content-free rule.** The payload carries structure — tool name, entity IDs, latency, token counts, error class, quota bucket — and never content: no email bodies, no search queries, no draft text. Content lives in Phoenix traces under their own retention; DSAR export of telemetry is then trivially safe, and the event table can be kept long enough to be useful.
+
+### The event table (AlloyDB)
+
+```sql
+CREATE TABLE akira_event (
+  event_uuid   uuid PRIMARY KEY,      -- minted by the gateway; dedup key for at-least-once delivery
+  user_id      bigint NOT NULL,
+  occurred_at  timestamptz NOT NULL,
+  surface      text NOT NULL,         -- 'mcp' | 'copilot'
+  host         text,                  -- 'claude' | 'chatgpt' | 'app' | ...
+  session_id   text,
+  event_type   text NOT NULL,         -- 'tool_invoked' | 'quota_denied' | 'memory_write' | 'skill_invoked'
+  tool         text,
+  cost_class   text,                  -- 'R' | 'L' | 'P' | 'A'
+  intent       text,                  -- stamped at write from the static tool→intent map
+  entities     jsonb,                 -- [{"type":"person","id":123}, ...]
+  payload      jsonb                  -- latency_ms, tokens_in/out, error_class, quota bucket
+) PARTITION BY RANGE (occurred_at);   -- monthly partitions
+```
+
+- **Intent is stamped at write time from a versioned, static tool→intent map** — no LLM in this pipeline, ever. v1 map sketch: `warm_intro_paths` / `draft_email` → `outreach`; `search_people` / `get_person` / `search_companies` → `research_network`; `upcoming_meetings` / calendar → `meeting_prep`; collections / notes → `organizing`; `request_enrichment` / `discover` → `expanding_network`. The map lives in config with a version stamp so intent history is reinterpretable.
+- **Retention: 90 days of raw partitions, aggregates forever.** With a 30-day half-life, a day-90 event carries 12.5% weight — dropping the partition loses nothing meaningful, and the durable story lives in the edges and priors.
+
+### Two consumers
+
+1. **Edge writer — near-real-time.** Cloud Run push subscription: insert the raw row (`ON CONFLICT (event_uuid) DO NOTHING`), then MERGE the `USES` / `ATTENDS_TO` aggregates (`count`, `first_seen`, `last_seen`). Idempotent by construction — the raw-row conflict check makes redelivery a no-op for the edge increment too.
+2. **Priors cron — nightly.** Go cron on the contacts-interaction-log pattern: recompute decayed weights from the trailing 90 days of raw events, rewrite `behavioral_priors`, re-render the profile doc (pulling overrides from Xano), bump the version counter, and refresh the `weight` property on `USES` / `ATTENDS_TO` edges.
+
+### Decay math
+
+`weight = Σ 2^(-age_days / half_life)` over a user's events per target, **half-life 30 days** (tunable). The cron recomputes from scratch nightly rather than decaying incrementally: drift-proof, and retuning the half-life re-prices all history for free. `count` / `first_seen` / `last_seen` stay monotonic on the edge; `weight` is the decayed number. Priors caps: top 5 intents, top 8 tools, top 10 entities — sized to the ~300-token budget.
+
+### Phoenix vs telemetry — different jobs
+
+|  | Phoenix traces | `akira_event` |
+| --- | --- | --- |
+| Carries | Full content: prompts, drafts, tool results | Structure only — no content |
+| Retention | Short — debugging \+ evals | 90-day raw, durable aggregates |
+| Consumers | Humans and eval jobs (Question 10) | The learning loop (edges, priors) \+ metering audit |
+
+Never build the learning loop on observability traces — they're content-bearing, short-lived, and access-restricted for good reasons.
+
+### Resolves — Question 1 storage home
+
+Everything that feeds the profile doc's machine-written sections now lives in AlloyDB (events, aggregates, and the cron that renders them), so: **`profile_doc` materializes in AlloyDB jsonb**, rebuilt by the same nightly cron; **`profile_overrides` stays in Xano** beside the settings UI that edits it, read by the cron through the existing internal API at render time.
+
+### Remaining sub-forks (Question 3)
+
+- **Quota counters for the gateway (Question 7):** `count()` over raw events per call vs a fast counter (Redis / a pg counter table). Starting position: SQL count is fine at v1 volume; revisit when tool QPS says so.
+- **Do app-UI events join this pipeline at v1?** (Profile views in the app, outside Akira.) Starting position: no — Akira events only; the contacts interaction log remains a separate input the priors cron can join later.
+- **Half-life value:** 30 days to start; tune against real sessions in Phoenix.
+- **`quota_denied` weighting:** unmet demand is a real signal (a user hitting the `deep_research` wall is telling us something) — logged from day one, but not weighted into priors until we decide it should be.
+
 ## Guardrails
 
 <Note>
@@ -324,23 +400,24 @@ Add TTL / decay on the behavioral weights so a hiring sprint from March doesn't 
 Numbered so we can resolve them one at a time on this page.
 
 1. **~~Delivery model.~~** **Resolved 2026-08-11 — hybrid.** MCP power surface \+ leashed in-app Copilot, one shared tool layer. Remaining sub-questions folded into 2 (memory tools on hosts), 9 (OAuth scopes), and 5 (approval of learned composite tools).
-2. **Profile doc schema \+ home.** **Draft above — needs review.** Remaining: storage home (decide with 3), tombstone dedup key, cadence in priors, budget validation.
+2. **Profile doc schema \+ home.** **Draft above — needs review.** ~~Storage home~~ resolved with 3 (overrides Xano, doc AlloyDB). Remaining: tombstone dedup key, cadence in priors, budget validation.
 3. **Distillation path.** In-app: which model, what trigger, the extraction prompt, dedup / conflict-resolution rules (newest-wins is the starting position). MCP: which memory tools we expose, how tool descriptions coax hosts into calling them reliably, and which hosts support MCP sampling.
-4. **Telemetry pipeline.** Which Akira events get logged, where the event table lives, cron cadence, and the decay half-life for behavioral weights. The answer also settles the profile doc's storage home (Question 1).
+4. **Telemetry pipeline.** **Draft above — needs review.** Remaining: quota-counter mechanism (with 7), app-UI events in or out at v1, half-life tuning, `quota_denied` weighting.
 5. **mem0 promotion job.** Confidence threshold, the N for recurrence, sync cadence, and how promotion dedupes against edges that already exist. Reads the same distilled stream that feeds the profile doc's interpretive sections.
-6. **Learned-skill representation.** How repeated tool sequences are detected, how a learned skill materializes (server-side composite tool is the working answer), and whether the user reviews/approves a skill before it appears in their tool list.
+6. **Learned-skill representation.** How repeated tool sequences are detected (the `skill_invoked` \+ `tool_invoked` event stream is the input), how a learned skill materializes (server-side composite tool is the working answer), and whether the user reviews/approves a skill before it appears in their tool list.
 7. **Static tool inventory.** **Draft above — needs review.** ~~send\_email fork~~ **resolved: draft-and-deeplink at v1.** Remaining: the in-app `web_search` leash settings, email/calendar read scoping through external hosts, quota numbers, Copilot's subset.
-8. **Metering \+ quotas.** Per-plan quotas on L and P class tools, usage credits, and enforcement in the tool layer (decided direction: never in the chat layer).
+8. **Metering \+ quotas.** Per-plan quotas on L and P class tools, usage credits, and enforcement in the tool layer (decided direction: never in the chat layer). Counter mechanism shared with Question 3.
 9. **Relationship to Copilot / AI SDK migration.** Under the hybrid, Copilot stays the in-app surface — does the AI SDK Migration scope change, and does Akira's tool layer become the shared backend for both?
-10. **Privacy \+ compliance.** DSAR export = profile doc \+ overrides \+ mem0 memories; delete cascade = overrides \+ doc wipe, mem0 wipe, bitemporal edge close; OAuth scopes for the MCP server (email/calendar content vs metadata).
+10. **Privacy \+ compliance.** DSAR export = profile doc \+ overrides \+ mem0 memories \+ (content-free) telemetry; delete cascade = overrides \+ doc wipe, mem0 wipe, telemetry purge, bitemporal edge close; OAuth scopes for the MCP server (email/calendar content vs metadata).
 11. **Evals.** The Phoenix metrics that prove personalization changed outcomes — what's the control?
 
 ## Next steps
 
 - [x] Resolve Question 0 (delivery model) — **hybrid, decided 2026-08-11.**
 - [x] Draft the static tool surface (question 6) — **draft above; `send_email` fork resolved: draft-and-deeplink at v1.**
-- [x] Draft the profile doc schema (question 1) — **v0 draft above, needs review.**
+- [x] Draft the profile doc schema (question 1) — **v0 draft above; storage home resolved with question 3.**
+- [x] Draft the telemetry pipeline (question 3) — **v0 draft above, needs review.**
 - [ ] Settle the in-app `web_search` leash, Copilot's subset, and quota numbers (questions 6–7).
-- [ ] Confirm where Akira tool-call events can be emitted today (question 3) — also settles the profile doc's storage home.
-- [ ] Draft the mem0 promotion job spec (question 4).
+- [ ] Draft the mem0 promotion job spec (question 4) — reads the same distilled stream as the profile doc.
+- [ ] Draft the distillation path \+ memory-tool descriptions (question 2).
 - [ ] When forks are resolved, promote this page to a working spec and move the workshop history to the PR.

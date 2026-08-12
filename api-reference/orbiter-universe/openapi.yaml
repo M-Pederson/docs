@@ -1,0 +1,1378 @@
+openapi: 3.1.0
+info:
+  title: Orbiter Universe API
+  version: 0.1.0
+  description: |
+    The consumer-facing contract of the Orbiter Universe backend. Every caller is a registered client (the Orbiter App backend, self-hosted App backends, tooling) authenticating with an API key. Every response carries the canonical entity id — a merged id resolves through the merge chain and the response echoes the requested id.
+servers:
+  - url: https://universe.orbiter.io
+security:
+  - bearerAuth: []
+tags:
+  - name: Entities
+    description: Canonical entity reads and identifier resolution.
+  - name: Enrichment
+    description: |
+      Data-plane enrichment triggers: the company get-or-create entry gate (scope enrich:company) and the person one (enrich:person). The two scopes are independent.
+  - name: Projections
+    description: Versioned company projections consumers upsert from.
+  - name: Graph
+    description: |
+      Operator-only graph seeding (scope graph:seed). Not part of the consumer contract — self-hosted clients never call these.
+  - name: Admin
+    description: |
+      Management plane: client registry and API-key lifecycle (scope clients:manage). Not part of the consumer contract — self-hosted clients never call these.
+  - name: Agents
+    description: |
+      Management plane for the agentic enrichment tier: re-drive stalled Deep Bio jobs, or research one person again on purpose. Staff-only (WorkOS role admin, no scope grants them) because each call can spend provider credit. Not part of the consumer contract — an agent's output leaves through the publish projections like any other fact.
+paths:
+  /v1/entities/{id}:
+    get:
+      operationId: getEntity
+      tags:
+        - Entities
+      summary: Get the canonical entity for an id
+      description: |
+        Resolves the id through the merge chain (merged_into) and returns the living canonical row. The response id may differ from the requested id — consumers must overwrite stored references with the returned id. Requires scope `read:entity`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: The canonical entity.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EntityEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /v1/enrichment/companies/get-add:
+    post:
+      operationId: getAddCompany
+      tags:
+        - Enrichment
+      summary: Get-or-create a company (the enrichment entry gate)
+      description: |
+        The only sanctioned company get-or-create path. Resolves the seed through strong identifiers (profile URL, domain), runs the pre-create guards and the LLM research preflight, dedups against the Universe backbone and the fundable mirror, and creates the company with its initial graph node when nothing matches. Every branch returns the shell: guard misses come back 200 with `company_created: false` and null fields — a blocked input is an answer, not an error. A company name alone is never enough: the seed must carry a domain or profile URL. Requires scope `enrich:company`.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GetAddCompanyRequest'
+      responses:
+        '200':
+          description: The company shell (found, created, or typed miss).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompanyShellEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /v1/enrichment/persons/get-add:
+    post:
+      operationId: getAddPerson
+      tags:
+        - Enrichment
+      summary: Get-or-create a person (the enrichment entry gate)
+      description: |
+        The only sanctioned person get-or-create path. Resolves the seed through its identifiers, dedups BEFORE paying for any provider, then runs the identity ladder (People Data Labs → Enrich Layer → Exa) only when nothing matched, and creates the person with an initial graph node. Every branch returns the shell: guard misses come back 200 with `person_created: false` and null fields — a blocked input is an answer, not an error. Requires scope `enrich:person`, which is independent of `enrich:company`. Two response fields need reading before you integrate. `match_via` names the key that resolved an existing person, so a caller can tell a LinkedIn hit from an email one. `fiber_deferred` means identity is still settling in a background run: the person row and node exist, enrichment has NOT been dispatched yet, and it fires automatically once the run lands — so poll the entity rather than re-posting the seed.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GetAddPersonRequest'
+      responses:
+        '200':
+          description: The person shell (found, created, or typed miss).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PersonShellEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /v1/callbacks/fullenrich:
+    post:
+      operationId: fullEnrichCallback
+      tags:
+        - Enrichment
+      summary: Receive a finished FullEnrich profile (provider plane)
+      description: |
+        **Provider plane, not a consumer surface** — FullEnrich POSTs the profile we asked for. There is no API key and no scope: the caller proves itself with `X-Signature-SHA1`, an HMAC of the raw body keyed with the API key we call FullEnrich with. An unconfigured key denies every request. Documented for operators, not for integration: no consumer may call it, and it reads nothing out of the Universe. Delivery is at-least-once and may arrive more than once for one lookup, so the body is taken as evidence before it is judged. Every signed body is answered 200, including one we cannot parse or attribute — a non-2xx makes FullEnrich redeliver, and redelivery is what once wrote one person's profile onto another. A 500 means we failed to keep the payload and genuinely want it again.
+      security:
+        - providerSignature: []
+      requestBody:
+        required: true
+        description: FullEnrich's webhook body, kept verbatim.
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '200':
+          description: The delivery was taken.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmptyEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /v1/backfill/graph/seed/locations:
+    post:
+      operationId: seedGraphLocations
+      tags:
+        - Graph
+      summary: Run one bounded batch of geography node creation
+      description: |
+        Operator-only. `kind=country` MERGEs `Country:Entity` nodes; `kind=region` MERGEs `Region:Entity` nodes plus their `IN_COUNTRY` edge; `kind=city` MERGEs `City:Entity` nodes plus `IN_REGION` (or `IN_COUNTRY` for region-less cities). Rows whose parent node is missing are held back (`awaiting_parent`) and picked up on a later run — seed countries, then regions, then cities, re-running each while `has_more` is true. Requires an authenticated admin user (role `admin`); consumer API keys are rejected.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                kind:
+                  type: string
+                  enum:
+                    - country
+                    - region
+                    - city
+                limit:
+                  type: integer
+                  description: Rows per batch (default 15, max 100).
+              required:
+                - kind
+      responses:
+        '200':
+          description: Batch summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SeedResultEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /v1/backfill/graph/seed/expertise:
+    post:
+      operationId: seedGraphExpertise
+      tags:
+        - Graph
+      summary: Run one bounded batch of expertise taxonomy node creation
+      description: |
+        Operator-only. `kind=domain` creates `DomainExpertise:Entity` nodes; `kind=subdomain` creates `SubDomainExpertise:Entity` nodes plus `HAS_SUBDOMAIN` edges. Subdomains whose parent domain has no node yet are held back (reported as `awaiting_parent`) and picked up on a later run. Seed domains to exhaustion before subdomains. Re-run while `has_more` is true. Requires an authenticated admin user (role `admin`); consumer API keys are rejected.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                kind:
+                  type: string
+                  enum:
+                    - domain
+                    - subdomain
+                limit:
+                  type: integer
+                  description: Rows per batch (default 15, max 100).
+              required:
+                - kind
+      responses:
+        '200':
+          description: Batch summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SeedResultEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /v1/backfill/graph/wipe:
+    post:
+      operationId: wipeGraph
+      tags:
+        - Graph
+      summary: Wipe enrichment-created graph nodes and/or table rows
+      description: |
+        Operator-only, DESTRUCTIVE. `target` selects what dies — `nodes` (default): one bounded batch of nodes whose labels are outside the reference keep-set (Country, Region, City, DomainExpertise, SubDomainExpertise) — or, with `entity_type`, only that scope's labels (company = Company + Funding_Round; person = Person + its credential nodes Work, Certification, Honor) — plus the write-back ledgers nulled (entities graph_node_uuid / graph_written_at, entity_addresses graph_written_at, funding_rounds graph_node_uuid / raised_edge_uuid) so replay rebuilds them; round caveat: with rows kept, cleared round uuids require a table-side reset before deals reprocess or duplicates land. `tables`: one-transaction delete of enrichment-written ROWS — theses, typed caches, entities and every ON DELETE CASCADE dependent (identifiers, facts, payloads, attempts, queue, satellites, dates, rounds, profiles) — plus fundables.deals.processed_at reset so the fanout re-materializes rounds (mirror data itself untouched); no graph calls. `all`: tables first, then a node batch. Seeded reference rows and nodes always survive. Do not run while enrichment/queue drain is active. Requires `confirm: true`; re-run while `has_more` is true (node batches; table wipes are one-shot). Requires an authenticated admin user (role `admin`); consumer API keys are rejected.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                confirm:
+                  type: boolean
+                  description: Must be true — guards against stray POSTs.
+                limit:
+                  type: integer
+                  description: Nodes per batch (default 1000, max 10000).
+                entity_type:
+                  type: string
+                  description: |
+                    Optional scope; omit to wipe every non-reference node. Known scopes today: company, person.
+                target:
+                  type: string
+                  enum:
+                    - nodes
+                    - tables
+                    - all
+                  description: What dies; omitted = nodes.
+              required:
+                - confirm
+      responses:
+        '200':
+          description: Batch summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WipeResultEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /v1/falkordb:
+    get:
+      operationId: listFalkorDBInstances
+      tags:
+        - Graph
+      summary: List graph connection-config rows
+      description: |
+        Operator-only. Returns every falkordb.falkordb row, newest first. The OLDEST row is the one read at boot to build the graph client. Credentials are included by design. Requires an authenticated admin user (role `admin`); consumer API keys are rejected.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: All connection-config rows.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InstanceListEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      operationId: createFalkorDBInstance
+      tags:
+        - Graph
+      summary: Create a graph connection-config row
+      description: |
+        Operator-only. Inserts a falkordb.falkordb row; the config is read at boot, so it takes effect on the next process start. db_connection or host is required. Requires an authenticated admin user (role `admin`); consumer API keys are rejected.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                graph_name:
+                  type: string
+                user_name:
+                  type: string
+                password:
+                  type: string
+                host:
+                  type: string
+                port:
+                  type: string
+                db_connection:
+                  type: string
+                  description: |
+                    Full endpoint (redis:// / falkors:// URL or host:port); used verbatim when set.
+      responses:
+        '201':
+          description: The created row.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InstanceEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /v1/falkordb/{id}:
+    delete:
+      operationId: deleteFalkorDBInstance
+      tags:
+        - Graph
+      summary: Delete a graph connection-config row
+      description: |
+        Operator-only. Removes a falkordb.falkordb row; effective on the next process start. Requires an authenticated admin user (role `admin`); consumer API keys are rejected.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Deleted (data is null).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmptyEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /v1/admin/clients:
+    post:
+      operationId: createConsumerClient
+      tags:
+        - Admin
+      summary: Register a consumer client
+      description: |
+        Management plane, never part of the consumer data contract. Registers a client with its entitlement scopes; issue a key next via `POST /v1/admin/clients/{id}/keys`. Requires an authenticated admin USER (WorkOS session bearer token, role `admin`) — consumer API keys are always rejected here. Until the auth feature lands the verifier is nil and every deployed environment denies all requests.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                  description: Unique display name for the client org.
+                scopes:
+                  type: array
+                  items:
+                    type: string
+                  description: |
+                    Entitlement scopes — data plane only (read:entity, read:person, read:company, projections:pull, corrections:propose, enrich:company, enrich:person, social_media_insights:company). Unknown scopes are rejected; management actions are role-guarded and have no scope.
+                entitlements:
+                  type: object
+                  description: |
+                    Optional entity-level filter for partial-data deals, e.g. {"entity_types": ["person"]}. Empty = full access within scopes.
+                contact_email:
+                  type:
+                    - string
+                    - 'null'
+              required:
+                - name
+      responses:
+        '201':
+          description: The registered client (no key material).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsumerClientEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: A client with this name already exists.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /v1/admin/clients/{id}/keys:
+    post:
+      operationId: issueConsumerClientKey
+      tags:
+        - Admin
+      summary: Issue an API key for a client
+      description: |
+        Management plane. Mints a raw API key, stores only its SHA-256 hash, and returns the raw key ONCE — it cannot be retrieved again, only revoked and replaced. Multiple active keys per client enable zero-downtime rotation: issue new, deploy, revoke old. Requires an authenticated admin user (role `admin`), never a consumer API key.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                label:
+                  type:
+                    - string
+                    - 'null'
+                  description: Ops label, e.g. "initial key 2026-07".
+                expires_at:
+                  type:
+                    - string
+                    - 'null'
+                  format: date-time
+                  description: Optional expiry; must be in the future.
+      responses:
+        '201':
+          description: The issued key, raw secret included this once.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssuedKeyEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /v1/admin/keys/{id}/revoke:
+    post:
+      operationId: revokeConsumerClientKey
+      tags:
+        - Admin
+      summary: Revoke an API key
+      description: |
+        Management plane. Soft-revokes one key (the row survives for audit); other keys on the same client keep working. Requires an authenticated admin user (role `admin`), never a consumer API key.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Revoked (data is null).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmptyEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /v1/admin/agents/deep-bio/sweep:
+    post:
+      operationId: sweepDeepBioJobs
+      tags:
+        - Agents
+      summary: Re-drive Deep Bio jobs that stopped without settling (management plane)
+      description: |
+        Picks the research jobs that stalled and asks a worker to run each again. **Management plane, staff only** — a WorkOS session with role `admin`, never a consumer API key. There is no scope that grants this, because a swept job can spend provider credit. Three kinds of row are picked: a `pending` job whose run request was lost, an `error` job whose retry is due, and a `running` job whose lease expired because its worker died. Jobs out of attempts are never picked, so a doomed job stops being swept rather than looping. The case this exists for is a job RELEASED after its envelope landed: it holds a paid, valid payload that nothing else will ever normalize. Sweeping that job usually costs NOTHING, because the runner resumes from the stored envelope instead of re-buying the research. It only REQUESTS runs — it never creates a job, so it cannot spend outside the launch guards (freshness window and daily cap). One bounded batch per call, so an operator watches the counts rather than starting an unbounded drain. A full batch is not a cleared backlog: call again until `picked` is zero.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: |
+            Jobs to request in this batch. Omitted uses the server default (5, matching the cron's batch size).
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+      responses:
+        '200':
+          description: |
+            What the sweep asked for. `picked` is what the query returned and `requested` is what was published; a gap means the topic refused and those rows stay picked for the next sweep.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeepBioSweepEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /v1/admin/agents/deep-bio/persons/{id}/force:
+    post:
+      operationId: forceDeepBio
+      tags:
+        - Agents
+      summary: Research one person's Deep Bio again (management plane)
+      description: |
+        Creates a research job even when the person already has a recent successful one, bypassing the freshness window. **Management plane, staff only** — a WorkOS session with role `admin`, never a consumer API key. There is no scope that grants this: one call buys minutes of web research and tens of thousands of output tokens. The daily spend cap STILL APPLIES. Forcing is for re-running one person, never for getting past the ceiling — a refusal by the cap returns 200 with `outcome: skipped` and a null `job_id`, because nothing went wrong, the answer is no. Single-flight still applies too: a person with a live job gets that job's id back rather than a second one. `requested` is false when the job exists but no worker was asked (the run request failed) — the sweep above collects it.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The person entity's canonical id.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: |
+            The job the request resolved to, and what the guards decided.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeepBioForceEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Consumer API key issued by the consumers registry.
+    providerSignature:
+      type: apiKey
+      in: header
+      name: X-Signature-SHA1
+      description: |
+        Provider callback plane. Hex-lowercase HMAC-SHA1 of the raw request body, keyed with the API key we call that provider with — so the provider holds no consumer identity and no second secret exists. Verified against the bytes as sent; a re-serialized body has a different digest.
+  schemas:
+    Meta:
+      type: object
+      properties:
+        requestId:
+          type: string
+      required:
+        - requestId
+    Error:
+      type: object
+      properties:
+        code:
+          type: string
+          description: Upper-snake error kind (VALIDATION_FAILED, NOT_FOUND, ...).
+        message:
+          type: string
+        details:
+          type:
+            - array
+            - 'null'
+          items:
+            type: object
+            properties:
+              field:
+                type: string
+              issue:
+                type: string
+      required:
+        - code
+        - message
+    ErrorEnvelope:
+      type: object
+      properties:
+        data:
+          type: 'null'
+        error:
+          $ref: '#/components/schemas/Error'
+        meta:
+          $ref: '#/components/schemas/Meta'
+      required:
+        - data
+        - error
+        - meta
+    EmptyEnvelope:
+      type: object
+      properties:
+        data:
+          type: 'null'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+      required:
+        - data
+        - error
+        - meta
+    Entity:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: The canonical (living) entity id. Persist this one.
+        requested_id:
+          type: string
+          format: uuid
+          description: The id the caller asked for; differs after a merge.
+        entity_type:
+          type: string
+        display_name:
+          type:
+            - string
+            - 'null'
+      required:
+        - id
+        - requested_id
+        - entity_type
+        - display_name
+    EntityEnvelope:
+      type: object
+      properties:
+        data:
+          $ref: '#/components/schemas/Entity'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+      required:
+        - data
+        - error
+        - meta
+    GetAddCompanyRequest:
+      type: object
+      description: |
+        The 17-field seed contract. Legacy integer fields (data_source_id, source_entity_id) are accepted for caller compatibility and ignored.
+      properties:
+        domain:
+          type: string
+          description: Bare host preferred; URL-shaped values are discarded.
+        profile_url:
+          type: string
+          description: |
+            Company profile URL (LinkedIn company/school page or Crunchbase organization page). /school/ URLs are preserved.
+        company_name:
+          type: string
+          description: Hint only — never used to match or create by itself.
+        source:
+          type: string
+          description: Canonical source string recorded on the entity.
+        data_source_id:
+          type: integer
+          description: Legacy; accepted and ignored.
+        is_vc:
+          type:
+            - boolean
+            - 'null'
+          description: Hint only; VC status is derived from evidence.
+        is_school:
+          type: boolean
+          description: Escalate-only; triggers the school-input guard.
+        queue:
+          type: boolean
+          description: Forces the queue path instead of async dispatch.
+        hold_downstream:
+          type: boolean
+          description: Suppresses both dispatch and queueing.
+        return_fast:
+          type: boolean
+          description: Skips the synchronous LLM preflight only.
+        lookup_only:
+          type: boolean
+          description: Match-only; a miss returns the miss shell.
+        allow_create:
+          type:
+            - boolean
+            - 'null'
+          description: |
+            Defaults true. Explicit false is lookup-only; explicit true unlocks the controlled work-history queue exception.
+        cascade_depth:
+          type: integer
+          description: 0 = seed (async dispatch); >0 = leaf (queued).
+        priority_tier:
+          type:
+            - integer
+            - 'null'
+          description: Explicit 0/1 survives; absent defaults to 4.
+        source_function:
+          type: string
+          description: Trace metadata + fan-out governor key.
+        source_entity_id:
+          type: integer
+          description: Legacy; accepted and ignored.
+        source_entity_uuid:
+          type:
+            - string
+            - 'null'
+          format: uuid
+          description: Originating entity, persisted to the queue.
+        source_entity_type:
+          type: string
+        seeded_by_user:
+          type:
+            - integer
+            - 'null'
+          description: Observability only.
+        force:
+          type: boolean
+          description: |
+            Re-runs providers past the fetch-once/debounce gates on the dispatched run (spend). Eligibility gates and write policies are never bypassed; ignored on queued and lookup-only paths.
+    CompanyShell:
+      type: object
+      description: |
+        Returned populated on found/created branches, null-fielded on misses. company_created is true only on a fresh create.
+      properties:
+        company_created:
+          type: boolean
+        master_company_id:
+          type:
+            - string
+            - 'null'
+          format: uuid
+          description: The Universe entity UUID (canonical id).
+        node_uuid:
+          type:
+            - string
+            - 'null'
+          format: uuid
+          description: |
+            Graph node uuid; populated on creates unless the graph was unavailable (backfilled later).
+        company_name:
+          type:
+            - string
+            - 'null'
+        company_domain:
+          type:
+            - string
+            - 'null'
+        permalink:
+          type:
+            - string
+            - 'null'
+          description: Reserved; always null today.
+        linkedin_url:
+          type:
+            - string
+            - 'null'
+      required:
+        - company_created
+        - master_company_id
+        - node_uuid
+        - company_name
+        - company_domain
+        - permalink
+        - linkedin_url
+    CompanyShellEnvelope:
+      type: object
+      properties:
+        data:
+          $ref: '#/components/schemas/CompanyShell'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+      required:
+        - data
+        - error
+        - meta
+    GetAddPersonRequest:
+      type: object
+      description: |
+        The #13039 seed contract. Legacy integer fields (user_id, source_entity_id) and Xano's data_source environment selector are accepted for caller compatibility and ignored.
+      properties:
+        full_name:
+          type: string
+          description: |
+            Split deterministically into first/middle/last. A provider-supplied name wins over this one.
+        email:
+          type: array
+          items:
+            type: string
+          description: |
+            Lowercased and deduped. Drives the identity ladder; a non-role-local address is a strong key for a person.
+        links:
+          type: array
+          items:
+            type: string
+          description: |
+            Profile and contact URLs. The first linkedin.com/in link becomes the identity candidate; the rest are stored as links.
+        phone_numbers:
+          type: array
+          items:
+            type: string
+          description: |
+            Normalized to E.164. A number with no + and no phone_region is stored but never becomes an identifier — a guessed country code would fuse two unrelated people.
+        company_name:
+          type: string
+          description: Employer hint; read by the orchestrator, not the gate.
+        title:
+          type: string
+          description: Role hint; read by the orchestrator, not the gate.
+        user_id:
+          type: integer
+          description: Legacy; accepted and ignored.
+        source:
+          type: string
+          description: |
+            Business attribution recorded on contact rows (e.g. "User Input", "Hubspot"). Provider-discovered rows carry the provider's own name instead.
+        data_source:
+          type: string
+          description: |
+            Legacy Xano environment selector (live/staging/sandbox); accepted and ignored — each environment has its own database.
+        phone_region:
+          type: string
+          description: |
+            ISO 3166-1 alpha-2 hint (e.g. "GB") that lets a local-format number become an identifier. Not part of the Xano contract.
+        queue:
+          type: boolean
+          description: Forces the queue path instead of async dispatch.
+        deep_research:
+          type: boolean
+          description: |
+            Requests the agentic bio tier; OR-promoted on the queue row, so it is never cleared by a later request that omits it.
+        cascade_depth:
+          type: integer
+          description: |
+            0 = seed (providers run, async dispatch); >0 = leaf (no provider spend, queued) so one seed cannot start a wave.
+        priority_tier:
+          type:
+            - integer
+            - 'null'
+          description: |
+            Passed through as given — an explicit 0 SURVIVES here, unlike Xano, which coerced it to 4 and made the row undrainable.
+        is_c_suite:
+          type: boolean
+          description: Marks a company-seeded executive; read downstream.
+        hold_downstream:
+          type: boolean
+          description: Suppresses both dispatch and queueing.
+        orbiter_verified:
+          type: boolean
+          description: |
+            Accepted; not yet applied to the stored emails (the email writer has no verified flag today).
+        source_function:
+          type: string
+        source_entity_id:
+          type: integer
+          description: Legacy; accepted and ignored.
+        source_entity_uuid:
+          type:
+            - string
+            - 'null'
+          format: uuid
+          description: Discovery provenance, persisted to the queue row.
+        source_entity_type:
+          type: string
+        force:
+          type: boolean
+          description: |
+            Re-runs providers past the debounce on the dispatched run; never rides a queue row.
+    PersonShell:
+      type: object
+      description: |
+        Returned populated on found/created branches, null-fielded on misses. person_created is true only on a fresh create.
+      properties:
+        person_created:
+          type: boolean
+        master_person_id:
+          type:
+            - string
+            - 'null'
+          format: uuid
+          description: The Universe entity UUID (canonical id).
+        node_uuid:
+          type:
+            - string
+            - 'null'
+          format: uuid
+          description: |
+            Graph node uuid; populated on creates unless the graph was unavailable (backfilled later).
+        full_name:
+          type:
+            - string
+            - 'null'
+          description: |
+            A temp_-prefixed value means no source produced a name yet; it is repaired later and must not be displayed.
+        linkedin_url:
+          type:
+            - string
+            - 'null'
+          description: |
+            Identity-grade only — an unverified research candidate is never returned here.
+        match_via:
+          type:
+            - string
+            - 'null'
+          description: |
+            Which key resolved an existing person (linkedin, email, phone, pdl, fundable); null on a create.
+        fiber_deferred:
+          type: boolean
+          description: |
+            Identity is still resolving in a background run. Enrichment has not been dispatched yet and fires when the run settles.
+      required:
+        - person_created
+        - master_person_id
+        - node_uuid
+        - full_name
+        - linkedin_url
+        - match_via
+        - fiber_deferred
+    PersonShellEnvelope:
+      type: object
+      properties:
+        data:
+          $ref: '#/components/schemas/PersonShell'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+      required:
+        - data
+        - error
+        - meta
+    SeedFailure:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        error:
+          type: string
+      required:
+        - id
+        - name
+        - error
+    SeedResult:
+      type: object
+      properties:
+        kind:
+          type: string
+        remaining_before:
+          type: integer
+          description: Queue depth before this batch ran.
+        processed:
+          type: integer
+        created:
+          type: integer
+        edges_created:
+          type: integer
+        awaiting_parent:
+          type: integer
+          description: |
+            Subdomain rows held back because their parent domain has no node yet (subdomain kind only; 0 otherwise).
+        failed:
+          type: array
+          items:
+            $ref: '#/components/schemas/SeedFailure'
+        has_more:
+          type: boolean
+          description: True when rows remain — run another batch.
+      required:
+        - kind
+        - remaining_before
+        - processed
+        - created
+        - edges_created
+        - awaiting_parent
+        - failed
+        - has_more
+    SeedResultEnvelope:
+      type: object
+      properties:
+        data:
+          $ref: '#/components/schemas/SeedResult'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+      required:
+        - data
+        - error
+        - meta
+    WipeResult:
+      type: object
+      properties:
+        remaining_before:
+          type: integer
+          description: Non-reference nodes in the graph before this batch.
+        nodes_deleted:
+          type: integer
+        edges_deleted:
+          type: integer
+        entity_links_cleared:
+          type: integer
+          description: |
+            universe.entities rows whose graph_node_uuid / graph_written_at were nulled.
+        address_links_cleared:
+          type: integer
+          description: |
+            universe.master_addresses rows whose graph_written_at was nulled (re-queued for the locations drain).
+        round_links_cleared:
+          type: integer
+          description: |
+            universe.funding_rounds rows whose graph_node_uuid / raised_edge_uuid were nulled — see the operation's round caveat before re-materializing deals.
+        entities_deleted:
+          type: integer
+          description: |
+            universe.entities rows deleted (targets tables/all); cascade victims are not counted separately.
+        rows_deleted:
+          type: integer
+          description: |
+            Explicitly-deleted blocker rows (theses, typed caches, dangling relation facts) for targets tables/all.
+        deals_reset:
+          type: integer
+          description: |
+            fundables.deals rows whose processed_at write-marker was cleared (targets tables/all).
+        has_more:
+          type: boolean
+          description: True when nodes remain — run another batch.
+      required:
+        - remaining_before
+        - nodes_deleted
+        - edges_deleted
+        - entity_links_cleared
+        - address_links_cleared
+        - round_links_cleared
+        - entities_deleted
+        - rows_deleted
+        - deals_reset
+        - has_more
+    WipeResultEnvelope:
+      type: object
+      properties:
+        data:
+          $ref: '#/components/schemas/WipeResult'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+      required:
+        - data
+        - error
+        - meta
+    Instance:
+      type: object
+      description: |
+        One graph connection-config row. Credentials included by design — the point is to hand back connection details.
+      properties:
+        id:
+          type: integer
+          format: int64
+        graph_name:
+          type: string
+        user_name:
+          type: string
+        password:
+          type: string
+        host:
+          type: string
+        port:
+          type: string
+        db_connection:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+      required:
+        - id
+        - graph_name
+        - user_name
+        - password
+        - host
+        - port
+        - db_connection
+        - created_at
+    InstanceListEnvelope:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Instance'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+      required:
+        - data
+        - error
+        - meta
+    InstanceEnvelope:
+      type: object
+      properties:
+        data:
+          $ref: '#/components/schemas/Instance'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+      required:
+        - data
+        - error
+        - meta
+    ConsumerClient:
+      type: object
+      description: A registered consumer client. Never carries key material.
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+        entitlements:
+          type: object
+        contact_email:
+          type:
+            - string
+            - 'null'
+        created_at:
+          type: string
+          format: date-time
+      required:
+        - id
+        - name
+        - scopes
+        - entitlements
+        - contact_email
+        - created_at
+    ConsumerClientEnvelope:
+      type: object
+      properties:
+        data:
+          $ref: '#/components/schemas/ConsumerClient'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+      required:
+        - data
+        - error
+        - meta
+    IssuedKey:
+      type: object
+      description: |
+        A freshly issued key. raw_key appears here and nowhere else — only its SHA-256 hash is stored.
+      properties:
+        id:
+          type: string
+          format: uuid
+        client_id:
+          type: string
+          format: uuid
+        label:
+          type:
+            - string
+            - 'null'
+        expires_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        raw_key:
+          type: string
+      required:
+        - id
+        - client_id
+        - label
+        - expires_at
+        - created_at
+        - raw_key
+    IssuedKeyEnvelope:
+      type: object
+      properties:
+        data:
+          $ref: '#/components/schemas/IssuedKey'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+      required:
+        - data
+        - error
+        - meta
+    DeepBioSweep:
+      type: object
+      required:
+        - picked
+        - requested
+        - failed
+        - job_ids
+      properties:
+        picked:
+          type: integer
+          description: Rows the sweep query returned.
+        requested:
+          type: integer
+          description: Rows a worker was successfully asked to run.
+        failed:
+          type: integer
+          description: |
+            Rows whose run request could not be published. They stay picked for the next sweep.
+        job_ids:
+          type: array
+          description: The jobs a run was requested for.
+          items:
+            type: string
+            format: uuid
+    DeepBioSweepEnvelope:
+      type: object
+      required:
+        - data
+      properties:
+        data:
+          $ref: '#/components/schemas/DeepBioSweep'
+        error:
+          type:
+            - 'null'
+        meta:
+          type:
+            - object
+            - 'null'
+    DeepBioForce:
+      type: object
+      required:
+        - outcome
+        - job_id
+        - requested
+      properties:
+        outcome:
+          type: string
+          enum:
+            - created
+            - already_running
+            - fresh
+            - skipped
+          description: |
+            What the guards decided. `created` is a new job; `already_running` means single-flight handed back a live one; `skipped` means the daily cap refused. `fresh` cannot occur here — forcing bypasses the freshness window — and is listed only because the field shares its vocabulary with the launch outcome.
+        job_id:
+          type:
+            - string
+            - 'null'
+          format: uuid
+          description: Null when the request was refused before a row existed.
+        requested:
+          type: boolean
+          description: |
+            Whether a worker was asked to run the job. False for a job that already has a worker, or when the run request failed.
+    DeepBioForceEnvelope:
+      type: object
+      required:
+        - data
+      properties:
+        data:
+          $ref: '#/components/schemas/DeepBioForce'
+        error:
+          type:
+            - 'null'
+        meta:
+          type:
+            - object
+            - 'null'
+  responses:
+    BadRequest:
+      description: The request failed validation.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Unauthorized:
+      description: Missing, unknown, or revoked API key.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Forbidden:
+      description: The client lacks the entitlement scope for this resource.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    NotFound:
+      description: The resource does not exist.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Internal:
+      description: Unexpected server error.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'

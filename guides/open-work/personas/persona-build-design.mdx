@@ -1,0 +1,115 @@
+---
+title: "Persona Build Design"
+description: "Workshop log for the persona/build-persona test function — one-hop graphContext from the Falkor graph plus Kimi K3 narrative synthesis, iterated against sandbox Richard Kerris."
+icon: "masks-theater"
+---
+
+This is the **working page for the Persona Build workshop** (started 2026-08-14): a test function that turns one `master_person` into the eight persona narratives, iterated live against **sandbox Richard Kerris (`master_person` #9)**. The canonical references stay where they are — [Personas](/guides/open-work/personas) defines the 8 dimensions and schemas, [Build Persona](/guides/open-work/personas/build-persona) carries the canonical extraction prompt, and [New Build Plan](/guides/open-work/personas/new-build-plan) scopes the context sources. This page records what was actually built, how it was tested, and every deviation made along the way.
+
+<Warning>
+  **Behavior change shipped to `mvp/node/update-person-node` (#2758, v1.20 — live, 2026-08-14).** The Person node's `interests` property is now sourced from **`master_person.interests`** (the native array written by social-insights v2/v3 and deep-person-basic) instead of the legacy `interest_join` taxonomy, which produced a comma-joined string. The dead `interest_join` query was removed. `social_media_influence` was already being projected from `master_person.social_media_influence` — verified, no change needed.
+
+  Both properties ride the existing `clean-my-json2` (#2806) gate: **when the source value is null or empty, the parameter is NOT added to the node.** Two consequences to keep in mind: (1) because Cypher `SET` only touches provided keys, a node keeps its **last non-empty value** if the table field is later emptied — there is no clear-on-null; (2) there is **no backfill** — nodes pick up array-shaped interests the next time `update-person-node` runs for that person.
+</Warning>
+
+## What the test function does
+
+`persona/build-persona` (#13349) takes a `master_person_id` and runs two stages. **No DB writes** — it is a response-only prototype.
+
+**Stage 1 — `graphContext`.** Resolves `master_person.node_uuid`, then sends one Cypher through `mvp/falkor/send-cypher` (#2815). Because send-cypher reads its connection from `environmental_variables_falkordb` in the **active data source**, calling with `X-Data-Source: sandbox` automatically targets the sandbox graph.
+
+```cypher
+MATCH (p:Entity {uuid: "{{$var.masterPerson.node_uuid}}"})
+OPTIONAL MATCH (p)-[r]-(n)
+RETURN p AS person, r AS edge, n AS neighbor, CASE WHEN r IS NULL THEN NULL ELSE id(startNode(r)) = id(p) END AS outbound
+```
+
+A shaping lambda folds the rows into the `graphContext` response object:
+
+- `person` — the person's node (labels \+ properties), with **every `*embedding*` property stripped** (they are vector noise for an LLM and huge).
+- `connections[]` — one entry per one-hop edge: `edge_type`, `direction` (`outbound`/`inbound`, computed in-Cypher), `edge_properties` (embeddings stripped — the LLM-written edge `description` and `valid_from`/`valid_to` ride along as evidence), and the packed `neighbor` node.
+- `stats` — `edge_count`, `neighbor_count`, `raw_rows`.
+
+**Stage 2 — synthesis (skip with `synthesize: false`).** The system prompt is rendered in a `util.template_engine` block — it is the [Build Persona](/guides/open-work/personas/build-persona) prompt adapted for graph input (deltas below). The full `graphContext` travels as the **user message**, JSON-stringified and bounded to a 60,000-char evidence budget. The call goes to **`moonshotai/kimi-k3`** on OpenRouter with the house rules: strict ZDR (`data_collection: deny`, `zdr: true`), `require_parameters: true`, `sort: "throughput"`, `response_format: json_object`, temperature 0.2, `reasoning_effort: medium`, `max_tokens` 8000 (headroom for K3 reasoning tokens — the K2048 empty-verdict trap). Kimi is tool-free here, so the moonshotai provider pin is not required (same reasoning as the social-insights helper v2.3). A `model` input overrides the default for A/Bs.
+
+### Prompt deltas vs the canonical Build Persona page
+
+| # | Delta | Why |
+| --- | --- | --- |
+| 1 | Input section describes the `graphContext` JSON (person node \+ one-hop `connections[]`) instead of a YAML document | This builder feeds graph evidence, not the YAML assembler |
+| 2 | `persona_narratives` is an **array of exactly 8 objects** (each carrying `dimension` \+ the fixed metadata \+ `narrative`) instead of an object keyed by dimension | Array-of-narratives output requested for this workshop; fixed metadata unchanged |
+| 3 | `persona_id` is pre-filled as `mp_{master_person_id}` and `snapshot_date` is stamped server-side by the template engine | Deterministic pass-throughs shouldn't burn model attention |
+
+Everything else — the eight dimension definitions, the grounding \+ null rule, voice/length, `persona_sequence_summary` — is reproduced from the canonical prompt.
+
+## Artifacts
+
+<Card icon="play">
+  ```text
+  persona/build-persona — 13349
+  ```
+
+  **The workshop test function** (v0.1). Input `master_person_id` (\+ optional `synthesize`, `model`). Returns `graphContext`, `persona`, and a `synthesis` telemetry object (valid/reason/usage/preview). The production rollup name `person/build-persona` from the Personas page stays reserved for the promoted version (vectors \+ `person_personas` upsert).
+</Card>
+
+<Card icon="layer-group">
+  ```text
+  mvp/node/update-person-node — 2758
+  ```
+
+  **v1.20** — projects `master_person.interests` (native array) and `social_media_influence` onto the Person node; null/empty values are not added (see Warning above). Rollback: `~/xano/persona-build/2758_update-person-node_original.xs`.
+</Card>
+
+<Card icon="globe">
+  ```text
+  POST qa/run-build-persona — api 8988 (Admin Backfill, canonical rlSvC4qe)
+  ```
+
+  **TEMP QA wrapper — unauthenticated — delete after the workshop.** Exists because the metadata function-run endpoint cannot resolve nested `function.run` refs on branch v1. `update_node: true` runs #2758 first; `synthesize: false` stops after `graphContext`.
+</Card>
+
+### Run it
+
+```bash
+curl -X POST "https://xh2o-yths-38lt.n7c.xano.io/api:rlSvC4qe/qa/run-build-persona" \
+  -H "Content-Type: application/json" \
+  -H "X-Data-Source: sandbox" \
+  -H "X-Branch: v1" \
+  -d '{"master_person_id": 9, "update_node": true, "synthesize": true}'
+```
+
+## Test log — 2026-08-14, Richard Kerris (sandbox #9)
+
+| Run | Input | Result |
+| --- | --- | --- |
+| 1 — node projection \+ graph only | `update_node: true, synthesize: false` | **PASS**, 7.7s. Node now carries `interests` as a native 9-element array and the `social_media_influence` paragraph. graphContext: **26 edges / 23 neighbors**, all directions resolved, embeddings stripped. |
+| 2 — full synthesis | defaults (kimi-k3) | **PASS**, 15.8s, **\$0.068**. 16,181 prompt / 1,328 completion tokens. Valid JSON array, **8/8 narratives non-null**, summary present. |
+
+Edge mix in run 1: `WORKS_AT` ×12, `HAS_EXPERTISE` ×6, `ATTENDED` ×2, `ADVISOR_TO` ×2, `BOARD_MEMBER_OF` ×2, `WORKED_ON` ×1, `LOCATED_IN` ×1 — all outbound.
+
+**Grounding checks that passed** (the point of feeding the graph, not just the table row):
+
+- `track_record` and `passions_interests` both picked up the `WORKED_ON` edge — the 2007 "The Bongos \+ Moby: Bulrushes" music video — which exists **only** as a graph edge.
+- `domain_focus` was written from the six `HAS_EXPERTISE` edge descriptions (developer relations, VFX technology strategy, 3D software product management, …), citing the companies from their evidence fields.
+- `passions_interests` used the new node `interests` array (photography, music, drums, star trek, the beatles, film, travel, food, family).
+- `communication_style` leaned on `social_media_influence` (platform mix \+ "around 23 reactions per LinkedIn post").
+- `person.location` resolved from the `LOCATED_IN` neighbor (San Francisco) — not present as a node property.
+- No fabrications spotted against the underlying enrichment data; calibrated language ("suggests", "appears") used on the interpretive dimensions.
+
+<Accordion title="Run 2 — persona_sequence_summary (verbatim)">
+  Richard Kerris is GM of Media & Entertainment and Head of Worldwide Developer Relations at NVIDIA in San Francisco, capping a three-decade career at the intersection of entertainment technology and developer ecosystems. His expertise spans media & entertainment strategy, developer relations, VFX technology, 3D software (Maya), professional video tools (Final Cut Pro, Shake), and cloud rendering, built through leadership roles at Alias|Wavefront, Apple, Lucasfilm (as CTO), HP, Nokia, AWS, and startups like Avegant and OTOY where he held board and advisory seats. A Variety "Top 10 Innovators to Watch" honoree who appeared in multiple Steve Jobs keynotes, he is a repeat builder of worldwide developer relations organizations with a knack for translating technical depth into market narrative. Publicly he posts about NVIDIA, AI, and media on LinkedIn and X with an evangelist's voice, and beyond work he is drawn to photography, music, drumming, the Beatles, Star Trek, film, travel, and family.
+</Accordion>
+
+## Iteration backlog
+
+1. **Prompt tokens are dominated by graphContext** (16.2k prompt tokens for a 26-edge person). The biggest lever is trimming edge telemetry that carries no persona signal — `match_score`, `semantic_input`, `description_generated_at`, `weight`, internal timestamps — while keeping `description`, `valid_from`/`valid_to`, `evidence`, `depth`, `recency`. Est. 30–40% reduction.
+2. **Social posts are not in the graph** — stage 2 sees the synthesized `social_insights`/`social_media_influence` node properties, not the first-party `social_post` corpus (table 776). Decide whether the promoted builder joins that evidence directly (the v3 posts capture would make `public_engagement`/`communication_style` quotable and dated).
+3. **Fleet run** across the 16 sandbox people to check null-rule behavior on sparse profiles (Siddeek/Mwangi-class) — the Kerris result can't validate that narratives go null when they should.
+4. **Promotion path**: 8 embeddings (per the locked gemini standard) \+ `person_personas` upsert \+ rename to `person/build-persona`; then delete temp api 8988.
+
+## Related
+
+- [Personas](/guides/open-work/personas) — canonical 8-dimension design, schemas, matcher plan
+- [Build Persona](/guides/open-work/personas/build-persona) — canonical extraction prompt this workshop adapted
+- [New Build Plan](/guides/open-work/personas/new-build-plan) — context-source scoping that led here
+- [Social Insights v3 tests](/guides/open-work/enrichment-engine-v1-1/social-insights-v3-tests) — where `interests` and `social_media_influence` get written

@@ -49,6 +49,11 @@ tags:
     description: Important dates a user tracks about their contacts, and the shared date labels. Requires a verified WorkOS access token.
   - name: Discover
     description: Deep-research records. Requires a verified WorkOS access token.
+  - name: EdgeSync
+    description: |
+      Operator surface over the Edge Sync funnel: schedule a rebuild of a
+      user's graph and observe outstanding projection work. Requires a
+      verified WorkOS access token.
   - name: EmailAddresses
     description: Email addresses on persons/companies. Requires a verified WorkOS access token.
   - name: EmailFolders
@@ -68,7 +73,9 @@ tags:
   - name: Files
     description: |
       File-ingestion pipeline. Register a GCS object and the worker
-      extracts → classifies → optionally builds a pitch profile.
+      extracts → classifies → chunks → embeds, then completes the file.
+      A fundraising deck additionally queues a pitch profile, built as a
+      separate stage: `status: completed` does not mean its profile is ready.
   - name: GetStream
     description: Inbound Stream Chat (GetStream) webhooks recording chat messages as comments.
   - name: Imports
@@ -78,6 +85,7 @@ tags:
       per-row report. Requires a verified WorkOS access token.
   - name: Links
     description: Web links on persons/companies. Requires a verified WorkOS access token.
+  - name: Memories
   - name: MergeSuspects
     description: Suspected duplicate contacts for user review.
   - name: Notes
@@ -799,6 +807,111 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /connection-requests:
+    get:
+      tags:
+        - Connections
+      summary: List pending connection requests
+      description: |
+        The caller's pending connection requests, both directions (not yet
+        accepted, not declined, not blocked). Clients split incoming vs
+        outgoing on user_from_id. Ports Xano GET /orbiter-connect-requests.
+      operationId: listConnectionRequests
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Pending requests involving the caller.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionRequestsResponseEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags:
+        - Connections
+      summary: Send a connection request
+      description: |
+        Creates a pending request from the verified session user to
+        user_to_id — there is deliberately no user_from_id field, identity
+        never comes from the body. 409 when the users are already connected
+        or a pending request exists in either direction; declined requests
+        don't block a retry. Ports Xano POST /orbiter-connect-requests.
+      operationId: createConnectionRequest
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateConnectionRequestRequest'
+      responses:
+        '201':
+          description: Request created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionRequestResponseEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /connection-requests/{id}:
+    patch:
+      tags:
+        - Connections
+      summary: Accept or decline a connection request
+      description: |
+        Only the recipient may respond, and only while the request is
+        pending. Accepting stamps connected_at and writes the bidirectional
+        users.connection_joins pair in one transaction. Ports Xano PUT
+        /orbiter-connect-requests/{id}.
+      operationId: updateConnectionRequest
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Connection request id.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateConnectionRequestRequest'
+      responses:
+        '200':
+          description: The updated request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionRequestResponseEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '500':
           $ref: '#/components/responses/Internal'
   /organizations:
@@ -3500,50 +3613,18 @@ paths:
           $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/Internal'
-  /contacts/imports/upload-url:
-    post:
-      tags:
-        - Imports
-      summary: Create a signed upload URL for a contact-import file
-      description: |
-        Mints a short-lived V4 signed PUT URL under the caller's storage
-        prefix. The client must PUT the file with the same Content-Type
-        and an `x-goog-content-length-range: 0,<max_bytes>` header — both
-        are bound into the signature.
-      operationId: createImportUploadURL
-      security:
-        - bearerAuth: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/CreateUploadURLRequest'
-      responses:
-        '200':
-          description: Signed upload URL and its constraints.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/UploadURLEnvelope'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '500':
-          $ref: '#/components/responses/Internal'
   /contacts/imports:
     post:
       tags:
         - Imports
-      summary: Register an uploaded file as a contact import
+      summary: Register a contact import
       description: |
-        Creates the import job and starts asynchronous processing. File
-        sources (linkedin_csv, vcard) send the gcs_uri of an upload under
-        the caller's own prefix; the nylas source sends nylas_grant_id —
-        one of the caller's connected email accounts — and the worker
-        syncs the grant's full address book (looping the Nylas
-        next_cursor).
+        Creates the import job and starts asynchronous processing.
+        File sources (linkedin_csv, vcard) POST multipart/form-data with an
+        `input_source` field and a `file` part, streamed straight into
+        storage. The nylas source POSTs JSON with nylas_grant_id — one of
+        the caller's connected email accounts — and the worker syncs the
+        grant's full address book (looping the Nylas next_cursor).
       operationId: registerContactImport
       security:
         - bearerAuth: []
@@ -3553,6 +3634,20 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/RegisterImportRequest'
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - input_source
+                - file
+              properties:
+                input_source:
+                  type: string
+                  description: 'File source format: linkedin_csv or vcard. Must precede the file part.'
+                file:
+                  type: string
+                  format: binary
+                  description: The raw export file.
       responses:
         '201':
           description: Created import job (status pending).
@@ -3675,6 +3770,180 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /log-and-parse/runs:
+    post:
+      tags:
+        - Imports
+      summary: Start a mailbox log-and-parse run
+      description: |
+        Kicks off a per-user parse of all the caller's connected email
+        accounts. Sweeps messages + calendar events once, discovers the
+        people the user actually knows, and writes one email_account_import
+        row per eligible person. Runs asynchronously; poll the run for status.
+      operationId: startLogParseRun
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartRunRequest'
+      responses:
+        '202':
+          description: Run accepted and queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LogParseRunEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+    get:
+      tags:
+        - Imports
+      summary: List a connected account's log-and-parse runs
+      description: |
+        Returns the caller's runs for one connected email account, newest
+        first — the account's parse history. grant_id is required.
+      operationId: listLogParseRuns
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: grant_id
+          in: query
+          required: true
+          description: The Nylas grant id to filter runs by.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The account's runs, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListLogParseRunsEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /log-and-parse/runs/{run_id}:
+    get:
+      tags:
+        - Imports
+      summary: Get a log-and-parse run
+      operationId: getLogParseRun
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: The run and its counters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LogParseRunEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /contacts/{contacts_id}/memories:
+    get:
+      tags:
+        - Memories
+      summary: List a contact's memories
+      description: |
+        Returns the caller's mem0 memories about one contact — the content of the
+        relationship extracted from email/calendar/notes. Scoped to the caller.
+      operationId: listContactMemories
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: contacts_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: The contact's memories.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListMemoriesEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /contacts/{contacts_id}/memories/search:
+    post:
+      tags:
+        - Memories
+      summary: Search a contact's memories
+      description: Semantic search within the caller's memories about one contact.
+      operationId: searchContactMemories
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: contacts_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SearchMemoriesRequest'
+      responses:
+        '200':
+          description: Matching memories, ranked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListMemoriesEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /me/memories:
+    get:
+      tags:
+        - Memories
+      summary: List the caller's own memories
+      description: The caller's user-scoped memories (goals, preferences).
+      operationId: listUserMemories
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The caller's own memories.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListMemoriesEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/Internal'
   /travels:
@@ -6871,6 +7140,80 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/Internal'
+  /edge-sync/rebuild:
+    post:
+      tags:
+        - EdgeSync
+      summary: Rebuild the caller's graph
+      description: |
+        Schedules a full rebuild of the authenticated user's graph: the relay
+        drops it and replays it from Postgres. The owner is taken from the
+        verified session, never the body, so a caller cannot schedule work
+        against another user's graph.
+
+        Returns 202 — the rebuild happens on the relay's next pass.
+      operationId: rebuildUserGraph
+      security:
+        - bearerAuth: []
+      responses:
+        '202':
+          description: The rebuild was scheduled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RebuildEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /edge-sync/backfill:
+    post:
+      tags:
+        - EdgeSync
+      summary: Schedule a rebuild for every user
+      description: |
+        Operator endpoint. Schedules a rebuild for every user whose graph can
+        be rooted, and returns how many were queued. Backs the migration off
+        the old `:Profile` shape and the periodic backstop.
+
+        Users with no linked person are skipped: there is no `node_uuid` to
+        root their graph at.
+      operationId: backfillUserGraphs
+      security:
+        - bearerAuth: []
+      responses:
+        '202':
+          description: The sweep was scheduled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackfillEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /edge-sync/status:
+    get:
+      tags:
+        - EdgeSync
+      summary: Get funnel status
+      description: |
+        Reports outstanding funnel work. A pending count that climbs without
+        falling means the relay is not draining.
+      operationId: getEdgeSyncStatus
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Current funnel status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
   /falkordb:
     get:
       tags:
@@ -6978,6 +7321,322 @@ paths:
           $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/Internal'
+  /files:
+    get:
+      tags:
+        - Files
+      summary: Retrieve the caller's files by filter
+      description: |
+        One endpoint for every retrieval. Filters combine, and the response shape
+        depends on which are present:
+
+        - `q` — text search. Without `semantic`, matches `file_name` /
+          `display_name` with a case-insensitive substring match; costs no
+          embedding call, so it is safe for type-ahead. With `semantic=true` the
+          query is embedded and files are ranked by how close their nearest chunk
+          sits to it. Returns one row PER FILE either way, so a document with
+          many matching passages does not crowd out the rest. Ranked, so no
+          cursor is returned.
+        - `ids` — batch read of specific files, for polling upload progress in
+          one request instead of one per file. Ids the caller cannot see are
+          omitted rather than erroring.
+        - `contact_id` / `company_contact_id` — that one contact's files.
+        - `scope` — `mine` (the caller's uploads), `contacts` (every file across
+          all the caller's contacts), or `all` (default, both). Ignored when a
+          contact is pinned.
+
+        Every variant is scoped to the caller: files they own, or files linked to
+        a contact they own. Soft-deleted files are never returned.
+      operationId: listUserFiles
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: q
+          schema:
+            type: string
+          description: Search text. Matched against file names unless `semantic=true`.
+        - in: query
+          name: semantic
+          schema:
+            type: boolean
+            default: false
+          description: |
+            Rank by meaning instead of matching names. Costs a live embedding
+            call, so it is opt-in rather than the default.
+        - in: query
+          name: ids
+          schema:
+            type: string
+          description: Comma-separated file ids. Use for upload-progress polling.
+        - in: query
+          name: scope
+          schema:
+            type: string
+            default: all
+          description: One of `mine`, `contacts`, `all`. Ignored when a contact is pinned.
+        - in: query
+          name: contact_id
+          schema:
+            type: string
+            format: uuid
+        - in: query
+          name: company_contact_id
+          schema:
+            type: string
+            format: uuid
+        - in: query
+          name: classification
+          schema:
+            type: string
+          description: Narrow to one LLM-assigned file type, e.g. `pitch_deck`.
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - in: query
+          name: cursor
+          schema:
+            type: string
+          description: Opaque cursor from a prior page. Not used by `q` or `ids`.
+      responses:
+        '200':
+          description: |
+            A page of files, or ranked search hits when `q` is present.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/ListFilesResponseEnvelope'
+                  - $ref: '#/components/schemas/SearchFilesEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /files/upload:
+    post:
+      tags:
+        - Files
+      summary: Upload one or many files
+      description: |
+        Stores each file in GCS, records its row, and publishes `files.uploaded`
+        per file, so every uploaded file independently runs the whole pipeline
+        (extract → classify → chunk → embed). Returns immediately with
+        `status=pending` for each; poll `GET /v1/files?ids=…` for progress.
+
+        IMPORTANT — part ordering: send every text field BEFORE the file parts.
+        Each file streams straight to GCS as it is reached, so `contact_id` and
+        `company_contact_id` must already be known and verified by then.
+
+        Byte-transfer progress is a client-side concern (`XMLHttpRequest.upload.
+        onprogress`); the server cannot report it sooner than the client knows it.
+
+        This route does not accept pre-extracted markdown — it is asynchronous
+        and the worker extracts every file. Use the deprecated
+        `/ingestion/files/upload-file-markdown` if you must supply markdown.
+
+        Files are independent: one failure neither fails the request nor undoes
+        its siblings. `201` when all succeeded, `207` when some failed (per-file
+        `error` in the array), and an error envelope only when none succeeded.
+        Max body size 100 MB across all files.
+      operationId: uploadFiles
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/UploadFilesRequest'
+      responses:
+        '201':
+          description: Every file was stored and queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadFilesEnvelope'
+        '207':
+          description: |
+            Some files were stored and queued; others failed. Inspect each
+            element's `error`. `meta.uploaded` / `meta.failed` carry the counts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadFilesEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: A supplied contact_id / company_contact_id is not the caller's.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /files/{id}:
+    get:
+      tags:
+        - Files
+      summary: Get one of the caller's files
+      description: |
+        Returns a file the caller owns or that is linked to one of their
+        contacts; anything else is a 404 rather than a 403, so the endpoint
+        reveals nothing about other users' files.
+
+        `include_markdown` is opt-in because markdown is the whole extracted
+        document and routinely megabytes.
+      operationId: getUserFile
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - in: query
+          name: include_markdown
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: The file, with markdown when requested.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/FileResponseEnvelope'
+                  - $ref: '#/components/schemas/UploadFileResponseEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    delete:
+      tags:
+        - Files
+      summary: Delete one of the caller's files
+      description: |
+        Soft delete. The row, its GCS blob, and its embeddings all survive, so
+        the file stays restorable and a restore costs no re-extraction. The
+        deletion timestamp is cascaded onto the file's contact links in the same
+        transaction, so the file disappears from every contact listing at once.
+
+        Returns 200 with a null payload, per the house convention that deletes
+        are not 204.
+      operationId: deleteUserFile
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: File soft-deleted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmptyEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /files/{id}/preview:
+    get:
+      tags:
+        - Files
+      summary: Get a link to the file's preview image
+      description: |
+        Returns a short-lived signed URL for the file's preview image — a
+        downscaled render of page one, produced when the file was processed.
+        Available for PDFs and image uploads; other formats have no preview
+        yet and return 404.
+
+        The link is returned instead of the image bytes so the client fetches
+        the object straight from storage. Files whose preview has not been
+        produced (text formats, or anything uploaded before previews existed)
+        return 404. `expires_at` is null when the preview is hosted elsewhere
+        and we did not sign it.
+      operationId: getUserFilePreview
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: A link to the preview image.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FilePreviewEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /files/{id}/rename:
+    post:
+      tags:
+        - Files
+      summary: Rename one of the caller's files
+      description: |
+        Sets `display_name`. The upload-time `file_name` is never overwritten:
+        the extraction worker owns it, and other consumers (activities, email
+        attachments, the Xano `files.completed` webhook) read it as the original
+        name. Clients should render `display_name ?? file_name`.
+      operationId: renameUserFile
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RenameFileRequest'
+      responses:
+        '200':
+          description: The renamed file.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileResponseEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
   /ingestion/files:
     post:
       tags:
@@ -7057,6 +7716,7 @@ paths:
         and must be sent **last**, after all text fields, so the server can
         process it in a single pass without buffering it in memory.
       operationId: uploadFileMarkdown
+      deprecated: true
       security:
         - bearerAuth: []
       requestBody:
@@ -7100,6 +7760,7 @@ paths:
         IMPORTANT — part ordering: send the `file` part **last**, after all
         text fields, so they are known when the file part is reached.
       operationId: uploadFileRaw
+      deprecated: true
       security:
         - bearerAuth: []
       requestBody:
@@ -7471,6 +8132,45 @@ paths:
                         type: string
         '401':
           $ref: '#/components/responses/Unauthorized'
+  /persons/url-lookup:
+    post:
+      operationId: lookupPerson
+      tags:
+        - Persons
+      summary: Look up a person by unique signal
+      description: |
+        Resolve a person from any provided unique signal (LinkedIn URL, email, or phone). At least one is required; the first match wins (no priority order). On a miss, third-party enrichment is requested and the response is pending_enrichment.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PersonLookupRequest'
+      responses:
+        '200':
+          description: Lookup result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/PersonLookup'
+                  error:
+                    type:
+                      - object
+                      - 'null'
+                  meta:
+                    type: object
+                    properties:
+                      request_id:
+                        type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
   /person-financials:
     get:
       operationId: getPersonFinancials
@@ -7831,6 +8531,81 @@ paths:
                         type: string
         '401':
           $ref: '#/components/responses/Unauthorized'
+    post:
+      operationId: createCompany
+      tags:
+        - Companies
+      summary: Create a company
+      description: |
+        Resolve a company from its website or LinkedIn/Crunchbase company page and add it to the authenticated user's contacts. A company we do not already hold is created through the enrichment provider and written here under the id it assigns. Idempotent: repeating the call returns the same company with company_created and contact_added false.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompanyCreateRequest'
+      responses:
+        '200':
+          description: Company already existed; contact ensured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompanyCreateEnvelope'
+        '201':
+          description: Company created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompanyCreateEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /companies/url-lookup:
+    post:
+      operationId: lookupCompany
+      tags:
+        - Companies
+      summary: Look up a company by unique signal
+      description: |
+        Resolve a company from any provided unique signal (LinkedIn URL, domain, email, or phone). At least one is required; the first match wins (no priority order). On a miss, third-party enrichment is requested and the response is pending_enrichment.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompanyLookupRequest'
+      responses:
+        '200':
+          description: Lookup result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CompanyLookup'
+                  error:
+                    type:
+                      - object
+                      - 'null'
+                  meta:
+                    type: object
+                    properties:
+                      request_id:
+                        type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
   /companies/{company_id}:
     get:
       operationId: getCompany
@@ -7982,6 +8757,64 @@ paths:
                         type: string
         '401':
           $ref: '#/components/responses/Unauthorized'
+    post:
+      operationId: addCompanyContact
+      tags:
+        - Company Contacts
+      summary: Add a company to contacts
+      description: |
+        Creates the caller's company contact and copies the company's public detail records (emails, links, addresses, phones) into the contact join tables. Idempotent: re-adding returns 200 with contact_added=false.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompanyAddContactRequest'
+      responses:
+        '200':
+          description: Company contact already existed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CompanyAddContact'
+                  error:
+                    type:
+                      - object
+                      - 'null'
+                  meta:
+                    type: object
+                    properties:
+                      request_id:
+                        type: string
+        '201':
+          description: Company contact created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CompanyAddContact'
+                  error:
+                    type:
+                      - object
+                      - 'null'
+                  meta:
+                    type: object
+                    properties:
+                      request_id:
+                        type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
   /company-contacts/clone:
     post:
       operationId: cloneCompanyContacts
@@ -9034,6 +9867,119 @@ components:
           type: 'null'
         meta:
           $ref: '#/components/schemas/Meta'
+    ConnectionRequest-2:
+      type: object
+      required:
+        - id
+        - user_from_id
+        - user_to_id
+        - request_message
+        - declined
+        - from_blocked
+        - connected_at
+        - accept_message
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        user_from_id:
+          type:
+            - string
+            - 'null'
+          format: uuid
+        user_to_id:
+          type:
+            - string
+            - 'null'
+          format: uuid
+        request_message:
+          type:
+            - string
+            - 'null'
+        declined:
+          type: boolean
+        from_blocked:
+          type: boolean
+        connected_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        accept_message:
+          type:
+            - string
+            - 'null'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    ConnectionRequestsResponse:
+      type: object
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConnectionRequest-2'
+    ConnectionRequestsResponseEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          $ref: '#/components/schemas/ConnectionRequestsResponse'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+    CreateConnectionRequestRequest:
+      type: object
+      required:
+        - user_to_id
+      properties:
+        user_to_id:
+          type: string
+          format: uuid
+        request_message:
+          type:
+            - string
+            - 'null'
+          maxLength: 2000
+    ConnectionRequestResponseEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          $ref: '#/components/schemas/ConnectionRequest-2'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+    UpdateConnectionRequestRequest:
+      type: object
+      required:
+        - action
+      properties:
+        action:
+          type: string
+          enum:
+            - accept
+            - decline
+        accept_message:
+          type:
+            - string
+            - 'null'
+          maxLength: 2000
     OrganizationListItem:
       type: object
       required:
@@ -10620,8 +11566,10 @@ components:
         - nylas_grant_id
         - email
         - enabled
+        - error
         - threads
-      description: One Nylas grant's thread list, optionally with a next page cursor.
+      description: |
+        One Nylas grant's thread list, optionally with a next page cursor. A grant whose upstream fetch failed (e.g. provider rate limit) is returned with enabled=false, error set, and empty threads — one throttled account never fails the whole response.
       properties:
         nylas_grant_id:
           type: string
@@ -10630,6 +11578,10 @@ components:
           format: email
         enabled:
           type: boolean
+        error:
+          type:
+            - string
+            - 'null'
         next_cursor:
           type: string
         threads:
@@ -11107,6 +12059,22 @@ components:
           type: boolean
         parsed:
           type: boolean
+        seven_day_parsed:
+          type: boolean
+        history_complete:
+          type: boolean
+        parse_status:
+          type: string
+        earliest_interaction_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        last_parsed_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
         oldest_sync:
           type:
             - string
@@ -11506,8 +12474,11 @@ components:
         - name
         - is_primary
         - event_widget_preference
+        - enabled
+        - error
         - events
-      description: A calendar paired with its enriched events for the requested range.
+      description: |
+        A calendar paired with its enriched events for the requested range. A calendar whose upstream fetch failed (e.g. provider rate limit) is returned with enabled=false, error set, and empty events instead of being silently dropped.
       properties:
         id:
           type: string
@@ -11521,6 +12492,12 @@ components:
           type: boolean
         event_widget_preference:
           type: boolean
+        enabled:
+          type: boolean
+        error:
+          type:
+            - string
+            - 'null'
         events:
           type: array
           items:
@@ -11560,54 +12537,6 @@ components:
             - 'yes'
             - 'no'
             - maybe
-    CreateUploadURLRequest:
-      type: object
-      required:
-        - filename
-        - content_type
-      properties:
-        filename:
-          type: string
-          description: Original filename, e.g. Connections.csv.
-        content_type:
-          type: string
-          description: MIME type the client will PUT with, e.g. text/csv.
-    UploadURLResponse:
-      type: object
-      required:
-        - upload_url
-        - object_key
-        - gcs_uri
-        - max_bytes
-        - expires_at
-      properties:
-        upload_url:
-          type: string
-          description: Signed PUT URL.
-        object_key:
-          type: string
-        gcs_uri:
-          type: string
-          description: Pass back on register.
-        max_bytes:
-          type: integer
-          format: int64
-        expires_at:
-          type: string
-          format: date-time
-    UploadURLEnvelope:
-      type: object
-      required:
-        - data
-        - error
-        - meta
-      properties:
-        data:
-          $ref: '#/components/schemas/UploadURLResponse'
-        error:
-          type: 'null'
-        meta:
-          $ref: '#/components/schemas/Meta'
     ContactImportResponse:
       type: object
       required:
@@ -11622,6 +12551,11 @@ components:
           type: string
         source_filename:
           type: string
+        nylas_grant_id:
+          type:
+            - string
+            - 'null'
+          description: Nylas grant id this import syncs; null for file sources.
         status:
           type: string
           description: 'Job lifecycle: pending, parsing, importing, completed, failed.'
@@ -11717,23 +12651,15 @@ components:
       required:
         - input_source
       properties:
-        gcs_uri:
-          type: string
-          description: URI returned by the upload-url endpoint. Required for file sources (linkedin_csv, vcard).
         input_source:
           type: string
-          description: 'Source format: linkedin_csv, vcard, or nylas.'
-        source_filename:
-          type:
-            - string
-            - 'null'
-          description: Display filename; defaults to the object key basename.
+          description: Source format. JSON registration is nylas-only; file sources use multipart.
         nylas_grant_id:
           type:
             - string
             - 'null'
           format: uuid
-          description: Connected email account id (from GET /v1/nylas-grants). Required for the nylas source; gcs_uri is ignored.
+          description: Connected email account id (from GET /v1/nylas-grants). Required for the nylas source.
     ContactImportEnvelope:
       type: object
       required:
@@ -11815,6 +12741,182 @@ components:
           type: 'null'
         meta:
           $ref: '#/components/schemas/Meta'
+    LogParseRunResponse:
+      type: object
+      required:
+        - id
+        - grant_id
+        - depth
+        - status
+        - messages_seen
+        - events_seen
+        - nylas_requests
+        - addresses_written
+        - gmail_quota_units
+        - provider_requests_email
+        - provider_requests_event
+        - throttle_wait_ms
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        grant_id:
+          type: string
+        depth:
+          type: string
+        status:
+          type: string
+          description: pending | sweeping | completed | failed | grant_error | rate_limited
+        messages_seen:
+          type: integer
+        events_seen:
+          type: integer
+        nylas_requests:
+          type: integer
+        addresses_written:
+          type: integer
+        gmail_quota_units:
+          type: integer
+          description: Gmail quota units consumed (Nylas-Gmail-Quota-Usage header, email endpoints).
+        provider_requests_email:
+          type: integer
+        provider_requests_event:
+          type: integer
+        throttle_wait_ms:
+          type: integer
+          description: Total ms self-throttled under the Gmail unit budget.
+        window_start:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        window_end:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        started_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        completed_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        error:
+          type:
+            - string
+            - 'null'
+        created_at:
+          type: string
+          format: date-time
+        candidates_processed:
+          type: integer
+          description: Discovered counterparts evaluated in the processing pass.
+        contacts_added:
+          type: integer
+          description: People promoted to contacts.
+        company_contacts_added:
+          type: integer
+          description: Company contacts promoted.
+        threads_summarized:
+          type: integer
+          description: Email threads AI-summarized (0 when AI is off).
+        processed_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: When the processing pass finished (distinct from completed_at, the sweep).
+    ListLogParseRunsEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/LogParseRunResponse'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+    StartRunRequest:
+      type: object
+      required:
+        - depth
+        - grant_id
+      properties:
+        depth:
+          type: string
+          description: Processing scope — "7d" or "all". Not enforced as an enum server-side.
+          example: 7d
+        grant_id:
+          type: string
+          description: Required Nylas grant id — a run parses exactly one connected account.
+    LogParseRunEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          $ref: '#/components/schemas/LogParseRunResponse'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+    Memory:
+      type: object
+      required:
+        - id
+        - text
+        - metadata
+        - score
+        - created_at
+      properties:
+        id:
+          type: string
+        text:
+          type: string
+        metadata:
+          type: object
+          additionalProperties: true
+        score:
+          type:
+            - number
+            - 'null'
+        created_at:
+          type: string
+    ListMemoriesEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Memory'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+    SearchMemoriesRequest:
+      type: object
+      required:
+        - query
+      properties:
+        query:
+          type: string
+          description: The search query.
     TravelResponse:
       type: object
       required:
@@ -15921,6 +17023,84 @@ components:
           type: 'null'
         meta:
           $ref: '#/components/schemas/Meta'
+    Rebuild:
+      type: object
+      required:
+        - scheduled
+        - reason
+      properties:
+        scheduled:
+          type: boolean
+          description: Always true; the work runs on the relay's next pass.
+        reason:
+          type: string
+          description: Why the rebuild was queued, recorded on the outbox event.
+      additionalProperties: false
+    RebuildEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          $ref: '#/components/schemas/Rebuild'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+      additionalProperties: false
+    Backfill:
+      type: object
+      required:
+        - queued
+        - reason
+      properties:
+        queued:
+          type: integer
+          description: How many rebuilds were scheduled.
+        reason:
+          type: string
+          description: Why the sweep was queued, recorded on each outbox event.
+      additionalProperties: false
+    BackfillEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          $ref: '#/components/schemas/Backfill'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+      additionalProperties: false
+    Status:
+      type: object
+      required:
+        - pending_events
+      properties:
+        pending_events:
+          type: integer
+          format: int64
+          description: Outbox events not yet applied.
+      additionalProperties: false
+    StatusEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          $ref: '#/components/schemas/Status'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+      additionalProperties: false
     FalkorDBInstance:
       type: object
       required:
@@ -16047,6 +17227,13 @@ components:
         classification:
           type: string
           description: LLM-assigned file type (e.g. pitch_deck, term_sheet).
+        display_name:
+          type:
+            - string
+            - 'null'
+          description: |
+            The user's rename, null until renamed. file_name keeps the
+            upload-time name; clients render display_name ?? file_name.
         status:
           type: string
           description: |
@@ -16092,6 +17279,232 @@ components:
           type: 'null'
         meta:
           $ref: '#/components/schemas/Meta'
+    FileMatch:
+      type: object
+      required:
+        - id
+        - file_name
+        - gcs_uri
+        - status
+        - match_type
+      description: |
+        One search hit. `snippet` and `distance` are non-null only for a semantic
+        match, where the ranking came from a chunk rather than the name.
+      properties:
+        id:
+          type: string
+          format: uuid
+        file_name:
+          type: string
+        display_name:
+          type:
+            - string
+            - 'null'
+        gcs_uri:
+          type: string
+        classification:
+          type:
+            - string
+            - 'null'
+        status:
+          type: string
+        match_type:
+          type: string
+          description: '`name` or `semantic`.'
+        snippet:
+          type:
+            - string
+            - 'null'
+          description: The nearest matching chunk's text.
+        distance:
+          type:
+            - number
+            - 'null'
+          description: Cosine distance of the nearest chunk; smaller is closer.
+    SearchFilesResponse:
+      type: object
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/FileMatch'
+    SearchFilesEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          $ref: '#/components/schemas/SearchFilesResponse'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+    UploadFilesRequest:
+      type: object
+      required:
+        - file
+      description: |
+        Multi-file upload body. Send all text fields FIRST, then one `file` part
+        per file. No markdown field: the worker extracts every file.
+      properties:
+        file_source:
+          type: string
+          maxLength: 255
+          description: Free-form source label. Defaults to `user-upload`.
+        contact_id:
+          type: string
+          format: uuid
+          description: |
+            Attach every file in this request to this contact. Must be one of the
+            caller's own contacts, else 404. May be combined with
+            `company_contact_id`: a deck can belong to a person and their company.
+        company_contact_id:
+          type: string
+          format: uuid
+          description: Attach every file to this company contact. Must be the caller's.
+        file:
+          type: array
+          items:
+            type: string
+            format: binary
+          description: |
+            One or more file parts, each named `file`. Send them LAST, after
+            every text field.
+    UploadedFile:
+      type: object
+      required:
+        - name
+      description: |
+        One element of an upload result. Either the success fields or `error` is
+        populated, never both.
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          description: The file's name; the rename if one exists, else the uploaded name.
+        path:
+          type: string
+          description: Public GCS URL of the stored object.
+        status:
+          type: string
+          description: Always `pending` here; the pipeline runs asynchronously.
+        error:
+          type:
+            - object
+            - 'null'
+          description: Present only for a file that failed.
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+    UploadFilesEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/UploadedFile'
+        error:
+          type: 'null'
+        meta:
+          allOf:
+            - $ref: '#/components/schemas/Meta'
+            - type: object
+              properties:
+                uploaded:
+                  type: integer
+                failed:
+                  type: integer
+    FileResponseEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          $ref: '#/components/schemas/FileResponse'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+    UploadFileResponse:
+      description: |
+        FileResponse plus the document markdown — extracted synchronously by
+        the raw endpoint, or echoed from the supplied value by the markdown
+        endpoint. List/get responses omit markdown to stay lean.
+      allOf:
+        - $ref: '#/components/schemas/FileResponse'
+        - type: object
+          required:
+            - markdown
+          properties:
+            markdown:
+              type: string
+    UploadFileResponseEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          $ref: '#/components/schemas/UploadFileResponse'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+    FilePreview:
+      type: object
+      required:
+        - url
+        - expires_at
+      properties:
+        url:
+          type: string
+          format: uri
+          description: Signed, short-lived link to the preview image.
+        expires_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: |
+            When the link stops working. Null when the preview is hosted
+            elsewhere and carries its own lifetime.
+    FilePreviewEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          $ref: '#/components/schemas/FilePreview'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+    RenameFileRequest:
+      type: object
+      required:
+        - file_name
+      properties:
+        file_name:
+          type: string
+          maxLength: 255
+          description: The new display name. Stored in `display_name`.
     CreateFileRequest:
       type: object
       required:
@@ -16132,19 +17545,6 @@ components:
             - 'null'
           format: int64
           description: Xano suggestion-request id (only set for suggestion-flow ingestions).
-    FileResponseEnvelope:
-      type: object
-      required:
-        - data
-        - error
-        - meta
-      properties:
-        data:
-          $ref: '#/components/schemas/FileResponse'
-        error:
-          type: 'null'
-        meta:
-          $ref: '#/components/schemas/Meta'
     UploadFileRawRequest:
       type: object
       required:
@@ -16190,32 +17590,6 @@ components:
             markdown:
               type: string
               description: Pre-extracted document markdown.
-    UploadFileResponse:
-      description: |
-        FileResponse plus the document markdown — extracted synchronously by
-        the raw endpoint, or echoed from the supplied value by the markdown
-        endpoint. List/get responses omit markdown to stay lean.
-      allOf:
-        - $ref: '#/components/schemas/FileResponse'
-        - type: object
-          required:
-            - markdown
-          properties:
-            markdown:
-              type: string
-    UploadFileResponseEnvelope:
-      type: object
-      required:
-        - data
-        - error
-        - meta
-      properties:
-        data:
-          $ref: '#/components/schemas/UploadFileResponse'
-        error:
-          type: 'null'
-        meta:
-          $ref: '#/components/schemas/Meta'
     EventTypesResponse:
       type: object
       required:
@@ -16537,6 +17911,51 @@ components:
         orbiter_connection:
           oneOf:
             - $ref: '#/components/schemas/Connection'
+            - type: 'null'
+    PersonLookupRequest:
+      type: object
+      description: |
+        Unique signals for POST /persons/url-lookup. At least one must be set.
+      properties:
+        linkedin_url:
+          type: string
+        email:
+          type: string
+        phone:
+          type: string
+    PersonLookupResult:
+      type: object
+      description: Lean person returned when a lookup matches.
+      properties:
+        id:
+          type: string
+          format: uuid
+        full_name:
+          type: string
+        avatar:
+          type:
+            - string
+            - 'null'
+        current_title:
+          type:
+            - string
+            - 'null'
+        bio:
+          type:
+            - string
+            - 'null'
+    PersonLookup:
+      type: object
+      description: Result of POST /persons/url-lookup.
+      properties:
+        found:
+          type: boolean
+        status:
+          type: string
+          description: found | pending_enrichment
+        person:
+          oneOf:
+            - $ref: '#/components/schemas/PersonLookupResult'
             - type: 'null'
     PersonInvestment:
       type: object
@@ -17024,6 +18443,101 @@ components:
         company_contact:
           oneOf:
             - $ref: '#/components/schemas/CompanyContactNested'
+            - type: 'null'
+    CompanyCreateRequest:
+      type: object
+      description: Body for POST /companies.
+      required:
+        - company_name
+        - domain
+      properties:
+        company_name:
+          type: string
+        domain:
+          type: string
+          description: |
+            The company's website, with or without a scheme (acme.com, https://acme.com), or its LinkedIn/Crunchbase company page (https://www.linkedin.com/company/acme).
+    CompanyCreate:
+      type: object
+      description: Result of POST /companies.
+      properties:
+        company_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        domain:
+          type:
+            - string
+            - 'null'
+        linkedin_url:
+          type:
+            - string
+            - 'null'
+        logo:
+          type:
+            - string
+            - 'null'
+        company_created:
+          type: boolean
+          description: True only when this call created the company.
+        company_contact_id:
+          type: string
+          format: uuid
+        contact_added:
+          type: boolean
+          description: True only when this call added the company to the caller's contacts.
+    CompanyCreateEnvelope:
+      type: object
+      properties:
+        data:
+          $ref: '#/components/schemas/CompanyCreate'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+    CompanyLookupRequest:
+      type: object
+      description: |
+        Unique signals for POST /companies/url-lookup. At least one must be set.
+      properties:
+        linkedin_url:
+          type: string
+        domain:
+          type: string
+        email:
+          type: string
+        phone:
+          type: string
+    CompanyLookupResult:
+      type: object
+      description: Lean company returned when a lookup matches.
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        logo:
+          type:
+            - string
+            - 'null'
+        domain:
+          type:
+            - string
+            - 'null'
+    CompanyLookup:
+      type: object
+      description: Result of POST /companies/url-lookup.
+      properties:
+        found:
+          type: boolean
+        status:
+          type: string
+          description: found | pending_enrichment
+        company:
+          oneOf:
+            - $ref: '#/components/schemas/CompanyLookupResult'
             - type: 'null'
     Employees:
       type: object
@@ -17569,6 +19083,28 @@ components:
           $ref: '#/components/schemas/CompanyNested'
         contact_count:
           type: integer
+    CompanyAddContactRequest:
+      type: object
+      required:
+        - company_id
+      properties:
+        company_id:
+          type: string
+          format: uuid
+    CompanyAddContact:
+      type: object
+      description: Result of POST /company-contacts.
+      properties:
+        company_contact_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        company_id:
+          type: string
+          format: uuid
+        contact_added:
+          type: boolean
     CloneCompanyContactsResult:
       type: object
       properties:

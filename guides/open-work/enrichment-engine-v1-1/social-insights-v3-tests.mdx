@@ -1,0 +1,124 @@
+---
+title: "Social Insights v3 Tests"
+description: "Test infrastructure for Social Insights v3: first-party post capture (ScrapeCreators) feeding synthesis. Every new/changed Xano artifact is documented here as the Go/GCP port spec."
+---
+
+> **Status: test infrastructure LIVE in Xano; first sandbox run complete 2026-08-14.** Nothing here touches the v1 production path or the v2 experiment. **This page is the changelog of record for the Go/GCP rebuild** — if v3 tests win, every artifact below is the port spec.
+
+## Hypothesis
+
+v2 proved the evidence pool — not the synthesis model — is the quality bottleneck: Exa snippets are mostly undated and can't see inside walled-garden platforms. v3 adds **first-party post capture**: pull the person's actual recent posts (X, LinkedIn, Instagram) into a table, then hand the synthesis model dated, first-party evidence. Expected wins: real quotes, exact dates, measurable posting cadence, platform-migration signals, and post-evidenced interests.
+
+## Architecture
+
+```text
+profile discovery (existing, inside insights fn: Exa -> LLM 2-evidence audit -> create-master-link)
+        |  known profiles grow run-over-run
+        v
+fetch-person-posts_v3 (#13342)  -- ScrapeCreators -->  social_post (#776)
+        |                                                    |
+        v                                                    v
+get-social-insights_v3 (#13343) -- evidence lanes: 3x Exa + platform envelopes + captured posts
+        |
+        v
+openrouter-grok45-social-call_v2 (#13338, grok-4.6, strict ZDR, throughput-sorted)
+```
+
+<Info>
+  **Discovery convergence note.** Profile discovery still lives _inside_ the insights function (unchanged v2 machinery: Exa candidates → two-evidence-point LLM audit → only high-confidence URLs persisted via `create-master-link` #2541). That means platform coverage for the posts fetcher **grows run-over-run** rather than up front. We evaluated reusing `mvp/music/find-person-social` #13118 as a standalone discovery step — rejected: it is music-specific (hardcodes "musician" in the query) and read-only. **Go port recommendation: extract a dedicated `discover-person-social-profiles` stage and linearize the pipeline as discover → fetch → synthesize.**
+</Info>
+
+## Changelog — new and changed artifacts
+
+<Warning>
+  **NEW TABLE (Go port: becomes a GCP/AlloyDB table).** `social_post` — Xano table **#776**, created 2026-08-14. Platform-agnostic first-party posts. **Natural key: `(master_person_id, platform, post_id)`** with a unique index; upsert-only writer is #13342.
+
+  | Column | Type | Notes |
+  | --- | --- | --- |
+  | `master_person_id` | int → master\_person | author |
+  | `platform` | enum `x / linkedin / instagram / youtube / other` |  |
+  | `post_id` | text | platform-native id (natural-key component) |
+  | `post_url` | text | canonical URL when available |
+  | `posted_at` | timestamp | null when the provider gives no parseable date |
+  | `post_type` | text | post / reshare / reply / article / reel / video |
+  | `post_text` | text | normalized content, capped 4,000 chars |
+  | `engagement` | json | `{likes, comments, reshares, views}`, nulls when unexposed |
+  | `raw` | json | untouched provider item for replay |
+  | `source` | text | e.g. `ScrapeCreators Twitter` |
+  | `fetched_at` | timestamp | last provider fetch |
+
+  Indexes: unique `(master_person_id, platform, post_id)`; btree `(master_person_id, posted_at desc)`; btree `(created_at desc)`.
+</Warning>
+
+<Card icon="cloud-arrow-up">
+  ```text
+  mvp/social/social-insights/fetch-person-posts_v3 — 13342
+  ```
+
+  **NEW — posts capture.** Input `{master_person_id, max_posts? (default 25/platform)}`. Resolves platform targets from `master_link` profile rows with a `twitter_person` handle fallback (this mattered: sandbox Kerris had NO X link in master\_link — the fallback found `@richardkerris`). Three try/catch-isolated lanes call ScrapeCreators, normalize tolerantly (raw payload always kept), and upsert on the natural key. A lane with no handle or a provider error reports zero posts; it never fails the run.
+</Card>
+
+<Card icon="play">
+  ```text
+  mvp/social/social-insights/get-social-insights_v3 — 13343
+  ```
+
+  **NEW — v3 synthesis** (clone of #13339 v2.2). Diff vs v2: reads `twitter_person`/`instagram_person` envelopes (bio, handle, followers) and `social_post` rows (sorted `posted_at` desc, cap 40, 400 chars each) as two new evidence lanes; prompt v3 makes `recent_posts`/`platform_profiles` **tier-0 first-party primary evidence** (posts beat search snippets on conflict), adds hard 90-day recency weighting with quiet-timeline callouts, and makes posts/bios first-class interests sources. Telemetry tagged v3 (`OpenRouter Social Insights v3`, `log_crash` function\_name `…_v3`, `recent_posts_count` \+ `platform_profile_count` in provider\_usage). Interests merge (append-unique) and profile-URL discovery/persistence are unchanged from v2.
+</Card>
+
+<Card icon="globe">
+  ```text
+  qa/run-social-insights — API 8987 (Admin Backfill group 1271) — CHANGED
+  ```
+
+  **TEMP QA runner, extended 2026-08-14** with a `v3` branch: inputs now `{master_person_id, force_run, version: "v1"|"v2"|"v3", model, fetch_posts (default true), max_posts}`. v3 runs #13342 then #13343 and returns `{posts_fetch, insights}`. Still unauthenticated, still requires the `X-Data-Source: sandbox` HEADER, still scheduled for deletion with probe fn #13340 when experiments end.
+</Card>
+
+**Reused, UNCHANGED:** shared LLM call `openrouter-grok45-social-call_v2` **#13338** (default `x-ai/grok-4.6`, strict ZDR \+ `provider.sort: throughput`, `model` input for A/Bs); `mvp/link/create-master-link` **#2541**; `twitter_person` **#368** / `instagram_person` **#369** (read-only envelope reads). Rollback sources \+ run outputs: `~/xano/social-insights-v2/`.
+
+## External API dependency (new)
+
+<Warning>
+  **ScrapeCreators** (`api.scrapecreators.com`, header `x-api-key: $env.scrapecreators` — same key the existing link-triggered profile scrapers use). New endpoints consumed by #13342:
+
+  | Lane | Endpoint | Params |
+  | --- | --- | --- |
+  | X | `GET /v1/twitter/user-tweets` | `handle`, `trim=true` |
+  | LinkedIn | `GET /v1/linkedin/profile` | `url` (recent posts ride along in the profile payload) |
+  | Instagram | `GET /v2/instagram/user/posts` | `handle`, `trim=true`, cursor `next_max_id` (not yet used) |
+
+  Go port carries this dependency (or swaps in an equivalent) — budget ~2–3 scrape calls per person per refresh.
+</Warning>
+
+## First test — sandbox Richard Kerris (#9), 2026-08-14
+
+**Posts capture:** X 25 tweets (handle via twitter\_person fallback) \+ LinkedIn 1 post \+ Instagram 0 (no handle) → 26 rows upserted into `social_post`.
+
+**Synthesis (grok-4.6):** 8 insights, \$0.048, 76s, 9,406 prompt tokens (posts lane ≈ \+3k tokens vs v2). Quality jump over v2 is visible in kind, not just degree:
+
+- **Real quotes with exact dates** from his own posts: “game changing” (Omniverse→Vision Pro, 2024-04-09), “Embrace it” (Runway GenAI, 2024-04-06), “Just don’t make me wear the red shirt” (Star Trek humor, 2024-04-02).
+- **Cadence \+ platform migration** — impossible from Exa snippets: first-party X shows 8 posts 2024-03→2024-04 then goes quiet; dated professional posting continues on LinkedIn through 2026. One insight states exactly that.
+- **Style read from actual posts**: short partner-tagging one-liners (@runwayml, @nvidia, @Apple, @OTOY), emoji, humor.
+- **Interests before → after:** `[photography, music]` → `[photography, music, drums, star trek, family]` — drums returned with post evidence, star trek and family are new, all via the append-unique merge.
+
+| Version | Evidence | Cost/run | Latency |
+| --- | --- | --- | --- |
+| v2 (grok-4.6) | 3× Exa only | \$0.036–0.049 | 60–90s |
+| **v3 (grok-4.6)** | 3× Exa \+ envelopes \+ **26 first-party posts** | **\$0.048 \+ ~2–3 scrape calls** | 76s \+ fetch time |
+
+## Open items
+
+1. **Instagram lane untested** — no sandbox person has an IG handle yet; test on a live-datasource person or seed one in sandbox.
+2. **LinkedIn depth** — profile payload carried only 1 post; if more depth is needed, evaluate a dedicated LinkedIn posts endpoint.
+3. **Dedicated discovery stage** — extract discover-profiles from the synthesis loop (see convergence note) before promotion; high-confidence rules already exist in the v2 audit lambda.
+4. **Lane distillation** — at 40-post caps, raw posts fit the prompt; for prolific posters add a cheap distiller lane (kimi-k3 at $$0.047/31s or deepseek-v4-flash at ~$$0.0007/run) before synthesis.
+5. **Refresh policy** — posts refetch cadence \+ `social_post` retention are undecided; current guard is only the insights 5-day freshness check.
+6. **More people** — run the v2-vs-v3 comparison across the remaining sandbox people (Huang, Gallanty, Siddeek have v2 baselines).
+
+## Promotion / Go-port checklist
+
+1. Port `social_post` to AlloyDB with the same natural key; keep `raw`.
+2. Implement discover → fetch → synthesize as separate Go stages (discovery rules = v2 audit lambda semantics: two person-binding evidence points, platform path allow-list, twitter.com→x.com canonicalization).
+3. Port prompt v3 verbatim (system/user split; tier-0 posts evidence; 90-day weighting; interests merge semantics: append-unique, case/whitespace-insensitive, drop empties).
+4. Keep provider posture: OpenRouter grok-4.6, strict ZDR (`data_collection: deny`, `zdr: true`, `require_parameters: true`), `sort: throughput`, model as config for A/Bs.
+5. Delete Xano temp artifacts when tests conclude: API **8987**, probe fn **13340**; decide fate of test fns **13342/13343** (delete or keep as reference until Go parity).

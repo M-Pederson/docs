@@ -14,7 +14,11 @@ This is the **working page for the Persona Build workshop** (started 2026-08-14)
 
 ## What the test function does
 
-`persona/build-persona` (#13349) takes a `master_person_id` and runs two stages. **No DB writes** — it is a response-only prototype.
+`persona/build-persona` (#13349, **v0.3**) takes a `master_person_id`, runs two stages, and **persists the build into the `persona` table (754)** — an upsert keyed on `master_person_id` (skip with `persist: false`). A gated or invalid synthesis never writes, so a bad run cannot blank a good row.
+
+<Note>
+  **The `persona` table already existed** — table **754** (2026-06-25, modeled on `investment_thesis` #709) with `master_person_id`, `node_uuid`, and the 8 narrative/vector column pairs — so the workshop reuses it rather than creating a duplicate. Three columns were added 2026-08-14 via the safe incremental schema route: `persona_sequence_summary` (text), `synthesis` (json telemetry), `graph_context` (json evidence snapshot). Vector columns stay null until the embedding stage.
+</Note>
 
 **Stage 1 — `graphContext`.** Resolves `master_person.node_uuid`, then sends one Cypher through `mvp/falkor/send-cypher` (#2815). Because send-cypher reads its connection from `environmental_variables_falkordb` in the **active data source**, calling with `X-Data-Source: sandbox` automatically targets the sandbox graph.
 
@@ -30,7 +34,19 @@ A shaping lambda folds the rows into the `graphContext` response object:
 - `connections[]` — one entry per one-hop edge: `edge_type`, `direction` (`outbound`/`inbound`, computed in-Cypher), `edge_properties` (embeddings stripped — the LLM-written edge `description` and `valid_from`/`valid_to` ride along as evidence), and the packed `neighbor` node.
 - `stats` — `edge_count`, `neighbor_count`, `raw_rows`.
 
-**Stage 2 — synthesis (skip with `synthesize: false`).** The system prompt is rendered in a `util.template_engine` block — it is the [Build Persona](/guides/open-work/personas/build-persona) prompt adapted for graph input (deltas below). The full `graphContext` travels as the **user message**, JSON-stringified and bounded to a 60,000-char evidence budget. The call goes to **`moonshotai/kimi-k3`** on OpenRouter with the house rules: strict ZDR (`data_collection: deny`, `zdr: true`), `require_parameters: true`, `sort: "throughput"`, `response_format: json_object`, temperature 0.2, `reasoning_effort: medium`, `max_tokens` 8000 (headroom for K3 reasoning tokens — the K2048 empty-verdict trap). Kimi is tool-free here, so the moonshotai provider pin is not required (same reasoning as the social-insights helper v2.3). A `model` input overrides the default for A/Bs.
+**Stage 2 — synthesis (skip with `synthesize: false`).** The system prompt is rendered in a `util.template_engine` block — it is the [Build Persona](/guides/open-work/personas/build-persona) prompt adapted for a three-section evidence envelope (deltas below).
+
+<Warning>
+  **Deep bio \+ social insights are REQUIRED evidence (decided 2026-08-14).** Synthesis hard-gates on both: the latest completed `profile_enrichment_job` deep-bio payload AND non-empty `master_person.social_insights`. When either is missing the function returns `graphContext` but skips the LLM call and the persist entirely, with `synthesis.reason = "missing_required_evidence"` plus `has_deep_bio` / `has_social_insights` flags. Do not build personas for ineligible people.
+</Warning>
+
+The user message is one JSON envelope with three sections, bounded to a 100,000-char evidence budget:
+
+1. `graphContext` — as above, **slimmed in v0.3**: property telemetry that carries no persona signal is dropped (`match_score`, `semantic_*`, `description_generated_at`, `created_at`/`updated_at`, avatar/logo/image URLs, `display_label`, `visibility`) while `description`, `valid_from`/`valid_to`, `evidence`, `depth`, `recency`, titles, and role history stay.
+2. `deepBio` — the **full deep-bio research payload minus sources**: `subject_name`, `subject_aliases`, `biography`, `biography_sections`, `interests`, `relationships`, `unverified_claims`, `extracted_entities` from `profile_enrichment_job.response.result`. **Excluded: `citations`, `verification`, `metadata`** (source lists and research telemetry). The prompt instructs the model to treat `unverified_claims` as unconfirmed — calibrated inference only, never hard facts. Provenance (`profile_enrichment_job_id`, `job_id`) is returned in `evidence_check`.
+3. `socialInsights` — `master_person.social_insights` verbatim (dated observations with quotes and engagement counts).
+
+The call goes to **`moonshotai/kimi-k3`** on OpenRouter with the house rules: strict ZDR (`data_collection: deny`, `zdr: true`), `require_parameters: true`, `sort: "throughput"`, `response_format: json_object`, temperature 0.2, `reasoning_effort: medium`, `max_tokens` 8000 (headroom for K3 reasoning tokens — the K2048 empty-verdict trap). Kimi is tool-free here, so the moonshotai provider pin is not required (same reasoning as the social-insights helper v2.3). A `model` input overrides the default for A/Bs.
 
 ### Prompt deltas vs the canonical Build Persona page
 
@@ -39,6 +55,7 @@ A shaping lambda folds the rows into the `graphContext` response object:
 | 1 | Input section describes the `graphContext` JSON (person node \+ one-hop `connections[]`) instead of a YAML document | This builder feeds graph evidence, not the YAML assembler |
 | 2 | `persona_narratives` is an **array of exactly 8 objects** (each carrying `dimension` \+ the fixed metadata \+ `narrative`) instead of an object keyed by dimension | Array-of-narratives output requested for this workshop; fixed metadata unchanged |
 | 3 | `persona_id` is pre-filled as `mp_{master_person_id}` and `snapshot_date` is stamped server-side by the template engine | Deterministic pass-throughs shouldn't burn model attention |
+| 4 | Input is a three-section evidence envelope (`graphContext` \+ `deepBio` \+ `socialInsights`) instead of a single YAML document; deep-bio sources (`citations`/`verification`/`metadata`) never travel | Persona needs the researched context, not the research apparatus |
 
 Everything else — the eight dimension definitions, the grounding \+ null rule, voice/length, `persona_sequence_summary` — is reproduced from the canonical prompt.
 
@@ -49,7 +66,7 @@ Everything else — the eight dimension definitions, the grounding \+ null rule,
   persona/build-persona — 13349
   ```
 
-  **The workshop test function** (v0.1). Input `master_person_id` (\+ optional `synthesize`, `model`). Returns `graphContext`, `persona`, and a `synthesis` telemetry object (valid/reason/usage/preview). The production rollup name `person/build-persona` from the Personas page stays reserved for the promoted version (vectors \+ `person_personas` upsert).
+  **The workshop test function** (v0.3). Input `master_person_id` (\+ optional `synthesize`, `persist`, `model`). Returns `graphContext`, `persona`, `synthesis` telemetry, `evidence_check` (deep-bio/insights flags \+ provenance), and `persona_row_id`. The production rollup name `person/build-persona` from the Personas page stays reserved for the promoted version (vectors \+ `person_personas` upsert).
 </Card>
 
 <Card icon="layer-group">
@@ -68,6 +85,30 @@ Everything else — the eight dimension definitions, the grounding \+ null rule,
   **TEMP QA wrapper — unauthenticated — delete after the workshop.** Exists because the metadata function-run endpoint cannot resolve nested `function.run` refs on branch v1. `update_node: true` runs #2758 first; `synthesize: false` stops after `graphContext`.
 </Card>
 
+<Card icon="database">
+  ```text
+  persona — table 754
+  ```
+
+  **The persisted persona row** — one per person, upserted by #13349. `master_person_id` (FK), `node_uuid` (from `master_person.node_uuid` at build time), 8 `*_narrative` columns, 8 `*_vector` columns (null until embedding), plus workshop columns `persona_sequence_summary`, `synthesis`, `graph_context`.
+</Card>
+
+<Card icon="cloud-arrow-up">
+  ```text
+  mvp/deep-research/deep-person-basic — 12833 (v4.18)
+  ```
+
+  **Live change:** optional `launch_mode` \+ `explicit_operator_authorized` passthrough to #12747 → reserve (#13301), enabling **operator replays** of people whose lifetime automatic Deep Bio reservation is terminal (`already_completed` = non-launchable). Absent inputs preserve automatic behavior for every existing caller. Rollback: `~/xano/persona-build/12833_deep-person-basic_original.xs`.
+</Card>
+
+<Card icon="globe">
+  ```text
+  POST qa/run-deep-bio — api 8989 · POST qa/run-deep-bio-sweeper — api 8990
+  ```
+
+  **TEMP deep-bio launchers — unauthenticated — delete after the workshop.** 8989 launches one person's async Deep Bio through #12833 (Cloud Run researches, the callback lands in the active datasource); `operator_replay: true` relaunches a terminal reservation. 8990 wraps the retry sweeper #13297.
+</Card>
+
 ### Run it
 
 ```bash
@@ -84,6 +125,11 @@ curl -X POST "https://xh2o-yths-38lt.n7c.xano.io/api:rlSvC4qe/qa/run-build-perso
 | --- | --- | --- |
 | 1 — node projection \+ graph only | `update_node: true, synthesize: false` | **PASS**, 7.7s. Node now carries `interests` as a native 9-element array and the `social_media_influence` paragraph. graphContext: **26 edges / 23 neighbors**, all directions resolved, embeddings stripped. |
 | 2 — full synthesis | defaults (kimi-k3) | **PASS**, 15.8s, **\$0.068**. 16,181 prompt / 1,328 completion tokens. Valid JSON array, **8/8 narratives non-null**, summary present. |
+| 3 — v0.2 persist | `update_node: true` | **PASS**, 53s. Persona upserted as **`persona` row 1** — 8 narratives \+ summary flattened into the table columns, `synthesis` \+ `graph_context` stored, `node_uuid` mirrored. |
+| 4 — v0.3 full evidence | defaults | **PASS**, 31s, **\$0.078**. 17,941 prompt tokens (three-section envelope, telemetry-trimmed graph). Row 1 **updated in place** (upsert proven). `evidence_check` pins deep-bio provenance to job row 6. |
+| 5 — v0.3 gate (Chris Dixon #17) | defaults | **GATED correctly** — `synthesis.reason = missing_required_evidence` (`has_deep_bio: true`, `has_social_insights: false`), no LLM call, nothing persisted, graphContext still returned (13 edges). |
+
+**v0.3 quality jump (run 4 vs run 2):** deep-bio evidence visibly grounds the narratives — Nokia's 122% developer-ecosystem growth, Avegant's \$35M B-round and 35,000 Glyph units, the VES Bay Area Board \+ SMPTE memberships, drumming on a Richard Barone record, and his quoted developer-relations philosophy ("it's not an apps numbers game…") all appear with correct attribution. None of that exists in the graph or on the node.
 
 Edge mix in run 1: `WORKS_AT` ×12, `HAS_EXPERTISE` ×6, `ATTENDED` ×2, `ADVISOR_TO` ×2, `BOARD_MEMBER_OF` ×2, `WORKED_ON` ×1, `LOCATED_IN` ×1 — all outbound.
 
@@ -100,12 +146,23 @@ Edge mix in run 1: `WORKS_AT` ×12, `HAS_EXPERTISE` ×6, `ATTENDED` ×2, `ADVISO
   Richard Kerris is GM of Media & Entertainment and Head of Worldwide Developer Relations at NVIDIA in San Francisco, capping a three-decade career at the intersection of entertainment technology and developer ecosystems. His expertise spans media & entertainment strategy, developer relations, VFX technology, 3D software (Maya), professional video tools (Final Cut Pro, Shake), and cloud rendering, built through leadership roles at Alias|Wavefront, Apple, Lucasfilm (as CTO), HP, Nokia, AWS, and startups like Avegant and OTOY where he held board and advisory seats. A Variety "Top 10 Innovators to Watch" honoree who appeared in multiple Steve Jobs keynotes, he is a repeat builder of worldwide developer relations organizations with a knack for translating technical depth into market narrative. Publicly he posts about NVIDIA, AI, and media on LinkedIn and X with an evangelist's voice, and beyond work he is drawn to photography, music, drumming, the Beatles, Star Trek, film, travel, and family.
 </Accordion>
 
+## Deep Bio backfill — sandbox eligibility sweep (2026-08-14)
+
+The corpus audit (21 sandbox people) found **10 fully eligible** (deep bio \+ social insights), **6 missing deep bio** (#1 Njenga, #5 Pederson, #6 Mwangi, #7 Jackson, #8 Khan, #16 Sidhu — all had insights), and **5 missing social insights** (#17–21 Dixon/Rampell/George/Lai/Andreessen — the later-added a16z cohort, which has deep bio).
+
+- The 4 never-run people launched cleanly through temp api 8989 (automatic reservations).
+- **#5 was a stale single-flight reservation** — Cloud Run owned a `subject_identity_mismatch` retry loop and went silent on 2026-08-09. The sweeper (#13297) was supposed to reclaim it but **crashes on a latent bug**: it logs `log_crash` phases (`deep_bio_stale_active`, `deep_bio_retry_breaker`) that are not in the strict `log_crash.phase` enum (#542) — the same enum-trap class as CLAUDE.md trap #10. The enum fix is UI-only (API schema writes destroy validators) and is being handled separately; the stale job itself was terminalized and #5 relaunched.
+- **#8 had failed at launch** ("orbiter-enrich API returned no job\_id") and its lifetime automatic reservation was terminal = non-launchable — this is what motivated the #12833 v4.18 operator-replay passthrough. Both #5 and #8 relaunched as `operator_replay`.
+
+Social insights for #17–21 are **deliberately not launched** — the v3 discovery stage writes `master_link` rows and needs a curation decision first.
+
 ## Iteration backlog
 
-1. **Prompt tokens are dominated by graphContext** (16.2k prompt tokens for a 26-edge person). The biggest lever is trimming edge telemetry that carries no persona signal — `match_score`, `semantic_input`, `description_generated_at`, `weight`, internal timestamps — while keeping `description`, `valid_from`/`valid_to`, `evidence`, `depth`, `recency`. Est. 30–40% reduction.
-2. **Social posts are not in the graph** — stage 2 sees the synthesized `social_insights`/`social_media_influence` node properties, not the first-party `social_post` corpus (table 776). Decide whether the promoted builder joins that evidence directly (the v3 posts capture would make `public_engagement`/`communication_style` quotable and dated).
-3. **Fleet run** across the 16 sandbox people to check null-rule behavior on sparse profiles (Siddeek/Mwangi-class) — the Kerris result can't validate that narratives go null when they should.
-4. **Promotion path**: 8 embeddings (per the locked gemini standard) \+ `person_personas` upsert \+ rename to `person/build-persona`; then delete temp api 8988.
+1. ~~Trim graphContext telemetry~~ — **done in v0.3** (denylist strip in the shaping lambda; stored `graph_context` now matches exactly what the LLM saw).
+2. **Social posts are not in the graph** — stage 2 sees the synthesized `social_insights`/`social_media_influence`, not the first-party `social_post` corpus (table 776). Decide whether the promoted builder joins that evidence directly (the v3 posts capture would make `public_engagement`/`communication_style` quotable and dated).
+3. **Fleet run** across all eligible sandbox people to check null-rule behavior on sparse profiles — the Kerris result can't validate that narratives go null when they should. Unblocked for the 6 backfilled people once their deep-bio callbacks land.
+4. **Social insights for #17–21** (a16z cohort) — needed before they are persona-eligible; awaiting the discovery-curation decision above.
+5. **Promotion path**: 8 embeddings (per the locked gemini standard) \+ `person_personas` upsert \+ rename to `person/build-persona`; then delete temp apis 8988/8989/8990.
 
 ## Related
 

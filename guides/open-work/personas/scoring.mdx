@@ -1,0 +1,59 @@
+---
+title: "Persona Scoring"
+description: "The three scoring layers: build narratives + vectors, save raw semantic scores in compare_persona, then interpret those saved scores in unlimited ways to find matches."
+icon: "sliders"
+---
+
+Everything about how personas turn into match scores, in one place. The design has **three strictly separated layers** — and the separation is the point: the expensive layers run **once**, and the layer where opinions live (weights, modes, lanes) can be re-tuned forever for free.
+
+```mermaid
+flowchart LR
+    A[persona/build-persona #13349<br/>evidence → 9 narratives] --> B[(persona — 754<br/>9 narratives + 1536-d vectors)]
+    B --> C[persona/compare-personas #13350<br/>cache-first pairwise compare]
+    C --> D[(compare_persona — 778<br/>RAW per-dimension cosines, saved)]
+    D --> E[Match strategies<br/>weights · z-scores · roles · lanes]
+    E --> F[Suggestions / leverage loops]
+```
+
+## Layer 1 — Build: narratives and vectors (runs once per person)
+
+`persona/build-persona` (#13349) turns one `master_person`'s evidence (graphContext \+ deep bio \+ social insights) into the **nine narratives**, persisted to `persona` (754). Each narrative gets its own **1536-d vector** (`gemini-embedding-001`, `dimensions:1536`, **L2-normalized** — so cosine similarity is a plain dot product). Vectors are backfilled **lazily**: the first compare that needs a missing vector computes it and writes it back to 754, so the embedding layer builds itself as compares run.
+
+This is the only layer that costs LLM tokens. Full build spec: [Persona Build Design](/guides/open-work/personas/persona-build-design).
+
+## Layer 2 — Compare: raw semantic scores, saved once (runs once per pair)
+
+`persona/compare-personas` (#13350) computes the **diagonal semantic comparison** between two people — dimension k against dimension k, nine cosines — and **saves the raw scores** in `compare_persona` (778). The contract:
+
+- **One row per unordered pair.** `master_person_a_id` = lower id, `master_person_b_id` = higher id, `pair_key` = `"lowId:highId"` (unique index). A↔B and B↔A are the same row, one lookup.
+- **Cache-first, always.** Check `compare_persona` before computing; a hit returns instantly (`cached: true`). `force` recomputes. First compute is ~9s (embedding backfill included); every later read is a row fetch.
+- **`scores` is raw material, not an opinion.** A json of `{dimension: cosine|null}` across all nine dimensions — null when either side's narrative is null. **No weighting, no normalization, no mode is baked in at this layer.**
+- **`overall_score` is only a convenience.** The unweighted mean of non-null dimensions, stored for eyeballing. Real matching should ignore it and re-aggregate from `scores`.
+- **Staleness is detectable, not enforced.** `persona_a_updated_at` / `persona_b_updated_at` snapshot the persona rows at compare time; if a persona is rebuilt later, the snapshots no longer match and the cached row is known-stale (recompute with `force`).
+
+Table spec (copy-paste for Go) lives on [Persona Build Design](/guides/open-work/personas/persona-build-design).
+
+## Layer 3 — Match: interpret the saved scores (runs as often as you like)
+
+Because layers 1–2 are persisted, every matching idea is **pure arithmetic over stored rows** — iterate on suggestion recipes with zero LLM or embedding cost. This is where all tuning lives:
+
+- **Weighting.** Boost or suppress dimensions per outcome — a vendor search weights `passions_interests` ~0.02, a co-founder search ~0.20; fundraising/hiring outcomes weight `current_needs` heavily. Change the weights, re-rank the same saved scores.
+- **Standardization.** Raw cosines are compressed and baseline-shifted per dimension — z-score each dimension **across the candidate pool** before aggregating, so a high value means "standout for that facet in this network," not "embeddings run hot here."
+- **Role-typed aggregation.** The nine dimensions play roles, not equal parts: **four drivers** (`domain_focus`, `public_engagement`, `passions_interests`, `current_needs`) soft-maxed so one strong thread can carry a match; **two valence** dims (`identity_profile`, `track_record`) whose sign flips between peer and complement mode; **two modifiers** (`soft_skills`, `communication_style`) near zero; **one structural** (`community_affiliation`) belonging to the graph, not the embedding space.
+- **Serendipity (off-diagonal).** Cross-dimension driver cells — the target's `domain_focus` against a candidate's `public_engagement`, and so on across the 4×4 driver family — surface non-obvious intros. Note these are computed **from the stored vectors**, not from the cached diagonal scores: `compare_persona` deliberately caches the diagonal, and cross-cells are query-time arithmetic (the Go contract computes them in SQL).
+
+<Note>
+  **Where each piece of the deep math is specced:** the scoring theory (roles, z-scores, aggregator trade-offs, interactive demonstrator) is [loop\_generic](/guides/open-work/suggestion-recipes/loop-generic); the executable Go/AlloyDB contract (`persona/get-scores` — SQL \+ Go, params, two-lane ranking) is [developer-requirements](/guides/open-work/suggestion-recipes/developer-requirements); the evaluation harness for tuning it is [harness-suggestions](/guides/open-work/suggestion-recipes/harness-suggestions); the vector store DDL and matcher shape are on [Personas](/guides/open-work/personas).
+</Note>
+
+## How the layers compose for the Go build
+
+The production matcher (`persona/get-scores`, Go on AlloyDB) computes diagonal cosines **in-database at query time**, z-scored per candidate pool — the same numbers Layer 2 caches. The two are complementary, and the design principle is shared: **raw semantic scores are computed from stored vectors and never entangled with weighting.** Whether the Go matcher reads through `compare_persona` as a cache or always computes in SQL (and optionally writes back) is an implementation decision for the Go build — either way the saved-raw-scores contract holds: `compare_persona` remains the durable pairwise record that suggestion tuning iterates on.
+
+## Live validation (sandbox)
+
+- Kerris × Huang: overall **0.6692**, peaks `public_engagement` .78 / `communication_style` .74; cached and reversed-order lookups both hit the same row.
+- Kerris × Njenga: overall **0.6225**, troughs `track_record` .52 / `identity_profile` .53.
+- First compute ~9s (18 lazy embeddings written back to 754); cached reads instant.
+
+Temp QA endpoint until promotion: `qa/run-compare-persona` (8991) — `{master_person_a_id, master_person_b_id, force?}`.

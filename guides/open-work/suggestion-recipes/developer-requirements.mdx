@@ -58,7 +58,8 @@ Xano  ──  persona/get-scores(person_id, user_id, params)  ──▶  GCP  �
 | `w_soft` | float | `0.03` | `0`–`1` | Modifier: soft-skills similarity (inverted in `complement`). |
 | `w_comm` | float | `0.02` | `0`–`1` | Modifier: communication-style tiebreaker. |
 | `serendipity_lift_floor` | float (τ) | `0.50` | `0`–`~3` | Min lift (`cross_argmax − driver_pool`, z-space) to qualify for the serendipity lane; raise to keep only genuinely non-obvious intros. |
-| `limit` | int | `20` | `1`–`100` | Max ranked candidates returned. |
+| `limit` | int | `24` | `1`–`100` | Max ranked candidates returned. Default is the product's **top-24 shelf** _(was 20; updated 2026-08-15 — see [Composing the top 24](#composing-the-top-24))_. |
+| `min_driver_dims` | int | `2` | `0`–`4` | Rankability floor — candidates with fewer **non-null driver dims** (`domain_focus` / `public_engagement` / `passions_interests` / `current_needs`) are excluded from ranking and reported in `below_driver_floor`. |
 | `candidate_ids` | uuid\[\] | _null_ → derive from the user's contacts | — | Optional explicit candidate set; the harness pins a fixed set for repeatable eval. **A pinned set bypasses derivation _and_ the exclusion sets** — the harness gets exactly the pool it asked for. |
 | `exclude_connected` | bool | `true` | — | **E1** — drop candidates with any direct person↔person edge to the target. |
 | `exclude_shared_employer` | bool | `true` | — | **E2** — drop candidates who share an employer with the target, past or present. |
@@ -76,7 +77,8 @@ Xano  ──  persona/get-scores(person_id, user_id, params)  ──▶  GCP  �
   "w_soft": 0.03,
   "w_comm": 0.02,
   "serendipity_lift_floor": 0.50,
-  "limit": 20
+  "limit": 24,
+  "min_driver_dims": 2
 }
 ```
 
@@ -140,8 +142,10 @@ FROM contact c
 JOIN master_person m ON m.id = c.master_person_id
 WHERE c.user_id = $2
   AND c.master_person_id <> $1
-  AND EXISTS (SELECT 1 FROM persona p
-              WHERE p.master_person_id = c.master_person_id AND p.dim = 1)
+  -- rankability floor: ≥ 2 non-null driver dims (see "Null dimensions — ranking rules")
+  AND (SELECT count(*) FROM persona p
+       WHERE p.master_person_id = c.master_person_id
+         AND p.dim IN (2, 5, 8, 9)) >= 2
   -- E3: target is a user → drop anyone already in the target's own contact list
   AND NOT EXISTS (SELECT 1
                   FROM contact tc
@@ -209,12 +213,14 @@ CREATE INDEX IF NOT EXISTS contact_user_idx ON contact (user_id, master_person_i
 ```
 
 ```sql get-scores query ($1 target master_person_id, $2 user_id)
-WITH cand AS (                               -- candidate pool = the user's contacts that have a persona, minus the target
+WITH cand AS (                               -- candidate pool = the user's contacts that survive the exclusions, minus the target
   SELECT DISTINCT c.master_person_id AS mp
   FROM contact c
   WHERE c.user_id = $2
     AND c.master_person_id <> $1
-    AND EXISTS (SELECT 1 FROM persona p WHERE p.master_person_id = c.master_person_id AND p.dim = 1)
+    AND (SELECT count(*) FROM persona p     -- rankability floor (min_driver_dims): ≥ 2 non-null driver dims
+         WHERE p.master_person_id = c.master_person_id
+           AND p.dim IN (2, 5, 8, 9)) >= 2
 ),
 tgt AS (                                     -- target's 9 vectors pivoted to columns (dim 7 handled outside the embedding)
   SELECT
@@ -252,17 +258,23 @@ sims AS (                                    -- cosine sim = 1-(<=>), valid beca
     1-(p8.embedding<=>t.v9) AS x_nee_pas     -- tgt needs   × cand passion
   FROM cand
   CROSS JOIN tgt t
-  JOIN persona p1 ON p1.master_person_id=cand.mp AND p1.dim=1
-  JOIN persona p2 ON p2.master_person_id=cand.mp AND p2.dim=2
-  JOIN persona p3 ON p3.master_person_id=cand.mp AND p3.dim=3
-  JOIN persona p4 ON p4.master_person_id=cand.mp AND p4.dim=4
-  JOIN persona p5 ON p5.master_person_id=cand.mp AND p5.dim=5
-  JOIN persona p6 ON p6.master_person_id=cand.mp AND p6.dim=6
-  JOIN persona p8 ON p8.master_person_id=cand.mp AND p8.dim=8
-  JOIN persona p9 ON p9.master_person_id=cand.mp AND p9.dim=9
+  -- LEFT JOINs, not INNER: a null narrative = no persona row for that dim. An INNER
+  -- JOIN would silently drop any candidate missing even one dim — and nulls are
+  -- common and legitimate. NULL cosines pass through to the null → z = 0 rule below.
+  LEFT JOIN persona p1 ON p1.master_person_id=cand.mp AND p1.dim=1
+  LEFT JOIN persona p2 ON p2.master_person_id=cand.mp AND p2.dim=2
+  LEFT JOIN persona p3 ON p3.master_person_id=cand.mp AND p3.dim=3
+  LEFT JOIN persona p4 ON p4.master_person_id=cand.mp AND p4.dim=4
+  LEFT JOIN persona p5 ON p5.master_person_id=cand.mp AND p5.dim=5
+  LEFT JOIN persona p6 ON p6.master_person_id=cand.mp AND p6.dim=6
+  LEFT JOIN persona p8 ON p8.master_person_id=cand.mp AND p8.dim=8
+  LEFT JOIN persona p9 ON p9.master_person_id=cand.mp AND p9.dim=9
 )
 SELECT s.master_person_id,
-  -- standardize each diagonal dimension across THIS candidate pool (the user's network)
+  -- standardize each diagonal dimension across THIS candidate pool (the user's network).
+  -- Window aggregates skip NULLs (μ/σ come from the non-null values only), and a NULL
+  -- similarity propagates NULL through the arithmetic → COALESCE lands it at z = 0:
+  -- the null rule falls out of this expression for free once the joins are LEFT.
   COALESCE((s_identity-avg(s_identity)OVER())/NULLIF(stddev_pop(s_identity)OVER(),0),0) AS z_identity,
   COALESCE((s_domain  -avg(s_domain)  OVER())/NULLIF(stddev_pop(s_domain)  OVER(),0),0) AS z_domain,
   COALESCE((s_soft    -avg(s_soft)    OVER())/NULLIF(stddev_pop(s_soft)    OVER(),0),0) AS z_soft,
@@ -278,9 +290,21 @@ FROM sims s;
 
 </CodeGroup>
 
+### Null dimensions — ranking rules
+
+_(Added 2026-08-15.)_ Null narratives are **common and legitimate** — the build's evidence floors guarantee them (sandbox corpus examples: 6/9 and 8/9 personas), so the scorer must treat a missing dim as normal input, not an edge case. And the stored `compare_persona.overall_score` — the unweighted mean of non-null dims — **must never be the ranker**: dimensions live in different cosine bands (~0.45–0.85), so an "average of 8" and an "average of 9" are means over different scales; a flat mean also weights the `w=0.02` tiebreaker like a driver and prefers diffusely-alike over one-strong-thread. Three rules replace it:
+
+1. **LEFT JOIN \+ NULL passthrough** (in the SQL above). A candidate missing a dim keeps their row; the cosine is NULL.
+2. **Null → z = 0, after standardization.** μ/σ per dim come from the non-null values; a null lands at the pool average — no evidence neither rewards nor penalizes. The `COALESCE` in the query implements this for free. Never renormalize a mean over available dims — that recreates the baseline bias in z-space.
+3. **Rankability floor (`min_driver_dims`, default 2).** A candidate with fewer than 2 non-null driver dims has no basis for a driver score — excluded at pool resolution and **counted** in `below_driver_floor`, never silently dropped.
+
+Corollary, for free: if the **target** is missing a dim, every candidate's cosine for it is NULL, the whole column standardizes to z = 0, and that dimension drops out of the ranking — correct behavior with no special case. Optional refinement (open question): de-weight by the build's `synthesis` coverage grades (`thin` → shrink toward 0); `dims_compared` from the compare row is a free UI signal ("matched on 6 of 9 facets").
+
 ### Go — composition & scoring
 
 Reads the rows above, applies the input params, returns ranked `Score`s. This is the `loop_generic` `ScoreBatch` adapted to the contact-resolved pool, parameterized, and with the graph-bridge term removed for v1.
+
+**Null handling in Go:** the diagonal z's arrive from SQL already coalesced to 0 — no work. The **raw cross-cells can be NULL** (either side of the pair missing that dim): scan them as nullable, skip null cells both in the per-type z-score pools and in the argmax, and a candidate whose 12 cells are all null simply gets no serendipity lane (treat the lift as −∞ → diagonal lane).
 
 ```go
 package persona
@@ -469,7 +493,8 @@ func zscore(xs []float64) []float64 {
   "mode": "peer",
   "candidate_pool_size": 184,
   "exclusions": { "pool_before": 238, "direct_connection": 9, "shared_employer": 14, "target_user_contacts": 31, "target_is_orbiter_user": true },
-  "params_used": { "softmax_temperature": 2.0, "w_drivers": 0.55, "w_valence": 0.20, "w_soft": 0.03, "w_comm": 0.02, "serendipity_lift_floor": 0.50, "limit": 20 },
+  "below_driver_floor": 3,
+  "params_used": { "softmax_temperature": 2.0, "w_drivers": 0.55, "w_valence": 0.20, "w_soft": 0.03, "w_comm": 0.02, "serendipity_lift_floor": 0.50, "limit": 24, "min_driver_dims": 2 },
   "results": [
     { "master_person_id": 5381, "rank": 1, "lane": "serendipity", "diagonal": 1.82, "serendipity_z": 2.41, "lift": 1.06, "ser_tgt_dim": 2, "ser_cand_dim": 8 },
     { "master_person_id": 1014, "rank": 2, "lane": "diagonal",    "diagonal": 2.10, "serendipity_z": 0.30, "lift": -0.40, "ser_tgt_dim": 5, "ser_cand_dim": 2 }
@@ -477,7 +502,24 @@ func zscore(xs []float64) []float64 {
 }
 ```
 
-### Open questions
+### Composing the top 24
+
+_(Added 2026-08-15.)_ Production surfaces **24** results per loop run. Two compositions, in ascending richness:
+
+**Blended list (v1-simplest).** The existing rank — min-max each lane, per-candidate max, sort, `limit: 24`. One call, one list. Its weakness: diagonal scores dominate blends, so the list tends to fill with same-mode, same-lane candidates and the intro *types* the method deliberately separates (peer vs complement, obvious vs serendipitous) collapse into one undifferentiated feed.
+
+**Shelf portfolio (recommended).** The 24 as **four shelves of six** — mode × lane:
+
+| Shelf | What it is | Quality floor |
+| --- | --- | --- |
+| peer × diagonal | "people like you" — strong obvious matches | diagonal z floor |
+| peer × serendipity | the non-obvious shared thread | lift ≥ τ |
+| complement × diagonal | "the missing piece" (founder ↔ investor) | diagonal z floor |
+| complement × serendipity | the non-obvious complement | lift ≥ τ |
+
+Mechanics: run both modes over the same score matrix — **pure arithmetic, zero recompute** (the whole point of saving raw scores); each shelf takes up to 6 candidates that pass its floor; **dedupe by best shelf** (a candidate who qualifies for several appears only where they rank highest, so 24 unique people); **backfill** unfilled slots from the blended overall ranking rather than padding a thin shelf with junk — if only 3 genuine serendipity hits clear τ, the shelf shows 3 and the blended list contributes 3 more elsewhere. Serendipity cards carry their `(ser_tgt_dim, ser_cand_dim)` provenance pair as the intro hook; near-ties break toward higher `dims_compared` (more matched facets → more explainable intro).
+
+The portfolio guarantees variety without sacrificing quality, and every shelf is explainable as a distinct product shelf ("people like you", "people you're missing", "you'd never have guessed"). Directionality is already covered: diagonal cosines are symmetric by construction, and the 4×4 cross-family scores both directions of every topical pairing. Optional later refinement: a per-shelf diversity guard (avoid six people from one company/scene cluster) — needs graph signals, not v1.
 
 <Info>
   **No graph traversal is needed for this scope — scoring is fully relational \+ vector on AlloyDB.** The candidate set comes from `contact` (`user_id → master_person → persona`) and the ranking is persona similarity; both live in AlloyDB. The graph signals in the full [scoring pipeline](/guides/open-work/suggestion-recipes/loop-generic) only matter for the broader _"rank everyone reachable"_ mode and **collapse here**: when the pool is the user's **direct contacts**, there is no multi-hop distance to score, and the user is themselves the bridge between any two of their contacts. So `w_bridge` / `node_nudge` / `max_hops` are **out of scope for v1** (they belong to a future reachable-network mode), and the Go composite is embedding-only **by design** — not a limitation.
@@ -486,7 +528,9 @@ func zscore(xs []float64) []float64 {
 </Info>
 
 - **`person_id` → `master_person_id`.** Confirm the input `person_id` _is_ the `master_person_id`, or define the resolution (persons table?).
-- **`persona` table shape.** The SQL assumes **8 rows per person** keyed `(master_person_id, dim)`. If Mark's reference builder writes one row with 8 vector columns (or a vector array), the query changes — lock the shape before coding.
+- **`persona` table shape.** The SQL assumes **up to 9 rows per person** keyed `(master_person_id, dim)` — a null narrative means the row is simply absent (which is why the scoring joins are LEFT). If Mark's reference builder writes one row with 9 vector columns (the Xano 754 shape), the query changes — lock the shape before coding.
+- **Coverage de-weighting.** The build's `synthesis` coverage grades (`rich | moderate | thin | none`) were stored for match-time de-weighting. Decide the transform (e.g. `thin` → shrink z toward 0 by half) and whether v1 ships with it or it waits for the harness to prove it helps.
+- **Shelf portfolio parameters.** The [top-24 composition](#composing-the-top-24) recommends 4 shelves × 6 with floors \+ backfill. Confirm the shelf sizes, the diagonal z floor per shelf, and whether the UI presents the shelves as labeled sections or one interleaved feed.
 - **Small-pool standardization.** Z-scores are computed across _the user's contacts_. A user with few contacts → noisy/degenerate z-scores. Define a **minimum pool size** and a fallback (e.g. network-wide μ/σ per dimension precomputed offline).
 - **Dim 7 (`community_affiliation`).** Graph-gated in the full method; with no graph it's just **another embedding dimension** here. Decide: score it on the diagonal like dims 1–6/8/9 (it has a narrative \+ vector), or leave it out of v1.
 - **`master_person` → user resolution (E3).** Confirm the table/column that maps a `master_person` to a user account (`app_user.master_person_id` is assumed in the E3 SQL) and that it's reachable from the scoring function's AlloyDB.

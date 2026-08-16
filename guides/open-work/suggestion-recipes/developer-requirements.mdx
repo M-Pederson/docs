@@ -64,7 +64,7 @@ Xano  ──  persona/get-scores(person_id, user_id, params)  ──▶  GCP  �
 | `exclude_connected` | bool | `true` | — | **E1** — drop candidates with any direct person↔person edge to the target. |
 | `exclude_shared_employer` | bool | `true` | — | **E2** — drop candidates who share an employer with the target, past or present. |
 | `exclude_target_contacts` | bool | `true` | — | **E3** — when the target resolves to an Orbiter user, drop everyone in the target's own contact list. No-op when the target is not a user. |
-| `mutuality` | enum `off` \| `min` \| `harmonic` | `off` | — | Combine target→candidate and candidate→target scores (open question — production should enable). |
+| `mutuality` | enum `off` \| `min` \| `harmonic` | `min` | — | Combine target→candidate and candidate→target scores — an intro is only as good as its weaker side. **Decided 2026-08-15: `min` from day one**; `off` stays available for harness isolation runs. |
 
 ```json
 {
@@ -78,7 +78,8 @@ Xano  ──  persona/get-scores(person_id, user_id, params)  ──▶  GCP  �
   "w_comm": 0.02,
   "serendipity_lift_floor": 0.50,
   "limit": 24,
-  "min_driver_dims": 2
+  "min_driver_dims": 2,
+  "mutuality": "min"
 }
 ```
 
@@ -115,7 +116,7 @@ _(Added 2026-08-15.)_ An introduction only has value if the two people can't alr
 | Set | Excludes candidates who… | Why | Source |
 | --- | --- | --- | --- |
 | **E1** — direct connection | have **any direct person↔person edge** to the target (`ATTENDED_TOGETHER`, `STUDIED_UNDER`, `MENTOR`, `CO_INVESTORS`, `SAME_AS`, …) | already connected — not an introduction | FalkorDB Universe, one membership query |
-| **E2** — shared employer | share a **`WORKS_AT` company** with the target, **past or present** (the edge is bitemporal; deliberately no `valid_to` filter — "both worked at" and "works at same company" are the same check) | colleagues and alumni are trivially reachable; the intro is redundant | Same FalkorDB query as E1 |
+| **E2** — shared company orbit | share a **company** with the target via **`WORKS_AT`, `FOUNDED`, `BOARD_MEMBER_OF`, or `ADVISOR_TO`**, **past or present** (bitemporal edges; deliberately no `valid_to` filter and no headcount guard — **decided 2026-08-15**: any shared stint excludes, and the orbit includes founders/board/advisors, not just employees) | colleagues, alumni, and the company's board/advisor orbit are trivially reachable; the intro is redundant | Same FalkorDB query as E1 |
 | **E3** — target's own graph | appear in the **target-user's own contact list**, when the target `master_person` resolves to an Orbiter user account | the target already knows them — Orbiter has first-party proof | AlloyDB `contact` anti-join — **no cross-graph query** |
 
 <Warning>
@@ -160,14 +161,16 @@ MATCH (c:Person)
 WHERE c.uuid IN $cands
   AND (
         (c)--(t)                                              // E1: any direct person↔person edge
-     OR (c)-[:WORKS_AT]->(:Company)<-[:WORKS_AT]-(t)          // E2: shared employer, past or present
+        // E2: shared company orbit — employees, founders, board, advisors; past or present
+     OR (c)-[:WORKS_AT|FOUNDED|BOARD_MEMBER_OF|ADVISOR_TO]->(:Company)
+           <-[:WORKS_AT|FOUNDED|BOARD_MEMBER_OF|ADVISOR_TO]-(t)
   )
 RETURN collect(DISTINCT c.uuid) AS excluded
 ```
 
 </CodeGroup>
 
-E1 uses the untyped `(c)--(t)` pattern on purpose: any direct edge between the two people means they're connected, and new person↔person edge types are excluded automatically instead of silently leaking through a named list. If the graph round trip is unacceptable for v1, the graph-free fallback for E1 is the **co-contact proxy** (a pair is "connected" when ≥ N users hold _both_ as contacts) — weaker, but purely relational; E2 can likewise come from a relational employment table if one is synced to AlloyDB. E3 needs neither: it is always a pure SQL anti-join.
+E1 uses the untyped `(c)--(t)` pattern on purpose: any direct edge between the two people means they're connected, and new person↔person edge types are excluded automatically instead of silently leaking through a named list. **Decided 2026-08-15: v1 keeps this FalkorDB query** — it is exact and catches Universe-only edges (`ATTENDED_TOGETHER`, `CO_INVESTORS`, …) no relational source can see. The **co-contact proxy** (a pair is "connected" when ≥ N users hold _both_ as contacts) remains documented only as a contingency if the graph is ever unreachable. E3 needs neither: it is always a pure SQL anti-join.
 
 ### Steps to implement
 
@@ -185,7 +188,7 @@ E1 uses the untyped `(c)--(t)` pattern on purpose: any direct edge between the t
     One AlloyDB query returns, per candidate, the eight embedding-scored diagonal dims (z-scored across the pool) plus the twelve raw `4×4` off-diagonal topical cells. Dim 7 (`community_affiliation`) is **not** embedding-scored.
   </Step>
   <Step title="Compose in Go: role-typed aggregation + serendipity">
-    Apply the input params — soft-max the drivers, sign the valence by `mode`, add modifiers; compute the serendipity lift over the driver pool. (No graph-bridge term in v1.)
+    Apply the input params — soft-max the drivers, sign the valence by `mode`, add modifiers; compute the serendipity lift over the driver pool. (No graph-bridge term in v1.) **Mutuality (decided 2026-08-15):** compute the composite in both directions — roles swapped; the diagonal z's are symmetric, so only the complement valence and the serendipity provenance change — and combine per candidate with `min()`.
   </Step>
   <Step title="Rank & return JSON">
     Two lanes (diagonal / serendipity by lift floor), min-max normalized to a single overall order; emit the harness payload.
@@ -297,6 +300,7 @@ _(Added 2026-08-15.)_ Null narratives are **common and legitimate** — the buil
 1. **LEFT JOIN \+ NULL passthrough** (in the SQL above). A candidate missing a dim keeps their row; the cosine is NULL.
 2. **Null → z = 0, after standardization.** μ/σ per dim come from the non-null values; a null lands at the pool average — no evidence neither rewards nor penalizes. The `COALESCE` in the query implements this for free. Never renormalize a mean over available dims — that recreates the baseline bias in z-space.
 3. **Rankability floor (`min_driver_dims`, default 2).** A candidate with fewer than 2 non-null driver dims has no basis for a driver score — excluded at pool resolution and **counted** in `below_driver_floor`, never silently dropped.
+4. **Small-pool fallback — min 30** _(decided 2026-08-15)_. Below 30 candidates the curve is meaningless (one person skews μ/σ): standardize against **precomputed network-wide per-dimension μ/σ** instead of the pool windows. One offline stats job, one branch in the query.
 
 Corollary, for free: if the **target** is missing a dim, every candidate's cosine for it is NULL, the whole column standardizes to z = 0, and that dimension drops out of the ranking — correct behavior with no special case. Optional refinement (open question): de-weight by the build's `synthesis` coverage grades (`thin` → shrink toward 0); `dims_compared` from the compare row is a free UI signal ("matched on 6 of 9 facets").
 
@@ -508,7 +512,7 @@ _(Added 2026-08-15.)_ Production surfaces **24** results per loop run. Two compo
 
 **Blended list (v1-simplest).** The existing rank — min-max each lane, per-candidate max, sort, `limit: 24`. One call, one list. Its weakness: diagonal scores dominate blends, so the list tends to fill with same-mode, same-lane candidates and the intro *types* the method deliberately separates (peer vs complement, obvious vs serendipitous) collapse into one undifferentiated feed.
 
-**Shelf portfolio (recommended).** The 24 as **four shelves of six** — mode × lane:
+**Shelf portfolio (decided 2026-08-15 — runs under the hood).** The 24 as **four shelves of six** — mode × lane:
 
 | Shelf | What it is | Quality floor |
 | --- | --- | --- |
@@ -519,25 +523,39 @@ _(Added 2026-08-15.)_ Production surfaces **24** results per loop run. Two compo
 
 Mechanics: run both modes over the same score matrix — **pure arithmetic, zero recompute** (the whole point of saving raw scores); each shelf takes up to 6 candidates that pass its floor; **dedupe by best shelf** (a candidate who qualifies for several appears only where they rank highest, so 24 unique people); **backfill** unfilled slots from the blended overall ranking rather than padding a thin shelf with junk — if only 3 genuine serendipity hits clear τ, the shelf shows 3 and the blended list contributes 3 more elsewhere. Serendipity cards carry their `(ser_tgt_dim, ser_cand_dim)` provenance pair as the intro hook; near-ties break toward higher `dims_compared` (more matched facets → more explainable intro).
 
-The portfolio guarantees variety without sacrificing quality, and every shelf is explainable as a distinct product shelf ("people like you", "people you're missing", "you'd never have guessed"). Directionality is already covered: diagonal cosines are symmetric by construction, and the 4×4 cross-family scores both directions of every topical pairing. Optional later refinement: a per-shelf diversity guard (avoid six people from one company/scene cluster) — needs graph signals, not v1.
+**Presentation (decided 2026-08-15): no shelf labels in the UI.** The portfolio is an internal allocation that guarantees variety; the user sees **one interleaved ranked list of 24**, each card carrying its own explanation (the diagonal top dims, or the serendipity provenance pair). The shelf a result came from can ride along as metadata (`shelf` field) for analytics and future UI experiments without being shown. Directionality is already covered: diagonal cosines are symmetric by construction, and the 4×4 cross-family scores both directions of every topical pairing. Optional later refinement: a per-shelf diversity guard (avoid six people from one company/scene cluster) — needs graph signals, not v1.
+
+### Decisions & open questions
 
 <Info>
   **No graph traversal is needed for this scope — scoring is fully relational \+ vector on AlloyDB.** The candidate set comes from `contact` (`user_id → master_person → persona`) and the ranking is persona similarity; both live in AlloyDB. The graph signals in the full [scoring pipeline](/guides/open-work/suggestion-recipes/loop-generic) only matter for the broader _"rank everyone reachable"_ mode and **collapse here**: when the pool is the user's **direct contacts**, there is no multi-hop distance to score, and the user is themselves the bridge between any two of their contacts. So `w_bridge` / `node_nudge` / `max_hops` are **out of scope for v1** (they belong to a future reachable-network mode), and the Go composite is embedding-only **by design** — not a limitation.
 
-  **Already-connected suppression is now specced** _(2026-08-15, was deferred)_: the [pool exclusions](#pool-exclusions-the-negative-space) subtract direct connections (E1), shared employers (E2), and — when the target is an Orbiter user — the target's own contacts (E3) **before the scoring query runs**. The person↔person source is one read-only FalkorDB membership query (E1 \+ E2); E3 is a pure `contact` anti-join. The graph-free fallback, if that one query is unwanted in v1, is the co-contact proxy — see open questions.
+  **Already-connected suppression is now specced** _(2026-08-15, was deferred)_: the [pool exclusions](#pool-exclusions-the-negative-space) subtract direct connections (E1), shared employers (E2), and — when the target is an Orbiter user — the target's own contacts (E3) **before the scoring query runs**. The person↔person source is one read-only FalkorDB membership query (E1 \+ E2); E3 is a pure `contact` anti-join. Decided 2026-08-15: v1 keeps the graph query; the co-contact proxy is documented as contingency only.
 </Info>
 
+### Decided — 2026-08-15 (Mark)
+
+Ten former open questions, resolved in one pass. Each is reflected in the spec above; this list is the record.
+
+| # | Question | Decision |
+| --- | --- | --- |
+| 1 | E2 tenure semantics | **Any shared employer excludes** — no tenure-overlap requirement, no large-employer/headcount guard. Errs toward exclusion: a wrong exclusion loses one candidate; a wrong inclusion suggests someone they may already know. |
+| 2 | E2 edge scope | **Widen to the company orbit**: `WORKS_AT` \+ `FOUNDED` \+ `BOARD_MEMBER_OF` \+ `ADVISOR_TO` (not `INVESTED_IN` — an investor intro is sometimes exactly what the loop should surface). |
+| 3 | Coverage de-weighting | **Deferred to the harness.** v1 ranks without it; the coverage grades ride along in the response so the harness can prove (or disprove) that shrinking `thin` dims improves picks before any multiplier ships. |
+| 4 | Shelf presentation | **Portfolio under the hood, no labels in the UI** — one interleaved ranked list of 24; `shelf` rides as metadata only. |
+| 5 | Mutuality | **`min()` from day one** (contract default now `min`). Both directions are arithmetic over the same matrix. |
+| 6 | Dim 7 (`community_affiliation`) | **Out of v1 scoring.** High community-similarity is non-monotonic (very similar ≈ already connected); scoring it as if higher-is-better would mislead. The narrative still displays on cards; the graph owns this signal in reachable-network mode. |
+| 7 | Small-pool standardization | **Min pool 30**; below it, standardize against precomputed network-wide per-dimension μ/σ (offline stats job \+ one query branch). |
+| 8 | E1 source | **Keep the single FalkorDB membership query.** Exact, read-only, catches Universe-only edges. Co-contact proxy stays documented as contingency only. |
+| 9 | AlloyDB `persona` shape | **9 rows per person, keyed `(master_person_id, dim)`** — null dims are absent rows (matches the LEFT-JOIN SQL); the Go writer unpivots Xano 754's wide row on sync. |
+| 10 | Pool sizes | **Average a few thousand; power users 20K–30K contacts.** See the scaling plan below — 30K is a design input, not a tail risk. |
+
+**Scaling plan for 20–30K pools** _(follows from decision 10)_: the full 20-cosine matrix \+ window z-scores are comfortable to a few thousand candidates but not at 30K. Ship the `persona (master_person_id, dim)` index from day one, and above a threshold (~10K, tune later) run a **two-stage rank**: stage 1 computes only the four **driver diagonals** for the whole pool (4 cosines instead of 20), z-scores them, soft-maxes, and keeps the top ~2K; stage 2 runs the full matrix (all diagonals \+ 12 cross-cells \+ mutuality) on the shortlist. The stage-2 z-scores are computed over the shortlist rather than the full pool — an accepted approximation, since stage 1 already standardized over everyone. Also at this scale, **do not materialize a `compare_persona` row per pair per run** (30K rows per loop run); write back only the surfaced results.
+
+### Open questions
+
 - **`person_id` → `master_person_id`.** Confirm the input `person_id` _is_ the `master_person_id`, or define the resolution (persons table?).
-- **`persona` table shape.** The SQL assumes **up to 9 rows per person** keyed `(master_person_id, dim)` — a null narrative means the row is simply absent (which is why the scoring joins are LEFT). If Mark's reference builder writes one row with 9 vector columns (the Xano 754 shape), the query changes — lock the shape before coding.
-- **Coverage de-weighting.** The build's `synthesis` coverage grades (`rich | moderate | thin | none`) were stored for match-time de-weighting. Decide the transform (e.g. `thin` → shrink z toward 0 by half) and whether v1 ships with it or it waits for the harness to prove it helps.
-- **Shelf portfolio parameters.** The [top-24 composition](#composing-the-top-24) recommends 4 shelves × 6 with floors \+ backfill. Confirm the shelf sizes, the diagonal z floor per shelf, and whether the UI presents the shelves as labeled sections or one interleaved feed.
-- **Small-pool standardization.** Z-scores are computed across _the user's contacts_. A user with few contacts → noisy/degenerate z-scores. Define a **minimum pool size** and a fallback (e.g. network-wide μ/σ per dimension precomputed offline).
-- **Dim 7 (`community_affiliation`).** Graph-gated in the full method; with no graph it's just **another embedding dimension** here. Decide: score it on the diagonal like dims 1–6/8/9 (it has a narrative \+ vector), or leave it out of v1.
 - **`master_person` → user resolution (E3).** Confirm the table/column that maps a `master_person` to a user account (`app_user.master_person_id` is assumed in the E3 SQL) and that it's reachable from the scoring function's AlloyDB.
-- **E2 tenure semantics.** v1 excludes on **any** shared `WORKS_AT` company, overlapping tenures or not — alumni ties are trivially discoverable either way. Open: whether a **large-employer guard** is worth it later (two people who each spent two years at a 100k-person company, a decade apart, are weak "already reachable" evidence — a headcount floor or an overlapping-tenure requirement for big companies would let those pairs back in).
-- **E2 edge scope.** `WORKS_AT` only for v1. Open: widen to the rest of the company orbit — `FOUNDED`, `BOARD_MEMBER_OF`, `ADVISOR_TO` — so a candidate on the board of the target's company is also excluded.
-- **E1 without the graph.** If v1 must stay purely relational, replace the FalkorDB membership query with the **co-contact proxy** (pair is "connected" when ≥ N users hold both as contacts) — weaker recall on Universe-only edges (`ATTENDED_TOGETHER`, `CO_INVESTORS`, …), but zero graph dependency. Decide the threshold N if used.
 - **Versioned personas.** If `persona` is bitemporal/versioned, add a `valid_to IS NULL` (current) filter to every join.
 - **Embedding consistency.** Every persona must share one embedding model \+ dimensionality (gemini, 3072, normalized) or `1-(<=>)` is invalid. Reject/await mixed-model rows.
-- **Mutuality.** v1 scores one direction (target→candidate). The method notes production should combine both directions (`min` / harmonic) — out of scope for v1, flag for v2.
-- **Performance.** For large contact lists the per-dim cross-join \+ window z-scores are fine to a few thousand candidates; beyond that, index `persona(master_person_id, dim)`, consider an ANN prefilter, or precompute the pool. Confirm expected pool sizes with Mark.
+- **Harness-owned tunables.** The remaining constants are hypotheses the harness freezes, not decisions to make now: per-shelf diagonal z floors, serendipity τ, soft-max temperature, weights, the coverage multiplier (decision 3), and the two-stage threshold from the scaling plan.

@@ -44,7 +44,7 @@ Xano  ──  persona/get-scores(person_id, user_id, params)  ──▶  GCP  �
 ## `persona/get-scores` — proposed input contract
 
 <Note>
-  **Proposed — Mark to confirm. This is the v1 (my-contacts) contract.** Derived from the `loop_generic` scoring constants (`wDrivers`, `wValence`, `wSoft`, `wComm`, `softmaxTemp`) and the tuner controls. Identity inputs are required; every scoring knob defaults to the current pipeline constant, so a call with only `person_id` \+ `user_id` reproduces today's behavior. The graph knobs — `w_bridge`, `node_nudge`, `max_hops`, `include_suppressed` — are **not** in v1: they require a relationship graph and only apply to a future _reachable-network_ mode (see the build plan below). v1 has no multi-hop traversal — the candidate pool is the user's direct contacts.
+  **Proposed — Mark to confirm. This is the v1 (my-contacts) contract.** Derived from the `loop_generic` scoring constants (`wDrivers`, `wValence`, `wSoft`, `wComm`, `softmaxTemp`) and the tuner controls. Identity inputs are required; every scoring knob defaults to the current pipeline constant, so a call with only `person_id` \+ `user_id` reproduces today's behavior. The graph knobs — `w_bridge`, `node_nudge`, `max_hops`, `include_suppressed` — are **not** in v1: they require a relationship graph and only apply to a future _reachable-network_ mode (see the build plan below). v1 has no multi-hop traversal — the candidate pool is the user's direct contacts, **minus the [exclusion sets](#pool-exclusions-the-negative-space)** (already-connected to the target, shared employer, and — when the target is an Orbiter user — the target's own contacts). The exclusions are membership lookups, not traversal scoring: they cost one read-only graph query, not a graph engine in the scoring path.
 </Note>
 
 | Parameter | Type | Default | Range | What it controls |
@@ -59,7 +59,10 @@ Xano  ──  persona/get-scores(person_id, user_id, params)  ──▶  GCP  �
 | `w_comm` | float | `0.02` | `0`–`1` | Modifier: communication-style tiebreaker. |
 | `serendipity_lift_floor` | float (τ) | `0.50` | `0`–`~3` | Min lift (`cross_argmax − driver_pool`, z-space) to qualify for the serendipity lane; raise to keep only genuinely non-obvious intros. |
 | `limit` | int | `20` | `1`–`100` | Max ranked candidates returned. |
-| `candidate_ids` | uuid\[\] | _null_ → derive from the user's contacts | — | Optional explicit candidate set; the harness pins a fixed set for repeatable eval. |
+| `candidate_ids` | uuid\[\] | _null_ → derive from the user's contacts | — | Optional explicit candidate set; the harness pins a fixed set for repeatable eval. **A pinned set bypasses derivation _and_ the exclusion sets** — the harness gets exactly the pool it asked for. |
+| `exclude_connected` | bool | `true` | — | **E1** — drop candidates with any direct person↔person edge to the target. |
+| `exclude_shared_employer` | bool | `true` | — | **E2** — drop candidates who share an employer with the target, past or present. |
+| `exclude_target_contacts` | bool | `true` | — | **E3** — when the target resolves to an Orbiter user, drop everyone in the target's own contact list. No-op when the target is not a user. |
 | `mutuality` | enum `off` \| `min` \| `harmonic` | `off` | — | Combine target→candidate and candidate→target scores (open question — production should enable). |
 
 ```json
@@ -92,13 +95,75 @@ The implementation spec for the GCP function. Everything runs in **Go against Al
 All personas live in one AlloyDB table, **nine `(narrative, vector)` rows per person**, linked to a `master_person`. A `contact` row links a `master_person` to a `user_id`. The join that defines the candidate pool is the heart of this function:
 
 <Info>
-  **The rule:** given the **target** (`master_person`) and the **`user_id`** (the introducer), the candidate set is **every _other_ persona belonging to that user's contacts** — i.e. `contact.user_id = $user_id → contact.master_person_id → persona`, minus the target. The user is the connector; we rank the target against the rest of _their_ network.
+  **The rule:** given the **target** (`master_person`) and the **`user_id`** (the introducer), the candidate set is **every _other_ persona belonging to that user's contacts** — i.e. `contact.user_id = $user_id → contact.master_person_id → persona`, minus the target, **minus the three exclusion sets below**. The user is the connector; we rank the target against the part of _their_ network the target can't already reach.
 </Info>
 
 ```text
 user_id ──(contact.user_id)──▶ contact ──(contact.master_person_id)──▶ master_person ──(persona.master_person_id)──▶ persona  (9 vectors)
-                                                                                    └── exclude the target's master_person_id
+                                                                                    └── minus the target's master_person_id
+                                                                                    └── minus E1  direct edge to target        (graph)
+                                                                                    └── minus E2  shared employer with target  (graph)
+                                                                                    └── minus E3  the target-user's contacts   (SQL, only when target is a user)
 ```
+
+### Pool exclusions — the negative space
+
+_(Added 2026-08-15.)_ An introduction only has value if the two people can't already reach each other. Three exclusion sets define that negative space, subtracted from the pool **before** scoring:
+
+| Set | Excludes candidates who… | Why | Source |
+| --- | --- | --- | --- |
+| **E1** — direct connection | have **any direct person↔person edge** to the target (`ATTENDED_TOGETHER`, `STUDIED_UNDER`, `MENTOR`, `CO_INVESTORS`, `SAME_AS`, …) | already connected — not an introduction | FalkorDB Universe, one membership query |
+| **E2** — shared employer | share a **`WORKS_AT` company** with the target, **past or present** (the edge is bitemporal; deliberately no `valid_to` filter — "both worked at" and "works at same company" are the same check) | colleagues and alumni are trivially reachable; the intro is redundant | Same FalkorDB query as E1 |
+| **E3** — target's own graph | appear in the **target-user's own contact list**, when the target `master_person` resolves to an Orbiter user account | the target already knows them — Orbiter has first-party proof | AlloyDB `contact` anti-join — **no cross-graph query** |
+
+<Warning>
+  **Prune before z-scoring, not after.** The z-scores standardize each dimension _across the candidate pool_ — the pool defines every candidate's μ/σ. Dropping excluded candidates after scoring (the way the full pipeline's Go gate drops `Dist <= 1`) leaves their similarities inside the window functions and shifts everyone else's z-scores. The exclusions must shrink the `cand` set _before_ the scoring query runs. Keep the Go drop-gate only as belt-and-suspenders.
+</Warning>
+
+**Phase order** (cheapest first, each phase shrinks the next phase's input):
+
+1. **Resolve the pool + E3 in one SQL query.** Resolve whether the target `master_person` maps to a user account; if it does, anti-join that user's `contact` rows. `contact` is the relational projection of the user's `KNOWS` star — same set, so E3 never needs to touch the target's graph. Select each survivor's `node_uuid` alongside `master_person_id` (the graph key for phase 2).
+2. **One FalkorDB round trip for E1 + E2.** Send the target's `node_uuid` plus the surviving candidate `node_uuid`s; get back the excluded ids. Membership test only — no traversal, no scoring signal. Chunk the `IN` list if the pool exceeds a few thousand.
+3. **Score the final pool.** Feed the survivors through the existing `candidate_ids` input path — **the scoring SQL and the Go composition are unchanged**; exclusion is entirely a pool-resolution concern.
+
+<CodeGroup>
+
+```sql E3 — pool resolution with the target-user anti-join
+-- $1 target master_person_id ; $2 user_id (the introducer)
+WITH target_user AS (              -- does the target map to an Orbiter user?
+  SELECT u.id AS user_id
+  FROM app_user u                  -- confirm table/column names (open question)
+  WHERE u.master_person_id = $1
+)
+SELECT DISTINCT c.master_person_id AS mp, m.node_uuid
+FROM contact c
+JOIN master_person m ON m.id = c.master_person_id
+WHERE c.user_id = $2
+  AND c.master_person_id <> $1
+  AND EXISTS (SELECT 1 FROM persona p
+              WHERE p.master_person_id = c.master_person_id AND p.dim = 1)
+  -- E3: target is a user → drop anyone already in the target's own contact list
+  AND NOT EXISTS (SELECT 1
+                  FROM contact tc
+                  JOIN target_user tu ON tc.user_id = tu.user_id
+                  WHERE tc.master_person_id = c.master_person_id);
+```
+
+```cypher E1 + E2 — one batched membership query (FalkorDB Universe)
+// $target = target node_uuid ; $cands = surviving candidate node_uuids (phase 1 output)
+MATCH (t:Person {uuid: $target})
+MATCH (c:Person)
+WHERE c.uuid IN $cands
+  AND (
+        (c)--(t)                                              // E1: any direct person↔person edge
+     OR (c)-[:WORKS_AT]->(:Company)<-[:WORKS_AT]-(t)          // E2: shared employer, past or present
+  )
+RETURN collect(DISTINCT c.uuid) AS excluded
+```
+
+</CodeGroup>
+
+E1 uses the untyped `(c)--(t)` pattern on purpose: any direct edge between the two people means they're connected, and new person↔person edge types are excluded automatically instead of silently leaking through a named list. If the graph round trip is unacceptable for v1, the graph-free fallback for E1 is the **co-contact proxy** (a pair is "connected" when ≥ N users hold _both_ as contacts) — weaker, but purely relational; E2 can likewise come from a relational employment table if one is synced to AlloyDB. E3 needs neither: it is always a pure SQL anti-join.
 
 ### Steps to implement
 
@@ -106,8 +171,11 @@ user_id ──(contact.user_id)──▶ contact ──(contact.master_person_id
   <Step title="Resolve the target">
     `person_id` (input) → the target's `master_person_id` (the `persona` key). Confirm the mapping — see open questions.
   </Step>
-  <Step title="Resolve the candidate pool (the contact join)">
-    Select the `master_person_id` of every contact of `user_id` that has a persona, excluding the target. This is the only place the candidate set is defined — keep it one query.
+  <Step title="Resolve the candidate pool (the contact join + E3)">
+    Select the `master_person_id` (and `node_uuid`) of every contact of `user_id` that has a persona, excluding the target — and, when the target resolves to an Orbiter user, anti-join the target-user's own `contact` rows (E3). This is the only place the candidate set is defined — keep it one query.
+  </Step>
+  <Step title="Apply the graph exclusions (E1 + E2)">
+    One FalkorDB membership query with the target's `node_uuid` and the surviving candidate `node_uuid`s: drop anyone with a direct person↔person edge to the target or a shared `WORKS_AT` company (past or present). See [Pool exclusions](#pool-exclusions-the-negative-space). Survivors feed the scoring query via the `candidate_ids` path.
   </Step>
   <Step title="Score in SQL: per-dimension cosine + topical cross-cells">
     One AlloyDB query returns, per candidate, the eight embedding-scored diagonal dims (z-scored across the pool) plus the twelve raw `4×4` off-diagonal topical cells. Dim 7 (`community_affiliation`) is **not** embedding-scored.
@@ -400,6 +468,7 @@ func zscore(xs []float64) []float64 {
   "user_id": 12,
   "mode": "peer",
   "candidate_pool_size": 184,
+  "exclusions": { "pool_before": 238, "direct_connection": 9, "shared_employer": 14, "target_user_contacts": 31, "target_is_orbiter_user": true },
   "params_used": { "softmax_temperature": 2.0, "w_drivers": 0.55, "w_valence": 0.20, "w_soft": 0.03, "w_comm": 0.02, "serendipity_lift_floor": 0.50, "limit": 20 },
   "results": [
     { "master_person_id": 5381, "rank": 1, "lane": "serendipity", "diagonal": 1.82, "serendipity_z": 2.41, "lift": 1.06, "ser_tgt_dim": 2, "ser_cand_dim": 8 },
@@ -411,16 +480,19 @@ func zscore(xs []float64) []float64 {
 ### Open questions
 
 <Info>
-  **No graph (FalkorDB) is needed for this scope — it's fully relational \+ vector on AlloyDB.** The candidate set comes from `contact` (`user_id → master_person → persona`) and the ranking is persona similarity; both live in AlloyDB. The graph signals in the full [scoring pipeline](/guides/open-work/suggestion-recipes/loop-generic) only matter for the broader _"rank everyone reachable"_ mode and **collapse here**: when the pool is the user's **direct contacts**, there is no multi-hop distance to score, and the user is themselves the bridge between any two of their contacts. So `w_bridge` / `node_nudge` / `max_hops` are **out of scope for v1** (they belong to a future reachable-network mode), and the Go composite is embedding-only **by design** — not a limitation.
+  **No graph traversal is needed for this scope — scoring is fully relational \+ vector on AlloyDB.** The candidate set comes from `contact` (`user_id → master_person → persona`) and the ranking is persona similarity; both live in AlloyDB. The graph signals in the full [scoring pipeline](/guides/open-work/suggestion-recipes/loop-generic) only matter for the broader _"rank everyone reachable"_ mode and **collapse here**: when the pool is the user's **direct contacts**, there is no multi-hop distance to score, and the user is themselves the bridge between any two of their contacts. So `w_bridge` / `node_nudge` / `max_hops` are **out of scope for v1** (they belong to a future reachable-network mode), and the Go composite is embedding-only **by design** — not a limitation.
 
-  **The one thing it can't do:** detect whether the **target and a candidate already know each other** (to skip a redundant intro). `contact` encodes _user→person_ edges, not _person↔person_, so v1 won't suppress already-connected pairs. Acceptable for the harness; if we want it later it needs a person↔person source (a relationship table, or a co-contact proxy across users) — **not** necessarily FalkorDB. See open questions.
+  **Already-connected suppression is now specced** _(2026-08-15, was deferred)_: the [pool exclusions](#pool-exclusions-the-negative-space) subtract direct connections (E1), shared employers (E2), and — when the target is an Orbiter user — the target's own contacts (E3) **before the scoring query runs**. The person↔person source is one read-only FalkorDB membership query (E1 \+ E2); E3 is a pure `contact` anti-join. The graph-free fallback, if that one query is unwanted in v1, is the co-contact proxy — see open questions.
 </Info>
 
 - **`person_id` → `master_person_id`.** Confirm the input `person_id` _is_ the `master_person_id`, or define the resolution (persons table?).
 - **`persona` table shape.** The SQL assumes **8 rows per person** keyed `(master_person_id, dim)`. If Mark's reference builder writes one row with 8 vector columns (or a vector array), the query changes — lock the shape before coding.
 - **Small-pool standardization.** Z-scores are computed across _the user's contacts_. A user with few contacts → noisy/degenerate z-scores. Define a **minimum pool size** and a fallback (e.g. network-wide μ/σ per dimension precomputed offline).
 - **Dim 7 (`community_affiliation`).** Graph-gated in the full method; with no graph it's just **another embedding dimension** here. Decide: score it on the diagonal like dims 1–6/8/9 (it has a narrative \+ vector), or leave it out of v1.
-- **Already-connected detection (deferred).** If we later want to skip target↔candidate pairs that already know each other, add a person↔person source — a relationship/edge table, or a co-contact proxy (count of users who have _both_ as contacts). Not needed for the harness; not a FalkorDB dependency.
+- **`master_person` → user resolution (E3).** Confirm the table/column that maps a `master_person` to a user account (`app_user.master_person_id` is assumed in the E3 SQL) and that it's reachable from the scoring function's AlloyDB.
+- **E2 tenure semantics.** v1 excludes on **any** shared `WORKS_AT` company, overlapping tenures or not — alumni ties are trivially discoverable either way. Open: whether a **large-employer guard** is worth it later (two people who each spent two years at a 100k-person company, a decade apart, are weak "already reachable" evidence — a headcount floor or an overlapping-tenure requirement for big companies would let those pairs back in).
+- **E2 edge scope.** `WORKS_AT` only for v1. Open: widen to the rest of the company orbit — `FOUNDED`, `BOARD_MEMBER_OF`, `ADVISOR_TO` — so a candidate on the board of the target's company is also excluded.
+- **E1 without the graph.** If v1 must stay purely relational, replace the FalkorDB membership query with the **co-contact proxy** (pair is "connected" when ≥ N users hold both as contacts) — weaker recall on Universe-only edges (`ATTENDED_TOGETHER`, `CO_INVESTORS`, …), but zero graph dependency. Decide the threshold N if used.
 - **Versioned personas.** If `persona` is bitemporal/versioned, add a `valid_to IS NULL` (current) filter to every join.
 - **Embedding consistency.** Every persona must share one embedding model \+ dimensionality (gemini, 3072, normalized) or `1-(<=>)` is invalid. Reject/await mixed-model rows.
 - **Mutuality.** v1 scores one direction (target→candidate). The method notes production should combine both directions (`min` / harmonic) — out of scope for v1, flag for v2.

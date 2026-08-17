@@ -1,0 +1,274 @@
+---
+title: "Resend Email Invite"
+description: "Go build plan for sending secure, branded Org member invitations through Resend"
+icon: "envelope"
+---
+
+This page is the v1 build plan for the email sent when an Org admin invites a team member to join an Org on Orbiter.io.
+
+<Danger>
+  **Do not spend time designing this email for v1.** Use the simplest functional HTML possible. Focus only on sending the invitation successfully and making the **Connect to Orbiter.io** button take the new user to the correct authentication flow.
+</Danger>
+
+<Warning>
+  **The existing Resend API key is stored in Xano environmental variables as `RESEND_API_KEY`.** The live Xano sender also uses `RESEND_FROM_EMAIL`. Never copy either secret into source code, logs, the invitation URL, or browser code. The Go service must receive the corresponding secret through its server-side secret manager or runtime environment.
+</Warning>
+
+## How Resend works
+
+Orbiter sends Resend an authenticated `POST https://api.resend.com/emails` request containing `from`, `to`, `subject`, and `html`. Resend accepts the message and returns an email ID. Use that ID to record the send. The sender must use an Orbiter-owned domain that has been verified in Resend.
+
+For Go, either use the official `github.com/resend/resend-go/v3` SDK or call the HTTP API directly. The API request is the same either way. See Resend's [Go quickstart](https://resend.com/docs/send-with-go), [Send Email API](https://resend.com/docs/api-reference/emails/send-email), and [domain verification guide](https://resend.com/docs/dashboard/domains/introduction).
+
+## Existing Xano reference
+
+The current waitlist sender is the implementation reference:
+
+| Item | Live value |
+| --- | --- |
+| Workspace | Orbiter workspace `3`, branch `v1` |
+| Function | `waitlist/send_welcome_email` |
+| Function ID | `9840` |
+| Recipient input | `email_address` |
+| Resend endpoint | `POST https://api.resend.com/emails` |
+| From address | `$env.RESEND_FROM_EMAIL` |
+| Authorization | `Bearer $env.RESEND_API_KEY` |
+
+The Xano function builds the HTML, sends it as the `html` field, and returns Resend's API response:
+
+```xanoscript Existing Xano pattern — function #9840
+api.request {
+  url = "https://api.resend.com/emails"
+  method = "POST"
+  params = {}
+    |set:"from":$env.RESEND_FROM_EMAIL
+    |set:"to":$input.email_address
+    |set:"subject":"You're invited to join an Org on Orbiter.io"
+    |set:"html":$email_html
+  headers = []
+    |push:("Authorization: Bearer "|concat:$env.RESEND_API_KEY:"")
+    |push:"Content-Type: application/json"
+  timeout = 30
+} as $api_response
+```
+
+The Go service should reproduce this contract, not call Xano merely to send the email.
+
+## V1 invitation contract
+
+When an Org admin submits an invitation, the Go service must:
+
+1. Authenticate the requester and confirm they are an admin of the Org.
+2. Normalize the invited email address to lowercase.
+3. Confirm that its domain exactly matches one of the Org's verified domains.
+4. Reject an existing member, a duplicate pending invitation, or an email on another domain.
+5. Create a pending invitation with a one-time token and expiration.
+6. Build the branded **New Org Member Signup** URL.
+7. Render the HTML email with the Org name, Org logo, invited email, and signup URL.
+8. Send the message through Resend with an idempotency key.
+9. Store Resend's returned email ID and the invitation's send status.
+
+### Suggested invitation record
+
+| Field | Purpose |
+| --- | --- |
+| `id` | UUID for the invitation |
+| `org_id` | Org the person is invited to join |
+| `email` | Normalized invited company email |
+| `role` | Initial Org role |
+| `token_hash` | Hash of the one-time token; never store the usable token |
+| `status` | `pending`, `accepted`, `expired`, or `revoked` |
+| `expires_at` | Expiration checked before showing signup or accepting |
+| `invited_by_user_id` | Admin who sent the invitation |
+| `resend_email_id` | ID returned by Resend |
+| `sent_at` / `accepted_at` | Lifecycle timestamps |
+
+## Build the signup URL
+
+Use this shape:
+
+```text Example — invitation URL
+https://app.orbiter.io/new-org-member-sign-up?invite=<one-time-token>
+```
+
+The token resolves server-side to the invitation record containing the `org_id`, invited email, and expiration. Do not use a bare URL such as `?org_id=42` as authorization: anyone could change it. Do not put the Org name or logo in the URL. After validating the token, the signup page loads the current name and logo from the Org record.
+
+The token must be:
+
+- cryptographically random and URL-safe
+- stored only as a hash in the database
+- scoped to one invitation and one Org
+- single-use after acceptance
+- revocable and time-limited
+
+## Invitation email
+
+Render email HTML server-side with Go's `html/template` package so the Org name, logo URL, and other dynamic values are escaped. The invitation URL is generated by the server and inserted into the button.
+
+```html Example — Resend Org invitation email
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Join {{.OrgName}} on Orbiter.io</title>
+  </head>
+  <body style="margin:0;background:#0a0a0b;color:#ffffff;font-family:Arial,sans-serif;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#0a0a0b;">
+      <tr>
+        <td align="center" style="padding:40px 20px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#18181b;border-radius:16px;">
+            <tr>
+              <td align="center" style="padding:40px;">
+                <img src="{{.OrgLogoURL}}" alt="{{.OrgName}}" width="72" style="display:block;border:0;border-radius:12px;margin-bottom:24px;" />
+                <h1 style="margin:0 0 16px;font-size:28px;line-height:1.25;color:#ffffff;">
+                  Welcome to {{.OrgName}} on Orbiter.io
+                </h1>
+                <p style="margin:0 0 28px;font-size:16px;line-height:1.6;color:#a1a1aa;">
+                  You have been invited to connect your company account and join the {{.OrgName}} organization.
+                </p>
+                <table role="presentation" cellpadding="0" cellspacing="0">
+                  <tr>
+                    <td bgcolor="#2563eb" style="border-radius:8px;">
+                      <a href="{{.InviteURL}}" style="display:inline-block;padding:14px 24px;color:#ffffff;text-decoration:none;font-size:16px;font-weight:700;">
+                        Connect to Orbiter.io
+                      </a>
+                    </td>
+                  </tr>
+                </table>
+                <p style="margin:28px 0 0;font-size:13px;line-height:1.5;color:#71717a;">
+                  This invitation was sent to {{.InvitedEmail}} and expires on {{.ExpiresAt}}.
+                  If you were not expecting it, you can ignore this email.
+                </p>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>
+```
+
+Also send a plain-text fallback containing the Org name and the full signup URL.
+
+## Send from Go
+
+The direct HTTP version makes the Resend contract explicit:
+
+```go Example — send the invitation through Resend
+package email
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+)
+
+type resendRequest struct {
+	From    string   `json:"from"`
+	To      []string `json:"to"`
+	Subject string   `json:"subject"`
+	HTML    string   `json:"html"`
+	Text    string   `json:"text,omitempty"`
+}
+
+type resendResponse struct {
+	ID string `json:"id"`
+}
+
+func sendOrgInvite(ctx context.Context, apiKey, from, to, subject, htmlBody, textBody, invitationID string) (string, error) {
+	payload, err := json.Marshal(resendRequest{
+		From: from, To: []string{to}, Subject: subject, HTML: htmlBody, Text: textBody,
+	})
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.resend.com/emails", bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", "org-invite:"+invitationID+":v1")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
+		return "", fmt.Errorf("resend returned %s: %s", resp.Status, body)
+	}
+
+	var sent resendResponse
+	if err := json.NewDecoder(resp.Body).Decode(&sent); err != nil {
+		return "", err
+	}
+	return sent.ID, nil
+}
+```
+
+Resend supports the `Idempotency-Key` header to prevent duplicate sends for the same request. Its API-level idempotency window is 24 hours, so the invitation record must remain the durable duplicate-send guard.
+
+## Endpoint build plan
+
+### 1. Admin creates the invitation
+
+```http
+POST /v1/orgs/{org_id}/invitations
+Authorization: Bearer <Orbiter session>
+Content-Type: application/json
+Idempotency-Key: <client request id>
+
+{"email":"new.member@vamoswatu.com","role":"member"}
+```
+
+The handler validates admin access and domain eligibility, creates the invitation in a transaction, and queues the email. Do not hold the request open while retrying Resend.
+
+### 2. Worker renders and sends
+
+The worker loads the invitation and Org, builds the one-time URL, renders the HTML and text templates, and calls Resend. On success, save `resend_email_id`, `sent_at`, and `send_status: sent`.
+
+Retry network errors, `429`, and `5xx` responses with backoff. Treat other `4xx` responses as configuration or payload errors requiring operator attention. Reuse the same Resend idempotency key on retries.
+
+### 3. Signup page resolves the invitation
+
+```http
+GET /v1/org-invitations/resolve?invite=<one-time-token>
+```
+
+After hashing and validating the token, return only the safe page data needed before authentication:
+
+```json Example — branded signup response
+{
+  "org_id": "019...",
+  "org_name": "VamosWatu",
+  "org_logo_url": "https://.../vamoswatu.png",
+  "invited_email_masked": "n***@vamoswatu.com",
+  "expires_at": "2026-08-24T18:00:00Z"
+}
+```
+
+The page renders **Welcome to VamosWatu on Orbiter.io**, then starts the [invited team member signup flow](/guides/open-work/org-graph-scope#invited-team-member-signup-flow).
+
+### 4. Accept only after onboarding succeeds
+
+Keep the invitation `pending` through WorkOS, the Nylas email authorization, Identity Verification, and Orbiter Universe enrichment. Mark it `accepted` and activate Org membership only after the complete onboarding flow succeeds.
+
+## V1 definition of done
+
+- Only an authenticated Org admin can send an invitation.
+- The invited email domain must match the Org's verified domain.
+- The email is branded with the current Org name and logo.
+- The **Connect to Orbiter.io** button contains a one-time, expiring invitation token.
+- Resend sends from a verified Orbiter domain using a server-side API key.
+- Sends and retries are idempotent, and the returned Resend email ID is stored.
+- Invalid, expired, revoked, already-used, and wrong-domain invitations fail closed.
+- Org membership activates only after the full invited-user onboarding flow completes.

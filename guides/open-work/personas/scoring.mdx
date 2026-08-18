@@ -14,7 +14,10 @@ flowchart LR
     C2 --> D2[(compare_simulated_persona — 784<br/>raw per-dimension cosines)]
     D1 --> E[Step 2 — cluster to Top 24<br/>sim-leaning quotas · quality floors · spike lane]
     D2 --> E
-    E --> F[Leverage-loop suggestions]
+    E --> G[Step 3 — graph elimination + refill<br/>Universe graph, and User graph when target is a User]
+    G --> W[Step 4 — generate the WHY<br/>kimi-k3 · full context + mem0 both sides · saved on the compare row]
+    W --> J[Step 5 — judge to final 6<br/>rate the 24 WHYs · 18 persist with filtered = true]
+    J --> F[Leverage-loop suggestions]
 ```
 
 **The stores.** `persona` (754) — one row per real person, nine narrative/vector pairs. `simulated_persona` (783) — 1–3 archetype rows per loop target, same nine columns. `compare_persona` (778) — direct pairwise scores. `compare_simulated_persona` (784) — archetype-vs-contact scores. All four keep **raw cosines only**: no weighting, no normalization, no mode is ever persisted.
@@ -143,6 +146,8 @@ table "compare_persona" {
     int persona_b_id? { description = "persona (754) row id for person B at compare time" }
     timestamp persona_a_updated_at? { description = "persona row A updated_at snapshot — staleness detection" }
     timestamp persona_b_updated_at? { description = "persona row B updated_at snapshot — staleness detection" }
+    text? why? { description = "Step 4 output — LLM-written case for the introduction (why + win-win), from full context of both people w/ mem0 + match provenance. Null until generated" }
+    timestamp why_generated_at? { description = "When the WHY was generated — staleness signal after persona rebuilds" }
   }
 
   index = [
@@ -184,6 +189,8 @@ table "compare_simulated_persona" {
     int candidate_persona_id? { description = "persona (754) row id of the candidate at compare time" }
     timestamp candidate_persona_updated_at? { description = "Candidate persona updated_at snapshot — staleness detection" }
     timestamp simulated_persona_updated_at? { description = "Archetype row updated_at snapshot — staleness detection after a re-simulation" }
+    text? why? { description = "Step 4 output — LLM-written case for the introduction (why + win-win), from full context of both people w/ mem0 + match provenance. Null until generated" }
+    timestamp why_generated_at? { description = "When the WHY was generated — staleness signal after persona/archetype rebuilds" }
   }
 
   index = [
@@ -222,7 +229,78 @@ Everything below is arithmetic over the saved rows — **zero recompute**, endle
   **Relationship to the earlier portfolio.** The peer/complement × diagonal/serendipity top-24 on [developer-requirements](/guides/open-work/suggestion-recipes/developer-requirements) predates Simulated Personas. When archetypes exist for the target, **this sim-leaning cut is the recommended plan** — the archetype axis subsumes most of what the serendipity cross-cells were reaching for (non-obvious helpers), and the K=0 row is the fallback when no simulation exists. Quotas, floors, the spike thresholds, and the corroboration bonus are **harness-owned tunables**; nothing here is baked into storage.
 </Note>
 
-Temp QA endpoints until promotion: `qa/run-compare-persona` (8991) for direct pairs; the simulated-compare runner is **to build** (mirror #13350 against 784). First compute for a pair ~9s including lazy embedding backfill; cached reads instant.
+## Step 3 — Graph elimination and refill
+
+The Top 24 are candidates, not results — each must be verified against the graph(s) for an existing direct connection to the target before it can be suggested:
+
+1. **Universe graph check.** One batched membership query with the target's `node_uuid` and all 24 candidate `node_uuid`s: any candidate with a **direct edge to the target** (untyped `(c)--(t)` — any edge type counts, so new edge types are covered automatically) is **eliminated**.
+2. **User graph check (conditional).** When the leverage-loop target **is an Orbiter User**, also check the target's own User graph for a direct target↔candidate connection — a relationship that exists only in their personal graph still disqualifies the introduction. Eliminate those too.
+3. **Refill and repeat.** However many were eliminated, pull the **next-best matches** from the Step 2 ranked remainder (same lane logic — an eliminated archetype pick refills from that archetype's next candidate above the floor, then cascades), run the new picks through the same graph check(s), and **repeat until 24 matches stand with no known direct connection**. Batch each wave into one membership query per graph; pools are pre-shrunk so this converges in one or two waves.
+
+<Note>
+  This composes with the [pool exclusions](/guides/open-work/suggestion-recipes/developer-requirements#pool-exclusions-the-negative-space) (E1–E3), which run **before** scoring: when the pool was properly excluded, Step 3 removals are rare. Step 3 is the authoritative **post-selection verification** — it catches connections formed after the compare rows were cached, pools scored before exclusions existed, and the User-graph case for user-targets.
+</Note>
+
+## Step 4 — Generate the WHY
+
+Each verified match is carried as a **qualified-match object** that knows its provenance:
+
+```json
+{ "master_person_id": 1234, "compare_persona_id": 87, "compare_simulated_persona_id": null }
+```
+
+— exactly **one of the two compare ids is set** (a straight compare or a simulated compare), and that row is where the WHY is saved: both `compare_persona` (778) and `compare_simulated_persona` (784) now carry **`why`** (text) and **`why_generated_at`** (staleness — regenerate after either side's persona/archetype rebuilds).
+
+The WHY is written by **kimi-k3** from the **full context of the leverage-loop target w/ mem0** plus the **full context of the suggested match w/ mem0** plus the match provenance. System prompt (spec, copy-paste):
+
+```text
+You are Why, the introduction writer for a relationship platform. You receive full context on two real people — the PERSON (the leverage-loop target) and the MATCH (a suggested introduction from the user's network) — plus the matching provenance that surfaced the match. You write the case for introducing them.
+
+Input sections
+- person: persona narratives (nine dimensions), mem0 memories (notes, interactions, stated goals), profile facts.
+- match: the same sections for the suggested match.
+- provenance: how the match surfaced — a direct persona match (peer signal) or a match against a Simulated Persona archetype (helper signal, including the archetype's for_need), plus the strongest scoring dimensions and any near-perfect single-dimension spike.
+
+Rules
+- Ground every claim in the provided context. Never invent facts, shared history, or intentions that are not in the input. If the input only supports a modest case, write the honest modest case.
+- Use both people's real names naturally.
+- Lead with the reason that would make the USER (the introducer) nod immediately — the sharpest overlap or complementarity, never a summary of two bios.
+- Mutual value is the test: what does each side get? Timing outranks static similarity — current needs on either side are the strongest material.
+- When the provenance is the story, tell it (the match answers the person's current need for X; one dimension aligns near-perfectly on Y).
+- 2-4 sentences for why. 1-3 win_win_outcomes, each one sentence, each naming who wins what.
+- No hedging boilerplate, no "may potentially" chains, no restating the input.
+
+Output ONLY JSON:
+{
+  "why": "<2-4 sentences: why introduce these two people now>",
+  "win_win_outcomes": ["<one concrete sentence naming who wins what>", "..."],
+  "provenance_used": "<one clause: the thread the case is built on>"
+}
+```
+
+## Step 5 — Judge to the final 6
+
+A second LLM pass (kimi-k3 primary; judge model is a tunable) **rates the 24 WHYs** and picks the six with the biggest expected impact. All 24 persist as leverage-loop suggestions — the other 18 with **`filtered = true`** on the suggestion row, hidden by default and revealed when the user asks for more. Judge system prompt (spec, copy-paste):
+
+```text
+You are the introduction judge. You receive up to 24 candidate introductions for one person — each with its why, win_win_outcomes, and provenance (direct peer match or Simulated-Persona archetype match, with its scores). Rank them by expected impact.
+
+Criteria, in order
+1. Mutual, concrete value — both sides visibly win; specific beats generic.
+2. Timing — cases built on both sides' CURRENT needs outrank static similarity.
+3. Actionability — the first meeting writes itself; the why implies the agenda.
+4. Credibility — grounded specifics, not similarity vibes.
+5. Diversity — among near-ties, prefer a final set spanning different archetypes and needs over six variants of the same introduction.
+
+Output ONLY JSON, ranking ALL candidates:
+{ "ranked": [ { "master_person_id": <id>, "rank": 1, "reason": "<one line>" }, ... ] }
+```
+
+The top 6 become visible suggestions (`filtered = false`); ranks 7–24 persist with `filtered = true`.
+
+---
+
+**To build:** the simulated-compare runner (mirror `persona/compare-personas` #13350 against 784), the Step 3 graph-verification pass (one batched membership query per graph per wave), the Step 4 WHY generator, the Step 5 judge, and the `filtered` bool on the leverage-loop suggestion rows. Temp QA endpoints until promotion: `qa/run-compare-persona` (8991) for direct pairs. First compute for a pair ~9s including lazy embedding backfill; cached reads instant.
 
 ## Related
 

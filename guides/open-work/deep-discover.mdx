@@ -77,43 +77,36 @@ Three design points that make this good rather than merely functional:
 
 ### Process with Deep Discover enabled
 
-What actually happens, hop by hop, when a user submits a Discover query with Deep Discover on. Stages 1–7 are prototyped end-to-end in the Phase-0 harness (`deep_discover/test_search` #13373); stages 8–11 are the production build (Phases 2–4 below).
-
 <Steps>
-  <Step title="Submit">
-    `POST /discover` with `deep_discover: true`. The graph-RAG lane starts immediately and runs unchanged — the web lane forks off in parallel and never blocks it.
+  <Step title="Create the discover record — graph RAG starts">
+    `POST /discover` (`deep_discover: true`) writes the primary `discover` record and initiates the graph-RAG flow exactly as today — Cypher context from the Universe graph into the Discover LLM. Nothing about the existing lane changes or waits.
   </Step>
-  <Step title="Shape & route">
-    One flash-class LLM call turns the natural-language query into lane routing: `target_types` (company / person / film_tv / music) plus per-lane search inputs — rephrased company and people queries, structured film filters (genres, years, sort), the music act name. Lanes not targeted never run and never bill. Fail-open for company/people, fail-closed for film/music.
+  <Step title="Create the secondary record — launch deep discover async">
+    A **discover secondary record** is created immediately with the copy *"Searching beyond the Orbiter Universe…"* and status `processing`, and the deep-discover query fires **async** (the harness pipeline productionized — see *Inside the async call* below). The secondary record is the UI's handle on the whole web-lane lifecycle.
   </Step>
-  <Step title="Fan out per registry adapter">
-    Each targeted type calls its registry adapter in parallel: companies and people → Exa (categories `company` / `people`, highlights focused on the *original* query) + Parallel.ai Entity Search; film → TMDB `/discover` + per-title `external_ids` for IMDb anchors, with Serper `site:imdb.com/title` as an always-on topical supplement; music → MusicBrainz artist search → label relationships → release-label fallback.
+  <Step title="Initial response renders">
+    The graph-RAG answer lands on the primary record and renders as usual, while the secondary record remains visibly `processing` — the user gets their in-Universe answer at normal Discover speed, never blocked by the web lane.
   </Step>
-  <Step title="Normalize anchors">
-    Apex domain (www./m. stripped, aggregator hosts rejected), `linkedin.com/in/<slug>`, canonical `imdb.com/title/tt…/`, bare MBID. An entity that can't produce an anchor is dropped or demoted to a lead — anchors are the graph MERGE keys, so nothing anchorless can ever be ingested.
+  <Step title="Secondary response → de-dupe → seed → enrich">
+    When the deep-discover API responds with its anchored entities, de-dupe against the initial graph-RAG response: already in the answer → drop; in the graph but missed by RAG → inject; net-new → **seed each into the Orbiter Universe by type** through the registry entry points (company get-or-create on domain, person via LinkedIn URL, film title seed on IMDb URL, music MBID gates — kill switches surfaced, capped at K). Then **poll until every seeded entity has finished enrichment** (poll cadence and a hard deadline are an open knob below).
   </Step>
-  <Step title="Union across engines">
-    Cross-engine merge keyed on anchor. Engines overlap near zero in practice, so the union is where recall comes from; `source_engines` and per-engine ranks are kept per entity.
+  <Step title="Re-query the graph and run the LLM">
+    Pull each response entity's nodes and edges from the graph and run the Discover LLM against that fresh context — producing the **second response**, written to the discover secondary record.
   </Step>
-  <Step title="Gap-fill weak anchors">
-    Companies anchored only on a LinkedIn page get one Serper lookup for their apex domain — accepted only when the domain plausibly matches the company name (the TaskOrbiter→taskrabbit.com guard), original anchor kept as secondary.
-  </Step>
-  <Step title="Relevance gate">
-    One LLM call (default `qwen/qwen3.7-flash`, `DD_GATE_MODEL` env override, automatic fallback model on rate-limit) scores every entity 0–1 against the original query with a one-line reason: 1.0 = directly part of the answer, 0.5 = plausible candidate, 0 = could not be. Top-3 semantic-engine rank counts as weak evidence.
-  </Step>
-  <Step title="Dedupe against the graph (production)">
-    Deterministic resolve on anchors, three buckets: already in the RAG answer → drop; in the graph but missed by RAG → inject nodes into the answer context for free; net-new → continue.
-  </Step>
-  <Step title="Answer v1 + entity cards (production)">
-    The Discover answer composes from graph context, injected nodes, and net-new candidates with their snippets. Cards render: **In your Universe** / **Found on web — adding now** / **Lead**.
-  </Step>
-  <Step title="Capped auto-ingest → enrichment (production)">
-    Top-K net-new entities (cap ~6–8) with live anchors dispatch to their per-type entry points; kill switches surface in the UI. Enrichment waterfalls run.
-  </Step>
-  <Step title="Fan-in → Answer v2 (production)">
-    Count-with-deadline (~2–3 min): as enrichment lands, pull nodes/edges for the new uuids, run the supplemental LLM pass, and append the upgraded answer over the `discover` realtime channel. Stragglers upgrade their cards silently.
+  <Step title="UI refresh + pathfinders">
+    Trigger the UI refresh over the `discover` realtime channel: the secondary record flips from processing to its answer, entity cards upgrade to full profiles, and **pathfinders run** (the discover-paths machinery) to draw each new entity's relationship paths into the user's network.
   </Step>
 </Steps>
+
+#### Inside the async call (step 2)
+
+The deep-discover API is the Phase-0 harness pipeline (`deep_discover/test_search` #13373), production-hardened end to end:
+
+1. **Shaper** — one flash-class call routes the query: `target_types` + per-lane inputs (rephrased company/people queries, structured film filters, music act name). Untargeted lanes never run.
+2. **Registry fan-out** — Exa (`company`/`people`) + Parallel.ai Entity Search; TMDB `/discover` + `external_ids` with an always-on Serper `site:imdb.com/title` topical supplement; MusicBrainz artist → label rels → release-labels fallback.
+3. **Normalize + union** — anchors only (apex domain, `/in/` slug, `tt` URL, MBID), aggregator hosts rejected, cross-engine merge keyed on anchor.
+4. **Gap-fill** — LinkedIn-only companies get one Serper lookup for their apex domain, accepted only on a name↔domain match.
+5. **Relevance gate** — every entity scored 0–1 with a reason (default `qwen/qwen3.7-flash`, rate-limit fallback `kimi-k2.6`; `DD_GATE_MODEL` / `DD_GATE_FALLBACK` env overrides). The response is the anchored, scored entity list consumed by step 4.
 
 ## Entity-type registry — extensibility is configuration
 
@@ -195,6 +188,7 @@ Exit criteria: 15–20 golden Discover-style queries with graded results — anc
 - **Answer-v2 shape** — appended "update" block (recommended) vs. full regenerated answer.
 - **Leads in v1** — cards that evaporate, or a persistent leads inbox?
 - **Flag naming** — reuse the existing `deep_research` boolean on `POST /discover` or mint `deep_discover` alongside it.
+- **Enrichment polling** — poll cadence and hard deadline for step 4 of the deployment flow (and whether a completion signal can replace polling later).
 - **Film titles** — standalone title seed vs. via-people only (inherited from the swarm plan; blocks the film_tv registry row, not v1).
 
 ## References

@@ -73,6 +73,48 @@ Three design points that make this good rather than merely functional:
 
 **Latency budget:** shaper ~0.4 s + engine fan-out 1–3 s + resolve ~ms + relevance gate ~0.7 s ≈ **3–5 s** — the same class as the graph-RAG + LLM lane, so the web lane lands with or just behind answer v1.
 
+## Discover Query Deployment
+
+### Process with Deep Discover enabled
+
+What actually happens, hop by hop, when a user submits a Discover query with Deep Discover on. Stages 1–7 are prototyped end-to-end in the Phase-0 harness (`deep_discover/test_search` #13373); stages 8–11 are the production build (Phases 2–4 below).
+
+<Steps>
+  <Step title="Submit">
+    `POST /discover` with `deep_discover: true`. The graph-RAG lane starts immediately and runs unchanged — the web lane forks off in parallel and never blocks it.
+  </Step>
+  <Step title="Shape & route">
+    One flash-class LLM call turns the natural-language query into lane routing: `target_types` (company / person / film_tv / music) plus per-lane search inputs — rephrased company and people queries, structured film filters (genres, years, sort), the music act name. Lanes not targeted never run and never bill. Fail-open for company/people, fail-closed for film/music.
+  </Step>
+  <Step title="Fan out per registry adapter">
+    Each targeted type calls its registry adapter in parallel: companies and people → Exa (categories `company` / `people`, highlights focused on the *original* query) + Parallel.ai Entity Search; film → TMDB `/discover` + per-title `external_ids` for IMDb anchors, with Serper `site:imdb.com/title` as an always-on topical supplement; music → MusicBrainz artist search → label relationships → release-label fallback.
+  </Step>
+  <Step title="Normalize anchors">
+    Apex domain (www./m. stripped, aggregator hosts rejected), `linkedin.com/in/<slug>`, canonical `imdb.com/title/tt…/`, bare MBID. An entity that can't produce an anchor is dropped or demoted to a lead — anchors are the graph MERGE keys, so nothing anchorless can ever be ingested.
+  </Step>
+  <Step title="Union across engines">
+    Cross-engine merge keyed on anchor. Engines overlap near zero in practice, so the union is where recall comes from; `source_engines` and per-engine ranks are kept per entity.
+  </Step>
+  <Step title="Gap-fill weak anchors">
+    Companies anchored only on a LinkedIn page get one Serper lookup for their apex domain — accepted only when the domain plausibly matches the company name (the TaskOrbiter→taskrabbit.com guard), original anchor kept as secondary.
+  </Step>
+  <Step title="Relevance gate">
+    One LLM call (default `qwen/qwen3.7-flash`, `DD_GATE_MODEL` env override, automatic fallback model on rate-limit) scores every entity 0–1 against the original query with a one-line reason: 1.0 = directly part of the answer, 0.5 = plausible candidate, 0 = could not be. Top-3 semantic-engine rank counts as weak evidence.
+  </Step>
+  <Step title="Dedupe against the graph (production)">
+    Deterministic resolve on anchors, three buckets: already in the RAG answer → drop; in the graph but missed by RAG → inject nodes into the answer context for free; net-new → continue.
+  </Step>
+  <Step title="Answer v1 + entity cards (production)">
+    The Discover answer composes from graph context, injected nodes, and net-new candidates with their snippets. Cards render: **In your Universe** / **Found on web — adding now** / **Lead**.
+  </Step>
+  <Step title="Capped auto-ingest → enrichment (production)">
+    Top-K net-new entities (cap ~6–8) with live anchors dispatch to their per-type entry points; kill switches surface in the UI. Enrichment waterfalls run.
+  </Step>
+  <Step title="Fan-in → Answer v2 (production)">
+    Count-with-deadline (~2–3 min): as enrichment lands, pull nodes/edges for the new uuids, run the supplemental LLM pass, and append the upgraded answer over the `discover` realtime channel. Stragglers upgrade their cards silently.
+  </Step>
+</Steps>
+
 ## Entity-type registry — extensibility is configuration
 
 The pipeline never names an entity type in code. A registry table carries one row per type; every stage reads it. v1 ships two rows; adding movies, music, events, or podcasts later is one row + one adapter each, with zero pipeline changes.

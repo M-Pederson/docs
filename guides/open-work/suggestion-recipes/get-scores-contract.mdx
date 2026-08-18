@@ -1,0 +1,72 @@
+---
+title: "persona/get-scores Contract"
+sidebarTitle: "get-scores Contract"
+description: "The input contract for the leverage-loop scoring call — every parameter with defaults, the example call, the response sketch, and the compare_persona save flow."
+icon: "file-contract"
+---
+
+The input contract for **`persona/get-scores`** — the one call that ranks a user's contacts as introduction partners for a target person. Split out of [Developer Requirements](/guides/open-work/suggestion-recipes/developer-requirements), which carries the build plan (pool resolution, exclusions, SQL, Go composition) that implements this contract. The scoring theory behind the knobs is [loop\_generic](/guides/open-work/suggestion-recipes/loop-generic).
+
+## Input contract
+
+<Note>
+  **Proposed — Mark to confirm. This is the v1 (my-contacts) contract.** Derived from the `loop_generic` scoring constants (`wDrivers`, `wValence`, `wSoft`, `wComm`, `softmaxTemp`) and the tuner controls. Identity inputs are required; every scoring knob defaults to the current pipeline constant, so a call with only `person_id` \+ `user_id` reproduces today's behavior. The graph knobs — `w_bridge`, `node_nudge`, `max_hops`, `include_suppressed` — are **not** in v1: they require a relationship graph and only apply to a future _reachable-network_ mode (see the [build plan](/guides/open-work/suggestion-recipes/developer-requirements)). v1 has no multi-hop traversal — the candidate pool is the user's direct contacts, **minus the [exclusion sets](/guides/open-work/suggestion-recipes/developer-requirements#pool-exclusions-the-negative-space)** (already-connected to the target, shared employer, and — when the target is an Orbiter user — the target's own contacts). The exclusions are membership lookups, not traversal scoring: they cost one read-only graph query, not a graph engine in the scoring path.
+</Note>
+
+| Parameter | Type | Default | Range | What it controls |
+| --- | --- | --- | --- | --- |
+| `person_id` | uuid | — | **required** | Target person; the user's contacts are ranked as intro partners for them. |
+| `user_id` | int | — | **required** | Requesting user (the introducer); scopes the candidate set to _this user's contacts_. |
+| `mode` | enum `peer` \| `complement` | `peer` | — | Flips the valence sign (and inverts soft-skills in `complement`). `peer` = like-meets-like; `complement` = the missing piece (founder ↔ investor). |
+| `softmax_temperature` | float | `2.0` | `0`–`~10` | Driver-pool aggregation: `0` averages the drivers, higher slides toward max (rewards one strong thread). |
+| `w_drivers` | float | `0.55` | `0`–`1` | Weight on the driver pool (`domain_focus` / `public_engagement` / `passions_interests` / `current_needs`). |
+| `w_valence` | float | `0.20` | `0`–`1` | Weight on the valence dims (`identity_profile` / `track_record`), signed by `mode`. |
+| `w_soft` | float | `0.03` | `0`–`1` | Modifier: soft-skills similarity (inverted in `complement`). |
+| `w_comm` | float | `0.02` | `0`–`1` | Modifier: communication-style tiebreaker. |
+| `serendipity_lift_floor` | float (τ) | `0.50` | `0`–`~3` | Min lift (`cross_argmax − driver_pool`, z-space) to qualify for the serendipity lane; raise to keep only genuinely non-obvious intros. |
+| `limit` | int | `24` | `1`–`100` | Max ranked candidates returned. Default is the product's **top-24 shelf** _(see [Composing the top 24](/guides/open-work/suggestion-recipes/developer-requirements#composing-the-top-24))_. |
+| `min_driver_dims` | int | `2` | `0`–`4` | Rankability floor — candidates with fewer **non-null driver dims** (`domain_focus` / `public_engagement` / `passions_interests` / `current_needs`) are excluded from ranking and reported in `below_driver_floor`. |
+| `candidate_ids` | uuid\[\] | _null_ → derive from the user's contacts | — | Optional explicit candidate set; the harness pins a fixed set for repeatable eval. **A pinned set bypasses derivation _and_ the exclusion sets** — the harness gets exactly the pool it asked for. |
+| `exclude_connected` | bool | `true` | — | **E1** — drop candidates with any direct person↔person edge to the target. |
+| `exclude_shared_employer` | bool | `true` | — | **E2** — drop candidates who share an employer with the target, past or present. |
+| `exclude_target_contacts` | bool | `true` | — | **E3** — when the target resolves to an Orbiter user, drop everyone in the target's own contact list. No-op when the target is not a user. |
+| `mutuality` | enum `off` \| `min` \| `harmonic` | `min` | — | Combine target→candidate and candidate→target scores — an intro is only as good as its weaker side. **Decided 2026-08-15: `min` from day one**; `off` stays available for harness isolation runs. |
+
+```json
+{
+  "person_id": "8f3c…uuid…",
+  "user_id": 12,
+  "mode": "peer",
+  "softmax_temperature": 2.0,
+  "w_drivers": 0.55,
+  "w_valence": 0.20,
+  "w_soft": 0.03,
+  "w_comm": 0.02,
+  "serendipity_lift_floor": 0.50,
+  "limit": 24,
+  "min_driver_dims": 2,
+  "mutuality": "min"
+}
+```
+
+<Tip>
+  **Returns (sketch, per the Go `Result` struct).** One row per candidate: `person_id`, `diagonal` (role-typed composite), `serendipity_z` \+ `lift`, the provenance pair (`ser_tgt_dim`, `ser_cand_dim` → the two narratives that explain the match and seed the drafted intro), `dropped` (suppressed / already-connected), and the lane (`diagonal` | `serendipity`) \+ rank. Mark to finalize the exact field names.
+</Tip>
+
+## Saving scores — the `compare_persona` flow
+
+Raw semantic scores are durable. Pairwise per-dimension cosines are **saved once** in `compare_persona` (778) and re-interpreted forever — the three-layer model on [Persona Scoring](/guides/open-work/personas/scoring): build once, compare once, match many ways. How `persona/get-scores` composes with that cache:
+
+1. **Read (implementer's choice).** Before computing, existing pair rows can be reused. The cache holds **one row per unordered pair**: `master_person_a_id` = lower id, `master_person_b_id` = higher, `pair_key` = `"lowId:highId"` under a unique index — a target×candidate lookup in either order hits the same row.
+2. **Compute misses in the scoring query.** Diagonal cosines come straight from the stored vectors in-database — the _same raw numbers_ the cache stores, unweighted. The serendipity **cross-cells (4×4 driver family) are query-time arithmetic from vectors and are not cached** — the cache is diagonal-only by design.
+3. **Rank.** Z-scores across the candidate pool, role-typed aggregation, lanes, mutuality — all interpretation, none of it persisted. Nothing about weighting ever touches the saved rows.
+4. **Selective write-back (decided 2026-08-15).** Never write the whole pool: a 20–30K-contact power-user run must not create 30K cache rows. Write back only high-value pairs — the returned top-24 / shelf survivors — upserted on the canonical pair with `persona_a_updated_at` / `persona_b_updated_at` snapshots. Those snapshots are the staleness signal: when a persona is rebuilt, its `updated_at` no longer matches the snapshot and the cached row is known-stale (recompute with `force`).
+
+**Contract of the saved row:** `scores` is the raw `{dimension: cosine | null}` json across all nine dimensions — null whenever either side's narrative is null under the evidence floors (`communication_style`, `current_needs`), with `dims_compared` recording how many dimensions actually scored. `overall_score` is the unweighted mean of non-null dims — a stored convenience for eyeballing, **never the ranker**. `embedding_model` records the embedding standard (`google/gemini-embedding-001 @1536 L2-normalized`). The verbatim table spec for the Go port is on [Persona Build Design](/guides/open-work/personas/persona-build-design); the Xano reference implementation of the cache-first compare is `persona/compare-personas` (#13350).
+
+## Related
+
+- [Developer Requirements](/guides/open-work/suggestion-recipes/developer-requirements) — the build plan implementing this contract: pool resolution, exclusions E1–E3, scoring SQL, Go composition, top-24 shelf
+- [loop\_generic](/guides/open-work/suggestion-recipes/loop-generic) — the scoring theory behind every knob
+- [Persona Scoring](/guides/open-work/personas/scoring) — the three-layer model this call sits on top of
+- [Persona Build Design](/guides/open-work/personas/persona-build-design) — `persona` 754 / `compare_persona` 778 / `queue_persona` 779 table specs

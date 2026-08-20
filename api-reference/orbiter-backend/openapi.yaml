@@ -587,6 +587,65 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/Internal'
+  /users/me/sessions:
+    get:
+      tags:
+        - Auth
+      summary: List my active sessions
+      description: |
+        Returns the caller's active WorkOS sessions, newest first. The
+        session backing this request has is_current true, so a settings
+        screen can render it as "this device". Sessions live in WorkOS;
+        nothing is stored locally.
+      operationId: listMySessions
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The caller's active sessions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionListResponseEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /users/me/sessions/{sessionId}:
+    delete:
+      tags:
+        - Auth
+      summary: Revoke one of my sessions
+      description: |
+        Revokes one of the caller's own WorkOS sessions, invalidating its
+        refresh token. The session's current access token stays valid
+        until it expires (verification is stateless), so the device is
+        signed out within minutes, not instantly. A session id that does
+        not belong to the caller returns 404. Revoking the is_current
+        session is allowed and acts as a sign-out for this device.
+      operationId: revokeMySession
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          description: WorkOS session id (the "session_..." id from GET /v1/users/me/sessions).
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Session revoked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmptyEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
   /users/me/password:
     post:
       tags:
@@ -1012,13 +1071,20 @@ paths:
       summary: Create a organization
       description: |
         Creates a team organization owned by the authenticated user:
-        the org row, an owner membership, and the optionally claimed
-        domain are written in one transaction, then mirrored to WorkOS
-        (org + admin membership) and a per-org FalkorDB graph is
-        provisioned — both best-effort: an outage does not fail the
+        the org row, an owner membership, and the claimed domains (at
+        least one, required) are written in one transaction, then
+        mirrored to WorkOS (org + admin membership), a per-org FalkorDB
+        graph is provisioned, and DNS ownership verification starts for
+        each domain — all best-effort: an outage does not fail the
         request; `workos_organization_id` stays null until a later sync
-        backfills it. Personal organizations cannot be created here;
-        they are provisioned automatically at sign-up.
+        backfills it. Each returned organization_domain carries the
+        `verification_token` to publish as a DNS TXT record; domains
+        stay `pending` until WorkOS confirms via webhook. The org starts
+        **unactivated**: it cannot be selected at sign-in, cannot mint an
+        org-scoped session, and cannot take members or invitations until
+        its first domain verifies (`activated` flips to true then).
+        Personal organizations cannot be created here; they are
+        provisioned automatically at sign-up.
       operationId: createOrganization
       security:
         - bearerAuth: []
@@ -1187,6 +1253,238 @@ paths:
           $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/Internal'
+  /organizations/{organization_id}/domains/verify:
+    post:
+      tags:
+        - Organizations
+      summary: Verify the organization's domains
+      description: |
+        (Re)starts DNS ownership verification for every unverified claimed
+        domain and returns each domain with its `verification_token` — the
+        value the owner publishes as a DNS TXT record. WorkOS polls DNS and
+        reports the outcome via the organization_domain webhooks; poll the
+        organization until `status` flips to `verified`. Owner/admin only.
+        409 when the organization has not been mirrored to WorkOS yet.
+      operationId: verifyOrganizationDomains
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: organization_id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: The organization's domains with verification tokens.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListOrganizationDomainsResponseEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /organizations/{organization_id}/invitations:
+    get:
+      tags:
+        - Organizations
+      summary: List invitations
+      description: |
+        Returns the organization's invitations, newest first, optionally
+        filtered by `?status=`. Only owner/admin members may list them —
+        pending invitations expose email addresses, so a plain member gets
+        403.
+      operationId: listOrganizationInvitations
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: organization_id
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - in: query
+          name: status
+          required: false
+          description: |
+            Filter by lifecycle state (pending, accepted, expired).
+            Omit to return every state. `revoked` is accepted but always
+            empty — revoked invitations are deleted, not stored.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The organization's invitations.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListInvitationsEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags:
+        - Organizations
+      summary: Invite a member
+      description: |
+        Invites an email address to join the organization. Unlike adding a
+        membership this grants no access on its own: WorkOS emails the
+        invitation and hosts acceptance, and the invitee becomes a member
+        only once they accept (which arrives back as an `invitation.*`
+        webhook). The address does not need to be an Orbiter user yet.
+
+        The WorkOS call is not best-effort — an invitation nobody receives
+        is not an invitation — so a delivery failure returns 5xx and
+        records nothing. A second invitation while one is still pending is
+        409, as is an address WorkOS refuses (already a member). The
+        inviter comes from the session, never the body. Personal
+        organizations take no invitations (403).
+      operationId: inviteOrganizationMember
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: organization_id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InviteMemberRequest'
+      responses:
+        '201':
+          description: The created invitation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvitationResponseEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /organizations/{organization_id}/invitations/{invitation_id}:
+    delete:
+      tags:
+        - Organizations
+      summary: Delete an invitation
+      description: |
+        Revokes a pending invitation's emailed link in WorkOS and deletes
+        the record entirely — it no longer appears in the invitation
+        list. For a live invitation WorkOS is revoked first and a remote
+        failure aborts, so the record never disappears while its link
+        still works. Any never-accepted invitation (pending, lapsed, or
+        expired) can be deleted; an accepted one gives 409 because it is
+        membership history. One belonging to another organization gives
+        404. Only owner/admin members may delete. The pending membership
+        WorkOS minted alongside the invitation is removed too (WorkOS
+        does not reliably cascade it), best-effort.
+      operationId: deleteOrganizationInvitation
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: organization_id
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - in: path
+          name: invitation_id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: The invitation was revoked and deleted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmptyEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /organizations/{organization_id}/invitations/{invitation_id}/resend:
+    post:
+      tags:
+        - Organizations
+      summary: Resend an invitation
+      description: |
+        Re-sends a pending invitation's email and extends its expiry. The
+        status stays pending; only `expires_at` moves. An invitation that
+        is no longer pending, or has no WorkOS record to resend, gives
+        409. Only owner/admin members may resend, and personal
+        organizations take no invitations (403).
+      operationId: resendOrganizationInvitation
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: organization_id
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - in: path
+          name: invitation_id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: The resent invitation, with its extended expiry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvitationResponseEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
   /organizations/{organization_id}/organization-memberships:
     get:
       tags:
@@ -1195,7 +1493,10 @@ paths:
       description: |
         Returns every membership for the organization, each row enriched
         with the member's person summary (`person`, null
-        when the user isn't linked to a person). The authenticated user must be a
+        when the user isn't linked to a person). Pending memberships are
+        excluded: WorkOS mints one when an invitation is sent, and an
+        invitee is not a member until they accept (see the invitations
+        endpoints). The authenticated user must be a
         member, else 403 — rosters are not enumerable by non-members.
       operationId: listOrganizationMemberships
       security:
@@ -1620,6 +1921,9 @@ paths:
         `workos_membership_id`). A member not yet provisioned locally
         returns 500 on purpose so WorkOS retries after the user webhook
         lands. Unknown event types return 200 with action "ignored".
+        WorkOS mints a `pending` membership when an invitation is sent;
+        it is recorded verbatim, and the members list filters it out
+        until acceptance flips it to active.
       operationId: workosMembershipWebhook
       security: []
       parameters:
@@ -1684,6 +1988,104 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/OrganizationWebhookResponseEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /organizations/webhooks/workos-invitations:
+    post:
+      tags:
+        - Organizations
+      summary: 'Webhook: WorkOS invitations'
+      description: |
+        Receives WorkOS `invitation.created/accepted/revoked/resent`
+        events and settles the local invitation row. This is the only path
+        by which an accepted invitation becomes visible to us — WorkOS
+        hosts acceptance. The resulting membership arrives separately as
+        `organization_membership.created`.
+
+        Verified via the `WorkOS-Signature` HMAC header using its own
+        signing secret, distinct from the membership and organization
+        endpoints. Idempotent under retries (keyed on the WorkOS
+        invitation id). A revocation deletes the local row (action
+        "deleted") — revoked invitations keep no record — and sweeps the
+        invite-minted pending membership, since WorkOS does not reliably
+        cascade that delete. An invitation
+        first seen here is adopted when its organization is known and
+        WorkOS still reports a live state (a stale pending snapshot is
+        checked against the WorkOS API first); one for an unknown
+        organization returns 200 with action "ignored", as do revoked
+        adoptions, unknown event types, and states. An invitee whose
+        local user row has not landed yet is still recorded as accepted,
+        with `accepted_user_id` left null.
+      operationId: workosInvitationWebhook
+      security: []
+      parameters:
+        - in: header
+          name: WorkOS-Signature
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Raw WorkOS event envelope ({ event, data }).
+      responses:
+        '200':
+          description: Event processed (or ignored).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvitationWebhookResponseEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /organizations/webhooks/workos-domains:
+    post:
+      tags:
+        - Organizations
+      summary: 'Webhook: WorkOS organization domains'
+      description: |
+        Receives WorkOS `organization_domain.*` events (verified,
+        verification_failed, created, updated) and syncs the local domain's
+        verification status. The org's **first** verified domain also
+        activates the org: memberships deferred at creation are mirrored
+        to WorkOS, making the org selectable at sign-in. Verified via the
+        `WorkOS-Signature` HMAC header (its own signing secret), not a
+        bearer token. Idempotent under WorkOS retries. Events for domains
+        this environment doesn't hold return 200 with action
+        "skipped_not_found"; unknown event types return 200 with action
+        "ignored".
+      operationId: workosDomainWebhook
+      security: []
+      parameters:
+        - in: header
+          name: WorkOS-Signature
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Raw WorkOS event envelope ({ event, data }).
+      responses:
+        '200':
+          description: Event processed (or ignored).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DomainWebhookResponseEnvelope'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -8482,6 +8884,47 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+  /contacts/merge:
+    post:
+      operationId: mergeContacts
+      tags:
+        - Contacts
+      summary: Merge two contacts
+      description: |
+        Fold the loser contact into the winner (survivor picked by the caller):
+        the loser's detail records move onto the winner, the loser is tombstoned
+        and hidden from queries, and the user's graph node is repointed.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - winner_contact_id
+                - loser_contact_id
+              properties:
+                winner_contact_id:
+                  type: string
+                  format: uuid
+                loser_contact_id:
+                  type: string
+                  format: uuid
+      responses:
+        '200':
+          description: Contacts merged.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmptyEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
   /contacts/{contact_id}:
     get:
       operationId: getContact
@@ -8950,6 +9393,55 @@ paths:
                         type: integer
         '401':
           $ref: '#/components/responses/Unauthorized'
+  /merge-suspects/backfill:
+    post:
+      operationId: backfillMergeSuspects
+      tags:
+        - MergeSuspects
+      summary: Backfill merge-suspect vectors
+      description: |
+        Enqueue a one-shot pass that vectorizes the authenticated user's
+        contacts and runs duplicate detection. Async; returns 202.
+      security:
+        - bearerAuth: []
+      responses:
+        '202':
+          description: Backfill enqueued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmptyEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /merge-suspects/{id}/dismiss:
+    post:
+      operationId: dismissMergeSuspect
+      tags:
+        - MergeSuspects
+      summary: Dismiss a merge suspect
+      description: Mark a suspect pair do-not-merge so detection never resurfaces it.
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Suspect dismissed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmptyEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
 components:
   securitySchemes:
     bearerAuth:
@@ -9667,6 +10159,8 @@ components:
         - copilot_enabled
         - last_signed_in_at
         - person
+        - persons_seeded
+        - companies_seeded
         - created_at
       properties:
         id:
@@ -9715,6 +10209,14 @@ components:
             - $ref: '#/components/schemas/MePersonResponse'
             - type: 'null'
           description: The user's own person; null when unset or unwired.
+        persons_seeded:
+          type: integer
+          format: int64
+          description: How many people exist in Orbiter because this user caused them to be enriched. Counts records they created, not records they hold as contacts; bulk-imported records have no creator and never count.
+        companies_seeded:
+          type: integer
+          format: int64
+          description: How many companies exist in Orbiter because this user caused them to be enriched. Same rule as persons_seeded.
         created_at:
           type: string
           format: date-time
@@ -9760,6 +10262,71 @@ components:
       properties:
         data:
           $ref: '#/components/schemas/AuthCapabilitiesResponse'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+    SessionResponse:
+      type: object
+      required:
+        - id
+        - status
+        - auth_method
+        - ip_address
+        - user_agent
+        - is_current
+        - created_at
+        - expires_at
+      properties:
+        id:
+          type: string
+          description: WorkOS session id ("session_...").
+        status:
+          type: string
+          description: |
+            WorkOS session status. Listing returns only "active" sessions.
+        auth_method:
+          type: string
+          description: |
+            How the session was created, as WorkOS reports it (e.g. "password", "oauth", "magic_auth").
+        ip_address:
+          type:
+            - string
+            - 'null'
+          description: IP address the session was created from.
+        user_agent:
+          type:
+            - string
+            - 'null'
+          description: User agent of the device that created the session.
+        is_current:
+          type: boolean
+          description: True for the session backing this request ("this device").
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+    SessionListResponse:
+      type: object
+      required:
+        - sessions
+      properties:
+        sessions:
+          type: array
+          description: Active sessions, newest first. Empty array when none.
+          items:
+            $ref: '#/components/schemas/SessionResponse'
+    SessionListResponseEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          $ref: '#/components/schemas/SessionListResponse'
         error:
           type: 'null'
         meta:
@@ -10065,6 +10632,8 @@ components:
         - is_personal
         - workos_organization_id
         - company_id
+        - activated
+        - activated_at
         - created_at
         - updated_at
         - role
@@ -10087,6 +10656,16 @@ components:
             - string
             - 'null'
           format: uuid
+        activated:
+          type: boolean
+          description: |
+            Whether this org may be switched into. False until a team
+            org verifies its first domain; always true for personal orgs.
+        activated_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
         created_at:
           type: string
           format: date-time
@@ -10138,19 +10717,64 @@ components:
       type: object
       required:
         - name
+        - domains
       properties:
         name:
           type: string
           minLength: 1
           description: Display name of the organization.
+        domains:
+          type: array
+          minItems: 1
+          items:
+            type: string
+          description: |
+            Domains to claim for the organization (FQDNs, e.g.
+            example.com). At least one is required; ownership must be
+            proven via DNS TXT verification before the domain counts as
+            verified. Consumer email domains (gmail.com, ...) are rejected.
+        external_id:
+          type:
+            - string
+            - 'null'
+          maxLength: 255
+          description: |
+            Caller-chosen id mirrored onto the WorkOS organization;
+            defaults to the local organization id.
+    OrganizationDomain:
+      type: object
+      required:
+        - id
+        - domain
+        - status
+        - verification_token
+        - verified_at
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
         domain:
+          type: string
+        status:
+          type: string
+          description: |
+            Ownership verification state: pending, verified, or failed.
+        verification_token:
           type:
             - string
             - 'null'
           description: |
-            Optional domain to claim for the organization (FQDN, e.g.
-            example.com). Registered with WorkOS in "pending"
-            verification state.
+            Value the domain owner publishes as a DNS TXT record; null
+            until WorkOS has issued one.
+        verified_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
     OrganizationResponse:
       type: object
       required:
@@ -10160,6 +10784,9 @@ components:
         - workos_organization_id
         - company_id
         - domains
+        - organization_domains
+        - activated
+        - activated_at
         - created_at
         - updated_at
       properties:
@@ -10183,11 +10810,30 @@ components:
           format: uuid
           description: |
             Company auto-linked by domain match at creation;
-            null when no domain was given or no company claims it.
+            null when no company claims the domain.
         domains:
           type: array
           items:
             type: string
+          description: Flat claimed-domain names; see organization_domains.
+        organization_domains:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrganizationDomain'
+          description: Claimed domains with ownership-verification state.
+        activated:
+          type: boolean
+          description: |
+            Whether the org may be selected and used. Personal orgs are
+            always activated; a team org activates when its first claimed
+            domain verifies. Until then it is absent from the sign-in org
+            picker and cannot mint an org-scoped session.
+        activated_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: Null for personal orgs and unactivated team orgs.
         created_at:
           type: string
           format: date-time
@@ -10284,11 +10930,191 @@ components:
             - 'null'
           minLength: 1
           description: New display name; omit to keep.
-        domain:
+        domains:
+          type:
+            - array
+            - 'null'
+          minItems: 1
+          items:
+            type: string
+          description: |
+            Replacement set of claimed domains (FQDNs); omit to keep.
+            Must contain at least one domain; replaced domains restart
+            DNS ownership verification.
+        external_id:
           type:
             - string
             - 'null'
-          description: New claimed domain (FQDN); omit to keep, "" to clear.
+          maxLength: 255
+          description: New WorkOS external id; omit to keep.
+    ListOrganizationDomainsResponse:
+      type: object
+      required:
+        - items
+        - total
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrganizationDomain'
+        total:
+          type: integer
+    ListOrganizationDomainsResponseEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          $ref: '#/components/schemas/ListOrganizationDomainsResponse'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+    InvitationResponse:
+      type: object
+      required:
+        - id
+        - organization_id
+        - email
+        - role
+        - status
+        - workos_invitation_id
+        - invited_by_user_id
+        - accepted_user_id
+        - expires_at
+        - accepted_at
+        - revoked_at
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        organization_id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        role:
+          type: string
+          description: Role granted on acceptance (owner, admin, member).
+        status:
+          type: string
+          description: |
+            Lifecycle state (pending, accepted, expired). Revoked
+            invitations are deleted outright, so the state never appears
+            here.
+        workos_invitation_id:
+          type:
+            - string
+            - 'null'
+          description: |
+            Null only when the invitation was recorded without a WorkOS
+            client configured, in which case no email was delivered.
+        invited_by_user_id:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: 'null'
+          description: |
+            Who invited them; null once that account is deleted, or for an
+            invitation created in the WorkOS dashboard.
+        accepted_user_id:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: 'null'
+          description: |
+            The joined user; null until the invitation is accepted and
+            their local user row exists.
+        expires_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        accepted_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        revoked_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: |
+            Always null: revoked invitations are deleted rather than
+            stored. Kept for wire-shape stability until the column drops.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    ListInvitationsEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          type: object
+          required:
+            - items
+            - total
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/InvitationResponse'
+            total:
+              type: integer
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+    InviteMemberRequest:
+      type: object
+      required:
+        - email
+      properties:
+        email:
+          type: string
+          format: email
+          description: |
+            Address to invite. Normalised to lower case before it is
+            stored or sent; need not belong to an Orbiter user yet.
+        role:
+          type:
+            - string
+            - 'null'
+          description: |
+            Role granted on acceptance (owner, admin, member). Defaults to
+            member. Validated server-side.
+        expires_in_days:
+          type:
+            - integer
+            - 'null'
+          description: |
+            How long the invitation stays valid, 1 to 30 days. Defaults to
+            the WorkOS default of 7.
+    InvitationResponseEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          $ref: '#/components/schemas/InvitationResponse'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
     PersonSummary:
       type: object
       required:
@@ -10527,6 +11353,77 @@ components:
       properties:
         data:
           $ref: '#/components/schemas/OrganizationWebhookResponse'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+    InvitationWebhookResponse:
+      type: object
+      required:
+        - event
+        - action
+        - workos_invitation_id
+        - invitation_id
+      properties:
+        event:
+          type: string
+        action:
+          type: string
+          description: What the handler did (updated, adopted, deleted, ignored).
+        workos_invitation_id:
+          type: string
+        invitation_id:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: 'null'
+          description: |
+            Null when the event was ignored without a matching local row;
+            an ignored event on a known row still carries its id.
+    InvitationWebhookResponseEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          $ref: '#/components/schemas/InvitationWebhookResponse'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+    DomainWebhookResponse:
+      type: object
+      required:
+        - event
+        - action
+        - organization_domain
+        - organization_activated
+      properties:
+        event:
+          type: string
+        action:
+          type: string
+          description: One of updated, skipped_not_found, ignored.
+        organization_activated:
+          type: boolean
+          description: |
+            True when this event verified the org's first domain, flipping
+            the org activated and mirroring its memberships to WorkOS.
+        organization_domain:
+          oneOf:
+            - $ref: '#/components/schemas/OrganizationDomain'
+            - type: 'null'
+    DomainWebhookResponseEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          $ref: '#/components/schemas/DomainWebhookResponse'
         error:
           type: 'null'
         meta:

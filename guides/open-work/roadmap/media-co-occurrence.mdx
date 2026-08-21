@@ -47,7 +47,7 @@ The three sources sit at opposite ends of the identity-risk spectrum:
 So the design splits: YouTube/conferences extend the podcast pipeline as new source adapters with full Stage A/B/C treatment. GDELT runs as a **closed-world overlay**: match article person strings only against names already resolved in the graph, apply a name-uniqueness gate, and write only aggregated co-mention edges with count thresholds. GDELT can strengthen edges; it can never mint identities.
 
 <Tip>
-  **Quota economics decide the YouTube design.** Data API v3 gives ~10k units/day; `search.list` costs 100 units, `playlistItems.list` costs 1. Enumerating a curated channel roster's uploads is ~free; global search is 100x more expensive and noisy. Roster-first, search only for person-side lookups (#2/#3), captions only when title\+description can't name the guest. Verify quota math in Phase 0.
+  **Quota economics decide the YouTube design.** Data API v3 gives ~10k units/day; `search.list` costs 100 units, `playlistItems.list` costs 1. Enumerating a curated channel roster's uploads is ~free; global search is 100x more expensive and noisy. Roster-first, search only for person-side lookups (#2/#3), metadata-only extraction in v1. Verify quota math in Phase 0.
 </Tip>
 
 ## Data-source landscape
@@ -70,7 +70,7 @@ Conference roster v1 is config, ICP-targeted (finance/media/tech operator events
 | Event containment | `(MediaAppearance)-[:PART_OF]->(Event)` for conference sessions so session-level and conference-level co-occurrence stay distinguishable. |
 | Co-occurrence | Derived through shared appearance/event nodes at query/score time, consistent with the stage-lane decision. No materialized co-appearance edges. |
 | GDELT exception | `(Person)-[:CO_MENTIONED_WITH]->(Person)`: direct aggregated edge, properties `article_count`, `first_seen`, `last_seen`, `window_counts`, `top_source_domains`, `evidence_refs` (relational). No per-article nodes; volume forbids it. |
-| Weight (§3.6 bands, lower = closer) | Interview host↔guest closest, then co-panelists (same session), co-speakers (same conference), news co-mention furthest and count-scaled above a floor. Values TBD against §3.6. |
+| Weight (§3.6 bands, lower = closer) | Interview host↔guest closest, then co-panelists (same session); these two score. Conference-level co-occurrence and news co-mentions are evidence-only per the decisions. Band values TBD against §3.6. |
 | Metadata envelope | Per the 2026-07-04 house standard on all of the above. |
 | Other properties | `valid_from` (event/publish date, bitemporal convention), `source_urls`, `confidence`, `video_id` / `session_ref`, `via_roster` (which roster entry produced it). |
 
@@ -90,7 +90,7 @@ Go on GCP, per-market/source adapters behind one fetcher interface, raw payloads
 ### YouTube adapter
 
 1. Roster poll: uploads playlist per channel (1 unit/call), new video IDs → queue.
-2. Guest extraction from title \+ description with the #12984 tier-1 config; captions fetched only when the cheap pass can't produce a confident guest set (interview channels almost always name guests in metadata). 2a. Podcast dedup: match against podcast-lane episodes by title \+ date \+ host so simulcasts strengthen one appearance instead of minting two.
+2. Guest extraction from title \+ description with the #12984 tier-1 config. Metadata-only in v1 per the decision above; Phase 0 measures the residual miss rate, and caption fallback ships later only if the gap justifies it. 2a. Podcast dedup: match against podcast-lane episodes by title \+ date \+ host so simulcasts strengthen one appearance instead of minting two.
 3. Resolution: the podcast lane's LinkedIn resolution flow, plus #12677 v5 adjudication for names without a URL. Auto-link ≥0.85; name \+ two corroborating points minimum; #13168 cap applies.
 4. Edge writer: `APPEARED_IN` with role (host/guest/panelist), idempotent per person-video pair.
 
@@ -103,10 +103,10 @@ Go on GCP, per-market/source adapters behind one fetcher interface, raw payloads
 
 ### GDELT overlay (closed-world)
 
-1. Daily BigQuery batch: GKG rows where ≥2 `V2Persons` strings match the tracked-name index.
+1. Daily BigQuery batch: GKG rows where ≥2 `V2Persons` strings match the tracked-name index. Backfill covers the rolling 24-month window only; no 2015 deep backfill.
 2. **Uniqueness gate**: a tracked person's name enters the matchable index only above a name-uniqueness score (corpus rarity \+ no same-name collision inside the graph). Common names never match, regardless of volume.
 3. **Corroboration boost**: `V2Organizations` containing the person's known employer upgrades match confidence; tone and theme fields stored, not gated on.
-4. Aggregation: pair counts rolled up per window; `CO_MENTIONED_WITH` written/updated only above the article-count floor (proposed: ≥3 distinct articles, ≥2 distinct source domains). Evidence article refs stay relational.
+4. Aggregation: pair counts rolled up over the rolling 24-month window; `CO_MENTIONED_WITH` written/updated only above the decided floor (≥3 distinct articles, ≥2 distinct source domains), and pairs that fall below it as the window rolls get retired. Evidence article refs stay relational.
 5. Never creates persons, appearances, or queue rows. Overlay only.
 
 ## Draft system prompt v0.1: video guest extraction (not deployed)
@@ -139,7 +139,7 @@ Adjudication follows #12677 v5, drafted against real cases in the LLM Test Harne
 
 | Table | Purpose |
 | --- | --- |
-| `media_source_roster` | Config: channels and conferences, cadence, adapter, status. Entry point #6 writes suggestions here as `proposed`. |
+| `media_source_roster` | Config: channels and conferences, cadence, adapter, status. Entry point #6 writes suggestions here as `proposed`; founder approves from a review queue. |
 | `media_appearance_mention` | One row per extracted participant per video/session: source ref, contract fields, resolution state, resolved `master_person_id`, edge state. Audit-first per #723. |
 | `media_appearance_resolution_attempts` | Append-only Stage-B log, mirrors `fundable_organization_enrichment_attempts`. |
 | `event` / `event_session` | Relational detail for conferences: dates, venue, track, agenda URLs. |
@@ -148,7 +148,7 @@ Adjudication follows #12677 v5, drafted against real cases in the LLM Test Harne
 ## Rollout order
 
 1. **Phase 0 spike (3-4 days)**: YouTube: 10-channel roster, quota math, measure what fraction of videos yield guests from metadata alone. Conferences: 2 event adapters incl. one Wayback backfill, bio-resolution rate. GDELT: run the tracked-name uniqueness scoring, sample-query BigQuery for a week of matches, measure collision rate. Confirms the gates before anything writes.
-2. **YouTube adapter** first: nearest to the proven podcast mechanics, immediate crossover with entry point #3.
+2. **YouTube adapter** first: full-history backfill of roster channels, then incremental; nearest to the proven podcast mechanics, immediate crossover with entry point #3.
 3. **Conference adapter**: roster v1, current year \+ Wayback backfill per event.
 4. **GDELT overlay** last, behind the uniqueness gate and count floor, shipping as intelligence-layer evidence only per the decision above; scoring promotion is a separate later call.
 

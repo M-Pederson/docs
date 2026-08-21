@@ -1,0 +1,155 @@
+---
+title: "Broadway Co-Producer Lists"
+description: "Scope & build plan for ingesting Broadway producing credits from IBDB and materializing co-production edges: source landscape, credit-extraction + identity-resolution pipeline, storage, and rollout."
+icon: "ticket"
+---
+
+**Status: scope & planning only.** Nothing on this page is built. Goal: ingest the full producing block of every Broadway production from IBDB, resolve producers to `master_person` / `master_company` records, and materialize production credits as graph edges so co-producing relationships become queryable co-investment paths.
+
+## Why
+
+Modern Broadway shows carry 20 to 40\+ names above the title. Co-producer billing is granted at investment thresholds (typically low-to-mid six figures, varying by capitalization and era; verify in Phase 0), so the credit block functions as a public, ordered proxy for the show's cap table. The pool skews precisely toward the Orbiter ICP: finance operators, real estate principals, media executives, and family offices co-investing outside their day jobs. Each production is a shared deal; two people on the same credit block wrote checks into the same LLC. That yields person-to-person co-investment edges that PDL and Crunchbase-class sources never see, with billing tier as a check-size signal and opening/closing dates for bitemporal validity. It composes naturally with the existing film/TV credit nodes (heavy person overlap) and the Fundable investor graph.
+
+## The key structural fact
+
+Every Broadway production is financed as its own single-purpose entity (LLC or LP), and most raise under Reg D, so a **Form D usually exists on EDGAR for the show entity**, naming the entity and its related persons (typically the lead producers) plus offering size. The public data therefore splits two ways:
+
+- **IBDB / Playbill credits**: the complete, ordered producing block, every co-producer included, with stable IBDB person and production IDs. Breadth.
+- **SEC Form D**: government-grade corroboration of the show entity and its lead tier, plus offering amounts. Precision anchor, lead tier only.
+
+Design accordingly: IBDB is the backbone; Form D is the corroboration and entity-unmasking layer.
+
+<Tip>
+  **The producing-shingle bridge.** A large share of credits are entities, not people: producing shingles, family LLCs, and grouped "in association with" blocks. Resolving a shingle's principals once (shingle site, Form D related persons, OpenCorporates, press) converts every credit that entity holds across shows into person-level edges. Same leverage as the family-foundation bridge in the donations plan.
+</Tip>
+
+## Data-source landscape
+
+| # | Source | Role | Access | Notes |
+| --- | --- | --- | --- | --- |
+| 1 | **IBDB** (ibdb.com, The Broadway League) | Primary backbone | Free, scrape | Canonical production pages with the full ordered producing block; person pages aggregate credits under stable IDs (the anchoring pattern Discover Deep Research uses for IMDb URLs and MBIDs). No public API. ToS/scrape posture needs the standard review; throttle hard, cache everything. |
+| 2 | **Playbill Vault** (playbill.com) | Cross-check / fallback | Free, scrape | Independent credit listings plus opening/closing dates; the fallback backbone if IBDB access posture changes. |
+| 3 | **Tony Awards db** (tonyawards.com) | High-value subset | Free, scrape | Producers are the named recipients on Best Play/Musical nominations; award co-recipient signal for the most successful cohort. |
+| 4 | **SEC EDGAR Form D** (full-text search) | Corroboration \+ unmasking | Free API | Show-entity filings: related persons (lead producers), offering amounts, entity addresses. |
+| 5 | **The Broadway League** | Season index, grosses | Free | Production universe per season; grosses give recoupment context if ever wanted. |
+| 6 | **OpenCorporates** | Shingle principals | Freemium API | Officer lookups for producing LLCs where Form D is silent. |
+| 7 | **Wikipedia/Wikidata, BroadwayWorld** | Corroboration | Free | Producer bios, producing-team announcements, historic context. |
+
+## Proposed edges (draft)
+
+| Aspect | Proposal |
+| --- | --- |
+| Pattern | `(Person)-[:PRODUCED]->(Production:Stage)` and `(Company)-[:PRODUCED]->(Production:Stage)`, with a person-level derivation carrying `via_entity_uuid` when the credit is held by a shingle. |
+| Node | New stage-production node keyed by IBDB production ID: title, theatre, opening/closing, revival flag, season. Open question: own label family vs extending the film/TV credit node family. |
+| Cardinality | One edge per producer-production pair. Co-production is derived through the shared production node at query/score time; materialize a `CO_PRODUCED_WITH` shortcut only if scoring perf demands it. |
+| Weight (§3.6 bands, lower = closer) | Tier-scaled: lead producer closest, then producer, co-producer, associate/executive, "in association with" furthest. Band values TBD against §3.6. |
+| Metadata envelope | Per the 2026-07-04 house standard: `uuid`, `created_at`, `updated_at`, `weight`, deterministic `description` ("X produced Y"), `description_generated_at`. |
+| Other properties | `billing_tier`, `billing_order`, `valid_from` / `valid_to` (opening/closing per the bitemporal convention), `ibdb_production_id`, `via_entity_uuid`, `source_urls`, `confidence`, `tony_winner` (bool, from the Tony sweep). |
+
+## What the graph already has (leverage, not build)
+
+- **IMDb & MusicBrainz waterfalls**: the queue drain contract, tiering, and promotion-audit machinery this lane should clone rather than reinvent. Born onto the unified contract from the IMDb & Music Queue Refactor, not a fourth bespoke queue.
+- **Heavy person overlap with film/TV credits**: many Broadway producers already exist as enriched persons via the IMDb waterfall, so existing-graph matching starts warm.
+- **Identity machinery**: `master-person-new` #13039 (kill switch #4617), `master-company-new` #12558 (kill switch #12789), Exa profile search #12936, `create-master-link` #2541, queue upsert #12854.
+- **Proven agent patterns to clone**: tiered resolver `resolve_org_identity` #12984 (cheap model first, confidence-gated write-back, append-only attempts audit per #723); deep-research config `deep-person-basic` #12833 for shingle-principal research; adjudication-with-corroboration from `verify-imdb-url` #12677 v5 and `find-artist` #13168 (same-name/different-profession rejection, name-only matches capped, auto-link only at high confidence).
+- **Fundable Stage-1 gating**: edges only for identities that resolve to an existing record or pass the auto-link threshold; everything else parks as `needs_review` with its evidence. Releasable later, never lost.
+- **LLM Test Harness** (API group 42) for extraction and adjudication prompt evals before anything ships.
+
+## Pipeline design: three stages
+
+### Stage A: production discovery \+ credit extraction
+
+Input: one season (backfill) or the current season (cron).
+
+1. Season index sweep (IBDB, cross-checked against the League list) → production queue rows keyed by IBDB production ID.
+2. Production-page fetch → deterministic HTML parse of the producing block. IBDB markup is structured; no LLM on the happy path.
+3. LLM pass only for compound credit strings: splitting "A, B & C", couple credits ("John and Jane Smith"), and grouped "in association with" blocks into typed tokens. Contract below.
+4. Tony sweep (annual): mark producer credits on nominated and winning productions.
+
+Output: structured **credit mentions**, never edges directly.
+
+| Role | Model | Why |
+| --- | --- | --- |
+| Compound-string splitting (step 3) | The #12984 tier-1 config (strict JSON, reasoning off) | High-volume, low-ambiguity token typing at tier-1 economics. |
+| Weak-signal retry | The #12984 tier-2 config | Strings the cheap model fumbles. |
+| Shingle-principal research (Stage B) | The #12833 deep-research config | The only deep-research surface in this lane. |
+| Adjudication (Stage B) | The #12677 v5 config, temp 0.1 | Full-context match adjudication with corroboration guards. |
+
+Pinned by reference so this lane inherits house model-config changes.
+
+### Stage B: identity resolution (per mention)
+
+Deterministic first, LLM last:
+
+1. **IBDB person-ID match**: previously resolved IBDB IDs map straight through (the MBID / IMDb-URL anchoring pattern).
+2. **Existing-graph match**: `master_person` by normalized name where a film/TV credit, a Fundable investor record, or a prior Broadway credit corroborates; existing `master_link` URL match when the mention carried one.
+3. **Shingle-principal path**: entity credits → Form D related persons, OpenCorporates officers, shingle site → person candidates.
+4. **Exa LinkedIn search** on the mention's identity points (co-credit overlap, era, geography, entity affiliation), #13121-style.
+5. **LLM adjudication**: the #12677 v5 shape with full mention context plus candidate profile, explicit same-name/different-era-or-industry rejection. **Auto-link only at `confidence: high` / ≥0.85**; 0.6–0.85 → `needs_review`; below → park. Name-only matches are capped below the auto-link threshold regardless of model output (the #13168 guard).
+
+Minimum to attempt auto-link: name plus **two** independent corroborating points (e.g., co-credit overlap \+ entity affiliation, or era \+ geography \+ known producing partner).
+
+### Stage C: edge writer
+
+MERGE `PRODUCED` with the metadata envelope; idempotent per producer-production pair. New-person policy mirrors the investor cascade: local-only leaves plus queue rows (tier TBD), kill switches respected, no recursive enrichment from a credit sweep. Closing-date updates rewrite `valid_to` only.
+
+## Draft system prompt v0.1: credit-string splitting (not deployed)
+
+```text
+You split ONE Broadway producing-credit string into typed producer tokens.
+
+Production: {{title}} ({{season}}). Credit line as printed: {{credit_string}}
+Billing tier for this line: {{billing_tier}}
+
+Return ONLY valid JSON: {"credits": [...]}. Each credit object:
+- name: exactly as written for this token
+- entity_type: "person" | "couple" | "company" | "unknown"
+- persons: for couples, the individual names as written, else null
+- billing_order: integer position within the line, 1-based
+- association_group: true when the token sits inside an "in association with" block
+- evidence_quote: the verbatim fragment for this token
+- confidence: "high" | "medium" | "low"
+
+Rules:
+1. Preserve names exactly; never expand initials or normalize.
+2. A couple credit ("John and Jane Smith") is one token with entity_type "couple" and both persons listed.
+3. Suffixes like "Inc.", "LLC", "Productions", "Entertainment", "Group" imply entity_type "company"; a bare personal name implies "person"; ambiguous brand-like names are "unknown".
+4. Do not merge tokens across lines or tiers; emit every token with its own evidence_quote.
+5. If the string contains no producer tokens, return {"credits": []}.
+```
+
+The Stage-B adjudication prompt follows #12677 v5 (match yes/no/none, confidence, reasoning, same-name rejection) and gets drafted against real cases in the LLM Test Harness before deployment.
+
+## Proposed storage (not built)
+
+| Table | Purpose |
+| --- | --- |
+| `broadway_production` | One row per IBDB production ID: title, theatre, opening/closing, revival flag, season, Tony status, source URLs. Relational home for per-production detail the graph doesn't need. |
+| `broadway_credit_mention` | One row per extracted credit token: production ref, raw contract fields, billing tier/order, resolution state (`unresolved` / `auto_linked` / `needs_review` / `rejected`), resolved `master_person_id` / `master_company_id`, `via_entity` ref, edge state. Audit-first per #723. |
+| `broadway_credit_resolution_attempts` | Append-only log of every Stage-B attempt: candidates, model, confidence, outcome, cost. Mirrors `fundable_organization_enrichment_attempts`. |
+
+## Rollout order
+
+1. **Phase 0 spike (2-3 days)**: scrape ~20 productions across eras; validate page stability and the deterministic parse rate; measure compound-string ambiguity; sample-match ~200 credits against the existing graph to estimate warm-start overlap; confirm the co-producer billing-threshold claim; ToS review.
+2. **Backfill extraction, 2000-present** (~900-1,000 productions, the co-producer-inflation era): crawler, parse, splitting, all landing in `broadway_credit_mention`. No edges yet.
+3. **Shingle unmasking \+ person resolution**, prioritized by productions with the highest existing-graph overlap; edges start writing behind the Stage-1 gate.
+4. **Recurring**: weekly new-openings cron, closing-date updates, annual Tony sweep. Pre-2000 backfill and Off-Broadway/West End only if Phase 0 overlap numbers justify them.
+
+## Open questions
+
+1. **Billing-tier weight bands**: fixed §3.6 bands per tier (proposed) vs scaling by known capitalization / Form D offering size.
+2. **Materialize `CO_PRODUCED_WITH`** or derive through the production node (proposed: derive; revisit after a scoring perf test).
+3. **Node label family**: new stage-production label vs extending the film/TV credit node family.
+4. **Couple credits**: one edge per spouse with a shared `couple_credit` marker (proposed), or household-level treatment per the Known model.
+5. **IBDB scrape posture**: pending standard review; Playbill Vault is the fallback backbone.
+6. **Scope guard**: Off-Broadway, national tours, and West End are out for v1; define the overlap threshold that earns them v2.
+7. **Runtime**: Xano interim vs the AlloyDB Universe backend. Same decision as the Fundable and donations lanes; the design above is runtime-agnostic.
+
+## References
+
+- [IBDB](https://www.ibdb.com) (The Broadway League)
+- [Playbill Vault](https://playbill.com/vault)
+- [Tony Awards database](https://www.tonyawards.com)
+- [SEC EDGAR full-text search](https://www.sec.gov/edgar/search/) (Form D filings)
+- [The Broadway League](https://www.broadwayleague.com)
+- [OpenCorporates](https://opencorporates.com)

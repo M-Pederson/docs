@@ -1,0 +1,218 @@
+---
+title: "990s, FEC & Form D"
+description: "Scope & build plan for the federal-filings lane: nonprofit governance from IRS 990s, political contributions from FEC bulk data, and non-VC raise related-persons from SEC Form D. Entry points, schemas, closed-world FEC gates, and rollout."
+icon: "building-columns"
+---
+
+**Status: scope & planning only.** Nothing on this page is built. Goal: turn the three highest-density free federal filing sources into graph edges: **IRS 990s** (who governs which nonprofits, who grants to whom), **FEC individual contributions** (who funds what, with employer identity points attached), and **SEC Form D** (who sits on private raises outside Crunchbase/Fundable coverage). All three are structured, bulk-accessible, zero-scrape, zero-vendor-cost. Two of the three ride on ingestion the [Educational Institution Donations](/guides/open-work/roadmap/educational-institution-donations) plan already specifies: that page owns the edu-recipient slice; this lane owns the general filings plumbing it plugs into.
+
+<Note>
+  **Shared component: 990 ingestion (owned here).** EIN resolution → e-file XML fetch → `filing_990` → parsed Part VII and grant schedules is built once, in this lane. The donations plan consumes the parsed store instead of fetching; one fetch feeds three edge families (trustees, grants, donations). Decided 2026-08-21.
+</Note>
+
+## Entry points
+
+Same invariant as the stage and media lanes: every route enqueues **filings or org pulls** (or person-lookups that resolve to them), and all mentions flow through shared extraction → resolution → edge-writer stages. FEC is this lane's closed-world overlay, the GDELT of money: it matches only against persons already resolved in the graph and never mints identities.
+
+| # | Entry point | Direction | Mechanism | Priority |
+| --- | --- | --- | --- | --- |
+| 1 | **Person triggers** | Person → filings | Expertise or enrichment signals (board member, trustee, director, philanthropist titles; nonprofit or fund employers) → person-side lookup across the 990 officer index and Form D related-persons index. | P0 |
+| 2 | **Discover misses** | Person → filings | Discover Deep Research resolves someone as a board member, foundation trustee, or issuer officer → approved miss enters via the person-side lookup. | P0 |
+| 3 | **Org-side seeding** | Org → people | Nonprofits already in the graph (School nodes from the edu lane, nonprofit-flagged companies from enrichment) → 990 pull → Part VII governance roster → mentions. | P1 |
+| 4 | **Donations-lane piggyback** | Filing → people | The edu-donations foundation backbone already fetches 990/990-PF XML; this lane consumes the governance section (Part VII) and grant schedules from the same pull. One fetch, three edge families. | P1 |
+| 5 | **Fundable gap-fill** | Filing → people | Quarterly Form D structured dataset diffed against Fundable rounds: raises Fundable has never seen enqueue the issuer \+ related persons. Real estate syndications, funds, media vehicles, the non-VC economy. | P1 |
+| 6 | **New-filing crons** | Filing → people | Daily EDGAR Form D feed, monthly FEC bulk updates, rolling IRS e-file drops. | P1 |
+| 7 | **FEC match view (closed-world)** | Overlay | Tracked-person name index joined against the FEC contribution corpus in BigQuery, uniqueness- and employer-gated. Refreshes as the graph grows; never creates persons. | P1 |
+| 8 | **Cross-source corroboration loop** | Internal | An FEC employer string, a 990 org, or a Form D issuer matching a graph company upgrades pending Stage-B resolutions across all lanes. | P2 |
+
+## Decisions (2026-08-21)
+
+| Question | Decision |
+| --- | --- |
+| Shared component | 990 ingestion is built once and owned here; the donations plan consumes the parsed `filing_990` store. |
+| FEC scoring | **Evidence-first** with a 60-day review mirroring the GDELT gate; product display of political giving remains a separate governance decision. |
+| Contribution floor | ≥\$1K aggregate per person-committee-cycle. |
+| 990 history window | Latest \+ 3 prior filing years, enabling co-board tenure overlap on `valid_from`/`valid_to`. |
+| Committee modeling | Company-family discriminator anchored on the FEC committee ID; candidate rollup is a v1.1 view over committee edges. |
+| Form ADV | Separate scope with its own page later; the fetcher interface keeps that adapter cheap whenever it lands. |
+| §3.6 bands | Set 2026-08-21 in the cross-lane sitting: trustee/director reuse `BOARD_MEMBER_OF` 8; `OFFICER_OF` 14/20; `RELATED_PERSON_OF` 15/20; `CONTRIBUTED_TO` traversal 60. Stage lane 12/16/22/28/35; media lane 15/20. |
+
+## Agent build brief
+
+Written for the coding agent building this lane. Three lanes build in parallel; this page is self-contained and everything you need is here or explicitly linked. Do not read intent into ambiguity: if something material is undecided, follow the escalation rule at the bottom.
+
+**Read first, in order:** [Edge Weights](/guides/ontology/edge-weights) (scale, hub rule, envelope), [Edges](/guides/ontology/edges) (conventions), [Educational Institution Donations](/guides/open-work/roadmap/educational-institution-donations) (the consumer of your `filing_990` store), and the pattern functions cited on this page: #12984 tiered resolver, #12677 v5 adjudication, #13168 name-only cap, #12833 deep research, #723 attempts audit, Fundable Stage-1 gating, `master-company-new` #12558.
+
+**Invariants — violating any one is a failed build:**
+
+1. One write path: 990 and Form D edges flow parse → mention row → resolution → edge writer; no edge without a `mention_ref`. You own `filing_990`; the donations lane consumes it and fetches nothing.
+2. FEC is closed-world: it never creates persons, committees-as-people, or queue rows. `CONTRIBUTED_TO` only for matches passing the uniqueness gate plus employer-or-geo corroboration (two independent corroborations recorded in `fec_contribution_match`), only ≥\$1K aggregate per person-committee-cycle, always `layer: evidence` and `excluded_from_scoring: true`.
+3. Trustee and director rows write the existing `BOARD_MEMBER_OF` edge at weight **8** with filing-provenance properties — not `OFFICER_OF`. `OFFICER_OF` is only `officer` (14) and `key_employee` (20). `RELATED_PERSON_OF` is 15 (executive\_officer / director) and 20 (promoter), keyed by EDGAR accession. `CONTRIBUTED_TO` traversal 60. Integer scale, floor 1, envelope everywhere.
+4. Auto-link only at ≥0.85 with name plus two independent corroborations; name-only capped; everything else `needs_review`. New-person policy (990 / Form D only): local-only leaves \+ queue rows, kill switches #4617/#12789, no recursive enrichment.
+5. Co-board and co-officer pairs derive through the shared Company node; never materialize pair edges.
+6. Tenure semantics: `OFFICER_OF` / `BOARD_MEMBER_OF` spans extend on consecutive filings and close when a roster drops the name; backfill = latest \+ 3 prior filing years per org; re-runs on unchanged filings are no-ops.
+7. Raw XML/TSV cached to GCS before parsing; FEC lives in BigQuery, queried on partitions, never full-table scans.
+8. Go on GCP only; Xano is out of bounds except disposable Phase 0 scripts that ship nothing.
+
+**Mention-row state machine:** `unresolved → auto_linked | needs_review | rejected`; `auto_linked → edge_written`; `needs_review → auto_linked | rejected` (human action only). Every transition appends to the per-source `*_resolution_attempts` table.
+
+**Fixtures (Phase 0 and regression):** three 990 orgs at latest \+ 3 filings (a large university, a family foundation, a small nonprofit — the university doubles as a donations-lane consumer test), one full FEC cycle slice against the current tracked-name index, one quarterly Form D dataset diffed against Fundable.
+
+**Definition of done per phase:** Phase 0 = fixture report as an appendix here (Part VII title→role ambiguity, FEC match and false-positive rates on a 200-row audit, Form D non-VC gap size, floor validation). Phase 1 (990 adapter) = `filing_990` \+ governance mentions landed, donations lane reading the store successfully, edges behind the Stage-1 gate. Phase 2 (Form D) = related-person edges writing, Fundable gap-fill rounds landing, stage lane reading `formd_related_person_mention`. Phase 3 (FEC overlay) = match view live behind its gates, rollups only, 60-day audit clock started. Each phase ends with acceptance queries green twice and crons \+ enrichment-QA checks registered.
+
+**Acceptance queries (zero rows required):** any `OFFICER_OF` with role `trustee` or `director`; `OFFICER_OF` weight outside {14, 20} or `RELATED_PERSON_OF` outside {15, 20}; filing-sourced `BOARD_MEMBER_OF` ≠ 8 or missing provenance; `CONTRIBUTED_TO` below the floor, with `excluded_from_scoring` ≠ true, or touching a person created after the batch began; any person or queue row whose origin is FEC; any 990 fetch outside the `filing_990` path; edges missing `mention_ref` or the envelope.
+
+**Hard limit for first runs:** cap at 100 filings and one FEC cycle until acceptance queries pass twice.
+
+**Coordination:** the fetcher interface is shared across all three lanes — first to ship registers it, the others consume. You own `filing_990` (donations lane reads) and `formd_related_person_mention` (stage lane reads); publish schema changes to both consumers as open-question entries before making them. Copy the mention/attempts table shape but own your tables. Never edit another lane's tables or adapters.
+
+**When blocked or a decision is missing:** do not guess. Append the question to this page's open questions with your proposed answer, park affected work `needs_review`, continue on unblocked work. Founder approvals arrive through the review queues; never bypass them.
+
+## Why
+
+These are the densest legally-clean relationship sources that exist for the ICP. A 990 Part VII roster is a curated list of wealthy, committed people who chose to sit in a room together for years: co-board edges are among the strongest public ties there are. FEC records are the only public dataset where an individual's name arrives **with employer and occupation attached**, making it both a giving signal and an identity-corroboration engine for every other lane. Form D related persons catch the deal economy Crunchbase never sees: real estate syndications, search funds, family vehicles, Broadway LLCs (the stage lane's corroboration layer is this lane's adapter). All three cross-corroborate: the same person's foundation trusteeship, contribution employer field, and issuer officer seat triangulate identity for free.
+
+## The key structural fact
+
+Three disclosure regimes, three data shapes:
+
+- **990 Part VII is a governance roster**: officers, directors, trustees, key employees, with compensation, published as structured XML. Small volume, high value, full resolution treatment.
+- **FEC itemized contributions are donor-side records with identity points**: name, employer, occupation, city/state/zip on every itemized row. But the corpus is ~100M\+ rows of common names: full resolution is absurd, so it runs **closed-world** like GDELT, with better raw material.
+- **Form D related persons are issuer-side and lead-tier only**: executive officers, directors, promoters on the raise entity, like a Broadway credit block truncated to the top line.
+
+Design accordingly: 990 and Form D get the full Stage A/B/C pipeline; FEC is an overlay that only ever strengthens or annotates existing persons.
+
+<Tip>
+  **The employer field is the sleeper asset.** Every itemized FEC row carries self-reported employer and occupation. Matched against graph companies, it corroborates identity resolutions in every other lane at zero cost, and time-series of employer strings across cycles reconstructs job histories PDL sometimes misses.
+</Tip>
+
+## Data-source landscape
+
+| # | Source | Role | Access | Notes |
+| --- | --- | --- | --- | --- |
+| 1 | **IRS 990 / 990-PF / 990-EZ e-file XML** | Governance \+ grants backbone | Free bulk (irs.gov) | Part VII rosters; grant schedules (Schedule I / 990-PF Part XV). The edu lane's fetch, reused. |
+| 2 | **ProPublica Nonprofit Explorer API** | Index \+ per-org lookup | Free API | EIN resolution, filing index, fresher than bulk drops for lookups. |
+| 3 | **FEC bulk data \+ api.open.fec.gov** | Contributions corpus | Free (bulk files; API key) | Itemized individual contributions with employer/occupation; committee and candidate masters. Loads to BigQuery next to GDELT. |
+| 4 | **SEC Form D structured datasets** | Related persons \+ raises | Free quarterly datasets \+ daily full-text feed | Issuer, offering size, related persons with roles. Diff source for Fundable gap-fill. |
+| 5 | **State campaign finance (FollowTheMoney / OpenSecrets)** | v1.1 | Free | State-level giving; park until federal is live. |
+| 6 | **SEC Form ADV** | Adjacent expansion | Free | RIA ownership and executives for the finance ICP; scoped separately with its own page later. |
+
+## Node & edge schemas (new in this scope)
+
+No new node label family: nonprofits, foundations, committees, and issuers all extend the existing Company family with discriminators (`nonprofit`, `foundation`, `fec_committee_id`, `is_issuer`), consistent with the stage-lane label decision. Form D raises land as Fundable-style round records, not a new node type. `DONOR_TO` is defined in the donations plan and reused here unchanged. **Three edge types are net-new**, and trustee/director rows reuse the existing `BOARD_MEMBER_OF` edge (weight 8, 1,300\+ live edges) with filing-provenance properties, so nonprofit board service scores through existing machinery from day one.
+
+### Edge: `OFFICER_OF` (new): `(Person)-[:OFFICER_OF]->(Company)`
+
+| Property | Type | Req | Notes |
+| --- | --- | --- | --- |
+| `role` | enum `officer` \| `key_employee` | ✓ | From Part VII title mapping. Trustee and director rows write the reused `BOARD_MEMBER_OF` edge (weight 8) instead, carrying the same provenance properties. |
+| `title_as_filed` | string | ✓ | Verbatim. |
+| `compensation_usd` | int |  | When reported. |
+| `valid_from` / `valid_to` | date | ✓ / opt | Filing-year span; extended as consecutive filings confirm, closed when a roster drops the name. Bitemporal convention. |
+| `filing_refs` | id\[\] | ✓ | Source filings. |
+| `weight` | float | ✓ | **14** officer, **20** key\_employee. |
+| `mention_ref`, `source_urls`, `confidence` |  | ✓ | Audit \+ provenance. |
+| envelope |  | ✓ | 2026-07-04 standard; deterministic description "X is an officer of Y". |
+
+Idempotent per (person, org, role). Co-board pairs derive through the shared Company node from the reused `BOARD_MEMBER_OF` edges at score time, never materialized: the stage-lane pattern.
+
+### Edge: `CONTRIBUTED_TO` (new): `(Person)-[:CONTRIBUTED_TO]->(Company {fec_committee_id})`
+
+| Property | Type | Req | Notes |
+| --- | --- | --- | --- |
+| `cycle` | string | ✓ | Election cycle. |
+| `amount_total_usd` | int | ✓ | Aggregated per person-committee-cycle; per-row detail stays relational. |
+| `contribution_count` | int | ✓ |  |
+| `employer_as_reported`, `occupation_as_reported` | string | ✓ | The corroboration payload. |
+| `layer` | `evidence` | ✓ | Evidence-first per the decision above; 60-day scoring review. |
+| `excluded_from_scoring` | bool `true` | ✓ | Hard flag, GDELT pattern. |
+| `evidence_refs` | id\[\] | ✓ | Rows in the contribution rollup table. |
+| envelope |  | ✓ | Deterministic description "X contributed to Y in the \<cycle\> cycle". |
+
+Aggregated edge, written only for closed-world matches passing the uniqueness \+ employer gate. Co-donor pairs derive through the shared committee node; evidence-only.
+
+### Edge: `RELATED_PERSON_OF` (new): `(Person)-[:RELATED_PERSON_OF]->(Company {is_issuer})`
+
+| Property | Type | Req | Notes |
+| --- | --- | --- | --- |
+| `role` | enum `executive_officer` \| `director` \| `promoter` | ✓ | As filed. |
+| `filing_accession` | string | ✓ | EDGAR anchor; idempotency key with person. |
+| `offering_amount_usd` | int |  | From the filing. |
+| `valid_from` | date | ✓ | Filing date. |
+| `weight` | float | ✓ | **15** executive\_officer / director, **20** promoter. |
+| `mention_ref`, `source_urls`, `confidence`, envelope |  | ✓ | Standard; description "X is a related person of Y". |
+
+Co-officer pairs on one issuer derive through the shared node, tier-weighted.
+
+### Weight bands (set 2026-08-21, cross-lane §3.6 sitting)
+
+| Relationship class | Derivation | Weight / pair |
+| --- | --- | --- |
+| Co-board service | Two reused `BOARD_MEMBER_OF` (**8**) on one org, overlapping validity | Pair 16, closest in this lane |
+| Officer co-tenure | `OFFICER_OF`: **14** officer, **20** key\_employee | Pair 28\+ |
+| Form D co-related-persons | `RELATED_PERSON_OF`: **15** executive officer / director, **20** promoter | Pair 30\+ |
+| Co-donor, same committee | Shared committee node | No band: evidence-only |
+| Contribution itself | `CONTRIBUTED_TO` | No band: evidence-only, 60-day review; traversal weight **60**, since committees are thousand-donor hubs and the hub rule applies regardless of the evidence flag |
+
+## Pipeline design per source
+
+Go on GCP: source adapters behind the one fetcher interface, raw XML/TSV cached to GCS, Pub/Sub → Cloud Run, mentions in AlloyDB, FEC corpus \+ match views in BigQuery beside GDELT, edges to FalkorDB.
+
+### 990 adapter
+
+1. Org queue (entry points #3/#4) → EIN resolution via ProPublica → e-file XML fetch (shared with the donations lane).
+2. Deterministic Part VII parse: name, title, compensation, hours. LLM only for title→role mapping edge cases (#12984 tier-1).
+3. Resolution: full Stage-B treatment (small volume, high value): existing-graph match with org-affiliation corroboration, Exa \+ #12677 v5 adjudication, ≥0.85 auto-link, #13168 name-only cap. Unresolved trustees become local-only leaves \+ queue rows.
+4. Edge writer: MERGE `OFFICER_OF` per filing year; consecutive filings extend `valid_to`, a dropped name closes it. Backfill: latest \+ 3 prior filing years per org.
+
+### FEC overlay (closed-world)
+
+1. Bulk load per cycle to BigQuery; monthly incremental.
+2. Match view: tracked-name index × contributions, gated by name uniqueness AND (employer matches a known affiliation OR geo matches a known location). Two independent corroborations required, the auto-link convention applied to matching rather than minting.
+3. Aggregation to person-committee-cycle rollups; `CONTRIBUTED_TO` written above the decided floor (≥\$1K aggregate per cycle; Phase 0 validates volume).
+4. Employer-string exhaust feeds entry point #8.
+5. Never creates persons, committees-as-people, or queue rows.
+
+### Form D adapter
+
+1. Quarterly structured dataset load; daily full-text feed for new filings; diff against Fundable rounds (entry point #5).
+2. Deterministic related-persons parse from the filing XML.
+3. Resolution: full Stage-B treatment; issuer entity resolves via `master-company-new` #12558; new non-VC raises land as Fundable-style round records.
+4. Edge writer: `RELATED_PERSON_OF` keyed by accession number; stage-lane consumers (Broadway show LLCs) read from the same table.
+
+## Governance note
+
+Political contribution data is public record but sensitive. Two commitments in v1: `CONTRIBUTED_TO` ships evidence-first (excluded from leverage-loop and outcome scoring, GDELT pattern), and product display of political giving is a separate, explicit decision that routes through the field-level sensitivity framework from the tokenization work, not a default-on profile field.
+
+## Proposed storage (not built)
+
+| Table | Purpose |
+| --- | --- |
+| `filing_990` | One row per fetched filing: EIN, org ref, tax year, XML ref, parse state. Shared with the donations lane. |
+| `governance_mention` | One row per Part VII line: filing ref, verbatim fields, resolution state, resolved `master_person_id`, edge state. Audit-first per #723. |
+| `fec_contribution_match` | Closed-world match rows: contribution ref, matched `master_person_id`, gate evidence (uniqueness score, employer/geo corroboration), rollup state. |
+| `formd_filing` / `formd_related_person_mention` | Accession-keyed filings and their related-person lines, resolution state, Fundable round linkage. |
+| `*_resolution_attempts` | Append-only Stage-B logs per source, mirroring `fundable_organization_enrichment_attempts`. |
+
+## Cost estimate (order of magnitude, validate in Phase 0)
+
+The cheapest lane on the board: all three sources are free and structured, and the parses are deterministic. One-time: BigQuery loads for 4-5 FEC cycles ≈ \$10-30 in storage and initial queries; 990 \+ Form D backfill LLM (title mapping edge cases \+ adjudications on ~5-10K governance and related-person mentions) ≈ \$30-80; GCP infra ≈ \$15-30/mo during backfill, under \$10/mo steady. Vendor enrichment credits apply only to net-new 990/Form D persons promoted out of the queue, gated by tier as everywhere. Engineering: 3-4 day Phase 0 spike, then roughly 2-3 weeks across the three adapters, with the 990 adapter partially shared with the donations build.
+
+## Rollout order
+
+1. **Phase 0 spike (3-4 days)**: parse Part VII on ~20 filings across org sizes and years, measure title→role mapping ambiguity; run the FEC match view against the current tracked-name index for one cycle, measure match rate and false-positive rate on a 200-row audit sample; diff one quarterly Form D dataset against Fundable, size the non-VC gap; tune the contribution floor.
+2. **990 adapter** first: rides the donations-lane fetch, highest edge quality (co-board), immediate value to the edu plan.
+3. **Form D adapter**: Fundable gap-fill \+ the stage lane's corroboration dependency.
+4. **FEC overlay** last, behind its gates, evidence-first; revisit scoring after a 60-day observation window mirroring the GDELT promotion pattern.
+
+## Open questions
+
+None. Banding landed 2026-08-21 in the cross-lane sitting; remaining unknowns are Phase 0 outputs.
+
+## References
+
+- [IRS 990 series e-file downloads](https://www.irs.gov/charities-non-profits/form-990-series-downloads)
+- [ProPublica Nonprofit Explorer API](https://projects.propublica.org/nonprofits/api)
+- [FEC bulk data](https://www.fec.gov/data/browse-data/?tab=bulk-data) · [api.open.fec.gov](https://api.open.fec.gov/developers/)
+- [SEC Form D data sets](https://www.sec.gov/dera/data/form-d) · [EDGAR full-text search](https://efts.sec.gov/LATEST/search-index?q=&dateRange=custom&forms=D)
+- [Educational Institution Donations](/guides/open-work/roadmap/educational-institution-donations) (the edu-recipient slice this lane generalizes)

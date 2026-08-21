@@ -1,0 +1,314 @@
+---
+title: "Speaking & Media Co-Occurrence"
+description: "Scope & build plan extending the podcast pipeline to YouTube interviews, conference speaker rosters, and GDELT news co-mentions: entry points, per-source designs, edge model, storage, and rollout."
+icon: "microphone-lines"
+---
+
+**Status: scope & planning only.** Nothing on this page is built. Goal: extend the podcast ingestion lane (curated media/tech/VC podcast cron: guest \+ LinkedIn resolution, hosts connected to guests in the graph) into a general speaking/media co-occurrence waterfall covering **YouTube interviews**, **conference speaker rosters**, and **GDELT news co-mentions**. All three are free sources; they differ sharply in signal strength and identity risk, so each gets its own gates.
+
+## Entry points
+
+Same invariant as the stage-production lane: every route enqueues **appearances or events** (or person-lookups that resolve to them), and all mentions flow through the shared extraction → resolution → edge-writer stages. GDELT is the one exception: it never creates people or appearance nodes, only aggregated edges between already-resolved graph persons (see gates below).
+
+| # | Entry point | Direction | Mechanism | Priority |
+| --- | --- | --- | --- | --- |
+| 1 | **Curated roster seeding** | Source → people | The podcast-set pattern extended: a config roster of interview YouTube channels and ICP conferences, seeded once (historical backfill), then polled. | P1 |
+| 2 | **Public-engagement persona trigger** | Person → appearances | A person whose persona narratives or enrichment signals show public speaking / media presence → person-side lookup across YouTube search and conference agenda archives, hits enqueue the source events. | P0 |
+| 3 | **Podcast-guest crossover** | Person → appearances | Everyone already resolved as a podcast guest gets a one-time YouTube \+ conference lookup; the populations overlap heavily. | P0 |
+| 4 | **Discover misses** | Person → appearances | Discover Deep Research resolves someone as a media-visible operator → approved miss enters via the person-side lookup. | P0 |
+| 5 | **Recurring crons** | Source → people | Channel-upload polling (YouTube), conference-season sweeps against the roster, GDELT batch pulls. Cadence per source below. | P1 |
+| 6 | **Roster expansion** | Source → source | Channels and conferences that keep surfacing already-tracked people get promoted into the roster (agent-suggested, human-approved), the self-learning intelligence-layer pattern. | P2 |
+
+## Decisions (2026-08-21)
+
+| Question | Decision |
+| --- | --- |
+| GDELT scoring | **Evidence-first.** `CO_MENTIONED_WITH` ships as intelligence-layer evidence only in v1: visible in narratives and layers, excluded from leverage-loop and outcome scoring. Promotion to scored edges is a later call made against observed precision. |
+| Co-mention floor & decay | ≥3 distinct articles across ≥2 source domains, counted over a rolling 24-month window; stale pairs age out. |
+| Promotion criteria | Random 100-pair manual audit after 60 days of collection; promote into scoring only at ≥90% validated precision, quarterly re-audits thereafter. |
+| Scored levels | Interview host↔guest and co-panelists score against §3.6 bands. Conference-level co-occurrence is evidence-only, like GDELT. |
+| Captions | Metadata-only extraction in v1. Phase 0 measures the miss rate; caption fallback ships later only if the gap justifies it. |
+| Roster governance | Agent suggestions land as `proposed` rows in `media_source_roster`; founder approves from a review queue, the merge-suspects pattern. |
+| Historical windows | Full channel history for roster YouTube channels; GDELT limited to the rolling 24-month window, no 2015 backfill. |
+| §3.6 bands | Set 2026-08-21 in the cross-lane sitting: `W_interview` 15, `W_panel` 20; traversal weights on unbanded edges: conference `APPEARED_IN` 45, `PART_OF` 30, `CO_MENTIONED_WITH` 55. |
+
+## Agent build brief
+
+Written for the coding agent building this lane. Three lanes build in parallel; this page is self-contained and everything you need is here or explicitly linked. Do not read intent into ambiguity: if something material is undecided, follow the escalation rule at the bottom.
+
+**Read first, in order:** [Edge Weights](/guides/ontology/edge-weights) (scale, hub rule, envelope), [Edges](/guides/ontology/edges) (conventions), the podcast lane docs (this lane extends its spine and shares the `MediaAppearance` / `Event` definitions), and the pattern functions cited on this page: #12984 tiered resolver, #12677 v5 adjudication, #13168 name-only cap, #12833 deep research, #723 attempts audit, Fundable Stage-1 gating.
+
+**Invariants — violating any one is a failed build:**
+
+1. One write path: every appearance edge flows extraction → `media_appearance_mention` row → resolution → edge writer. No `APPEARED_IN` without a `mention_ref`.
+2. GDELT is closed-world: it never creates persons, appearances, or queue rows. `CO_MENTIONED_WITH` only between persons that already existed before the batch, only above the floor (≥3 distinct articles, ≥2 distinct source domains, rolling 24 months), always `layer: evidence` and `excluded_from_scoring: true`.
+3. Weights exact: interview `APPEARED_IN` 15, panelist 20, conference speaker 45, `PART_OF` 30, `CO_MENTIONED_WITH` 55. Integer scale, floor 1, never sub-1, 2026-07-04 envelope everywhere.
+4. YouTube v1 is metadata-only: no caption or transcript fetching in any code path. Roster-first: uploads-playlist enumeration; `search.list` only for person-side lookups inside a hard daily unit budget with a stop.
+5. Simulcast dedup: one `MediaAppearance` per episode across podcast audio and YouTube video, carrying both anchors. Zero duplicate appearances sharing (title, date, host set).
+6. Auto-link only at ≥0.85 with name plus two independent corroborations; name-only capped; everything else `needs_review`. New-person policy: local-only leaves \+ queue rows, kill switches respected, no recursive enrichment.
+7. Co-occurrence derives through shared appearance/event nodes; never materialize co-appearance edges.
+8. Raw payloads cached to GCS before parsing; retries parse from cache. Roster changes only through `media_source_roster` rows; `proposed` rows require founder approval, never auto-promote.
+9. Go on GCP only; GDELT queried from BigQuery partitions, never full-table scans.
+
+**Mention-row state machine:** `unresolved → auto_linked | needs_review | rejected`; `auto_linked → edge_written`; `needs_review → auto_linked | rejected` (human action only). Every transition appends to `media_appearance_resolution_attempts`.
+
+**Fixtures (Phase 0 and regression):** The TED AI Show (the worked example above: simulcast dedup, host role, 38 episodes), one non-simulcast interview channel, one entertainment-only channel that must yield empty participant sets cheaply, two conferences (one live agenda, one Wayback-recovered), one GDELT sample week against the current tracked-name index.
+
+**Definition of done per phase:** Phase 0 = fixture report as an appendix here (metadata-only guest yield %, bio-resolution rate, Wayback coverage, GDELT match and false-positive rates on a 200-row audit, quota math). Phase 1 (YouTube) = roster full-history mentions landed, dedup assertion green, edges behind the Stage-1 gate. Phase 2 (conferences) = session \+ `PART_OF` structure writing, co-panelist derivation verified on a fixture. Phase 3 (GDELT) = overlay live behind its gates, rollups only, 60-day audit clock started. Each phase ends with acceptance queries green twice and crons \+ enrichment-QA checks registered.
+
+**Acceptance queries (zero rows required):** `APPEARED_IN` missing `role` or `mention_ref`; any weight outside {15, 20, 45} for `APPEARED_IN` by role, or `PART_OF` ≠ 30, or `CO_MENTIONED_WITH` ≠ 55; any `CO_MENTIONED_WITH` with `excluded_from_scoring` ≠ true, below the floor, or touching a person created after the batch began; duplicate `MediaAppearance` sharing (title, date, host set); any caption-fetch code path reachable in v1.
+
+**Hard limit for first runs:** cap the first backfill at 500 videos and one conference until acceptance queries pass twice.
+
+**Coordination:** `MediaAppearance` and `Event` are shared definitions with the podcast lane — first to ship registers them, the other consumes; the fetcher interface is shared across all three lanes on the same rule. Copy the mention/attempts table shape but own your tables. Never edit another lane's tables or adapters.
+
+**When blocked or a decision is missing:** do not guess. Append the question to this page's open questions with your proposed answer, park affected work `needs_review`, continue on unblocked work. Founder approvals arrive through the review queues; never bypass them.
+
+## Why
+
+Who appears with whom is the public tier of the relationship graph. An interview is an hour of documented one-on-one contact between host and guest; a panel is curated peer grouping by a third party; repeated news co-mention is market-perceived association. All three are visible for exactly the ICP: operators in finance, real estate, media, and tech who speak. The podcast lane already proves the mechanics (episode → guest extraction → LinkedIn resolution → host-guest edges); this plan generalizes the mechanics across three more surfaces without changing the write path.
+
+Signal ordering, strongest to weakest: interview (host↔guest, 1:1) \> panel co-panelists (same session) \> co-speakers (same conference) \> news co-mention (same article). Weights and gates follow that ordering.
+
+## The key structural fact
+
+The three sources sit at opposite ends of the identity-risk spectrum:
+
+- **YouTube and conferences are appearance-anchored**: a video ID or a session on an agenda is a concrete event with names attached in context (title, description, bio blurb, employer line). Identity resolution has corroborating material, the same shape as podcast episodes.
+- **GDELT is string-anchored**: the GKG `V2Persons` field is a bare list of person-name strings per article, no context, massive volume, and name collisions everywhere. It is useless for discovering people and dangerous for auto-linking.
+
+So the design splits: YouTube/conferences extend the podcast pipeline as new source adapters with full Stage A/B/C treatment. GDELT runs as a **closed-world overlay**: match article person strings only against names already resolved in the graph, apply a name-uniqueness gate, and write only aggregated co-mention edges with count thresholds. GDELT can strengthen edges; it can never mint identities.
+
+<Tip>
+  **Quota economics decide the YouTube design.** Data API v3 gives ~10k units/day; `search.list` costs 100 units, `playlistItems.list` costs 1. Enumerating a curated channel roster's uploads is ~free; global search is 100x more expensive and noisy. Roster-first, search only for person-side lookups (#2/#3), metadata-only extraction in v1. Verify quota math in Phase 0.
+</Tip>
+
+## Data-source landscape
+
+| # | Source | Role | Access | Notes |
+| --- | --- | --- | --- | --- |
+| 1 | **YouTube Data API v3** | Interview \+ panel video backbone | Free (quota) | Channel → uploads playlist → video title/description/captions. Curated interview-channel roster mirrors the podcast set; many roster podcasts are simulcast on YouTube, which gives dedup and richer descriptions. |
+| 2 | **Conference sites \+ agenda platforms** | Speaker/session backbone | Free, scrape | Per-event source adapters; many events publish agendas on hosted platforms (Sched-style) with consistent speaker-page markup. Bio blurbs carry title \+ employer: strong identity points. |
+| 3 | **Wayback Machine CDX** | Historical agendas | Free API | Past-year agendas vanish; archived snapshots recover roughly a decade of speaker history per conference. |
+| 4 | **GDELT 2.0 GKG** | News co-mention overlay | Free (BigQuery public dataset) | `V2Persons` \+ `V2Organizations` per article, 15-minute cadence, history to 2015. Queried from BigQuery, where the Fundable sync infra already lives. |
+| 5 | **Podcast lane (existing)** | Proven mechanics \+ crossover seed | Internal | Guest extraction \+ LinkedIn resolution pattern to clone; resolved guests seed entry point #3. |
+
+Conference roster v1 is config, ICP-targeted (finance/media/tech operator events: Milken, SALT, Upfront Summit, Web Summit, SXSW, Cannes Lions class), deliberately short; entry point #6 grows it from evidence.
+
+## Node & edge schemas (new in this scope)
+
+This lane introduces **two node types** and **three edge types** to the ontology. Both node types are shared with the podcast lane: one definition, and whichever lane ships first registers them. Everything else (Person, Company) is existing.
+
+### Node: `MediaAppearance` (new)
+
+| Property | Type | Req | Notes |
+| --- | --- | --- | --- |
+| `uuid` | string | ✓ | Envelope. |
+| `source` | enum `podcast` \| `youtube` \| `conference_session` | ✓ | Discriminator. |
+| `title` | string | ✓ | Episode/video/session title as published. |
+| `valid_from` | date | ✓ | Publish or session date, bitemporal convention. |
+| `video_id` | string |  | YouTube anchor. |
+| `episode_ref` | string |  | Podcast anchor; simulcast dedup collapses audio \+ video onto one node carrying both refs. |
+| `session_ref` | string |  | Conference agenda anchor. |
+| `via_roster` | string |  | `media_source_roster` entry that produced it. |
+| `source_urls` | string\[\] | ✓ | Provenance. |
+| `confidence` | enum | ✓ | From extraction. |
+| envelope |  | ✓ | `created_at`, `updated_at`, `weight`, deterministic `description` ("Episode of The TED AI Show" / "Session at TED2026"), `description_generated_at`, per the 2026-07-04 standard. |
+
+Idempotency key: `source` \+ whichever anchor applies.
+
+### Node: `Event` (new)
+
+| Property | Type | Req | Notes |
+| --- | --- | --- | --- |
+| `uuid` | string | ✓ | Envelope. |
+| `name` | string | ✓ | "TED2026", "AWE USA 2026". |
+| `event_type` | enum `conference` | ✓ | Room to grow (award shows, summits). |
+| `start_date` / `end_date` | date | ✓ | Bitemporal convention. |
+| `venue`, `city` | string |  | From agenda. |
+| `source_urls` | string\[\] | ✓ | Provenance. |
+| envelope |  | ✓ | 2026-07-04 standard. |
+
+Key: (`name`, year).
+
+### Edge: `APPEARED_IN` (new): `(Person)-[:APPEARED_IN]->(MediaAppearance)`
+
+| Property | Type | Req | Notes |
+| --- | --- | --- | --- |
+| `role` | enum `host` \| `guest` \| `panelist` \| `speaker` | ✓ | Drives pair derivation. |
+| `weight` | float | ✓ | Per the band table below. |
+| `mention_ref` | id | ✓ | Audit link to `media_appearance_mention`. |
+| `source_urls`, `confidence` |  | ✓ | Provenance \+ resolution outcome. |
+| envelope |  | ✓ | Deterministic description: "Bilawal Sidhu appeared in \<title\> as host". |
+
+Idempotent per (person, appearance).
+
+### Edge: `PART_OF` (new): `(MediaAppearance)-[:PART_OF]->(Event)`
+
+Structural containment: traversal weight **30** (the `RECORDING_OF` analogue), no band. Exists so session-level and conference-level co-occurrence stay distinguishable at query time.
+
+### Edge: `CO_MENTIONED_WITH` (new): `(Person)-[:CO_MENTIONED_WITH]->(Person)`
+
+| Property | Type | Req | Notes |
+| --- | --- | --- | --- |
+| `article_count` | int | ✓ | Distinct articles in window. |
+| `window` | string | ✓ | `24mo` rolling. |
+| `window_counts` | json | ✓ | Per-quarter breakdown for decay visibility. |
+| `first_seen` / `last_seen` | date | ✓ |  |
+| `top_source_domains` | string\[\] | ✓ | Floor requires ≥2. |
+| `evidence_refs` | id\[\] | ✓ | Rows in `news_comention_rollup`; article detail stays relational. |
+| `layer` | `evidence` | ✓ | Per the evidence-first decision. |
+| `excluded_from_scoring` | bool `true` | ✓ | Hard flag scoring respects. |
+| envelope |  | ✓ | Deterministic description: "X and Y co-appear in news coverage". |
+
+Written once per pair (canonical uuid ordering), updated by the daily batch, retired when the rolling window drops the pair below floor.
+
+### Weight bands (set 2026-08-21, cross-lane §3.6 sitting)
+
+| Relationship class | Derivation | Weight / pair |
+| --- | --- | --- |
+| Interview host↔guest | Two `APPEARED_IN` on one interview appearance | **15** per edge, pair 30 (`COLLABORATORS`-class; episode nodes are degree-3, no hub risk) |
+| Co-panelists, same session | Two `APPEARED_IN {role: panelist}` on one session | **20** per edge, pair 40 (`CO_NOMINATED_WITH`-grade) |
+| Co-speakers, same conference | Shared `Event` via `PART_OF` | No band: evidence-only. Conference-speaker `APPEARED_IN` writes traversal weight **45** (the `PERFORMED_AT` analogue). |
+| News co-mention | `CO_MENTIONED_WITH` | No band: evidence-only. Traversal weight **55**. |
+
+### Context richness (v1.1 candidates)
+
+- Episode/session summaries stored on the appearance node and vectorized: direct evidence feeding the public-engagement persona narrative.
+- Topic tagging per appearance against the 70-domain expertise taxonomy: semantic scoring learns what they talked about, not just that they talked.
+- Employer capture from descriptions and bios into mention `identity_points`, corroborating Person→Company affiliations at zero extra fetch cost.
+
+## What the graph already has (leverage, not build)
+
+- **The podcast pipeline itself**: curated-set cron, historical-backfill-then-incremental pattern, guest \+ LinkedIn extraction contract, host↔guest edge writing. This lane is three more source adapters on that spine, not a new spine.
+- **Persona narratives**: the public-engagement narrative per person is both a trigger (entry point #2) and a consumer; appearance edges feed it back.
+- **Identity machinery**: `master-person-new` #13039 (kill switch #4617), Exa profile search #12936, `create-master-link` #2541, queue upsert #12854.
+- **Proven agent patterns**: #12984 tiered extraction economics; #12833 deep-research config for ambiguous person-side lookups; #12677 v5 adjudication with the #13168 name-only cap.
+- **BigQuery**: the Fundable changelog sync already runs on BigQuery; GDELT queries land in existing infra.
+- **Fundable Stage-1 gating** and the **LLM Test Harness** (API group 42), as everywhere.
+
+## Pipeline design per source
+
+Go on GCP, per-market/source adapters behind one fetcher interface, raw payloads cached to GCS, Pub/Sub → Cloud Run, mentions in AlloyDB, edges to FalkorDB.
+
+### YouTube adapter
+
+1. Roster poll: uploads playlist per channel (1 unit/call), new video IDs → queue.
+2. Guest extraction from title \+ description with the #12984 tier-1 config. Metadata-only in v1 per the decision above; Phase 0 measures the residual miss rate, and caption fallback ships later only if the gap justifies it. 2a. Podcast dedup: match against podcast-lane episodes by title \+ date \+ host so simulcasts strengthen one appearance instead of minting two.
+3. Resolution: the podcast lane's LinkedIn resolution flow, plus #12677 v5 adjudication for names without a URL. Auto-link ≥0.85; name \+ two corroborating points minimum; #13168 cap applies.
+4. Edge writer: `APPEARED_IN` with role (host/guest/panelist), idempotent per person-video pair.
+
+### Conference adapter
+
+1. Per-event adapter against the roster; current-year agenda live, past years via Wayback CDX.
+2. Deterministic parse of speaker and session pages; #12984 tier-1 only for unstructured bio blurbs. Bio title \+ employer are the identity points.
+3. Resolution as above; conference bios resolve unusually well (employer stated in-source).
+4. Edge writer: session `MediaAppearance` \+ `PART_OF` event; co-panelist derivation comes free.
+
+### GDELT overlay (closed-world)
+
+1. Daily BigQuery batch: GKG rows where ≥2 `V2Persons` strings match the tracked-name index. Backfill covers the rolling 24-month window only; no 2015 deep backfill.
+2. **Uniqueness gate**: a tracked person's name enters the matchable index only above a name-uniqueness score (corpus rarity \+ no same-name collision inside the graph). Common names never match, regardless of volume.
+3. **Corroboration boost**: `V2Organizations` containing the person's known employer upgrades match confidence; tone and theme fields stored, not gated on.
+4. Aggregation: pair counts rolled up over the rolling 24-month window; `CO_MENTIONED_WITH` written/updated only above the decided floor (≥3 distinct articles, ≥2 distinct source domains), and pairs that fall below it as the window rolls get retired. Evidence article refs stay relational.
+5. Never creates persons, appearances, or queue rows. Overlay only.
+
+## Draft system prompt v0.1: video guest extraction (not deployed)
+
+```text
+You extract interview participants from ONE YouTube video's metadata.
+
+Channel: {{channel_name}} (known hosts: {{known_hosts}})
+Title: {{title}}
+Description: {{description}}
+
+Return ONLY valid JSON: {"participants": [...]}. Each participant object:
+- name: exactly as written
+- role: "host" | "guest" | "panelist" | "unknown"
+- identity_points: {title, employer, linkedin_url, twitter_handle, other} (nulls allowed)
+- evidence_quote: verbatim fragment naming this participant
+- confidence: "high" | "medium" | "low"
+
+Rules:
+1. Known channel hosts default to role "host" unless the metadata contradicts it.
+2. Names mentioned as topics, not participants ("discussing Elon Musk's latest…"), are excluded.
+3. Extract LinkedIn/Twitter URLs and stated titles/employers from the description into identity_points.
+4. Multi-guest panels: every named participant gets its own object with role "panelist".
+5. If no participants are identifiable, return {"participants": []}.
+```
+
+Adjudication follows #12677 v5, drafted against real cases in the LLM Test Harness before deployment.
+
+## Proposed storage (not built)
+
+| Table | Purpose |
+| --- | --- |
+| `media_source_roster` | Config: channels and conferences, cadence, adapter, status. Entry point #6 writes suggestions here as `proposed`; founder approves from a review queue. |
+| `media_appearance_mention` | One row per extracted participant per video/session: source ref, contract fields, resolution state, resolved `master_person_id`, edge state. Audit-first per #723. |
+| `media_appearance_resolution_attempts` | Append-only Stage-B log, mirrors `fundable_organization_enrichment_attempts`. |
+| `event` / `event_session` | Relational detail for conferences: dates, venue, track, agenda URLs. |
+| `news_comention_rollup` | Aggregated GDELT pair counts per window with evidence article refs; the only GDELT state. |
+
+## Worked example: Bilawal Sidhu (simulated 2026-08-21)
+
+Dry run against public data; nothing written. Subject: TED tech curator and TED2026 co-host, inaugural host of The TED AI Show (38 episodes), a16z scout, creator with 2.1M\+ subscribers across a dual-brand channel structure. A deliberately hard case: host role, guest role, conference speaker, dual channels, and heavy news presence in one person.
+
+**Entry points fired:** #2 public-engagement persona, #3 podcast-guest crossover, and #6 in reverse: his professional channel and The TED AI Show land in `media_source_roster` as `proposed` for approval.
+
+**Extraction notes:** the entertainment channel (billyfx: VFX/AI content, ~990K TikTok, ~400K YouTube) returns empty participant sets at tier-1 cost and is skipped, validating channel-level rosters. Simulcast dedup collapses each TED AI Show episode's podcast audio and YouTube video onto one `MediaAppearance` carrying both anchors.
+
+```text
+// Interview pair (scored, W_interview)
+(:MediaAppearance {source: "podcast", title: "The TED AI Show — Eric Schmidt",
+  episode_ref, video_id, valid_from, via_roster: "ted-ai-show",
+  description: "Episode of The TED AI Show"})
+(bilawal:Person)-[:APPEARED_IN {role: "host", weight: W_interview}]->(ep)
+(schmidt:Person)-[:APPEARED_IN {role: "guest", weight: W_interview}]->(ep)
+
+// Conference session + containment (co-panel scored, W_panel)
+(demo:MediaAppearance {source: "conference_session", session_ref})
+      -[:PART_OF]->(ted2026:Event {name: "TED2026", start_date, venue})
+(bilawal)-[:APPEARED_IN {role: "panelist", weight: W_panel}]->(demo)
+(wickert:Person)-[:APPEARED_IN {role: "panelist", weight: W_panel}]->(demo)
+
+// GDELT overlay (evidence layer, never scored)
+(bilawal)-[:CO_MENTIONED_WITH {article_count: 14, window: "24mo",
+  first_seen, last_seen, top_source_domains, evidence_refs,
+  layer: "evidence", excluded_from_scoring: true}]->(schmidt)
+```
+
+**Write-set inventory (simulated):**
+
+| Type | Count | Notes |
+| --- | --- | --- |
+| `MediaAppearance` (interview) | ~46-50 | 38 TED AI Show episodes \+ ~8 guest spots (Product Growth, The Next Wave, Building the Open Metaverse, Bad Decisions Podcast, others) |
+| `MediaAppearance` (conference\_session) | ~8 | TED2026 Session 3, the Sam Wickert live demo, the onstage Eric Schmidt interview, TED2023 talk, TEDNext, AWE USA 2026, VidSummit 2023, Convergence AI Dallas 2025 |
+| `Event` | ~7 | The conferences above |
+| `Person` (local-only leaves \+ queue rows) | ~30-40 | Unresolved episode guests; investor-cascade policy, no recursive enrichment |
+| `APPEARED_IN` | ~110-120 | Host, guest, speaker, and panelist roles combined |
+| `PART_OF` | ~8 | Sessions → events |
+| `CO_MENTIONED_WITH` | ~3-6 | Pairs above the floor; all evidence layer |
+
+**Scoring derives** ~55 interview pairs (Helen Toner, Eric Schmidt, Victor Riparbelli, Brian McClendon, Ian Bremmer, and the rest of the guest list) plus one co-panel pair (Sam Wickert) as scored relationships. TED2026 roster adjacency and every co-mention sit in the evidence layer. The lane composes with his existing Fundable angel records (Pika Labs, Hedra) without touching them: media brokerage and investment edges converge on one node, which is the whole point.
+
+## Rollout order
+
+1. **Phase 0 spike (3-4 days)**: YouTube: 10-channel roster, quota math, measure what fraction of videos yield guests from metadata alone. Conferences: 2 event adapters incl. one Wayback backfill, bio-resolution rate. GDELT: run the tracked-name uniqueness scoring, sample-query BigQuery for a week of matches, measure collision rate. Confirms the gates before anything writes.
+2. **YouTube adapter** first: full-history backfill of roster channels, then incremental; nearest to the proven podcast mechanics, immediate crossover with entry point #3.
+3. **Conference adapter**: roster v1, current year \+ Wayback backfill per event.
+4. **GDELT overlay** last, behind the uniqueness gate and count floor, shipping as intelligence-layer evidence only per the decision above; scoring promotion is a separate later call.
+
+## Cost estimate (order of magnitude, validate in Phase 0)
+
+YouTube Data API is \$0 inside the 10K-unit/day quota: roster full-history polling costs single-digit units per channel page, and person-side searches at 100 units each get a daily budget. One-time backfill: ~15-30K roster videos through tier-1 extraction ≈ \$15-30, a few thousand adjudications ≈ \$10-25, conference bio extraction ≈ \$5-15. GDELT on BigQuery: the initial 24-month pass scans ~1-4 TiB of partitioned GKG columns ≈ \$5-25 at on-demand rates, then daily incremental partitions for pennies. Total one-time ≈ \$40-100; steady state ≈ \$10-20/mo infra, plus the same queue-gated vendor-credit caveat for net-new guests as every lane. Engineering per the rollout: a 3-4 day spike, then roughly 2-3 weeks across the three adapters.
+
+## Open questions
+
+None. Every decision is locked as of 2026-08-21; the remaining unknowns are Phase 0 outputs.
+
+## References
+
+- [YouTube Data API v3](https://developers.google.com/youtube/v3) (quota: [docs](https://developers.google.com/youtube/v3/getting-started#quota))
+- [GDELT 2.0 GKG](https://blog.gdeltproject.org/gdelt-2-0-our-global-world-in-realtime/) · [GDELT on BigQuery](https://blog.gdeltproject.org/google-bigquery-gkg-2-0-sample-queries/)
+- [Wayback Machine CDX API](https://archive.org/developers/wayback-cdx-server.html)
+- Podcast pipeline (internal): curated-set cron, guest \+ LinkedIn resolution

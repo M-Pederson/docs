@@ -1,0 +1,138 @@
+---
+title: "Why Firecrawl Extracts Our Documents"
+description: "The measured comparison against LlamaParse, including the chart-fabrication failure that decided it, and what stays on LlamaParse."
+---
+
+# Why Firecrawl extracts our documents
+
+Every file uploaded to Orbiter is turned into markdown before anything else
+happens to it. Classification, search, and all six sections of a pitch profile
+are built on that markdown, so whatever the extractor gets wrong is inherited by
+everything downstream.
+
+Until August 2026 that extractor was LlamaParse. It is now Firecrawl. This page
+records why, what was measured, and what LlamaParse still does.
+
+## The finding that decided it
+
+**LlamaParse invents numbers when a chart has no printed values.** It measures
+the height of a bar or the position of a line and writes the result out as an
+exact figure, with nothing marking it as an estimate.
+
+Three cases were confirmed by opening the slides:
+
+| Deck | Slide | What LlamaParse produced |
+| --- | --- | --- |
+| GYMGUYZ Investor Deck | 12 | A 13-row table of monthly cash collected, from a dashboard screenshot whose chart prints only axis labels |
+| HyPo Pitch Deck | 15 | A 20-row revenue table from two line charts with no data labels, and it labelled the periods as years when the chart covers five years |
+| GYMGUYZ Investor Deck | 11 | `2014 = 800000` inside an otherwise correct transcription of a printed table, where the deck states `$669,649` |
+
+The last one is the worst shape: a wrong value sitting inside a right-looking
+table, indistinguishable downstream from the real rows.
+
+The behaviour is not a tuning problem. It appears at every LlamaParse tier, and
+two tiers produced *different* invented values for the same chart, which is only
+possible if both are measuring pixels rather than reading text.
+
+## How it was measured
+
+A person judged **266 individual figures** against the slide each came from,
+across 8 decks sampled by file size (0.4 MB to 28 MB) and page count (9 to 39).
+Only disputed figures were judged: those where an extractor disagreed with an
+independent reading of the PDF, or where extractors disagreed with each other.
+Verdicts were 136 printed, 91 not printed, and 39 unverifiable.
+
+Scoring against those labels:
+
+| Extractor | Precision | Recall | Figures reported that are not in the document |
+| --- | --- | --- | --- |
+| **Firecrawl `ocr`** | **85.2%** | **93.4%** | 22 |
+| Firecrawl `auto` | 84.9% | 91.2% | 22 |
+| LlamaParse `agentic` | 57.2% | 84.6% | **86** |
+
+Agreement between the two vendors turned out to be a perfect signal: of the
+figures both reported, 43 of 43 were printed and none invented. A figure only
+LlamaParse reported was right 42.6% of the time.
+
+The labels live in the backend repository at
+`internal/features/files/testdata/figure_gold_labels.json`, and
+`make eval-extract` re-scores any extractor against them.
+
+<Warning>
+The automated reference used before those labels existed — `pdftotext` plus
+`tesseract` — finds only 26 of the 136 printed figures. Any accuracy rate
+measured against it alone understates recall badly and should not be quoted.
+</Warning>
+
+## Speed and cost
+
+Both were measured, not taken from vendor claims.
+
+| | Firecrawl `ocr` | LlamaParse `agentic` |
+| --- | --- | --- |
+| Five unseen 10-page documents | 28.8s total, 5.4s median | 6.9 min total, 80.7s median |
+| A 28 MB, 15-page deck | 2.1 seconds | not measured |
+| Credits per page | 1 | 10 |
+| Cost per 1,000 pages | $0.99 on the $99 team plan | $12.50 |
+
+LlamaParse tier pricing, for reference: `fast` 1 credit/page,
+`cost_effective` 3, `agentic` 10, `agentic_plus` 45. Paying more made accuracy
+worse in our tests, not better — `agentic_plus` produced the wrong-value-inside-
+a-real-table case above.
+
+Both vendors return repeat parses faster than first ones, so any timing taken
+over documents they have already seen is optimistic.
+
+## Why `ocr` and not `auto`
+
+Firecrawl's `auto` mode extracts text first and falls back to OCR per page.
+Forcing `ocr` on every page reads better in both directions:
+
+- On decks with no text layer at all, `auto` lost recall (87% against 100%).
+- On a born-digital, multi-column academic paper, `auto` interleaved the columns
+  and collapsed the author block, while `ocr` preserved reading order and
+  produced three times as many block separations.
+
+Mode does not change price — Firecrawl bills per page either way — so the only
+cost of forcing OCR is latency, roughly double.
+
+## What stays on LlamaParse
+
+Firecrawl cannot do three things, so LlamaParse remains wired for them:
+
+1. **Raster image uploads.** `/v2/parse` returns `UNSUPPORTED_FILE_TYPE` for
+   PNG, JPEG, TIFF and WebP. Its supported list is HTML, PDF, Word, Excel,
+   PowerPoint, OpenDocument, RTF, EPUB and CSV.
+2. **Files above 50 MB.** Verified server-side on a paid plan by uploading a
+   120 MB deck: `Uploaded file exceeds maximum size of 50MB`. Splitting such a
+   file into sub-50 MB page ranges works and loses nothing, but is not built.
+3. **Page screenshots** behind every PDF preview.
+
+Point 3 means the swap moved extraction, not data exposure: every PDF still
+reaches LlamaParse for its thumbnail.
+
+## Operational notes
+
+- **No fallback between vendors.** A Firecrawl error fails the file. Retrying on
+  LlamaParse would mask a regression in the primary extractor and bill both.
+- **Reverting needs no deploy.** Remove `FIRECRAWL_API_KEY` from the service and
+  extraction routes back to LlamaParse.
+- **Firecrawl handles at least 30 concurrent requests** with no throttling on the
+  paid plan. The 4-second pacing used in the evaluation harness is a free-tier
+  artifact and is not needed in production.
+- **Output does not vary by plan.** Re-extracting 26 decks on the paid key
+  produced byte-identical markdown to the free-tier run.
+- **Extraction logs carry the vendor.** Every extraction logs `step=extract`
+  with `extractor`, `duration`, `markdown_bytes` and `size_bytes`, on both the
+  worker and the synchronous upload path.
+
+## Limits of this evidence
+
+- The judged sample is 8 decks and 266 figures, all pitch decks. Word and Excel
+  files were verified to extract cleanly but were not scored for accuracy.
+- One of the 8 decks is text-rich, so "which extractor suits which document
+  type" is not answerable from this data. The failure we found is a property of
+  *chart slides*, which appear in decks of every kind.
+- Firecrawl's 22 flagged figures were sampled rather than audited one by one.
+  Every one checked turned out to be real text that our own reference reader had
+  missed, not an invention.

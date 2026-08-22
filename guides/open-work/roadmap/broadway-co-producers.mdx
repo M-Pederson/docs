@@ -6,6 +6,21 @@ icon: "ticket"
 
 **Status: scope & planning, decisions locked 2026-08-21.** Nothing on this page is built. Goal: ingest the full producing block of every Broadway and West End production, resolve producers to `master_person` / `master_company` records, and materialize production credits as graph edges so co-producing relationships become queryable co-investment paths.
 
+<Warning>
+  **API keys & credentials this lane needs.** Provision before Phase 0. Store in GCP Secret Manager and inject into Cloud Run as env vars — never in code or checked-in config.
+
+  | Credential | Env var | Used for | How to get |
+  | --- | --- | --- | --- |
+  | Companies House API key | `COMPANIES_HOUSE_API_KEY` | UK show-entity unmasking: officers \+ PSC registers (Stage B) | Free — register at [developer.company-information.service.gov.uk](https://developer.company-information.service.gov.uk) |
+  | OpenCorporates API token | `OPENCORPORATES_API_TOKEN` | Shingle-principal officer lookups where the market filing is silent | Freemium — [opencorporates.com](https://opencorporates.com) |
+  | SEC EDGAR declared `User-Agent` | `SEC_EDGAR_USER_AGENT` | Form D full-text search \+ filing fetches | Not a key: SEC fair-access policy requires a contact UA string (`Orbiter.io mark@orbiter.io`); undeclared requests get blocked |
+  | OpenRouter API key | `OPENROUTER_API_KEY` | Every LLM call: #12984 tier-1/2 splitting, #12677 v5 adjudication, #12833 shingle deep research | Existing org key |
+  | Exa API key | `EXA_API_KEY` | Stage-B LinkedIn/profile search (#12936 pattern) | Existing org key |
+  | GCP service account | Workload Identity | Pub/Sub, Cloud Run, GCS cache, AlloyDB, FalkorDB | Standard enrichment-lane SA |
+
+  IBDB, Playbill, the Tony Awards db, SOLT, Theatricalia, and The Broadway League are keyless scrape targets: no credentials, but the fetcher must identify itself and hold the ≤1 rps throttle (invariant 7).
+</Warning>
+
 ## Entry points
 
 One invariant: every route in enqueues **productions** (or person-lookups that resolve to productions), and all credits flow through Stage A → B → C. Nothing writes person credits directly, so every entry point inherits the same resolution gates and idempotent MERGE.
@@ -284,6 +299,135 @@ Dry run against public data; nothing written. Subject: the 2024 Tony Best Musica
 ## Cost estimate (order of magnitude, validate in Phase 0)
 
 Sources are \$0: IBDB/Playbill/SOLT scraping, EDGAR, and Companies House, with OpenCorporates freemium as needed. One-time backfill across ~1,800-2,000 productions at #12984 tier economics: ~6-10K splitting calls ≈ \$10-20, ~4-6K Stage-B adjudications ≈ \$25-60, ~400-700 shingle deep-research runs ≈ \$20-100, so total one-time LLM ≈ \$60-180. GCP (Cloud Run, Pub/Sub, GCS cache, AlloyDB increment) ≈ \$20-40/mo during backfill, under \$10/mo steady at ~70-80 new productions/yr. The only line that scales into real money is vendor enrichment credits (PDL / Enrich Layer per-match) for net-new persons promoted out of the queue, and that spend is already gated by queue tier. The dominant cost is engineering time per the rollout: a 3-4 day spike, then roughly 2-3 weeks to recurring.
+
+## Backfill
+
+This lane deploys into a **populated graph**: by the time the first `PRODUCED` edge writes, the IMDb, music, Fundable, and podcast lanes will have created hundreds of thousands of `master_person` / `master_company` rows, and daily enrichment keeps adding more underneath you. Backfill is therefore not "load the sources and go" — it is two sequenced sweeps plus a standing re-resolution loop that keeps paying out as the graph grows. This section operationalizes rollout phases 2–3.
+
+### Sweep 1 — source-side: seed every production first
+
+1. Seed once per market from the season indexes (Broadway 2000-present, ~900-1,000 productions; West End window per Phase 0) into the unified queue in the P1/P2 bands of entry point #5. A year is the seeding unit; seeding is an upsert on `source_production_id`, so re-seeding a season is a no-op.
+2. Drain through **Stage A only** at first: every production lands its `stage_credit_mention` rows with zero edges written. Mentions are durable; edges are releasable later, never lost (the Stage-1 gate).
+3. Go mechanics: one seeding job per market; a Pub/Sub topic per stage; Cloud Run workers with concurrency tuned to the ≤1 rps **per-source** throttle — parallelism scales across sources, never across pages of one source. Raw HTML lands in GCS before parse; a retried production parses from cache and must produce byte-identical mention rows (assert this in Phase 0).
+4. Checkpointing: the queue row **is** the checkpoint. Status transitions (`queued → fetched → parsed → mentions_landed`) mean a killed worker resumes by re-reading status — never by an in-memory cursor or loop position.
+5. Hard cap: first 50 productions, acceptance queries green twice, then open the bands (per the agent brief).
+
+### Sweep 2 — graph-side: run the existing population through the person-side entry points
+
+Entry points #1–#3 are written as triggers, but at deploy time each must run **once as a batch sweep** over the people already in the graph:
+
+| Sweep | Population | Mechanism |
+| --- | --- | --- |
+| Producer-crossover (#3) | Every `master_person` holding a film/TV credit with a producing role | Highest prior for stage crossover. Enumerate from existing credit edges; IBDB person-page lookup; hits enqueue that person's productions. |
+| Expertise-domain (#1) | Every person carrying a theatre/performing-arts domain from the 70-domain taxonomy | Phase 0 fixes the qualifying-domain list; sweep once, then the trigger owns new derivations. |
+| Enrichment-signal (#2) | Persons whose stored enrichment shows producer-shaped signals (titles, shingle employers, Broadway/West End bio mentions) | One-time scan of stored enrichment output; then the waterfall trigger owns it. |
+
+- Run sweep 2 **after** sweep 1's mention landing has begun: person-page lookups mostly enqueue productions the season backfill already covered, so a hit costs one lookup, not a pipeline run. Dedup is free — enqueue upserts on the production anchor.
+- Read the person population as a snapshot and record the high-water mark (`master_person.id` or `created_at`). Persons created after the mark belong to the live trigger path, not the sweep — re-running the sweep must not chase a moving population.
+
+### The re-resolution loop (the part that is easy to miss)
+
+Stage-B resolution quality is a function of graph density **at resolution time**. A co-producer who is unresolvable in week 1 may be trivial in week 6 because the Fundable lane added them, the media lane resolved them as a podcast guest, or the filings lane landed their Form D. The mention store is durable precisely so resolution can be retried:
+
+- Re-drain `unresolved` mentions on a schedule — weekly during backfill, monthly steady-state — cheapest matchers first: a source-ID or existing-graph match on retry costs nothing.
+- Targeted retries beat full re-drains: diff new `master_person` rows since the last pass (high-water mark) and re-attempt only mentions whose normalized name matches a new arrival.
+- Every retry appends to `stage_credit_resolution_attempts`; never overwrite a prior attempt — the attempts log is how resolution-rate drift gets detected.
+- `needs_review` rows are excluded from automated retries: those wait for human action, per the state machine.
+
+### Cutover to steady state
+
+Backfill is done per market when the season queue has drained through the bands and the weekly re-resolution retry yield falls below the Phase-0-set threshold. Record the cutover date. After it, the weekly new-openings cron and annual award sweeps own everything — never leave a backfill drain running beside the steady-state cron (one drain owner per queue).
+
+### What backfill must NOT do
+
+- Never trigger recursive enrichment: unresolved credits create local-only leaves \+ queue rows, tier-gated; the enrichment lanes decide when vendor credits get spent.
+- Never write edges during the mention-landing phase; the Stage-1 gate opens per rollout phase 3.
+- Never re-fetch on retry — parse from the GCS cache.
+- Check kill switches #4617/#12789 **per batch**, not per run: a switch flipped mid-backfill must stop the next batch, not the next backfill.
+
+## Smoke tests
+
+Three fixed inputs for the build team, one per entry-point family, with simulated expected responses to assert against. Run in sandbox against the Phase-0 harness; expectations below are simulated from public data (2026-08-21), so treat counts as ranges and exact-match only the invariant fields.
+
+### ST-1 — Production-side: The Outsiders (`ibdb:537824`), entry point #5
+
+Seed one production directly into the queue and drain Stage A \+ B.
+
+**Input:** `{"source_production_id": "ibdb:537824", "market": "broadway", "band": "P1"}`
+
+**Simulated expected response** (after Stage B, before the edge gate opens):
+
+```json
+{
+  "production": {
+    "source_production_id": "ibdb:537824",
+    "title": "The Outsiders",
+    "theatre": "Bernard B. Jacobs Theatre",
+    "valid_from": "2024-04-11",
+    "season": "2023-24",
+    "revival": false
+  },
+  "mentions": {
+    "total": 42,
+    "lead_producer": 5,
+    "co_producer_range": [35, 38],
+    "couples_split": 4,
+    "slash_credits_split": 1
+  },
+  "resolution": {
+    "auto_linked_examples": [
+      {"name": "Angelina Jolie", "via": "existing film/TV credits", "confidence": ">=0.85"},
+      {"name": "American Zoetrope", "via": "existing film/TV company node"}
+    ],
+    "needs_review_or_unresolved_range": [10, 18],
+    "new_master_person_created": 0
+  }
+}
+```
+
+**Pass criteria:** every mention row carries an `evidence_quote`; couple credits produce paired person tokens with `couple_credit` markers from one mention; the Shubert Organization yields exactly one credit mention (venue-owner role produces nothing); zero `PRODUCED` edges exist while the gate is closed; re-running the input is a no-op (identical mention set, no duplicates).
+
+### ST-2 — Person-side: producer-crossover lookup, entry point #3
+
+**Input:** one existing `master_person` with film/TV producing credits and known stage work — use the graph's resolved record for **Angelina Jolie** (warm via the IMDb waterfall).
+
+**Simulated expected response:**
+
+```json
+{
+  "lookup": {"source": "ibdb_person_search", "person_page_found": true},
+  "productions_enqueued": [
+    {"source_production_id": "ibdb:537824", "title": "The Outsiders", "dedup": "already_queued_noop"}
+  ],
+  "credits_written_directly": 0
+}
+```
+
+**Pass criteria:** the person-side route enqueues **productions only** — zero mention rows and zero edges are written by the lookup itself (invariant 1); a person with no IBDB page returns cleanly at the cost of one search; re-running produces `already_queued_noop`, not a duplicate queue row.
+
+### ST-3 — UK \+ shingle: Stranger Things: The First Shadow, entry point #8
+
+A West End origination that transferred to Broadway, lead-produced through a shingle (Sonia Friedman Productions) with a corporate co-producer (Netflix). Exercises the UK credits path, Companies House unmasking, and shingle expansion in one fixture.
+
+**Input:** the production via the UK anchor chosen in Phase 0 (Theatricalia ID or `(title, theatre, opening-year)` composite), `market: "west_end"`.
+
+**Simulated expected response:**
+
+```json
+{
+  "production": {"market": "west_end", "title": "Stranger Things: The First Shadow",
+    "theatre": "Phoenix Theatre", "valid_from": "2023-12-14"},
+  "mentions": {"total_range": [8, 20], "company_credits": ["Sonia Friedman Productions", "Netflix"]},
+  "shingle_unmasking": {
+    "entity": "Sonia Friedman Productions",
+    "companies_house_officers_found": true,
+    "principal_auto_linked": {"name": "Sonia Friedman", "corroborations": ["officer record", "press/co-credit overlap"]}
+  },
+  "shingle_expansion": {"productions_enqueued_range": [10, 40], "markets": ["west_end", "broadway"]}
+}
+```
+
+**Pass criteria:** UK credits parse lands mentions with the UK anchor as idempotency key; the Companies House join returns officers for the show entity (validates `COMPANIES_HOUSE_API_KEY` wiring end-to-end); principal derivation edges carry `via_entity_uuid`; expansion enqueues the shingle's other productions across **both** markets without writing any credit directly; the Broadway transfer of the same title resolves to a **separate** production node (different market \+ anchor), not a merge.
 
 ## Rollout order
 

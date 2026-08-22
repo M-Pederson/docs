@@ -6,6 +6,20 @@ icon: "building-columns"
 
 **Status: scope & planning only.** Nothing on this page is built. Goal: turn the three highest-density free federal filing sources into graph edges: **IRS 990s** (who governs which nonprofits, who grants to whom), **FEC individual contributions** (who funds what, with employer identity points attached), and **SEC Form D** (who sits on private raises outside Crunchbase/Fundable coverage). All three are structured, bulk-accessible, zero-scrape, zero-vendor-cost. Two of the three ride on ingestion the [Educational Institution Donations](/guides/open-work/roadmap/educational-institution-donations) plan already specifies: that page owns the edu-recipient slice; this lane owns the general filings plumbing it plugs into.
 
+<Warning>
+  **API keys & credentials this lane needs.** Provision before Phase 0. Store in GCP Secret Manager and inject into Cloud Run as env vars — never in code or checked-in config.
+
+  | Credential | Env var | Used for | How to get |
+  | --- | --- | --- | --- |
+  | FEC API key (api.data.gov) | `FEC_API_KEY` | api.open.fec.gov lookups: committee/candidate masters, spot checks. The bulk files themselves are keyless. | Free — [api.data.gov/signup](https://api.data.gov/signup/) |
+  | SEC EDGAR declared `User-Agent` | `SEC_EDGAR_USER_AGENT` | Form D structured datasets \+ the daily full-text feed | Not a key: SEC fair-access policy requires a contact UA string (`Orbiter.io mark@orbiter.io`); undeclared requests get blocked |
+  | OpenRouter API key | `OPENROUTER_API_KEY` | #12984 title→role mapping edge cases, #12677 v5 adjudication | Existing org key |
+  | Exa API key | `EXA_API_KEY` | Stage-B resolution of governance \+ related-person mentions | Existing org key |
+  | GCP service account | Workload Identity | BigQuery (FEC corpus loads \+ match views, beside GDELT), Pub/Sub, Cloud Run, GCS cache, AlloyDB, FalkorDB | Standard enrichment-lane SA with `bigquery.jobUser` |
+
+  IRS 990 e-file bulk downloads and the ProPublica Nonprofit Explorer API are keyless (ProPublica asks for attribution and modest request rates).
+</Warning>
+
 <Note>
   **Shared component: 990 ingestion (owned here).** EIN resolution → e-file XML fetch → `filing_990` → parsed Part VII and grant schedules is built once, in this lane. The donations plan consumes the parsed store instead of fetching; one fetch feeds three edge families (trustees, grants, donations). Decided 2026-08-21.
 </Note>
@@ -197,6 +211,135 @@ Political contribution data is public record but sensitive. Two commitments in v
 ## Cost estimate (order of magnitude, validate in Phase 0)
 
 The cheapest lane on the board: all three sources are free and structured, and the parses are deterministic. One-time: BigQuery loads for 4-5 FEC cycles ≈ \$10-30 in storage and initial queries; 990 \+ Form D backfill LLM (title mapping edge cases \+ adjudications on ~5-10K governance and related-person mentions) ≈ \$30-80; GCP infra ≈ \$15-30/mo during backfill, under \$10/mo steady. Vendor enrichment credits apply only to net-new 990/Form D persons promoted out of the queue, gated by tier as everywhere. Engineering: 3-4 day Phase 0 spike, then roughly 2-3 weeks across the three adapters, with the 990 adapter partially shared with the donations build.
+
+## Backfill
+
+This lane deploys into a **populated graph**, and that cuts differently per source. The 990 and Form D backfills get *cheaper* because of it — most governance names resolve warm against existing persons. The FEC overlay is *defined* by it: closed-world matching against the tracked-name index means the overlay's coverage is exactly the graph's population on the day the match view runs, so it must run last and re-run as the graph grows.
+
+One structural advantage over the stage and media lanes: **all three corpora are bulk-downloadable.** "Person-side lookup" in backfill should therefore run as **set-based joins against locally loaded indexes** (AlloyDB / BigQuery), never as per-person remote API calls. Load the corpus once, join the whole population at once — the remote APIs are for steady-state increments and spot checks only.
+
+### Sweep 1 — source-side, in rollout order
+
+**990 adapter (first).**
+
+1. Enumerate the org-side population (entry #3): every School node plus every nonprofit-flagged company already in the graph → EIN resolution via ProPublica → e-file XML fetch, latest \+ 3 filing years per org (the decided window). XML caches to GCS; `filing_990` rows are the shared store the donations lane reads — this backfill must complete an org's filings **before** the donations lane consumes that org (one fetch, three edge families).
+2. **Order orgs by existing-graph overlap** — orgs with the most already-resolved persons first (same prioritization as the stage lane's phase 3). Warm matches make the early batches cheap and give resolution-rate telemetry fast.
+3. **Process each org's filing years oldest → newest** so the tenure logic sees consecutive filings in order: spans extend on confirmation, close when a roster drops the name. Out-of-order arrival must still converge (MERGE extends idempotently); assert that in Phase 0 with a shuffled-year fixture.
+4. Checkpoint = per-(org, tax-year) status rows; a killed worker resumes from status, never from a loop cursor.
+
+**Form D adapter (second).** Load every quarterly structured dataset in the backfill window; diff against Fundable rounds (entry #5); related-person mentions land keyed by accession number. The daily full-text feed owns everything after the last loaded quarter — record that boundary. Stage-lane consumers (Broadway show LLCs) read `formd_related_person_mention` from the same tables; publish schema changes as open-question entries first, per the coordination rule.
+
+**FEC overlay (strictly last).** Bulk-load 4-5 cycles to BigQuery (one-time), build the tracked-name index from the graph **as it stands after the 990 and Form D sweeps have resolved their people**, then run the match view. Running it earlier just means re-running it sooner.
+
+### Sweep 2 — graph-side: set-based, not per-person
+
+Batch entry point #1 once over the existing population — as local joins:
+
+| Sweep | Population | Mechanism |
+| --- | --- | --- |
+| 990 officer-index join | Persons with board/trustee/director/philanthropist titles or nonprofit/fund employers | Join normalized names against the locally parsed Part VII index; hits enqueue the org's filings for full treatment. One query, whole population. |
+| Form D related-persons join | Same population, plus persons with issuer-officer signals | Join against the loaded related-persons dataset; hits enqueue the filing. |
+| FEC match view | The whole tracked-name index (built above) | Already set-based by design: uniqueness gate \+ employer-or-geo corroboration in BigQuery. |
+
+Snapshot the population, record the high-water mark; later arrivals belong to the live triggers (#1/#2) and the match-view refresh, not the sweep.
+
+### The re-resolution loop
+
+- `governance_mention` and `formd_related_person_mention` rows are durable: re-drain `unresolved` weekly during backfill, monthly steady-state; targeted retries against new-`master_person` diffs beat full re-drains. Attempts append-only, per source.
+- **Refresh the FEC match view monthly** as the tracked-name index expands — every person any lane resolves is a potential new contributor match. The 60-day scoring-review clock starts at overlay go-live and does not reset on refreshes.
+- Run the cross-source corroboration loop (entry #8) after each FEC refresh during backfill: fresh employer strings upgrade pending Stage-B resolutions in **every** lane, and backfill is when the pending pile is largest.
+
+### Cutover to steady state
+
+Per source: 990 cuts over to rolling e-file drops when the org queue is drained (record per-org latest-tax-year high-water marks); Form D to the daily feed at the last-loaded-quarter boundary; FEC to monthly bulk increments after the initial cycles load. One drain owner per queue — never run backfill and steady-state drains concurrently on the same source.
+
+### What backfill must NOT do
+
+- FEC never creates persons, committees-as-people, or queue rows — during backfill exactly as in steady state (invariant 2).
+- No 990 fetch outside the `filing_990` path — the donations lane depends on the single-fetch contract (invariant 1).
+- No recursive enrichment: unresolved trustees and related persons become local-only leaves \+ queue rows, tier-gated; kill switches #4617/#12789 checked per batch.
+- Hard caps first: 100 filings and one FEC cycle until acceptance queries pass twice (agent brief).
+
+## Smoke tests
+
+Three fixed inputs, one per source adapter, with simulated expected responses. Run in sandbox against the Phase-0 harness; simulated from public data (2026-08-21) — assert invariants exactly, counts as ranges.
+
+### ST-1 — 990 adapter: Ford Foundation (EIN `13-1684331`), entry point #3
+
+A 990-PF filer with a large, stable board — exercises EIN resolution, the shared `filing_990` store, Part VII parsing, role mapping, and tenure spans across latest \+ 3.
+
+**Input:** `{"ein": "13-1684331", "org": "Ford Foundation", "years": "latest+3"}`
+
+**Simulated expected response:**
+
+```json
+{
+  "ein_resolution": {"source": "propublica", "resolved": true},
+  "filings_landed": 4,
+  "governance_mentions_per_filing_range": [15, 25],
+  "role_mapping_examples": [
+    {"title_as_filed": "Trustee", "edge": "BOARD_MEMBER_OF", "weight": 8},
+    {"title_as_filed": "President", "edge": "OFFICER_OF", "role": "officer", "weight": 14},
+    {"title_as_filed": "EVP/COO", "edge": "OFFICER_OF", "role": "key_employee", "weight": 20}
+  ],
+  "tenure": {
+    "continuing_trustee": {"valid_from": "earliest filing year", "valid_to": null},
+    "departed_trustee": {"valid_to": "set at the filing year the roster drops the name"}
+  },
+  "donations_lane_read": {"filing_990_rows_readable": true, "refetches_triggered": 0}
+}
+```
+
+**Pass criteria:** zero `OFFICER_OF` edges with role `trustee`/`director` (they must land as `BOARD_MEMBER_OF` 8 — the acceptance query); tenure spans extend across consecutive filings and close on roster drops; re-running with shuffled year order converges to identical spans; the donations lane reads the parsed store without triggering a single fetch; compensation lands where reported.
+
+### ST-2 — Form D adapter: a Broadway show-entity filing, entry point #5
+
+Use the Form D of a recent Broadway LLC (locate The Outsiders' show entity via EDGAR full-text search in Phase 0) — exercises the daily-feed parse, Fundable diffing, and the cross-lane read the stage lane depends on.
+
+**Input:** `{"accession": "<EDGAR accession from Phase 0 lookup>", "source": "edgar_form_d"}`
+
+**Simulated expected response:**
+
+```json
+{
+  "issuer": {"resolved_via": "master-company-new #12558", "is_issuer": true,
+    "fundable_diff": "not_in_fundable -> new round record created"},
+  "related_persons_range": [3, 8],
+  "edges": [
+    {"edge": "RELATED_PERSON_OF", "role": "executive_officer", "weight": 15,
+     "filing_accession": "<same accession>", "valid_from": "filing date"}
+  ],
+  "offering_amount_usd": "from filing",
+  "stage_lane_read": {"formd_related_person_mention_readable": true}
+}
+```
+
+**Pass criteria:** idempotency holds on (person, accession) — re-landing the filing is a no-op; `RELATED_PERSON_OF` weights only in {15, 20}; the non-VC raise lands as a Fundable-style round record, not a new node type; the stage lane can read the mention table (validates the shared-table contract); unresolved related persons park as `needs_review` with evidence, never auto-linked on name alone.
+
+### ST-3 — FEC closed-world match, entry point #7
+
+**Input:** one cycle slice against a tracked-name index containing **Reid Hoffman** (distinctive name, employer Greylock known in-graph) and a deliberately common name (a graph person named "Michael Smith") as the negative control.
+
+**Simulated expected response:**
+
+```json
+{
+  "matches": {
+    "reid_hoffman": {
+      "uniqueness_gate": "passed",
+      "corroborations": ["employer_string matches Greylock affiliation", "geo matches known location"],
+      "rollup": {"aggregate_usd_gte": 1000, "edge": "CONTRIBUTED_TO",
+        "employer_as_reported": "captured", "layer": "evidence",
+        "excluded_from_scoring": true}
+    },
+    "michael_smith": {"uniqueness_gate": "rejected_common_name", "edges_written": 0}
+  },
+  "corroboration_exhaust": {"employer_strings_fed_to_entry_point_8": true},
+  "persons_created": 0, "queue_rows_created": 0
+}
+```
+
+**Pass criteria:** the common-name control writes nothing regardless of contribution volume; every match records **two** independent corroborations in `fec_contribution_match`; every `CONTRIBUTED_TO` is above the \$1K-per-cycle floor, carries `excluded_from_scoring: true`, and aggregates per person-committee-cycle (per-row detail stays relational); zero persons or queue rows originate from FEC — the assertion that matters most; the query runs on partitions only.
 
 ## Rollout order
 

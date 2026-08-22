@@ -6,6 +6,19 @@ icon: "microphone-lines"
 
 **Status: scope & planning only.** Nothing on this page is built. Goal: extend the podcast ingestion lane (curated media/tech/VC podcast cron: guest \+ LinkedIn resolution, hosts connected to guests in the graph) into a general speaking/media co-occurrence waterfall covering **YouTube interviews**, **conference speaker rosters**, and **GDELT news co-mentions**. All three are free sources; they differ sharply in signal strength and identity risk, so each gets its own gates.
 
+<Warning>
+  **API keys & credentials this lane needs.** Provision before Phase 0. Store in GCP Secret Manager and inject into Cloud Run as env vars — never in code or checked-in config.
+
+  | Credential | Env var | Used for | How to get |
+  | --- | --- | --- | --- |
+  | YouTube Data API v3 key | `YOUTUBE_API_KEY` | Roster uploads polling \+ person-side `search.list` (10K units/day quota — see the quota Tip below) | Google Cloud console: enable YouTube Data API v3 on the project, create an API key |
+  | GCP service account | Workload Identity | BigQuery jobs against the GDELT 2.0 GKG public dataset (billed to our project; GDELT itself needs no key), plus Pub/Sub, Cloud Run, GCS cache, AlloyDB, FalkorDB | Standard enrichment-lane SA with `bigquery.jobUser` |
+  | OpenRouter API key | `OPENROUTER_API_KEY` | #12984 tier-1 guest/bio extraction, #12677 v5 adjudication | Existing org key |
+  | Exa API key | `EXA_API_KEY` | Stage-B resolution for names without a LinkedIn URL | Existing org key |
+
+  Conference-site scraping and the Wayback CDX API are keyless; the fetcher identifies itself and throttles per the shared source-adapter rules.
+</Warning>
+
 ## Entry points
 
 Same invariant as the stage-production lane: every route enqueues **appearances or events** (or person-lookups that resolve to them), and all mentions flow through the shared extraction → resolution → edge-writer stages. GDELT is the one exception: it never creates people or appearance nodes, only aggregated edges between already-resolved graph persons (see gates below).
@@ -290,6 +303,132 @@ Dry run against public data; nothing written. Subject: TED tech curator and TED2
 | `CO_MENTIONED_WITH` | ~3-6 | Pairs above the floor; all evidence layer |
 
 **Scoring derives** ~55 interview pairs (Helen Toner, Eric Schmidt, Victor Riparbelli, Brian McClendon, Ian Bremmer, and the rest of the guest list) plus one co-panel pair (Sam Wickert) as scored relationships. TED2026 roster adjacency and every co-mention sit in the evidence layer. The lane composes with his existing Fundable angel records (Pika Labs, Hedra) without touching them: media brokerage and investment edges converge on one node, which is the whole point.
+
+## Backfill
+
+This lane deploys into a **populated graph**: the podcast lane and the person waterfalls will have been running for months, and the exact people YouTube metadata and conference bios name are already `master_person` rows. That is the design's biggest asset — resolution starts warm — and its biggest trap: the GDELT overlay and the person-side sweeps are only as good as the graph **at the moment they run**, so ordering and re-runs matter more here than in any other lane.
+
+### Sweep 1 — source-side, strictly in rollout order
+
+**YouTube (first).** Full channel history per roster channel, per the historical-windows decision:
+
+1. Enumerate each channel's uploads playlist oldest → newest (1 unit per page of 50 — a 1,000-video channel costs ~20 units), landing queue rows keyed on `video_id`. Upsert; re-enumeration is a no-op.
+2. Extraction drains the queue through the #12984 tier-1 config, metadata-only (invariant 4). Cache the raw API payloads to GCS before parsing; retries parse from cache.
+3. **Simulcast dedup requires the podcast lane's episode store to be readable before this backfill starts.** Match (title, date, host set) before minting a `MediaAppearance`; a match attaches `video_id` to the existing appearance instead of creating one.
+4. Quota budgeting: roster history is nearly free, but person-side `search.list` calls cost 100 units — at the 10K/day quota that is ~100 searches/day for the whole system. The backfill scheduler must never let person-side sweeps starve roster polling: give roster polling a reserved budget and let the person sweep trickle through what remains.
+5. Checkpoint = queue-row status, the stage-lane pattern. Per-channel high-water mark = last seen `video_id` \+ `publishedAt`; incremental polling owns everything after it.
+
+**Conferences (second).** Per (conference, year): current year from the live agenda, past years via Wayback CDX. Enumerate the snapshot list once per (event, year) and cache it; keep a completed-backfill ledger per (event, year) so re-runs skip finished pairs. Session mentions land like video mentions; co-panelist derivation is free at query time.
+
+**GDELT (strictly last).** The overlay is closed-world, so its value scales with the tracked-name index — build that index only **after** the YouTube and conference sweeps have resolved their people, and after the uniqueness gate has scored the expanded population. Then one 24-month pass over partitioned GKG columns (never a full-table scan, invariant 9), then daily increments. No 2015 deep backfill, per the decision table.
+
+### Sweep 2 — graph-side: batch the person-side entry points once
+
+| Sweep | Population | Mechanism |
+| --- | --- | --- |
+| Podcast-guest crossover (#3) | Every person already resolved as a podcast guest | One-time YouTube \+ conference lookup; the populations overlap heavily, so expect high hit rates. |
+| Public-engagement persona (#2) | Persons whose persona narratives or enrichment signals show speaking/media presence | Batch sweep once over stored personas; the trigger owns new derivations afterward. |
+
+Because each person-side lookup burns 100 quota units, **the graph-side sweep is quota-bound by design**: size it before launching. 5,000 qualifying persons ≈ 50 days at 100 searches/day. So (a) gate the population hard — public-engagement signal required, never "all persons"; (b) rank by signal strength so the strongest candidates run first; (c) accept that the tail trickles for weeks — it is not latency-sensitive; (d) if the ranked population is large, request a YouTube quota increase in Phase 0, not mid-backfill. Snapshot the population and record the high-water mark; later arrivals belong to the trigger.
+
+### The re-resolution loop
+
+- `media_appearance_mention` rows are durable: re-drain `unresolved` weekly during backfill, monthly steady-state; targeted retries against new-`master_person` diffs beat full re-drains. Every attempt appends to `media_appearance_resolution_attempts`.
+- **GDELT compounds on re-runs**: a person resolved today enters the matchable index and starts matching in tomorrow's batch — but their *historical* co-mentions within the rolling window only surface on a full-window recount. Schedule a **monthly full 24-month recount** alongside the daily increments; the recount also retires pairs that fell below the floor as the window rolled.
+- The 60-day promotion audit clock starts at overlay go-live, not per person — do not reset it when the index grows.
+
+### Cutover to steady state
+
+Per source: YouTube cuts over when roster history is drained (incremental polling owns post-high-water uploads); conferences when the (event, year) ledger covers the roster's Wayback depth; GDELT after the initial window pass (daily increments \+ monthly recount own it). One drain owner per queue — never run backfill and steady-state drains concurrently on the same source.
+
+### What backfill must NOT do
+
+- No caption or transcript fetching anywhere in the backfill path (invariant 4).
+- GDELT never creates persons, appearances, or queue rows — during backfill exactly as in steady state (invariant 2).
+- No recursive enrichment: unresolved guests are local-only leaves \+ queue rows, tier-gated.
+- Hard caps first: 500 videos and one conference until acceptance queries pass twice (agent brief).
+
+## Smoke tests
+
+Three fixed inputs, one per source adapter, with simulated expected responses. Run in sandbox against the Phase-0 harness; simulated from public data (2026-08-21) — assert invariants exactly, counts as ranges.
+
+### ST-1 — YouTube roster channel: The TED AI Show, entry point #1
+
+**Input:** `{"roster_entry": "ted-ai-show", "channel": "The TED AI Show", "known_hosts": ["Bilawal Sidhu"], "mode": "full_history"}`
+
+**Simulated expected response:**
+
+```json
+{
+  "enumeration": {"videos_found_range": [38, 45], "quota_units_spent_max": 5},
+  "appearances": {
+    "minted_range": [0, 7],
+    "simulcast_deduped_range": [35, 40],
+    "note": "podcast lane already holds these episodes; dedup attaches video_id instead of minting"
+  },
+  "mentions_per_episode_example": {
+    "video": "The TED AI Show — Eric Schmidt",
+    "participants": [
+      {"name": "Bilawal Sidhu", "role": "host", "resolution": "auto_linked"},
+      {"name": "Eric Schmidt", "role": "guest", "resolution": "auto_linked",
+       "identity_points": {"title": "former Google CEO"}}
+    ]
+  },
+  "negative_control": {"channel": "billyfx", "videos_sampled": 20,
+    "participants_extracted": 0, "appearances_minted": 0}
+}
+```
+
+**Pass criteria:** zero duplicate `MediaAppearance` sharing (title, date, host set); every simulcast appearance carries **both** `episode_ref` and `video_id`; known-host defaulting works (Bilawal = host unless metadata contradicts); the billyfx negative control yields empty participant sets at tier-1 cost with nothing minted; total quota spend for the fixture stays in single-digit units per channel page.
+
+### ST-2 — Conference agenda: TED2026, entry point #1 (roster) \+ Wayback path
+
+**Input:** `{"event": "TED2026", "adapter": "ted", "years": ["2026"], "source": "live_agenda"}` — then re-run the same event through the Wayback path for one archived year to exercise CDX.
+
+**Simulated expected response:**
+
+```json
+{
+  "event": {"name": "TED2026", "event_type": "conference", "sessions_landed_range": [40, 120]},
+  "fixture_session": {
+    "title": "Session 3 live demo",
+    "part_of": "TED2026",
+    "participants": [
+      {"name": "Bilawal Sidhu", "role": "panelist", "resolution": "auto_linked"},
+      {"name": "Sam Wickert", "role": "panelist",
+       "identity_points": {"employer": "from bio blurb"}}
+    ]
+  },
+  "co_panelist_derivation": {"pairs_for_fixture_session": 1, "materialized_edges": 0},
+  "wayback_rerun": {"snapshots_found": true, "sessions_recovered_gt": 0}
+}
+```
+
+**Pass criteria:** sessions write `MediaAppearance {source: "conference_session"}` \+ `PART_OF` → event with traversal weight 30; conference-speaker `APPEARED_IN` writes weight 45 and stays evidence-only; co-panelist pairs derive through the shared session node with **zero** materialized co-appearance edges; bio blurbs populate `identity_points` (employer in-source); the Wayback re-run recovers sessions for the archived year and the (event, year) ledger prevents double-landing.
+
+### ST-3 — GDELT closed-world week, entry point #5 (batch)
+
+**Input:** one sample week of GKG partitions against the current tracked-name index — include **Bilawal Sidhu** (unique name, known employer TED) and a deliberately common name (e.g., a graph person named "Michael Smith") in the index.
+
+**Simulated expected response:**
+
+```json
+{
+  "batch": {"partition_days": 7, "bytes_scanned_within_estimate": true},
+  "matches": {
+    "bilawal_sidhu": {"gate": "passed_uniqueness", "articles_matched_range": [1, 10]},
+    "michael_smith": {"gate": "rejected_common_name", "articles_matched": 0}
+  },
+  "edges": {
+    "co_mentioned_with_written": "only pairs at >=3 articles across >=2 domains in window",
+    "example": {"pair": ["Bilawal Sidhu", "Eric Schmidt"], "article_count": 14,
+      "layer": "evidence", "excluded_from_scoring": true}
+  },
+  "persons_created": 0, "appearances_created": 0, "queue_rows_created": 0
+}
+```
+
+**Pass criteria:** the uniqueness gate excludes the common-name control **regardless of volume**; every written edge carries `layer: evidence`, `excluded_from_scoring: true`, `window_counts`, and ≥2 `top_source_domains`; zero persons/appearances/queue rows originate from the batch (invariant 2 — this is the assertion that matters most); the query bills against partitions only; re-running the same week is idempotent on pair rollups.
 
 ## Rollout order
 

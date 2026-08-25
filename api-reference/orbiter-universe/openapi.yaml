@@ -15,7 +15,8 @@ tags:
     description: |
       Data-plane enrichment triggers: the company get-or-create entry gate (scope enrich:company) and the person one (enrich:person). The two scopes are independent.
   - name: Projections
-    description: Versioned company projections consumers upsert from.
+    description: |
+      Versioned packages consumers read and upsert from. Row-derived projections carry an entity's attributes; the graph-derived subgraph projection carries its relationships, including edge types that have no backing row.
   - name: Graph
     description: |
       Operator-only graph seeding (scope graph:seed). Not part of the consumer contract — self-hosted clients never call these.
@@ -50,6 +51,66 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/EntityEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /v1/entities/{id}/subgraph:
+    get:
+      operationId: getEntitySubgraph
+      tags:
+        - Projections
+      summary: Get an entity and its directly connected neighbours from the graph
+      description: |
+        Returns the entity plus everything one hop away, as nodes and edges copied verbatim from the graph, for a consumer to write into its own graph unchanged.
+        This projection is derived from the graph, not from Postgres rows. The row-derived projections carry only what has rows; several edge types have none, FOUNDED among them, so a consumer that rebuilds relationships from those loses them with no error.
+        Geography, expertise and tombstoned nodes are excluded, and a node reached by several edges is returned once. Exclusions are policy, not a caller option: they depend on the ontology, and two consumers copying one entity must get the same graph.
+        Only edges incident to the anchor are returned. An edge between two neighbours belongs to their own neighbourhoods.
+        Node and edge properties are returned verbatim and are deliberately untyped: the same key carries different types across labels, so updated_at is a string on Person and an integer on Company.
+        Embeddings are returned as arrays of numbers. A consumer must re-wrap them as vectors on write, or its vector index will not see them and search will silently return nothing.
+        404 until the entity's first node write has landed. Write the nodes before the edges. An edge write matches its two endpoints, so running it first drops every edge with no error and no warning, leaving a node set that looks complete and has no relationships.
+        Requires scope `subgraph:read`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Entity id. Resolved through the merge chain first.
+          schema:
+            type: string
+            format: uuid
+        - name: limit
+          in: query
+          required: false
+          description: |
+            Maximum neighbours returned. The anchor is always included and does not count toward it.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - name: include_embeddings
+          in: query
+          required: false
+          description: |
+            Vectors dominate the payload at roughly 107KB per node. A consumer that needs structure only should turn them off; one that intends to search must keep them, since they are generated here once and are never regenerated downstream.
+          schema:
+            type: boolean
+            default: true
+      responses:
+        '200':
+          description: The entity and its one-hop neighbourhood.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubgraphEnvelope'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -707,6 +768,127 @@ components:
         - data
         - error
         - meta
+    SubgraphNode:
+      type: object
+      required:
+        - id
+        - uuid
+        - labels
+        - is_root
+        - properties
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: |
+            Identifies the node within this response only. It means nothing in another graph; consumers merge on uuid.
+        uuid:
+          type: string
+          format: uuid
+          description: |
+            The node's identity, and what a consumer must merge on. Merge on Entity plus uuid alone and add subtype labels afterwards: merging on the full label set creates a second node under one uuid.
+        labels:
+          type: array
+          items:
+            type: string
+          example:
+            - Entity
+            - Person
+        is_root:
+          type: boolean
+          description: True for the requested entity, false for a neighbour.
+        properties:
+          type: object
+          additionalProperties: true
+          description: |
+            Verbatim node properties, untyped because one field name carries two types across labels: updated_at is a string on Person and an integer on Company, in the same response. Decode into an untyped map, never a typed struct.
+            embeddings arrives as an array and must be re-wrapped as a vector on write, or it stays an inert list the vector index never sees and search silently returns nothing. name_embedding is deprecated and should be discarded.
+    SubgraphEdge:
+      type: object
+      required:
+        - id
+        - type
+        - source
+        - target
+        - direction
+        - properties
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: Identifies the edge within this response only.
+        type:
+          type: string
+          example: WORKS_AT
+        source:
+          type: string
+          format: uuid
+          description: The true start node. Never flip it.
+        target:
+          type: string
+          format: uuid
+          description: The true end node.
+        direction:
+          type: string
+          enum:
+            - out
+            - in
+          description: Relative to the anchor. Informational only.
+        properties:
+          type: object
+          additionalProperties: true
+          description: |
+            Verbatim edge properties, untyped for the same reason as nodes: description_generated_at is a string on WORKS_AT and an integer on FOUNDED, in the same response. role_history is an escaped JSON string, not a nested object, and copies across as an opaque value.
+            Carries weight, the traversal cost pathfinding ranks on, which a consumer copies rather than recomputes.
+    Subgraph:
+      type: object
+      required:
+        - schema_version
+        - entity_id
+        - requested_id
+        - entity_type
+        - nodes
+        - edges
+        - truncated
+      properties:
+        schema_version:
+          type: string
+          description: Wire contract version. A breaking change gets a new version, not an edit.
+          example: entity_subgraph.v1
+        entity_id:
+          type: string
+          format: uuid
+          description: The canonical id after merge resolution, and the anchor node's uuid.
+        requested_id:
+          type: string
+          format: uuid
+          description: |
+            The id asked for. Differs from entity_id when a merge has moved the entity, so a consumer can heal a stored reference.
+        entity_type:
+          type: string
+          example: person
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/SubgraphNode'
+        edges:
+          type: array
+          items:
+            $ref: '#/components/schemas/SubgraphEdge'
+        truncated:
+          type: boolean
+          description: |
+            True when limit dropped neighbours. Edges to a dropped node are omitted, so a partial neighbourhood never reads as complete.
+    SubgraphEnvelope:
+      type: object
+      required:
+        - data
+        - error
+      properties:
+        data:
+          $ref: '#/components/schemas/Subgraph'
+        error:
+          type: 'null'
     GetAddCompanyRequest:
       type: object
       description: |

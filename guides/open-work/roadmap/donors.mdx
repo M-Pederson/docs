@@ -1,0 +1,388 @@
+---
+title: "Donors"
+description: "Build plan for the donations lane: DONOR_TO edges from the foundation backbone (990-PF grant schedules via the shared filing_990 store), curated mega-gift lists, and honor-roll sweeps — entry points, schema, resolution gates, backfill, and smoke tests."
+icon: "hand-holding-dollar"
+---
+
+**Status: build plan — nothing built.** This page operationalizes the [Educational Institution Donations](/guides/open-work/roadmap/educational-institution-donations) scope (researched 2026-07-05) into the v1.2 lane format: find donors and materialize **`DONOR_TO`** edges, donor identities resolved to `master_person` / `master_company`. v1 recipient scope is **educational institutions** (the graph's `Company:School` nodes); tables and stages are recipient-agnostic so the lane extends to any nonprofit recipient without a migration.
+
+<Warning>
+  **API keys & credentials this lane needs.** Provision before Phase 0. Store in GCP Secret Manager and inject into Cloud Run as env vars — never in code or checked-in config.
+
+  | Credential | Env var | Used for | How to get |
+  | --- | --- | --- | --- |
+  | Firecrawl API key | `FIRECRAWL_API_KEY` | Honor-roll / donor-wall / annual-report page fetches | Existing org key |
+  | Exa API key | `EXA_API_KEY` | Honor-roll page discovery \+ Stage-B LinkedIn/profile search | Existing org key |
+  | OpenRouter API key | `OPENROUTER_API_KEY` | Open-web gift discovery, per-page extraction, Stage-B adjudication | Existing org key |
+  | GCP service account | Workload Identity | Pub/Sub, Cloud Run, GCS page cache, AlloyDB, FalkorDB | Standard enrichment-lane SA |
+
+  No 990 credentials here: this lane never fetches filings (see the shared-component note). The SOURCE portal (AEI) and the curated gift lists are keyless public pages; DonorSearch is a deferred paid evaluation, not a v1 dependency.
+</Warning>
+
+<Note>
+  **Shared component: 990 ingestion (owned by [990s, FEC & Form D](/guides/open-work/roadmap/990-fec-form-d)).** EIN resolution → e-file XML fetch → `filing_990` → parsed Part VII rosters and grant schedules is built once, in that lane. This lane **consumes the parsed `filing_990` store and fetches nothing** — a missing filing means enqueueing the org into that lane's queue, never fetching here. One fetch feeds three edge families: trustees (that lane's `BOARD_MEMBER_OF`), grants (this lane's foundation-level `DONOR_TO`), and person-level donations (derived here via the trustee bridge). Decided 2026-08-21. Build-order consequence: **this lane's backbone runs only after that lane's 990 adapter (its Phase 1) has landed filings for the target orgs.**
+</Note>
+
+## Entry points
+
+Same invariant as the other v1.2 lanes: every route produces **donation mentions** (or resolves to filings/pages that do), and all mentions flow through shared extraction → resolution → edge-writer stages. No edge is ever written directly from a source.
+
+| # | Entry point | Direction | Mechanism | Priority |
+| --- | --- | --- | --- | --- |
+| 1 | **Org-side seeding** | Institution → gifts | `Company:School` nodes ordered by `ATTENDED` overlap → backbone lookup \+ curated-list filter \+ honor-roll sweep per institution. | P0 |
+| 2 | **Foundation backbone** | Filing → gifts | Parsed grant schedules (990-PF Part XV / Schedule I) in the shared `filing_990` store → grant rows naming tracked institutions become mentions. Structured, zero LLM. | P0 |
+| 3 | **Curated mega-gift lists** | List → gifts | Chronicle "Major Private Gifts", Million Dollar List, annual roundups → extraction per list snapshot, filtered to tracked institutions. | P0 |
+| 4 | **Honor-roll sweeps** | Page → gifts | Exa discovery of donor honor rolls / donor walls / annual giving reports \+ Firecrawl fetch → per-page extraction LLM. | P1 |
+| 5 | **Person triggers** | Person → gifts | Philanthropist/donor/trustee signals on tracked persons → targeted announced-gift search for that person. | P1 |
+| 6 | **Discover misses** | Person → gifts | Discover Deep Research resolves someone as a major donor or foundation trustee → approved miss enters via the person-side lookup. | P1 |
+| 7 | **New-filing piggyback** | Filing → gifts | The federal lane's rolling e-file cron lands new filings → new grant rows for tracked institutions enter as mentions. | P1 |
+| 8 | **Cross-lane corroboration** | Internal | Federal-lane trustee seats and FEC employer strings upgrade pending donor resolutions; a resolved donor upgrades pending mentions elsewhere. | P2 |
+
+## Decisions (2026-08-21)
+
+| Question | Decision |
+| --- | --- |
+| Shared component | 990 ingestion is owned by the [990s, FEC & Form D](/guides/open-work/roadmap/990-fec-form-d) lane; this lane reads the parsed `filing_990` store and never fetches. |
+| Edge ownership | `DONOR_TO` is defined **here** and reused unchanged by the federal-filings lane. |
+| Runtime | Go on GCP, per the v1.2 lane family; Xano is out of bounds except disposable Phase 0 scripts that ship nothing. |
+
+**Defaults adopted by this build plan (build with these; Mark ratifies or vetoes via the open questions):**
+
+| Default | Value |
+| --- | --- |
+| Recipient scope v1 | Educational institutions (`Company:School`); tables recipient-agnostic. |
+| Foundation modeling | **Both**: foundation `Company` node with `DONOR_TO` to the institution, plus a derived person-level `DONOR_TO {via_foundation_uuid}` for each resolved trustee — path queries work either way. |
+| Foundation & corporate donors in v1 | Yes — they are the free, precise tier and the trustee bridge is the best individual-identity source in the lane. |
+| Gift floor | Backbone grants: **all** (structured, free). Announced individual gifts: **≥\$100K**. Honor-roll rows: captured as mentions, **no edges in v1** — releasable later when the floor question is ratified, never lost. |
+| Edge granularity | One aggregate edge per donor–institution pair; per-gift detail stays relational. |
+| New-person queue tier | Lowest tier, no automatic promotion. |
+
+## Agent build brief
+
+Written for the coding agent building this lane. This page is self-contained; everything you need is here or explicitly linked. Do not read intent into ambiguity: if something material is undecided, follow the escalation rule at the bottom.
+
+**Read first, in order:** [Edge Weights](/guides/ontology/edge-weights) (scale, hub rule, envelope), [Edges](/guides/ontology/edges) (conventions), [Educational Institution Donations](/guides/open-work/roadmap/educational-institution-donations) (the research record: data-source landscape, IRS disclosure rules, prompt rationale), [990s, FEC & Form D](/guides/open-work/roadmap/990-fec-form-d) (owner of your `filing_990` input), and the pattern functions cited on this page: #12984 tiered resolver, #12677 v5 adjudication, #13168 name-only cap, #12833 deep research, #723 attempts audit, Fundable Stage-1 gating, `master-company-new` #12558, `master-person-new` #13039.
+
+**Invariants — violating any one is a failed build:**
+
+1. One write path: source → `donation_mention` row → resolution → edge writer; no `DONOR_TO` without a `mention_ref`. This lane never fetches 990 XML — a missing filing enqueues the org to the federal lane's queue.
+2. Auto-link only at ≥0.85 confidence with name plus **two** independent corroborating identity points; name-only matches are capped below the threshold no matter what the model says (#13168); 0.6–0.85 → `needs_review`; below → parked. `donor_type: anonymous` is terminal — never resolved, never guessed.
+3. The trustee bridge derives, it never resolves: person-level `DONOR_TO {via_foundation_uuid}` is written **only** for trustees the federal lane has already auto-linked (their `BOARD_MEMBER_OF` edge on the foundation node exists). This lane does not re-resolve trustees.
+4. New-person policy: local-only leaves \+ queue rows at the lowest tier, kill switches #4617/#12789 checked per batch, no recursive enrichment from a donation sweep — a donor's company never triggers founder or C-suite fanout here.
+5. `amount_usd` only when a source states a number; vague language ("a transformative gift") never becomes a number — at extraction time and at write time.
+6. Honor-roll mentions are captured with `giving_level`, but write no edges in v1 (the gift-floor default above).
+7. Aggregate edge per (donor, institution): MERGE idempotent, re-running a source is a no-op; per-gift rows stay relational under the mention. Envelope (2026-07-04 standard) on every edge.
+8. Fetched pages cache raw to GCS before extraction, keyed by content hash; unchanged pages skip extraction on re-runs.
+9. Go on GCP only; Xano is out of bounds except disposable Phase 0 scripts that ship nothing.
+
+**Mention-row state machine:** `unresolved → auto_linked | needs_review | rejected | anonymous`; `auto_linked → edge_written`; `needs_review → auto_linked | rejected` (human action only). Every transition appends to `donation_resolution_attempts`.
+
+**Fixtures (Phase 0 and regression):** the Ford Foundation filings already fixtured by the federal lane (its ST-1 — the shared-store read is this lane's consumer test), one Chronicle mega-gift list snapshot, and two honor-roll pages: one with class-year notations, one with giving bands and no amounts.
+
+**Definition of done per phase:** Phase 0 = fixture report as an appendix here (backbone yield per org, extraction precision on a 200-row audit, resolution rates by corroboration type, floor validation). Phase 1 (backbone) = foundation-level \+ derived person-level `DONOR_TO` landing behind the Stage-1 gate, consuming `filing_990` with zero fetches. Phase 2 (curated lists) = mega-gift mentions resolving through Stage B, edges landing. Phase 3 (honor-roll sweeps) = mentions captured and parked per the floor default. Each phase ends with acceptance queries green twice and crons \+ enrichment-QA checks registered.
+
+**Acceptance queries (zero rows required):** any `DONOR_TO` missing the envelope or `mention_ref`; any person-level `DONOR_TO` from a foundation-sourced mention missing `via_foundation_uuid` or whose trustee lacks the federal lane's `BOARD_MEMBER_OF`; any edge from a mention below the auto-link gate or in `needs_review`; any edge from an `anonymous` or honor-roll mention; any person or queue row minted from an anonymous mention; any 990 fetch originating in this lane; more than one `DONOR_TO` per (donor, institution) pair.
+
+**Hard limit for first runs:** 25 institutions, 200 foundation filings read, 500 mentions — until acceptance queries pass twice.
+
+**Coordination:** you consume `filing_990` (the federal lane owns it; schema changes reach you as open-question entries on that page) and own `donation_mention` \+ `donation_resolution_attempts`. `DONOR_TO` schema changes publish to the federal lane as open-question entries before you make them. Copy the mention/attempts table shape from the lane family but own your tables. Never edit another lane's tables or adapters.
+
+**When blocked or a decision is missing:** do not guess. Append the question to this page's open questions with your proposed answer, park affected work `needs_review`, continue on unblocked work. Founder approvals arrive through the review queues; never bypass them.
+
+## Why
+
+Philanthropy is a triple signal: **wealth** (capacity), **affinity** (the donor cares enough to give), and very often an **alumni tie** the graph may not yet know. `DONOR_TO` composes with `ATTENDED` for warm-path generation — "who gave to my alma mater / my target's alma mater" — and the foundation backbone resolves donors with government-grade identity data at zero vendor cost.
+
+## The key structural fact
+
+Donor data splits hard by **donor type**, because of IRS disclosure rules (researched 2026-07-05):
+
+- **Individuals → public charities: NOT in IRS data.** A 501(c)(3)'s Schedule B contributor names are withheld from public inspection. There is no government database of individual gifts to universities.
+- **Private foundations: fully public.** 990-PFs disclose **both** the full grant list (every grant, grantee, amount) **and** the officers/directors/trustees.
+
+So the lane is two-track: a **free, structured foundation backbone** (990-PF grant schedules — zero LLM) plus an **agent-driven long tail** for individual donors (announced gifts, honor rolls, named buildings).
+
+<Tip>
+  **The family-foundation bridge.** Most large "individual" giving flows through family foundations — and a 990-PF lists its trustees with addresses. "The Smith Family Foundation gave \$5M to Stanford" \+ trustees John & Jane Smith = person-level `DONOR_TO` (via foundation) with government-grade identity data. Because the federal lane already resolves those trustees for its `BOARD_MEMBER_OF` edges, the person-level donation edge here is a **derivation, not a resolution** — the free tier resolves far more people than it first appears, and this lane pays nothing for it.
+</Tip>
+
+## Data-source landscape
+
+| # | Source | Donor type | Access | Notes |
+| --- | --- | --- | --- | --- |
+| 1 | **Shared `filing_990` store** (990-PF grant schedules \+ Schedule I) | Foundations | Internal (federal lane) | The backbone. Grant rows with grantee names/EINs and amounts; trustee rosters ride the same parse. |
+| 2 | **SOURCE** (AEI) — foundation→higher-ed grants portal | Foundations | Free portal | Precomputed 990-PF backbone: 1M\+ grants, 57K\+ foundations, 2008–2025. Phase 0 verifies export/API availability; if usable, it seeds the backbone faster than parsing alone. |
+| 3 | **Chronicle of Higher Education / Forbes / Higher Ed Dive** mega-gift lists | Individuals \+ foundations | Free (curated) | Named mega-gifts with donor names and amounts; small-N, very high value per row. |
+| 4 | **Million Dollar List** (IU Lilly School) | All | Free, searchable | Announced \$1M\+ gifts since 2000. Freshness verified in Phase 0 before relying on it. |
+| 5 | **Institution-published pages**: honor rolls, donor walls, annual reports, campaign pages, press releases | Individuals | Free (Exa \+ Firecrawl) | The long tail. Class-year notations ("Jane Smith '88") are built-in identity points. |
+| 6 | **Commercial screening** (DonorSearch et al.) | Individuals | Paid | Deferred: evaluated only if the free tiers leave a coverage gap worth paying for. |
+| 7 | **Wikipedia/Wikidata** (benefactor lists, named buildings) | Individuals | Free | Corroboration \+ historic mega-donors. |
+
+## Node & edge schemas (new in this scope)
+
+No new node label family: foundations and corporate donors extend the existing Company family with discriminators (`foundation`, `nonprofit`), consistent with the lane-family label decision; institutions are the existing `Company:School` nodes. **One edge type is net-new** and is reused unchanged by the federal-filings lane.
+
+### Edge: `DONOR_TO` (new): `(Person)-[:DONOR_TO]->(Company)` and `(Company)-[:DONOR_TO]->(Company)`
+
+| Property | Type | Req | Notes |
+| --- | --- | --- | --- |
+| `donor_type` | enum `person` \| `couple` \| `foundation` \| `company` | ✓ | Anonymous mentions never become edges. |
+| `gift_count` | int | ✓ | Aggregate per donor–institution pair. |
+| `total_usd_known` | int |  | Sum of gifts with stated amounts only (invariant 5). |
+| `first_gift_year` / `last_gift_year` | int |  | From per-gift rows. |
+| `purpose` | string |  | Building, scholarship, professorship, campaign — most recent or largest gift. |
+| `gift_types` | enum\[\] |  | `cash` \| `pledge` \| `bequest` \| `in_kind` \| `unknown`. |
+| `via_foundation_uuid` | uuid |  | Set on derived person-level edges from the trustee bridge (invariant 3). |
+| `is_alumni` | bool |  | True when an `ATTENDED` edge to the same institution corroborates. |
+| `weight` | float | ✓ | Proposed bands below — **pending ratification**. |
+| `mention_ref`, `source_urls`, `confidence` |  | ✓ | Audit \+ provenance. |
+| envelope |  | ✓ | 2026-07-04 standard; deterministic description "X is a donor to Y". |
+
+Idempotent per (donor, institution). Per-gift detail stays relational under `donation_mention`. Co-donor pairs derive through the shared institution node at score time, never materialized — and the hub rule applies hard here: universities are thousand-donor hubs.
+
+### Weight bands (PROPOSED — not yet ratified in a §3.6 sitting)
+
+The edu scope page left the band cell open and the 2026-08-21 cross-lane sitting did not band `DONOR_TO`. The build proceeds on these proposals; ratification is open question #1.
+
+| Relationship class | Weight (lower = closer) |
+| --- | --- |
+| Person, direct named gift (≥ floor) | **25** |
+| Person via family foundation (trustee bridge) | **25** |
+| Foundation → institution (org-level) | **20** |
+| Company (corporate donor) → institution | **30** |
+| Honor-roll-only donor | **40** (no edges in v1; band reserved) |
+| Traversal at hub institutions | **60** — hub rule, mirroring `CONTRIBUTED_TO` traversal |
+
+## What the graph already has (leverage, not build)
+
+- **`Company:School` nodes exist** — the #12558 entry gate labels `.edu`-domain / `is_school` companies. Seed list = School nodes ranked by tracked-person `ATTENDED` overlap.
+- **`ATTENDED` edges** (writer #1898) — donors are disproportionately alumni; `ATTENDED` raises the match prior and disambiguates same-name candidates in Stage B.
+- **Federal-lane trustee resolution** — `BOARD_MEMBER_OF` edges on foundation nodes are this lane's free person-level donor source (invariant 3).
+- **Identity machinery**: `master-person-new` #13039 (kill switch #4617), Exa profile search #12936, `create-master-link` #2541, queue upsert #12854, `master-company-new` #12558 (kill switch #12789).
+- **Proven agent patterns**: tiered resolver #12984, deep-research config #12833, adjudication-with-corroboration #12677 v5 \+ #13168, attempts audit #723, Fundable Stage-1 gating.
+- **LLM Test Harness** (API group 42) for prompt evals before anything ships.
+
+## Pipeline design: three stages
+
+Go on GCP: source adapters behind the lane-family fetcher interface, raw pages cached to GCS, Pub/Sub → Cloud Run, mentions in AlloyDB, edges to FalkorDB.
+
+### Stage A: gift discovery (per institution)
+
+Sweeps in order of precision; output is structured **gift mentions** (contract below), never edges.
+
+1. Foundation backbone: read grant schedules from `filing_990` for grants naming this institution — deterministic, no LLM.
+2. Curated mega-gift lists filtered to this institution — one extraction per list snapshot, cached.
+3. Open-web sweep: press releases, news ("\$X gift to Y"), campaign pages — web-search-grounded LLM.
+4. Honor-roll / donor-wall pages: Exa discovery → Firecrawl fetch → extraction LLM per page.
+
+| Role | Model | Why |
+| --- | --- | --- |
+| Open-web discovery (step 3) | `moonshotai/kimi-k2.6` \+ `openrouter:web_search`/`web_fetch`, provider-pinned, `allow_fallbacks: false` | The house deep-research config (#12833), proven for multi-source synthesis with citations. |
+| Per-page extraction (steps 2, 4) | `google/gemini-3.1-flash-lite`, `reasoning: {enabled: false}`, strict JSON | #12984 tier-1 economics (~\$0.001/call); honor rolls are high-volume, low-ambiguity extraction. |
+| Weak-signal retry | `deepseek/deepseek-v4-flash` \+ web search | #12984 tier-2 pattern for pages the cheap model fumbles. |
+
+### Stage B: donor identity resolution (per mention)
+
+Deterministic first, LLM last:
+
+1. **Existing-graph match**: `master_person` by normalized name where an `ATTENDED` edge to the same institution exists (strong prior); `master_link` URL match when the mention carried one.
+2. **Trustee bridge**: foundation mentions resolve the foundation org (#12558); person-level edges then **derive** from the federal lane's resolved trustees — no Stage-B work per person (invariant 3).
+3. **Exa profile search** (#12936-style) using the mention's identity points: location, title/employer, class year, spouse.
+4. **LLM adjudication**: `google/gemini-3-flash-preview` (temp 0.1), full mention context \+ candidate profile — the #12677 v5 config with explicit same-name/different-person rejection. Auto-link ≥0.85 with name \+ two independent corroborations; #13168 name-only cap; 0.6–0.85 `needs_review`; below parks.
+
+Minimum to _attempt_ auto-link: name \+ two independent corroborating identity points (e.g. class year \+ city, employer \+ spouse name).
+
+### Stage C: edge writer
+
+MERGE `DONOR_TO` with the envelope; idempotent per (donor, institution); derived person edges carry `via_foundation_uuid`. New-person policy mirrors the investor cascade: local-only leaves \+ lowest-tier queue rows, kill switches respected, no recursive enrichment from a donation sweep.
+
+## Draft system prompt v0.1: gift extraction (not deployed)
+
+Drafted on the [edu scope page](/guides/open-work/roadmap/educational-institution-donations); reproduced here as the deployable copy. Eval in the LLM Test Harness before shipping.
+
+```text
+You extract charitable gifts to ONE educational institution from the provided page content.
+
+Institution: {{institution_name}} (also known as: {{aliases}}). Domain: {{domain}}.
+
+Return ONLY valid JSON: {"gifts": [...]}. Each gift object:
+- donor_name: exactly as written (couples: keep as written, e.g. "John and Jane Smith")
+- donor_type: "person" | "couple" | "foundation" | "company" | "anonymous"
+- amount_usd: number | null  (NEVER infer or convert vague language into a number)
+- gift_year: number | null
+- purpose: string | null  (building, scholarship, professorship, campaign name)
+- gift_type: "cash" | "pledge" | "bequest" | "in_kind" | "unknown"
+- giving_level: string | null  (honor-roll band when stated, e.g. "President's Circle $50,000+")
+- evidence_quote: verbatim sentence(s) naming the donor and the gift
+- identity_points: {location, title, employer, class_year, degree, spouse_name, other} (nulls allowed)
+- confidence: "high" | "medium" | "low"
+
+Rules:
+1. Only gifts TO this institution (or its named schools/colleges/foundations). Gifts BY the institution, grants it received from government, and sponsorships are out of scope.
+2. Anonymous donors: record the gift with donor_type "anonymous"; never guess identity.
+3. Class-year notations ("Jane Smith '88", "MBA '02") go into identity_points.class_year/degree.
+4. Honor-roll listings without amounts are valid gifts: amount_usd null + giving_level when the page states the band.
+5. Do not deduplicate across pages; emit every mention with its own evidence_quote.
+6. If the page contains no qualifying gifts, return {"gifts": []}.
+```
+
+The Stage-B adjudication prompt follows the #12677 v5 shape (full mention context \+ candidate profile → `match: yes/no/none`, `confidence`, reasoning; a same-name candidate in a different profession/era/geography is a **no**) — drafted against real cases in the LLM Test Harness before deployment.
+
+## Proposed storage (not built)
+
+Recipient-agnostic renames of the edu scope page's draft tables (`edu_donation_mention` → `donation_mention`), so the lane extends beyond edu without a migration; v1 rows are all edu recipients.
+
+| Table | Purpose |
+| --- | --- |
+| `donation_mention` | One row per extracted mention: recipient ref (institution), raw fields from the extraction contract, `evidence_url`, resolution state (`unresolved` / `auto_linked` / `needs_review` / `rejected` / `anonymous`), resolved `master_person_id` / `master_company_id`, edge state, `via_foundation` ref, source lane (backbone / curated / web / honor_roll). Audit-first per #723. |
+| `donation_resolution_attempts` | Append-only log of every Stage-B attempt: candidates, model, confidence, outcome, cost — mirrors `fundable_organization_enrichment_attempts`. |
+
+## Cost estimate (order of magnitude, validate in Phase 0)
+
+Near-zero source cost: the backbone is free and deterministic (the fetch bill lives in the federal lane), curated lists are a handful of extractions, and honor-roll extraction runs at tier-1 economics (~\$0.001/page). Backfill LLM for the top ~200 institutions (open-web discovery \+ adjudications on announced-gift mentions) ≈ \$50–150; GCP infra ≈ \$10–20/mo during backfill, under \$10/mo steady. Vendor enrichment credits apply only to net-new donor persons promoted out of the queue — lowest tier, so effectively zero until someone promotes them. Engineering: 2–3 day Phase 0 spike, then roughly 1 week for the backbone (mostly reads) and 1–2 weeks for curated \+ honor-roll stages. DonorSearch licensing is a separate decision, not in this estimate.
+
+## Backfill
+
+This lane deploys into a populated graph and behind the federal lane's backfill: the backbone consumes filings that lane lands, so **its 990 sweep leads, this lane follows org-by-org** (its backfill playbook already commits to completing an org's filings before this lane consumes them).
+
+### Sweep 1 — source-side, in rollout order
+
+**Backbone (first).**
+
+1. Enumerate the recipient population: every School node, ordered by `ATTENDED` overlap (warm matches first, resolution-rate telemetry fast).
+2. For each institution, read grant rows from `filing_990` naming it (grantee name/EIN match). Institutions whose grantor foundations have no landed filings enqueue those orgs to the federal lane and re-check on its cadence — never fetch here.
+3. Write foundation-level `DONOR_TO` per grant aggregate; derive person-level edges for federal-lane-resolved trustees.
+4. Checkpoint = per-(institution) status rows; a killed worker resumes from status, never from a loop cursor.
+
+**Curated lists (second).** One-time extraction of each list snapshot (Chronicle, Million Dollar List, roundups); mentions filter to tracked institutions; full Stage-B treatment. Small-N — this sweep is hours, not days.
+
+**Honor-roll sweeps (third).** Top-N institutions by `ATTENDED` overlap only (N from Phase 0 yield data); Exa page discovery → Firecrawl → extraction; mentions park per the floor default.
+
+### Sweep 2 — graph-side: set-based, not per-person
+
+Batch entry point #5 once over the existing population: persons with philanthropist/donor/trustee titles or foundation affiliations → targeted announced-gift search. Snapshot the population, record the high-water mark; later arrivals belong to the live triggers (#5/#6), not the sweep.
+
+### The re-resolution loop
+
+- `donation_mention` rows are durable: re-drain `unresolved` weekly during backfill, monthly steady-state; targeted retries against new-`master_person` diffs beat full re-drains.
+- After each federal-lane FEC refresh, run the corroboration loop (entry #8): fresh employer strings and new trustee resolutions upgrade pending donor mentions — backfill is when the pending pile is largest.
+- New trustee auto-links in the federal lane derive person-level `DONOR_TO` here without re-touching Stage B.
+
+### Cutover to steady state
+
+Backbone cuts over to the federal lane's rolling e-file cron (entry #7) when the institution queue drains — record per-institution high-water marks. Honor-roll pages re-sweep annually (cadence confirmed in Phase 0; most institutions publish once a year). One drain owner per queue — never run backfill and steady-state drains concurrently.
+
+### What backfill must NOT do
+
+- No 990 fetch from this lane, during backfill exactly as in steady state (invariant 1).
+- No recursive enrichment: donor leaves are lowest-tier queue rows; kill switches #4617/#12789 checked per batch.
+- No edges from honor-roll or anonymous mentions (invariants 2, 6).
+- Hard caps first: 25 institutions / 200 filings / 500 mentions until acceptance queries pass twice (agent brief).
+
+## Smoke tests
+
+Three fixed inputs, one per Stage-A lane, with simulated expected responses. Run in sandbox against the Phase-0 harness; simulated from public data (2026-08-25) — assert invariants exactly, counts as ranges.
+
+### ST-1 — Foundation backbone: Ford Foundation grants, entry point #2
+
+Reuses the federal lane's ST-1 fixture (EIN `13-1684331`, latest \+ 3 filings) — the shared-store consumer test from this side. Exercises the zero-fetch read, grant-schedule mention extraction, foundation-level edge writing, and the trustee-bridge derivation.
+
+**Input:** `{"institution_scope": "all_tracked_schools", "foundation_ein": "13-1684331", "source": "filing_990"}`
+
+**Simulated expected response:**
+
+```json
+{
+  "filing_990_read": {"filings_readable": 4, "fetches_triggered": 0},
+  "grant_mentions_to_tracked_institutions_range": [1, 40],
+  "edges": [
+    {"edge": "DONOR_TO", "donor_type": "foundation", "weight": 20,
+     "gift_count": "aggregated", "total_usd_known": "sum of stated amounts only"}
+  ],
+  "trustee_bridge": {
+    "derived_person_edges": "one per federal-lane auto_linked trustee",
+    "via_foundation_uuid": "set on every derived edge",
+    "stage_b_calls_for_trustees": 0
+  },
+  "persons_created": 0
+}
+```
+
+**Pass criteria:** zero fetches originate in this lane (the acceptance query); every derived person edge carries `via_foundation_uuid` and a corresponding federal-lane `BOARD_MEMBER_OF`; zero Stage-B calls for trustees; re-running the same filings is a no-op (idempotent MERGE); grant rows to untracked institutions produce no mentions.
+
+### ST-2 — Curated mega-gift: Bloomberg → Johns Hopkins, entry point #3
+
+The most public announced gift on record (\$1.8B, 2018, financial aid) — exercises curated-list extraction, a person-donor Stage-B resolution with abundant corroboration, and the aggregate edge contract.
+
+**Input:** `{"list_snapshot": "<Chronicle major-gifts snapshot from Phase 0>", "institution": "Johns Hopkins University"}`
+
+**Simulated expected response:**
+
+```json
+{
+  "extraction": {"donor_name": "Michael R. Bloomberg", "donor_type": "person",
+    "amount_usd": 1800000000, "gift_year": 2018, "purpose": "financial aid",
+    "identity_points": {"class_year": "1964", "other": "alumnus, founder of Bloomberg LP"}},
+  "resolution": {
+    "attended_prior": "ATTENDED edge to Johns Hopkins strengthens the prior when present",
+    "corroborations_gte": 2, "confidence_gte": 0.85, "state": "auto_linked"
+  },
+  "edge": {"edge": "DONOR_TO", "donor_type": "person", "weight": 25,
+    "total_usd_known_gte": 1800000000, "is_alumni": true,
+    "mention_ref": "present", "envelope": "complete"}
+}
+```
+
+**Pass criteria:** `amount_usd` equals the stated figure exactly — never re-derived; auto-link records two independent corroborations in `donation_resolution_attempts`; a second gift mention for the same pair updates the aggregate edge instead of writing a second edge; the evidence quote lands verbatim on the mention row.
+
+### ST-3 — Honor-roll page \+ negative controls, entry point #4
+
+One honor-roll fixture page with class-year notations, one anonymous gift, and a bare common name ("Michael Smith, Class of 1995") — exercises extraction fidelity, the no-edges-in-v1 floor default, the anonymous terminal state, and the name-only cap.
+
+**Input:** `{"page_url": "<honor-roll fixture from Phase 0>", "institution": "<fixture institution>"}`
+
+**Simulated expected response:**
+
+```json
+{
+  "extraction": {"gifts_range": [10, 200], "class_years_captured": true,
+    "giving_levels_captured": true, "amounts_invented": 0},
+  "states": {
+    "anonymous_gift": {"state": "anonymous", "resolution_attempts": 0},
+    "michael_smith": {"state": "needs_review",
+      "reason": "name-only capped below auto-link threshold (#13168)"}
+  },
+  "edges_written": 0,
+  "persons_created": 0, "queue_rows_created": 0
+}
+```
+
+**Pass criteria:** zero edges from honor-roll mentions (floor default); zero `amount_usd` values on rows where the page states none; the anonymous mention is terminal with zero resolution attempts; the common-name row parks `needs_review` regardless of model confidence; every mention carries its `evidence_quote`; re-fetching an unchanged page (same content hash) skips extraction.
+
+## Rollout order
+
+1. **Phase 0 spike (2–3 days)**: read the federal lane's fixture filings through the consumer path; verify SOURCE portal export/API availability; snapshot one curated list and measure extraction precision on a 200-row audit; sweep two honor-roll fixture pages; validate the gift-floor default against real yield.
+2. **Foundation backbone** — highest precision, zero LLM, and the trustee bridge resolves people for free. Gated on the federal lane's 990 adapter having landed filings.
+3. **Curated mega-gift lists** — hundreds of named donors at the top of the wealth pyramid.
+4. **Honor-roll sweeps** for the top-`ATTENDED` institutions — the volume tier, mention-only in v1.
+5. **DonorSearch evaluation** only if 2–4 leave a coverage gap worth paying for.
+
+Gating mirrors the Fundable Stage-1 rule: edges only for donors who resolve to an existing record or pass the auto-link threshold; everything else parks as `needs_review` with its evidence — releasable later, never lost.
+
+## Open questions
+
+1. **Weight-band ratification** — the proposed `DONOR_TO` bands above need a §3.6 sitting; the edu scope page left the cell open and the 2026-08-21 sitting did not band this edge.
+2. **Gift floor** — ratify the defaults: backbone all, announced ≥\$100K, honor-roll mention-only. The alternative cuts (announced ≥\$1M only, or honor-roll edges at weight 40) change Phase 2/3 scope, not the schema.
+3. **Honor-roll edges** — if ratified later, the reserved weight-40 band releases the parked mentions without re-extraction.
+4. **Commercial licensing appetite** — request a DonorSearch quote now, or after the free tiers land?
+5. **International scope** — UK (Charity Commission accounts), Canada (T3010) have analogous public filings; v2.
+
+## References
+
+- [Educational Institution Donations](/guides/open-work/roadmap/educational-institution-donations) — the research record this plan operationalizes (data-source landscape researched 2026-07-05, IRS disclosure analysis, external links)
+- [990s, FEC & Form D](/guides/open-work/roadmap/990-fec-form-d) — owner of the shared `filing_990` store
+- [IRS — Contributors' identities not subject to disclosure (Schedule B)](https://www.irs.gov/charities-non-profits/public-disclosure-and-availability-of-exempt-organizations-returns-and-applications-contributors-identities-not-subject-to-disclosure)
+- [ProPublica Nonprofit Explorer API](https://projects.propublica.org/nonprofits/api) (the federal lane's EIN/index source)
+- [Chronicle of Higher Education — Major Private Gifts to Higher Education](https://www.chronicle.com/article/major-private-gifts-to-higher-education/)
+- [Million Dollar List — IU Lilly Family School of Philanthropy](https://philanthropy.indianapolis.iu.edu/research/ongoing/index.html)
+- [DonorSearch — data](https://www.donorsearch.net/our-data/) · [DonorSearch API](https://www.donorsearch.net/api-integrations/)

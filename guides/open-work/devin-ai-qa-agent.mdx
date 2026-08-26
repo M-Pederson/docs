@@ -1,0 +1,157 @@
+---
+title: "Devin AI QA Agent"
+description: "Step-by-step for Denis: build a cloud agent that detects enrichment edge-case errors and opens Go fixes as pull requests with Devin."
+icon: "robot"
+---
+
+<Note>
+  This guide is written for the enrichment engineer who is new to Devin and runs the Go enrichment service on GCP.
+</Note>
+
+A Devin AI QA agent runs on a schedule, checks the enrichment error store, and hands one edge-case error to a Devin session. The session explores the Go repo, proposes a fix, and opens a pull request for human review.
+
+<Warning>
+  This is a design pattern built from the Devin CLI, MCP, and GCP. Devin's headless and autonomous modes are still evolving, so validate it against your team's Devin plan and security policy before running it unsupervised.
+</Warning>
+
+## What it does
+
+1. A Cloud Scheduler job or Pub/Sub trigger starts a small Cloud Run job.
+2. The job queries unhandled `log_crash` or `qa_errors` rows.
+3. If it finds an unhandled enrichment edge case, it writes a prompt file and invokes `devin --print`.
+4. Devin reads the repo, finds the relevant Go code, writes a fix, and opens a PR via the GitHub MCP.
+5. The error row is marked `devin_fix_attempted` so the cron skips it next time.
+
+## Prerequisites
+
+- The Go enrichment service is running on GCP.
+- A Devin team account with access to the repo.
+- The Go repo is hosted on GitHub and added to your Devin workspace.
+- A way to identify edge-case errors (for example, the `log_crash` table, a Cloud Logging sink, or a dedicated `qa_errors` queue).
+- A GitHub fine-grained token with pull request and contents write access to the repo.
+- A Devin token for headless runs.
+
+## Step 1: Add the repo to Devin
+
+In the Devin web app, connect the Go repo to your team workspace and wait for the codebase index to finish. Without this, Devin cannot search across packages or understand the enrichment flow.
+
+If the repo is already in the workspace, confirm the branch used by the agent is the one you want patched (usually `main`).
+
+## Step 2: Write the agent rules
+
+Add a repo-level rules file so every Devin session sees the same enrichment context. Create `.devin/global_rules.md` at the repo root (or use `AGENTS.md` if your team already uses that convention).
+
+Include:
+
+- The error schema and how to read `log_crash` rows.
+- Common edge-case patterns and which Go packages handle them.
+- The test command for the package being fixed (`go test ./...` or `go test ./package`).
+- PR title format: `fix(enrichment): <error-id>`.
+- Stop conditions: if tests fail, if the change touches more than a few files, or if the fix is unsafe, stop and report instead of opening a PR.
+
+## Step 3: Add the GitHub MCP
+
+Create a fine-grained GitHub token with contents and pull request write access for the repo, then add the GitHub MCP server to Devin:
+
+```bash
+export GITHUB_TOKEN=ghp_xxx
+devin mcp add -e GITHUB_TOKEN=$GITHUB_TOKEN github -- npx -y @modelcontextprotocol/server-github
+```
+
+Test it once in an interactive Devin session by asking the agent to open a trivial pull request, then close it.
+
+## Step 4: Build the Cloud Run trigger
+
+Pick one trigger:
+
+- **Cron (recommended to start):** A Cloud Scheduler job calls a Cloud Run job every 15 minutes. The job checks for unhandled errors and, when one exists, invokes Devin.
+- **Event-driven:** A Cloud Logging metric alert or Pub/Sub push subscription calls the same Cloud Run service immediately when an error crosses a threshold.
+
+Start with a cron so you can control when Devin runs and how much it costs.
+
+## Step 5: Write the runner script
+
+The Cloud Run container is a minimal image with the Devin CLI installed. It runs a script like this:
+
+```bash
+#!/bin/bash
+set -e
+
+# 1. Query the latest unhandled enrichment edge case
+ERROR_JSON=$(./fetch-oldest-qa-error)
+if [ "$ERROR_JSON" = "null" ]; then
+  echo "No new errors"
+  exit 0
+fi
+
+# 2. Write the Devin prompt
+ERROR_ID=$(echo "$ERROR_JSON" | jq -r '.id')
+cat > /tmp/fix-task.txt <<EOF
+You are an autonomous QA fixer for the Orbiter Go enrichment service.
+
+Error (JSON): $ERROR_JSON
+Repo path: /workspace/repo
+
+Task:
+1. Read the error, stack trace, and affected record.
+2. Search the repo for the relevant Go package and function.
+3. Write the smallest correct fix. Add or update a unit test that reproduces the edge case.
+4. Run the relevant package tests. If tests fail, stop and report the failure.
+5. Use the GitHub MCP to open a pull request against main with title "fix(enrichment): $ERROR_ID".
+6. Do not merge. Leave a short summary in the PR body.
+
+Rules:
+- Do not change unrelated packages.
+- If the fix is not obvious or would require a large refactor, stop and add a comment instead.
+- Include the error id and a one-line root cause in the PR description.
+EOF
+
+# 3. Run Devin headlessly
+devin --print \
+  --permission-mode accept-edits \
+  --respect-workspace-trust false \
+  --prompt-file /tmp/fix-task.txt
+```
+
+The `fetch-oldest-qa-error` binary is a small Go program that:
+
+- Reads the `qa_errors` or `log_crash` table.
+- Selects the oldest unhandled row with `devin_fix_attempted = false`.
+- Marks that row `devin_fix_attempted = true` before returning it.
+
+This prevents the cron from picking the same error twice.
+
+## Step 6: Test it locally
+
+Before moving to Cloud Run, run the prompt against a known, safe error on your laptop:
+
+```bash
+devin --print --permission-mode accept-edits --prompt-file /tmp/fix-task.txt
+```
+
+Check whether the diff is correct and the PR is opened to a test fork. Iterate the prompt and the rules file until it reliably produces small, correct fixes.
+
+## Step 7: Promote to production
+
+Start with these guardrails:
+
+- One error per run.
+- One run per hour.
+- `accept-edits` permission mode.
+- Require human review on every PR.
+
+After you have 10–20 clean fixes, you can move to `smart` permission mode. Only consider `autonomous` mode if you have a Devin sandbox enabled and your security team has approved it.
+
+## Security notes
+
+- Do not store `GITHUB_TOKEN` or the Devin token in the repo. Pass them as Cloud Run secrets or Secret Manager values.
+- Start with a test repo or fork. The agent can write code and open PRs, so give it the least permissions it needs.
+- `autonomous` mode requires `--sandbox`. Cloud Run containers do not provide a Devin sandbox automatically; confirm with Devin support before enabling.
+- Mark every error as `devin_fix_attempted` immediately, and maintain an allowlist of `error_kind` values the agent is allowed to handle. Reject anything that looks like a data or infrastructure issue.
+
+## Next steps
+
+1. Add the Go repo in the Devin web UI and confirm indexing.
+2. Add `.devin/global_rules.md` and the GitHub MCP in a local test session.
+3. Open a PR manually to verify the MCP works.
+4. Build the Cloud Run cron skeleton and run it against a single known error.

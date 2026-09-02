@@ -6,15 +6,17 @@ icon: "diagram-project"
 
 This page is the **graph-RAG design spec** for investor theses. It defines how the find-investors engine should project every built thesis into the Orbiter Universe Graph (FalkorDB) as a reified `InvestmentThesis` node, how the `investor_narrative` is vectorized, and how the `semantic_question` graph-RAG path retrieves the full thesis payload.
 
-For the conceptual schema and prompts, see [Investment thesis schema](/guides/open-work/suggestion-core-concepts/find-investors/thesis-schema). For the current Xano implementation, see [Xano production pipeline](/guides/open-work/suggestion-core-concepts/find-investors/xano-pipeline). For the AlloyDB migration plan, see [Find investors — AlloyDB build](/guides/open-work/vectors-alloydb/find-investors-engine).
-
-<Warning>
-  **Open data question before implementation.** The current `investment_thesis` table (Xano **709** / future AlloyDB `investment_theses`) does **not** contain an `investor_narrative` column. That text lives in the evidence-narrative pipeline (`investor_evidence_narrative`). The design below assumes the graph writer receives `investor_narrative` as an input. Decide before coding: add a column to `investment_theses`, join `investor_evidence_narrative`, or pass it through the build function output.
-</Warning>
+<Note>
+  **Resolved 2026-09-02 — `investor_narrative` is a column on the thesis row.** Add `investor_narrative` to `investment_thesis` (Xano **709**) / AlloyDB `investment_theses`; the build pipeline copies it in from `investor_evidence_narrative` at build time, so the graph writer reads one self-contained row. Because the node is re-projected on every thesis update, a narrative regeneration must write through to the thesis row — that write is what triggers the re-projection.
+</Note>
 
 ## Design summary
 
 Every thesis build should produce one `Entity:InvestmentThesis` node, linked to the investor (`Person` or `Company`) by a single `HAS_INVESTMENT_THESIS` edge. The node stores the full thesis payload and a 1536-dim Gemini embedding of `investor name + investor_narrative`, so graph RAG can discover and return the investor's complete thesis context.
+
+<Warning>
+  **Trigger: an investment thesis being created or updated.** Every insert or update to an `investment_thesis` row (Xano **709** / AlloyDB `investment_theses`) must fire the graph write below, which upserts **both** the `Entity:InvestmentThesis` node **and** its `HAS_INVESTMENT_THESIS` edge from the investor. A rebuild, a summary edit, a narrative regeneration, or a re-classification all count as updates: same `node_uuid`, fresh `updated_at`, `thesis_payload`, and `embeddings`. A thesis row that is newer than its graph node is a bug, not a lag.
+</Warning>
 
 ```mermaid
 graph LR
@@ -22,8 +24,8 @@ graph LR
     B --> C[embed name + narrative<br/>Gemini 1536 cosine]
     C --> D[Entity:InvestmentThesis node]
     D --> E[HAS_INVESTMENT_THESIS]
-    E --> F[Entity:Person | Entity:Company]
-    D --> G[semantic_question graph RAG<br/>Entity(embeddings) index]
+    E --> F["Entity:Person | Entity:Company"]
+    D --> G["semantic_question graph RAG<br/>Entity(embeddings) index"]
 ```
 
 ## User-facing decisions
@@ -34,11 +36,17 @@ These choices were locked with product before this spec was written:
 |---|---|
 | Graph model | Hyperedge-style reified node: `Entity:InvestmentThesis` + `HAS_INVESTMENT_THESIS` edge from the investor. |
 | Narrative storage | `investor_narrative` lives on the same `InvestmentThesis` node. |
+| Narrative source | `investor_narrative` column on `investment_theses`, copied from `investor_evidence_narrative` at build time. |
 | Vector property | `embeddings` (Gemini, 1536-dim) only — `name_embedding` is deprecated in the Go port. |
 | Embedding text | `firm_name` / person name + `investor_narrative`. |
 | Temporal model | One upserted node per investor; no versioning in v1. |
+| Sync trigger | Re-project the node on **every** thesis create or update — the node never lags the `investment_thesis` row. |
+| Payload size | No cap in v1; the writer logs `thesis_payload` bytes on every write, and a cap or split is revisited only on measured evidence. |
+| Writer location | Deferred to the Go team at implementation: in the Cloud Run thesis service post-commit, or an event-driven worker. Either must satisfy the Trigger section. |
+| Implementation | Go only. Xano never writes `InvestmentThesis` nodes; the projection arrives with the Go port. |
 | Backfill | No backfill; only new and rebuilt theses get graph nodes. |
 | RAG path | `semantic_question` only. |
+| RAG cutover | Flip `semantic_question` to `embeddings` immediately; backfill older `Entity` nodes afterwards (temporary recall drop accepted). |
 
 ## Graph schema
 
@@ -97,14 +105,20 @@ CREATE INDEX FOR (n:InvestmentThesis) ON (n.uuid)
 
 ## Go / AlloyDB write contract
 
-The graph write can live in the Cloud Run thesis service (after the AlloyDB write) or in a dedicated Go sidecar. The contract below is what the writer needs from the build pipeline and what it must emit to FalkorDB.
+The graph write can live in the Cloud Run thesis service (after the AlloyDB write) or in a dedicated Go worker fed by a row-change event. **That choice is deliberately left to the Go team at implementation time (decided 2026-09-02)** — whichever is picked must satisfy the [Trigger](#trigger) section below. The contract is what the writer needs from the build pipeline and what it must emit to FalkorDB, regardless of where it runs.
+
+### Trigger
+
+<Info>
+  Run this contract on **every** `investment_thesis` create or update, not only on first build. The write is idempotent: the node is `MERGE`d on `node_uuid`, the edge is `MERGE`d on the investor→thesis pattern, and only `created_at` is preserved. Wire it to the thesis row write itself (the AlloyDB commit in the Cloud Run service, or the Xano `investment_thesis` table trigger) rather than only to the build orchestrator, so edits made outside a full rebuild still re-project the node and edge.
+</Info>
 
 ### Inputs
 
 | Field | Source | Notes |
 |---|---|---|
 | `thesis_id` | AlloyDB `investment_theses.id` or Xano `investment_thesis.id` | Used to read the full thesis row and write back `node_uuid`. |
-| `investor_narrative` | `investor_evidence_narrative.narrative` (or a new column on `investment_theses`) | Must be available to the writer. |
+| `investor_narrative` | `investment_theses.investor_narrative` (copied from `investor_evidence_narrative` at build time) | Read from the thesis row; if empty, use the fallback text under [Vectorization details](#vectorization-details). |
 | `investor_node_uuid` | FalkorDB `Person`/`Company` node | Precondition: investor already exists in the graph. |
 | `investor_name` | `firm_name` or `master_person.name` | Used for `name` and embedding text. |
 
@@ -115,7 +129,7 @@ The graph write can live in the Cloud Run thesis service (after the AlloyDB writ
 3. **Check `node_uuid`** on the thesis row. If set, that is the `InvestmentThesis` node UUID. If null, generate a new UUID.
 4. **Build embedding text**: `investor_name + "\n\n" + investor_narrative`.
 5. **Generate vector** via `google/gemini-embedding-001` with `dimensions: 1536`, then L2-normalize.
-6. **Build `thesis_payload`** as JSON of the thesis row, excluding `*_vector` arrays.
+6. **Build `thesis_payload`** as JSON of the thesis row, excluding `*_vector` arrays, and log its byte size (no cap in v1 — see [Risks & open questions](#risks-open-questions)).
 7. **Execute parameterized Cypher** (recommended) or a sanitized string template.
 8. **Write `node_uuid` back** to the thesis row if it was generated.
 
@@ -251,7 +265,7 @@ The `semantic_question` graph-RAG path must be updated to retrieve `InvestmentTh
 ### Cutover implications
 
 <Warning>
-  Switching `semantic_question` from `name_embedding` to `embeddings` aligns with the Go port (where `name_embedding` is deprecated), but older FalkorDB nodes that lack `embeddings` may drop out of semantic search. Before shipping, run a global backfill of `embeddings` for all `Entity` nodes, or keep a dual-search transitional branch.
+  **Resolved 2026-09-02 — flip now, backfill later.** `semantic_question` switches to the `embeddings` index as soon as the `InvestmentThesis` writer ships; there is no dual-search transitional branch. Older FalkorDB `Entity` nodes that still lack `embeddings` drop out of semantic search until the global backfill runs (model it on `backfill-node-embeddings` #13115). That recall drop is accepted as temporary: schedule the backfill as the immediate follow-up, and treat any `Entity` node still missing `embeddings` after it as a defect.
 </Warning>
 
 ## Acceptance test
@@ -274,11 +288,11 @@ End-to-end retrieval test:
 
 | Risk / open question | Mitigation |
 |---|---|
-| `investor_narrative` is not a column on `investment_thesis` / `investment_theses` today. | Add a column, join `investor_evidence_narrative`, or pass it as a build-function parameter before implementation. |
-| `thesis_payload` can be large and may dominate LLM context. | Only one thesis node per investor; cap payload size or split into `summary_payload` + `full_payload` if needed. |
-| Parameterized Cypher support in the Go FalkorDB client must be verified. | Test on sandbox/staging first; fall back to a sanitized string template if parameter binding fails. |
+| `investor_narrative` was not a column on `investment_thesis` / `investment_theses`. | **Resolved 2026-09-02:** add the column; the build pipeline copies the narrative in from `investor_evidence_narrative` at build time. |
+| `thesis_payload` can be large and may dominate LLM context. | **Resolved 2026-09-02:** no cap in v1. One node per investor and the top-10 KNN bound it naturally; the writer logs `thesis_payload` bytes on every write, and a cap or a `summary_payload` / `full_payload` split is revisited only if measured sizes are a problem. |
+| Parameterized Cypher support in the Go FalkorDB client must be verified. | Verification task, not a decision: test on sandbox/staging first; fall back to a sanitized string template if parameter binding fails. |
 | `InvestmentThesis` nodes must carry `:Entity` for the vector index. | Enforce `:Entity:InvestmentThesis` in every Cypher pattern; reject writers that omit `:Entity`. |
-| Future Xano and Cloud Run paths may duplicate logic. | Keep the Cypher and payload-building logic in a shared Go package or document it for the Xano sync mirror. |
+| Future Xano and Cloud Run paths may duplicate logic. | **Resolved 2026-09-02:** Go only. Xano never writes `InvestmentThesis` nodes or `HAS_INVESTMENT_THESIS` edges; the projection arrives with the Go port, and the Cypher on this page is the single reference implementation. |
 
 ## Related docs
 

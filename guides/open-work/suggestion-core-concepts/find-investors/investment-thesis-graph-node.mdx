@@ -1,0 +1,288 @@
+---
+title: "Investment thesis graph node"
+description: "Graph RAG design for investor theses — reified InvestmentThesis nodes, vectorized investor narratives, and the Go/AlloyDB write contract"
+---
+
+This page is the **graph-RAG design spec** for investor theses. It defines how the find-investors engine should project every built thesis into the Orbiter Universe Graph (FalkorDB) as a reified `InvestmentThesis` node, how the `investor_narrative` is vectorized, and how the `semantic_question` graph-RAG path retrieves the full thesis payload.
+
+For the conceptual schema and prompts, see [Investment thesis schema](./thesis-schema). For the current Xano implementation, see [Xano production pipeline](./xano-pipeline). For the AlloyDB migration plan, see [Find investors — AlloyDB build](/guides/open-work/vectors-alloydb/find-investors-engine).
+
+<Warning>
+  **Open data question before implementation.** The current `investment_thesis` table (Xano **709** / future AlloyDB `investment_theses`) does **not** contain an `investor_narrative` column. That text lives in the evidence-narrative pipeline (`investor_evidence_narrative`). The design below assumes the graph writer receives `investor_narrative` as an input. Decide before coding: add a column to `investment_theses`, join `investor_evidence_narrative`, or pass it through the build function output.
+</Warning>
+
+## Design summary
+
+Every thesis build should produce one `Entity:InvestmentThesis` node, linked to the investor (`Person` or `Company`) by a single `HAS_INVESTMENT_THESIS` edge. The node stores the full thesis payload and a 1536-dim Gemini embedding of `investor name + investor_narrative`, so graph RAG can discover and return the investor's complete thesis context.
+
+```mermaid
+graph LR
+    A[Build pipeline<br/>AlloyDB / Xano] --> B[thesis payload + investor_narrative]
+    B --> C[embed name + narrative<br/>Gemini 1536 cosine]
+    C --> D[Entity:InvestmentThesis node]
+    D --> E[HAS_INVESTMENT_THESIS]
+    E --> F[Entity:Person | Entity:Company]
+    D --> G[semantic_question graph RAG<br/>Entity(embeddings) index]
+```
+
+## User-facing decisions
+
+These choices were locked with product before this spec was written:
+
+| Decision | Choice |
+|---|---|
+| Graph model | Hyperedge-style reified node: `Entity:InvestmentThesis` + `HAS_INVESTMENT_THESIS` edge from the investor. |
+| Narrative storage | `investor_narrative` lives on the same `InvestmentThesis` node. |
+| Vector property | `embeddings` (Gemini, 1536-dim) only — `name_embedding` is deprecated in the Go port. |
+| Embedding text | `firm_name` / person name + `investor_narrative`. |
+| Temporal model | One upserted node per investor; no versioning in v1. |
+| Backfill | No backfill; only new and rebuilt theses get graph nodes. |
+| RAG path | `semantic_question` only. |
+
+## Graph schema
+
+### Node: `Entity:InvestmentThesis`
+
+Labels: `Entity:InvestmentThesis`
+
+| Property | Type | Description |
+|---|---|---|
+| `uuid` | string | Primary key. Re-use `investment_thesis.node_uuid` if set; otherwise generate a fresh UUID and write it back. |
+| `name` | string | Display name: `firm_name` for company investors, or `{person_name} Investment Thesis`. |
+| `display_label` | string | `"InvestmentThesis"` |
+| `visibility` | boolean | `true` |
+| `created_at` | timestamp | Epoch-millis on create. |
+| `updated_at` | timestamp | Epoch-millis on every update. |
+| `investor_uuid` | string | `uuid` of the linked investor `Person`/`Company` node. |
+| `master_person_id` | int | Xano/AlloyDB investor FK (nullable). |
+| `master_company_id` | int | Xano/AlloyDB investor FK (nullable). |
+| `firm_name` | string | Investor entity name. |
+| `investor_type` | string | `vc_fund`, `angel`, `family_office`, `corporate_vc`, `syndicate`, `other`. |
+| `declared_thesis_summary` | string | Declared 1–2 sentence summary. |
+| `derived_thesis_summary` | string | Derived 1–2 sentence summary. |
+| `investor_narrative` | string | Full evidence narrative — the text that is vectorized. |
+| `thesis_payload` | string | Full `investment_thesis` row serialized as JSON, **excluding** the 12 `*_vector` JSON arrays and any graph-managed vector fields. |
+| `embeddings` | `vector(1536)` | Gemini embedding of `name + "\n\n" + investor_narrative`. |
+
+### Edge: `HAS_INVESTMENT_THESIS`
+
+| | |
+|---|---|
+| **Pattern** | `(investor:Entity:Person \| Entity:Company)-[rel:HAS_INVESTMENT_THESIS]->(thesis:Entity:InvestmentThesis)` |
+| **Direction** | Investor → thesis. |
+| **Weight** | None required; this is a meta edge and should stay out of pathfinding anchor sets. |
+
+Edge properties:
+
+| Property | Type | Description |
+|---|---|---|
+| `uuid` | string | Generated on create. |
+| `name` | string | `"HAS_INVESTMENT_THESIS"` |
+| `description` | string | `"{investor_name} has investment thesis"` |
+| `created_at` | timestamp | Epoch-millis on create. |
+| `updated_at` | timestamp | Epoch-millis on every update. |
+
+### Index requirements
+
+<Note>
+  No new vector index is needed. The existing `:Entity(embeddings)` HNSW/cosine index covers every node that carries the `embeddings` property, including `InvestmentThesis` nodes. Always include `:Entity` in `MATCH`/`MERGE` patterns so the base-label indexes apply.
+</Note>
+
+If any read pattern omits `:Entity` and uses only `:InvestmentThesis`, add:
+
+```cypher
+CREATE INDEX FOR (n:InvestmentThesis) ON (n.uuid)
+```
+
+## Go / AlloyDB write contract
+
+The graph write can live in the Cloud Run thesis service (after the AlloyDB write) or in a dedicated Go sidecar. The contract below is what the writer needs from the build pipeline and what it must emit to FalkorDB.
+
+### Inputs
+
+| Field | Source | Notes |
+|---|---|---|
+| `thesis_id` | AlloyDB `investment_theses.id` or Xano `investment_thesis.id` | Used to read the full thesis row and write back `node_uuid`. |
+| `investor_narrative` | `investor_evidence_narrative.narrative` (or a new column on `investment_theses`) | Must be available to the writer. |
+| `investor_node_uuid` | FalkorDB `Person`/`Company` node | Precondition: investor already exists in the graph. |
+| `investor_name` | `firm_name` or `master_person.name` | Used for `name` and embedding text. |
+
+### Steps
+
+1. **Read thesis row** by `thesis_id`.
+2. **Resolve `investor_node_uuid`** from `master_person.node_uuid` or `master_company.node_uuid`.
+3. **Check `node_uuid`** on the thesis row. If set, that is the `InvestmentThesis` node UUID. If null, generate a new UUID.
+4. **Build embedding text**: `investor_name + "\n\n" + investor_narrative`.
+5. **Generate vector** via `google/gemini-embedding-001` with `dimensions: 1536`, then L2-normalize.
+6. **Build `thesis_payload`** as JSON of the thesis row, excluding `*_vector` arrays.
+7. **Execute parameterized Cypher** (recommended) or a sanitized string template.
+8. **Write `node_uuid` back** to the thesis row if it was generated.
+
+### Parameterized Cypher
+
+```cypher
+MATCH (investor:Entity {uuid: $investor_uuid})
+MERGE (investor)-[rel:HAS_INVESTMENT_THESIS]->(thesis:Entity:InvestmentThesis {uuid: $thesis_uuid})
+ON CREATE SET
+  thesis.created_at = timestamp(),
+  thesis.name = $thesis_name,
+  thesis.display_label = 'InvestmentThesis',
+  thesis.visibility = true
+SET
+  thesis.updated_at = timestamp(),
+  thesis.investor_uuid = $investor_uuid,
+  thesis.master_person_id = $master_person_id,
+  thesis.master_company_id = $master_company_id,
+  thesis.firm_name = $firm_name,
+  thesis.investor_type = $investor_type,
+  thesis.declared_thesis_summary = $declared_thesis_summary,
+  thesis.derived_thesis_summary = $derived_thesis_summary,
+  thesis.investor_narrative = $investor_narrative,
+  thesis.thesis_payload = $thesis_payload,
+  thesis.embeddings = vecf32($gemini_vec)
+SET
+  rel.uuid = coalesce(rel.uuid, randomUUID()),
+  rel.name = 'HAS_INVESTMENT_THESIS',
+  rel.description = $rel_description,
+  rel.created_at = coalesce(rel.created_at, timestamp()),
+  rel.updated_at = timestamp()
+RETURN thesis
+```
+
+Parameter values:
+
+| Parameter | Value |
+|---|---|
+| `$investor_uuid` | Investor graph node `uuid` |
+| `$thesis_uuid` | Existing or generated thesis node UUID |
+| `$thesis_name` | `investor_name + " Investment Thesis"` |
+| `$master_person_id` / `$master_company_id` | FKs from thesis row |
+| `$firm_name` | Investor name |
+| `$investor_type` | Thesis row `investor_type` |
+| `$declared_thesis_summary` / `$derived_thesis_summary` | Thesis row summaries |
+| `$investor_narrative` | Evidence narrative |
+| `$thesis_payload` | JSON string of thesis row minus vector arrays |
+| `$gemini_vec` | 1536-element float array |
+| `$rel_description` | `"{investor_name} has investment thesis"` |
+
+### Vectorization details
+
+- **Model**: `google/gemini-embedding-001`
+- **Dimension**: `1536`
+- **Similarity**: cosine; vectors must be L2-normalized before storage and before query.
+- **Embedding text template**:
+  ```
+  {investor_name}
+
+  {investor_narrative}
+  ```
+- **Fallback** (if `investor_narrative` is empty): use `declared_thesis_summary + " " + derived_thesis_summary`.
+
+In Go, a normalized vector can be produced with OpenRouter:
+
+```bash
+curl https://openrouter.ai/api/v1/embeddings \
+  -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "google/gemini-embedding-001",
+    "input": "text to embed",
+    "dimensions": 1536
+  }'
+```
+
+Then L2-normalize the returned array before binding it to the Cypher parameter.
+
+## Graph RAG integration
+
+The `semantic_question` graph-RAG path must be updated to retrieve `InvestmentThesis` nodes.
+
+### Current state
+
+`query/semantic-question` currently:
+1. Embeds the user query with `vectors/create-vectors-string` (OpenAI `text-embedding-3-small`).
+2. Searches `Entity(name_embedding)`.
+3. Returns a whitelisted subset of node properties.
+
+### Target state
+
+1. **Embed the query with Gemini** so the query vector is comparable to `InvestmentThesis.embeddings`:
+
+   ```xanoscript
+   function.run "vectors/create-gemini-vectors" {
+     input = { text_to_embedd: $input.query }
+   } as $embeddings
+   ```
+
+   In Go, call the same OpenRouter endpoint with `google/gemini-embedding-001` and `dimensions: 1536`.
+
+2. **Search the `embeddings` index**:
+
+   ```cypher
+   CALL db.idx.vector.queryNodes(
+     'Entity',
+     'embeddings',
+     10,
+     vecf32({{ $query_vec }})
+   ) YIELD node, score
+   ```
+
+3. **Expand one hop** and return context:
+
+   ```cypher
+   WITH node, score
+   ORDER BY score ASC
+   WITH collect({node: node, score: score}) as allResults, allResults[0].score as bestScore
+   UNWIND allResults as r
+   WITH r, bestScore
+   WHERE r.score < 0.85 AND r.score < bestScore + 0.35
+   WITH r.node as node, r.score as score
+   ORDER BY score ASC
+   WITH collect(node) as nodeList
+   UNWIND nodeList as n
+   OPTIONAL MATCH (n)-[r]-(m)
+   RETURN collect({properties: properties(n), score: score}) as nodes,
+          collect(DISTINCT {rel: r, head: n, tail: m}) as relData
+   ```
+
+4. **Return full properties for `InvestmentThesis` nodes**. The post-processing step should detect the `:InvestmentThesis` label and return all properties except `embeddings` / `embedded_at`, so the LLM receives `thesis_payload`, `investor_narrative`, summaries, and structured fields. For other nodes, keep the existing whitelist.
+
+### Cutover implications
+
+<Warning>
+  Switching `semantic_question` from `name_embedding` to `embeddings` aligns with the Go port (where `name_embedding` is deprecated), but older FalkorDB nodes that lack `embeddings` may drop out of semantic search. Before shipping, run a global backfill of `embeddings` for all `Entity` nodes, or keep a dual-search transitional branch.
+</Warning>
+
+## Acceptance test
+
+End-to-end retrieval test:
+
+1. **Seed**: Build or identify an investor with a thesis row and an `investor_narrative`.
+2. **Run graph sync**: Call the graph writer and capture `thesis_uuid`.
+3. **Graph assertions**:
+   - `MATCH (thesis:Entity:InvestmentThesis {uuid: $thesis_uuid}) RETURN thesis` returns one node.
+   - `MATCH (investor)-[:HAS_INVESTMENT_THESIS]->(thesis)` returns the investor and thesis.
+   - `thesis.investor_narrative` and `thesis.thesis_payload` match source data.
+   - `thesis.embeddings` is 1536-dim.
+4. **RAG assertion**: Call `semantic_question` with a phrase from `investor_narrative`.
+   - Response `nodes` contains an `InvestmentThesis` node with `thesis_payload` populated.
+   - Response contains the linked investor node and a `HAS_INVESTMENT_THESIS` edge.
+5. **Regression**: Run existing `semantic_question` queries and confirm no structural errors or recall collapse.
+
+## Risks & open questions
+
+| Risk / open question | Mitigation |
+|---|---|
+| `investor_narrative` is not a column on `investment_thesis` / `investment_theses` today. | Add a column, join `investor_evidence_narrative`, or pass it as a build-function parameter before implementation. |
+| `thesis_payload` can be large and may dominate LLM context. | Only one thesis node per investor; cap payload size or split into `summary_payload` + `full_payload` if needed. |
+| Parameterized Cypher support in the Go FalkorDB client must be verified. | Test on sandbox/staging first; fall back to a sanitized string template if parameter binding fails. |
+| `InvestmentThesis` nodes must carry `:Entity` for the vector index. | Enforce `:Entity:InvestmentThesis` in every Cypher pattern; reject writers that omit `:Entity`. |
+| Future Xano and Cloud Run paths may duplicate logic. | Keep the Cypher and payload-building logic in a shared Go package or document it for the Xano sync mirror. |
+
+## Related docs
+
+- [Investment thesis schema](./thesis-schema) — conceptual schema and prompts
+- [Xano production pipeline](./xano-pipeline) — current v1 implementation
+- [Find investors — AlloyDB build](/guides/open-work/vectors-alloydb/find-investors-engine) — AlloyDB migration plan
+- [Node Types](/guides/ontology/nodes) — Orbiter FalkorDB node conventions
+- [Indexes](/guides/ontology/all-indexes) — vector and scalar index reference

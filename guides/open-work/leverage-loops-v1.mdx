@@ -1,0 +1,215 @@
+---
+title: "Leverage Loops v1"
+description: "End-to-end flow of a leverage loop in Orbiter Universe: from the button click in the App to the ranked WHYs delivered back, with the API contract, every pipeline stage, the tables, and what is left."
+icon: "infinity"
+---
+
+<Info>
+  **Updated at: 2026-09-01.** First successful live end-to-end run in dev the same day (target Steven Goh, 9 candidates, 5 delivered suggestions). Implementation lives on branch `ORBIT-1848/synthetic-persona-builder` in `orbiter-universe`, uncommitted at time of writing.
+</Info>
+
+A leverage loop answers one question for a user: **who in my network should I introduce to this person, and why?** The App owns the user's contacts and the button; Universe owns the personas, the scoring, the WHY drafts, and the judge. The two talk through one POST, one webhook, and one GET.
+
+<Danger>
+  **Design constraints that shaped v1.** No `mode`, `intent`, or operator inputs — persona-to-persona matching finds **peers**, synthetic archetypes find **complements**, and the judge is told the operator knows everyone in the pool. The App **pushes** the candidate ids (who-knows-whom lives in the Orbiter database, and Universe never calls the App). No Anthropic models anywhere. Pathfinding was removed from the plan.
+</Danger>
+
+## Sub-pages
+
+<Columns cols={2}>
+  <Card title="Personas" icon="masks-theater" href="/guides/open-work/personas">
+    The nine-dimension persona schema every loop scores against.
+  </Card>
+  <Card title="Build Persona" icon="hammer" href="/guides/open-work/personas/build-persona">
+    The person-side build: evidence gate, prompt v0.8, GLM parameters.
+  </Card>
+  <Card title="Persona Build Design" icon="compass-drafting" href="/guides/open-work/personas/persona-build-design">
+    Design rationale for the nine dimensions and the pairwise compare.
+  </Card>
+  <Card title="New Build Plan" icon="list-check" href="/guides/open-work/personas/new-build-plan">
+    Context feed scoping for the persona build.
+  </Card>
+  <Card title="Scoring" icon="calculator" href="/guides/open-work/personas/scoring">
+    The compare-function scoring spec: Boltzmann pooling, sign inversion, z-scores.
+  </Card>
+</Columns>
+
+## The flow, step by step
+
+<Steps>
+  <Step title="User clicks Leverage Loop button after selecting a contact">
+    In the App, the user opens a contact — the **target** — and clicks **Leverage Loop**. The App already knows the user's network (the App's contact join table), so it assembles the candidate pool itself: every contact's Universe entity id. By design every contact already has a persona in Universe, so the whole list is scoreable.
+
+    The App mints a `suggestion_request_id` for this click. It tracks back to one user's request to make suggestions for one target, and it is the idempotency key: the same id always returns the same job.
+  </Step>
+
+  <Step title="App calls POST /v1/leverage-loops">
+    One request carries everything Universe needs. Authentication is the data-plane API key with scope `leverage_loops:run`.
+
+    <ParamField header="Authorization" type="string" required>
+      `Bearer {api_key}` — a client key holding the `leverage_loops:run` scope.
+    </ParamField>
+    <ParamField header="Content-Encoding" type="string">
+      `gzip` is accepted. A 20,000-contact pool is ~780 KB of uuids uncompressed, ~200 KB gzipped. Body cap is 8 MB.
+    </ParamField>
+
+    <ParamField body="suggestion_request_id" type="uuid" required>
+      The App's id for this request. 1:1 with a job; idempotent on retry. Rides on every row Universe writes for the loop.
+    </ParamField>
+    <ParamField body="target_entity_id" type="uuid" required>
+      The Universe entity id of the person the user wants to help. Merged-into chains are resolved to the canonical id.
+    </ParamField>
+    <ParamField body="candidate_entity_ids" type="uuid[]" required>
+      The user's network as Universe entity ids. The target, non-persons, and duplicates are dropped server-side.
+    </ParamField>
+    <ParamField body="callback_url" type="string">
+      Where Universe POSTs the finished loop. Omit to poll with `GET /v1/leverage-loops/{job_id}` instead.
+    </ParamField>
+
+    ```json Request
+    {
+      "suggestion_request_id": "43ed622d-d9e7-42c9-aeee-90ca7697cb1d",
+      "target_entity_id": "01a05c7e-a51e-7225-bde3-0d3cdd92108a",
+      "candidate_entity_ids": [
+        "01a05c7f-7442-7752-b0d1-0f6b8442ad54",
+        "01a05c7e-cc57-750b-a394-0f045d9aa383",
+        "01a05c7f-7225-72c2-89b0-402e21a07625"
+      ],
+      "callback_url": "https://app.orbiter.io/webhooks/leverage-loops"
+    }
+    ```
+
+    ```json Response 202
+    {
+      "data": {
+        "job_id": "01a05f8b-cdda-7a39-8e1f-8baf8ff5f6a6",
+        "suggestion_request_id": "43ed622d-d9e7-42c9-aeee-90ca7697cb1d",
+        "status": "queued",
+        "requested": true,
+        "target_entity_id": "01a05c7e-a51e-7225-bde3-0d3cdd92108a",
+        "scored_count": 0,
+        "dropped_count": 0
+      }
+    }
+    ```
+
+    Nothing runs inline. The API writes the job row (`persona.loop_jobs`, status `queued`) and publishes `persona.loop_requested`; the worker does the rest. Minutes of LLM and scoring work never block the request.
+  </Step>
+
+  <Step title="Universe resolves the candidate pool">
+    Stage `resolving`. One batch query canonicalizes every id (follows `merged_into` to the surviving person) and confirms it is a person Universe holds. The target and duplicates are dropped. A pool with zero survivors fails the job here, before anything is spent.
+  </Step>
+
+  <Step title="Universe builds three synthetic personas from the target">
+    Stage `persona`. The target's own persona must already exist. Universe then builds **three synthetic archetypes** — ideal-match personas of the people who would complement this target — from the target's persona (GLM 5.3 Flash, Kimi K3 as the diverse retry). Each archetype gets nine narratives and nine 1536-dim vectors in the same embedding space as real personas. Their ids are stamped on the job.
+  </Step>
+
+  <Step title="Universe scores every candidate in two lanes">
+    Stage `scoring`. One pgvector pass per archetype computes, per candidate, seven cosine similarities against the **target** persona and seven against the **archetype**. The compare engine (`internal/kernel/loopscore`, spec-exact) z-scores each dimension across the pool, clamps to ±3, pools the driver dimensions with a Boltzmann soft-max, and composes:
+
+    - **Peer lane** — similarity to the target persona (persona-to-persona).
+    - **Complement lane** — similarity to the best of the three archetypes (max across archetypes; the winning archetype is recorded).
+
+    Only the top 200 of each lane persist as rows in `persona.loop_scores`; the job row keeps `scored_count` and `dropped_count`. A 20k pool never writes 20k rows.
+  </Step>
+
+  <Step title="Universe clusters to 24, then checks the graph">
+    Stage `shortlisting`. The two lanes are interleaved — peer, complement, peer, complement — into a cluster of **24**. Each pick is then checked against FalkorDB: a **direct edge** between the target and the candidate means they already know each other, so the candidate is disqualified (`already_connected`) and the next best in that lane backfills. The gate runs after selection, so it costs ~24 graph lookups regardless of pool size.
+  </Step>
+
+  <Step title="Universe drafts a WHY for each of the 24">
+    Stage `generating`. For every shortlisted candidate one LLM call (Kimi K3, the port of Xano `leverage-loop-demo` #13376) writes a `headline` and a three-paragraph `why`: the mechanism, the chemistry, the two-way specifics.
+
+    The context is the **two real people only** — deep bio, social insights, and persona narratives as text (never embeddings, never the synthetic archetype). The archetype surfaced the candidate; the WHY is about the people. Drafts stage in `persona.loop_whys`. One failed draft costs one candidate, never the loop.
+  </Step>
+
+  <Step title="Universe verifies grounding">
+    Stage `verifying`. A cheap GLM pass per draft lists every claim the two contexts do not support. The result lands as `verifier_flags` on the WHY and the judge treats it as authoritative.
+  </Step>
+
+  <Step title="Universe judges the 24 on WHY quality and impact">
+    Stage `judging`. One listwise GLM call (reasoning high) sees all drafts in shuffled order with opaque ids, each tagged with its lane. The rubric: concrete two-way mechanism, lane fit, balance across lanes, grounding, chemistry, structure, novelty, and **impact** — what the introduction could plausibly change for the target. It returns up to **6** ranked picks with `mechanism` and `rationale`, rejections with reason codes, and `needs_rewrite` notes. The full verdict persists on the job, per candidate on `loop_whys`, and the picks in `persona.loop_suggestions`.
+  </Step>
+
+  <Step title="Universe delivers the suggestions back to the App">
+    Stage `delivering`. If a `callback_url` was given, Universe POSTs the payload below with an HMAC-SHA256 signature (`X-Orbiter-Signature: sha256=…`, key `LEVERAGE_LOOP_WEBHOOK_SECRET`), retrying with backoff. Whether or not the webhook lands, `GET /v1/leverage-loops/{job_id}` returns the same payload, so the App can always recover. The job settles `delivered`.
+
+    ```json Webhook body / GET data
+    {
+      "job_id": "01a05f8b-cdda-7a39-8e1f-8baf8ff5f6a6",
+      "suggestion_request_id": "43ed622d-d9e7-42c9-aeee-90ca7697cb1d",
+      "status": "delivered",
+      "target_entity_id": "01a05c7e-a51e-7225-bde3-0d3cdd92108a",
+      "suggestions": [
+        {
+          "suggestion_id": "01a05f8f-2c1e-7b0a-9d3e-4f5a6b7c8d9e",
+          "candidate_entity_id": "01a05c7f-7661-78e9-b93a-f04f866d8b9f",
+          "candidate_name": "Ben Eisenberg",
+          "lane": "peer",
+          "rank": 1,
+          "headline": "Ben's licensed data rebuilds what Steven's LinkedIn judgment deleted.",
+          "why": "Ben and Steven are a peer match with a real transaction baked in. …",
+          "mechanism": "customer",
+          "rationale": "Steven must rebuild NinjaPear's data backbone on licensed data …",
+          "flags": []
+        }
+      ]
+    }
+    ```
+
+    Per suggestion the App receives the **WHY** (`headline` + `why`), the **rank** (the judge's order, 1 to 6), the **entity id** and **full name** of the suggested person, the lane that surfaced them, and the judge's mechanism and rationale — all keyed on `suggestion_request_id`. The App upserts by `suggestion_id`, stores the `job_id`, and pushes to the user.
+  </Step>
+</Steps>
+
+## Tables
+
+All loop tables carry `suggestion_request_id` so the planned 30-day purge can sweep ranking and WHY rows by request.
+
+| Table | Holds | Keyed on |
+| --- | --- | --- |
+| `persona.loop_jobs` | The stage machine: status, candidate ids, archetype ids, counts, judge verdict, shuffle seed | `suggestion_request_id` (unique) |
+| `persona.loop_scores` | Top 200 per lane: the full `ScoredCandidate` (z-vectors, Boltzmann parts, driver attribution), lane, lane rank, shortlisted, dropped reason | `(job_id, lane, candidate)` |
+| `persona.loop_whys` | Staged WHY per shortlisted candidate: headline, why, verifier flags, judge verdict, rank, mechanism, rationale, reason, `needs_rewrite` | `(job_id, candidate)` |
+| `persona.loop_suggestions` | The final picks with lane, rank, headline, why, mechanism, rationale | `(job_id, rank)` |
+| `persona.person_personas` | Real people's nine narratives and vectors (the peer lane's basis) | `entity_id` |
+| `persona.synthetic_personas` | The archetypes built per loop (the complement lane's basis) | `id`, `request_id` |
+
+Stage statuses: `queued → resolving → persona → scoring → shortlisting → generating → verifying → judging → delivering → delivered | failed`. Every stage persists before advancing and the transition is guarded, so a crashed or redelivered job resumes where it stopped instead of restarting.
+
+## Models
+
+| Stage | Model | Notes |
+| --- | --- | --- |
+| Synthetic archetypes | `z-ai/glm-5.3-flash` (retry `moonshotai/kimi-k3`) | temp 1.0, reasoning high, 16k tokens |
+| WHY generator | `moonshotai/kimi-k3` | temp 0.6, 12k tokens, 180s — port of #13376 |
+| Verifier | `z-ai/glm-5.3-flash` | temp 0 |
+| Judge | `z-ai/glm-5.3-flash` | temp 0, reasoning high, 16k tokens |
+| Embeddings | `google/gemini-embedding-2` via OpenRouter | 1536 dims, one space for every persona vector |
+
+<Check>
+  **Everything in the final scope is in place.**
+
+  - Trigger contract: `suggestion_request_id`, target, pushed candidate pool, optional callback — no mode, intent, or operator inputs.
+  - Two lanes with no mode input: personas find peers, three synthetic archetypes find complements (max across archetypes).
+  - Scale path for a 20k-contact pool: batch canonicalization, one scoring pass, top-200-per-lane persistence, gzip request bodies.
+  - Cluster of 24 by interleaving lanes, then the graph gate on a direct edge, with backfill.
+  - WHY context is the two real people (deep bio, social insights, persona text); the archetype never enters the prompt.
+  - Verifier flags, listwise judge with lane and impact rubric, verdict persisted three ways.
+  - Signed webhook delivery plus GET recovery; suggestion payload carries WHY, rank, entity id, full name, lane, mechanism, rationale.
+  - Live run in dev: 9 candidates scored, 5 peer + 4 complement shortlisted, 5 selected, 4 rejected, `thin_results=false`.
+  - Unit tests green under the race detector, lint clean, whole repo builds.
+</Check>
+
+<Tip>
+  **What's left**
+
+  - Commit the branch. Nothing is committed yet; `ORBIT-1847` (the persona schema migration) must merge first.
+  - Wire the App: send the POST from the Leverage Loop button, receive the webhook, upsert by `suggestion_id`.
+  - WHY model retest: Kimi K3 today (port of #13376). Xano #13377 ran the same prompt on GLM 5.3 Flash for cost; the Aug 18 grounding canary ruled GLM out for the WHY, but the verifier stage now catches unsupported claims, so re-run the comparison. Judge and verifier model bake-off likewise pending.
+  - 30-day purge cron over `loop_scores`, `loop_whys`, `loop_suggestions` by `suggestion_request_id`.
+  - Sweep for jobs stuck mid-stage (the stage machine supports resume; nothing re-drives it yet).
+  - Regeneration loop for `needs_rewrite` candidates (re-draft, re-verify, no re-judge).
+  - Add the numeric lane score to the delivery payload next to `rank` if the App wants to display it.
+  - Global network-wide μ/σ for pools under 20 candidates (the engine supports it; nothing computes it yet).
+  - Remove or formalize the `cmd/*-smoke` harnesses before the PR.
+</Tip>

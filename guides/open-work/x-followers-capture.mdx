@@ -1,0 +1,332 @@
+---
+title: "X Followers Capture"
+sidebarTitle: "X Followers Capture"
+description: "Build outline for capturing and logging a user's X (Twitter) followers after they connect X via OAuth: the OAuth handoff, the capture function, the x_follower table schema (every field the API returns plus entity_id and profile_url), rate limits, and what already exists in Xano."
+icon: "x-twitter"
+iconType: "brands"
+---
+
+<Info>
+  **Build outline for Charles.** The OAuth bootstrap, token refresh, and a followers test harness already exist in Xano workspace 3 (listed below). The capture function and the `x_follower` table are **proposed** and not built. Anything marked TODO needs confirming before it is coded.
+</Info>
+
+## What this delivers
+
+When a user connects their X account to Orbiter, we capture every account that follows them and log one row per follower in a new `x_follower` table. Each row carries the full user object the X API returns, plus two Orbiter fields: `entity_id` (the Orbiter user whose follower this is) and `profile_url` (`https://x.com/{username}`). The rows feed the X-to-LinkedIn resolver and, later, the Known relationship layer.
+
+## Flow
+
+```mermaid
+sequenceDiagram
+    participant U as User (app)
+    participant X as X OAuth 2.0
+    participant EX as twitter-api-oauth-exchange (13390)
+    participant CAP as twitter-api-capture-followers (proposed)
+    participant API as X API v2
+    participant DB as x_follower
+
+    U->>X: Authorize (PKCE, scopes users.read follows.read offline.access)
+    X-->>U: redirect with code
+    U->>EX: code + redirect_uri + code_verifier (+ entity_id)
+    EX->>X: POST /2/oauth2/token
+    EX->>API: GET /2/users/me
+    EX->>EX: upsert x_oauth_token (grant_type user, x_user_id, entity_id)
+    EX->>CAP: start capture for entity_id
+    loop up to 15 pages per 15-minute window
+        CAP->>API: GET /2/users/:id/followers?max_results=1000&pagination_token=...
+        API-->>CAP: data[] + meta.next_token
+        CAP->>DB: upsert (entity_id, x_user_id), set profile_url
+    end
+    CAP->>CAP: checkpoint next_token, write run summary
+```
+
+<Steps>
+  <Step title="User connects X">
+    The app starts the X OAuth 2.0 authorization-code flow with PKCE. Request the scopes `users.read`, `tweet.read`, `follows.read`, and `offline.access`. The last one returns a refresh token so the capture can run again without the user present. The callback URL must match the X developer portal exactly.
+  </Step>
+  <Step title="Exchange the code and store the token">
+    The callback calls `twitter-api-oauth-exchange` (13390) with the code, redirect URI, and PKCE verifier. It exchanges the code at `/2/oauth2/token`, looks the account up at `/2/users/me`, and upserts the pair into `x_oauth_token` keyed by `x_user_id`.
+
+    **Change required:** `x_oauth_token` has no `entity_id` today, so a token row cannot be tied back to an Orbiter user. Add `entity_id` (int) to the table and accept it as an input on 13390. See the table notes below.
+  </Step>
+  <Step title="Start the capture">
+    On a successful exchange, call the proposed `twitter-api-capture-followers` with the `entity_id`. Run it async (`runtime_mode = "async-shared"`) or through a queue row so the OAuth callback returns immediately. The function reads the user-context token row in its own stack, pages the followers endpoint, and upserts rows.
+  </Step>
+  <Step title="Checkpoint and resume">
+    The followers endpoint allows 15 requests per 15-minute window per user, at up to 1,000 followers per request, so one window covers about 15,000 followers. Accounts larger than that need a checkpoint: store `next_token` and the page count on a capture-run row and let a scheduled task resume until `next_token` is empty.
+  </Step>
+  <Step title="Log the run">
+    Write one run-summary row per capture (followers seen, pages, duration, whether it completed) and telemetry to `log_crash` with a dedicated phase. `log_crash.phase` is a strict enum, so add the phase value before the first write or the logger itself fails.
+  </Step>
+  <Step title="Hand off downstream">
+    Each row's `profile_url` is the input to `temp/resolve-x-to-linkedin` (13399), which resolves a LinkedIn URL through PDL, search plus judge, and an Enrich Layer confirmation. Resolved rows are the candidates for `master_link` creation described in [Enrich via non-LinkedIn Scope](/guides/open-work/enrich-via-non-linkedin-scope).
+  </Step>
+</Steps>
+
+## What exists in Xano today
+
+<Card icon="play">
+
+```
+twitter-api-oauth-exchange — 13390
+```
+
+One-time bootstrap for the OAuth 2.0 user-context flow. Exchanges an authorization code (or, in seed mode, an existing refresh token) at `/2/oauth2/token` using env `X_CLIENT_ID` / `X_CLIENT_SECRET` as HTTP Basic, looks the account up via `/2/users/me`, and upserts the pair into `x_oauth_token` with `grant_type = user`. Inputs: `code`, `redirect_uri`, `code_verifier`, `refresh_token`. Needs an `entity_id` input added.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+twitter-api-token — 13391
+```
+
+Keeps a token row fresh. For `token_type = user` it refreshes the row at `/2/oauth2/token` when it expires within 5 minutes and writes the rotated pair back. It returns only the row id, never the token: Xano masks secret values returned through a nested `function.run`, so the caller must `db.get` the row in its own stack and build the `Authorization` header there.
+
+</Card>
+
+<Card icon="cloud-arrow-up">
+
+```
+twitter-api-followers — 13389
+```
+
+Test harness for `GET /2/users/:id/followers`. Takes a handle (or empty for the authorized account via `/2/users/me`), `max_pages` (1 to 15), and `pagination_token`. Pages at 1,000 followers per call and returns the target user, `followers[]`, `followers_total`, `pages_fetched`, and `next_token`. The paging loop and the token handling are the pieces the capture function should reuse.
+
+</Card>
+
+<Card icon="database">
+
+```
+x_oauth_token — 788
+```
+
+Columns: `grant_type` (enum user, app), `x_user_id` (text, unique), `username`, `access_token`, `refresh_token`, `expires_at`, `scope`, plus timestamps. Add `entity_id` (int) so the row maps to an Orbiter user, and index `(entity_id, grant_type)`.
+
+</Card>
+
+<Card icon="cloud-arrow-up">
+
+```
+temp/resolve-x-to-linkedin — 13399
+```
+
+Downstream consumer. Takes an X URL and resolves a LinkedIn URL through a ladder: self-declared link in the bio, PDL keyed on the handle, search plus LLM judge (OpenRouter web plugin or Parallel Search, judge model switchable), then an Enrich Layer pull that confirms the reverse edge. On a 60-follower sample it resolved about 30 percent of profiles that show a real name and a bio, and under 10 percent of the rest.
+
+</Card>
+
+<Card icon="wrench">
+
+```
+temp/test-x-to-linkedin-pdl — 13398
+```
+
+Smaller harness that runs only the PDL step for one X URL. Useful for checking whether PDL knows a handle before spending on search.
+
+</Card>
+
+## Proposed table: x_follower
+
+One row per (Orbiter user, follower). The column set is every field the API returns for the `user.fields` list the harness already requests, with `public_metrics` flattened, plus the two Orbiter fields at the front.
+
+<Warning>
+  X user ids are 64-bit snowflakes (for example `1367171255879671808`) and exceed the safe integer range. Store `x_user_id` as **text**, never int.
+</Warning>
+
+| Column | Type | Source | Notes |
+| --- | --- | --- | --- |
+| `id` | int | Xano | Primary key |
+| `created_at` | timestamp | Xano | Row created |
+| `updated_at` | timestamp | Xano | Row last written |
+| `entity_id` | int | Orbiter | The Orbiter user whose follower this is. Required. |
+| `profile_url` | text | derived | `https://x.com/{username}`. Written on every upsert so a handle change updates it. |
+| `x_user_id` | text | API `id` | Follower's X user id. Unique with `entity_id`. |
+| `username` | text | API `username` | Handle without the `@` |
+| `name` | text | API `name` | Display name |
+| `description` | text | API `description` | Bio |
+| `profile_image_url` | text | API `profile_image_url` | `_normal` size; swap the suffix for `_400x400` when displaying |
+| `location` | text | API `location` | Free text as typed by the user |
+| `url` | text | API `url` | Profile website, usually a `t.co` link |
+| `verified` | bool | API `verified` | Legacy verified flag |
+| `x_created_at` | timestamp | API `created_at` | When the follower's X account was created. Renamed to avoid the Xano system column. |
+| `followers_count` | int | API `public_metrics.followers_count` | |
+| `following_count` | int | API `public_metrics.following_count` | |
+| `tweet_count` | int | API `public_metrics.tweet_count` | |
+| `listed_count` | int | API `public_metrics.listed_count` | |
+| `like_count` | int | API `public_metrics.like_count` | |
+| `media_count` | int | API `public_metrics.media_count` | |
+| `protected` | bool | API `protected` | Add `protected` to `user.fields`. Protected accounts should be excluded from enrichment. |
+| `verified_type` | text | API `verified_type` | Add to `user.fields`. Values `blue`, `business`, `government`, `none`. |
+| `entities` | json | API `entities` | Add to `user.fields`. Carries expanded bio and website URLs, which is where self-declared LinkedIn links live. |
+| `raw` | json | API | The full user object as returned, so nothing is lost if the field list changes |
+| `first_seen_at` | timestamp | capture | First run that saw this follower |
+| `last_seen_at` | timestamp | capture | Most recent run that saw this follower |
+| `capture_run_id` | int | capture | Run that last touched the row |
+| `is_following` | bool | capture | False when a completed full run no longer returns this account |
+| `unfollowed_at` | timestamp | capture | Set when `is_following` flips to false |
+
+Indexes:
+
+- unique on `(entity_id, x_user_id)`, which makes the upsert idempotent
+- btree on `(entity_id, last_seen_at)` for the unfollow sweep
+- btree on `username` for handle lookups from the resolver
+
+<Tip>
+  Column validators (`min`, `max`, `filters=trim`) can only be set in the Xano UI, and the whole-schema metadata `PUT` deletes them irreversibly. Create the table in the UI or through the incremental `POST /table/{id}/schema/type/{type}` route, and enforce trimming and clamping in the function as well.
+</Tip>
+
+XanoScript sketch of the same table for reference. Verify the syntax against the XanoScript table reference before pushing; the field list is the contract, the syntax is not.
+
+{/* TODO(Charles): confirm table XanoScript syntax (index block shape) against the current XanoScript docs before creating. */}
+
+```xanoscript x_follower
+table "x_follower" {
+  schema {
+    int id
+    timestamp created_at?=now
+    timestamp updated_at?
+    int entity_id
+    text profile_url filters=trim
+    text x_user_id filters=trim
+    text username filters=trim
+    text name? filters=trim
+    text description?
+    text profile_image_url?
+    text location? filters=trim
+    text url? filters=trim
+    bool verified?
+    timestamp x_created_at?
+    int followers_count?
+    int following_count?
+    int tweet_count?
+    int listed_count?
+    int like_count?
+    int media_count?
+    bool protected?
+    text verified_type? filters=trim
+    json entities?
+    json raw?
+    timestamp first_seen_at?
+    timestamp last_seen_at?
+    int capture_run_id?
+    bool is_following?=true
+    timestamp unfollowed_at?
+  }
+
+  index = [
+    {type: "primary", field: [{name: "id"}]}
+    {type: "unique", field: [{name: "entity_id"}, {name: "x_user_id"}]}
+    {type: "btree", field: [{name: "entity_id"}, {name: "last_seen_at"}]}
+    {type: "btree", field: [{name: "username"}]}
+  ]
+}
+```
+
+### Companion table: x_follower_capture_run
+
+One row per capture attempt so large accounts can resume and so a completed run can drive the unfollow sweep.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | int | Primary key |
+| `created_at`, `updated_at` | timestamp | |
+| `entity_id` | int | Orbiter user |
+| `x_user_id` | text | The connected account being captured |
+| `status` | enum | `running`, `paused_rate_limit`, `complete`, `failed` |
+| `followers_total` | int | `public_metrics.followers_count` on the target at start |
+| `followers_seen` | int | Running count across pages |
+| `pages_fetched` | int | |
+| `next_token` | text | Empty when complete |
+| `started_at`, `finished_at` | timestamp | |
+| `error_message` | text | Last error, if any |
+
+## Proposed function: twitter-api-capture-followers
+
+Build it as a leaf function that reads the token row in its own stack, following the pattern in 13389. Returning tokens through a nested `function.run` gets them masked in the live runtime.
+
+**Inputs**
+
+| Input | Type | Notes |
+| --- | --- | --- |
+| `entity_id` | int | Required. Selects the user-context token row. |
+| `capture_run_id` | int | Optional. Resume an existing run; when empty, create one. |
+| `max_pages` | int | Default 15, the per-window budget. |
+
+**Stack outline**
+
+1. Load the `x_oauth_token` row for `entity_id` with `grant_type = user`. If `expires_at` is within 5 minutes, run `twitter-api-token` (13391) to refresh, then re-read the row. Throw when no row exists.
+2. Create or load the `x_follower_capture_run` row. Set `status = running`.
+3. Resolve the target: `x_user_id` from the token row, or `/2/users/me` when it is empty. Read `public_metrics.followers_count` into `followers_total`.
+4. Loop while `next_token` is not empty and `pages_fetched < max_pages`:
+   - `GET https://api.x.com/2/users/{x_user_id}/followers?max_results=1000&user.fields=id,username,name,description,profile_image_url,public_metrics,created_at,location,url,verified,protected,verified_type,entities` with the user-context bearer.
+   - On HTTP 429, set `status = paused_rate_limit`, store `next_token`, and return. The resume task picks it up after the window resets.
+   - For each item in `data[]`, `db.add_or_edit x_follower` on `(entity_id, x_user_id)` with every column above, `profile_url = "https://x.com/" ~ username`, `last_seen_at = now`, `capture_run_id`, and `is_following = true`. Set `first_seen_at` only when the row is new.
+   - Store `meta.next_token` on the run row after each page so a crash mid-run loses at most one page.
+5. When `next_token` comes back empty, set `status = complete` and run the unfollow sweep: rows for this `entity_id` whose `last_seen_at` predates `started_at` get `is_following = false` and `unfollowed_at = now`. Skip the sweep on partial runs.
+6. Write the run summary and a `log_crash` telemetry row with the new phase value.
+
+**Response**
+
+```json
+{
+  "capture_run_id": 1,
+  "status": "complete",
+  "followers_total": 13212,
+  "followers_seen": 13212,
+  "pages_fetched": 14,
+  "next_token": "",
+  "new_rows": 13212,
+  "updated_rows": 0,
+  "unfollowed": 0
+}
+```
+
+**Resume task.** A scheduled task every 15 minutes queries runs with `status = paused_rate_limit` and calls the function with their `capture_run_id`. Keep the task inactive until the function is verified; a task created without `active = false` ships live.
+
+## Rate limits and access tier
+
+{/* TODO(Charles): confirm current limits and tier on developer.x.com before sizing the resume task. */}
+
+- `GET /2/users/:id/followers` allows 15 requests per 15-minute window per user in user context, at up to 1,000 results per request. That is roughly 15,000 followers per window, so a 250,000-follower account takes about 17 windows, or a little over 4 hours, on the resume task.
+- The followers lookup is not on the free X API tier. Confirm the app's tier includes it before the OAuth screen goes in front of users.
+- Rate limits are per connected user, so many users capturing at once do not contend with each other, but the app-wide limit still applies. Cap concurrent runs on the resume task.
+
+## Sample follower record
+
+This is one item from `data[]` as the harness returns it today, with the current `user.fields` list. Adding `protected`, `verified_type`, and `entities` extends it without changing anything shown here.
+
+```json
+{
+  "created_at": "2021-03-03T17:53:34.000Z",
+  "description": "",
+  "id": "1367171255879671808",
+  "name": "TheJ0y",
+  "profile_image_url": "https://pbs.twimg.com/profile_images/1367171530665250818/ndCHGAGi_normal.jpg",
+  "public_metrics": {
+    "followers_count": 100,
+    "following_count": 1056,
+    "like_count": 6099,
+    "listed_count": 6,
+    "media_count": 1,
+    "tweet_count": 1013
+  },
+  "url": "",
+  "username": "th3j0yy",
+  "verified": false
+}
+```
+
+The row this produces starts with `entity_id = <user>` and `profile_url = https://x.com/th3j0yy`, then the fields above.
+
+## Open questions
+
+1. **Token to user mapping.** `x_oauth_token` is keyed by `x_user_id` only. Do we allow more than one X account per Orbiter user? If yes, the unique index becomes `(entity_id, x_user_id)` and the capture runs once per connected account.
+2. **Refresh cadence.** Capture once at connect time, then nightly? Weekly? The unfollow sweep only works on completed full runs, so cadence sets how fresh `is_following` is.
+3. **Following as well as followers.** `/2/users/:id/following` has the same shape and limits. The Known model may want both directions; the table would need a `direction` column or a sibling table.
+4. **Protected and empty profiles.** Protected accounts and accounts that fail the resolver's gate (no real name, no bio) are stored but should not be enriched. Decide whether they appear in the app at all.
+5. **Retention.** Bios and locations are personal data supplied by third parties. Decide how long to keep rows for users who disconnect X.
+
+## Related
+
+- [Enrich via non-LinkedIn Scope](/guides/open-work/enrich-via-non-linkedin-scope) covers what happens when a bare X profile URL reaches `get-add/master-person-new`.
+- [Person entry points](/guides/enrichment/waterfall/person-entry-points) shows where `mvp/link/scrape-twitter-person` sits in the LinkedIn-first waterfall.

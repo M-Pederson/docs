@@ -1,0 +1,450 @@
+---
+title: "Phase 1: YouTube Adapter"
+sidebarTitle: "Phase 1: YouTube"
+description: "Agent-grade build spec for the first buildable slice of the speaking & media lane: YouTube interview channels only, roster-driven, in orbiter-universe. Why there is no podcast spine to extend, what the adapter writes to AlloyDB and the Universe graph, the YouTube Data API quota design, the extraction and resolution contracts, the build order, and the smoke tests."
+---
+
+**Status: build spec, nothing built (2026-09-05).** This page narrows the [Speaking & Media Co-Occurrence](/guides/open-work/roadmap/media-co-occurrence) lane to its Phase 1 — the **YouTube adapter, roster channels only** — and pins it to `orbiter-universe` (AlloyDB `universe.*`, the Universe FalkorDB graph, Cloud Run, Pub/Sub). Conferences (Phase 2), GDELT (Phase 3), and the person-side `search.list` entry points are **out of scope here**.
+
+<Warning>
+  **There is no "podcast spine" to extend.** The parent page describes YouTube as "three more source adapters on the podcast pipeline's spine" and tells the builder to read "the podcast lane docs". No such lane exists: nothing in Mintlify documents a podcast ingestion pipeline, `orbiter-universe` has no podcast code, and the only podcast-shaped thing anywhere is the Deep Bio ledger mapping `works[].type = podcast` rows to a **planned** `APPEARED_IN` edge (`deepbio/edges.go`, status `EdgePlanned`, no writer). So this page is **self-contained**: the YouTube adapter *is* the spine. It registers the `MediaAppearance` node and the `APPEARED_IN` edge, owns their storage, and exposes the writer the Deep Bio podcast rows will call when that writer lands. "Simulcast dedup against the podcast episode store" becomes a nullable `episode_ref` slot filled in later, not a Phase 1 dependency.
+</Warning>
+
+## What the adapter actually does
+
+Short answer: it turns a curated list of YouTube interview channels into `MediaAppearance` nodes (one per video) and `APPEARED_IN` edges from people the graph can identify, behind a gate. People are **never invented from a name**.
+
+| Layer | Written by Phase 1 | Not written by Phase 1 |
+| --- | --- | --- |
+| **GCS** | Verbatim `videos.list` items (`youtube/videos/<video_id>.json`) and playlist pages (`youtube/playlists/<channel_id>/<page>.json`) | Captions, transcripts, thumbnails |
+| **AlloyDB `universe.*` — lane tables** | `media_source_roster` (channels, hosts, status), `media_video_queue` (per-video work), `media_appearance` (one row per video, owns the graph node), `media_appearance_mention` (one row per extracted participant), `media_resolution_attempt` (append-only), `media_appearance_edge` (edge ledger), `media_youtube_quota` (daily unit ledger) | Event / session tables, `news_comention_rollup` |
+| **AlloyDB `universe.*` — backbone** | `person` entities **only** through a strong key (a LinkedIn URL in the description or found by Exa) or an adjudicated match; `enrichment_queue` rows at **tier 4** for newly minted people; `enrichment_attempts` rows per provider call | Name-only person stubs; typed-cache columns; any `entity_facts` row (a `MediaAppearance` is not an entity, so appearances are edge-ledger rows, not relationship facts — see [Storage model](#storage-model)) |
+| **Universe graph** | `MediaAppearance:Entity` nodes (new node kind, MERGE key proposed below — **Mark must confirm the key before the first graph write**, per the repo rule); `Person:Entity` nodes for newly minted strong-key people; **`APPEARED_IN`** edges, weight **15** (`host` / `guest`) or **20** (`panelist`), via a new `graph.MergeAppearedIn` | `Event` nodes, `PART_OF`, `CO_MENTIONED_WITH`, any pair edge (co-appearance derives at score time); any edge while `MEDIA_EDGE_WRITES_ENABLED=false` |
+| **Dispatch** | Nothing. No `entity.enrich_requested`, no Deep Bio. | Recursive enrichment |
+
+Everything is idempotent: re-polling a channel with no new uploads changes nothing; re-processing a video changes nothing.
+
+## Dependencies
+
+### Credentials and config
+
+| Env var | Type | Default / value | Used for |
+| --- | --- | --- | --- |
+| `YOUTUBE_API_KEY` | **new secret** (Secret Manager, `--set-secrets`) | — | YouTube Data API v3. Create in the GCP console on the Universe project: enable **YouTube Data API v3**, create an API key, **restrict it to that API**. Public data only, no OAuth. Empty disables the feature. |
+| `YOUTUBE_BASE_URL` | config | `https://www.googleapis.com/youtube/v3` | — |
+| `YOUTUBE_DAILY_UNIT_BUDGET` | int | `9000` | Hard ceiling this lane will spend of the project's 10,000 units/day (resets midnight Pacific) |
+| `YOUTUBE_SEARCH_UNIT_BUDGET` | int | `0` | Reserved for person-side `search.list` (100 units each). **0 in Phase 1** = the search path is compiled but never called |
+| `MEDIA_YOUTUBE_ENABLED` | flag | `false` | Constructs the feature |
+| `MEDIA_YOUTUBE_QUEUE_DRAIN_ENABLED` | flag | `false` | Video queue drain |
+| `MEDIA_YOUTUBE_QUEUE_DRAIN_MAX_ROWS` | int | `25` | Videos per drain tick |
+| `MEDIA_YOUTUBE_MAX_VIDEOS_FIRST_RUN` | int | `500` | Hard limit until acceptance passes twice (parent page) |
+| `MEDIA_EDGE_WRITES_ENABLED` | flag | `false` | **The Stage-1 gate** |
+| `MEDIA_MAX_NEW_PERSONS_PER_RUN` | int | `50` | Strong-key leaf creations per tick |
+| `MEDIA_AUTO_LINK_THRESHOLD` / `MEDIA_REVIEW_THRESHOLD` | float | `0.85` / `0.60` | Adjudication floors |
+| `MEDIA_EXTRACT_MODEL` | config | `google/gemini-3.1-flash-lite` | Participant extraction, reasoning off, strict JSON (#12984 tier-1) |
+| `MEDIA_ADJUDICATE_MODEL` | config | `google/gemini-3-flash-preview` | #12677 v5 adjudication, temperature 0.1 |
+| `OPENROUTER_API_KEY`, `EXA_API_KEY`, `GCS_BUCKET`, `GCS_MODE` | existing | — | LLM, Stage-B search, raw cache |
+
+All parsed in `internal/platform/config`, added to `.env.example` (**WORKER ENVS** for polling/extraction/resolution, **API ENVS** for the admin endpoints) in the same PR.
+
+<Tip>
+  **Quota math decides the design.** `channels.list`, `playlistItems.list` and `videos.list` cost **1 unit** per call; `search.list` costs **100**. A 1,000-video channel costs ~20 playlist pages + ~20 `videos.list` batches of 50 ids ≈ **40 units**. The whole Phase 1 roster backfill fits in one day's quota with room to spare; a single day of person-side searching would burn it all. Hence roster-first, search off.
+</Tip>
+
+### GCP resources
+
+| Resource | New? | Notes |
+| --- | --- | --- |
+| Cloud Run `orbiter-universe-worker` / `orbiter-universe` | no | Handlers and admin routes live in the existing binaries |
+| Pub/Sub `universe-enrichment-events` | no | New `event_type` values on the existing topic |
+| Cloud Scheduler `media-youtube-poll` (hourly) and `media-youtube-drain` (every 5 min) | **yes** | Created disabled; enabled by the flags above |
+| Cloud Scheduler `media-resolution-sweep` (weekly) | **yes** | Re-resolves `unresolved` mentions |
+| Secret `youtube-api-key` | **yes** | Mounted as `YOUTUBE_API_KEY` on both services |
+| GCS prefix `youtube/` on the existing bucket | **yes** | No new binding |
+
+### Repo seams the feature consumes
+
+`entitiespub.Resolver` (`ResolveStrong("linkedin", …)`, `MatchIdentifiers`), `entitiespub.Registrar`, `entitiespub.ReviewFiler`, the enrichment attempt ledger, `enrichment/fanoutlimit` + the queue writer (tier-4 leaves), `platform/graph` (`MergePerson`, plus the two new writers below), `platform/gcs`, `platform/llm.Caller`, `clients/exa`, `platform/httpx`, `platform/pubsub`. A new client `internal/clients/youtube`. Declared as narrow interfaces in the feature; wired in `internal/app`.
+
+## Storage model
+
+A `MediaAppearance` is **not** an entity: nothing enriches it, nothing cascades from it, and it never drains through `enrichment_queue` (the rule that gates entity-hood). It is a **support row that owns a graph node**, the `music_release` / `music_place` shape: `video_id` UNIQUE, `graph_node_uuid`, `graph_written_at`, a partial index over the unwritten tail as the sweep queue. Because `entity_facts.value_entity_id` can only point at an entity, a person's appearance cannot be a relationship fact; it is a row in the lane's own edge ledger, exactly like `music_support_edges` (music D-35).
+
+```sql
+-- +goose Up
+-- YouTube adapter, Enrichment Engine v1.2 speaking & media lane, Phase 1.
+-- Spec: Mintlify guides/open-work/roadmap/media-co-occurrence/phase-1-youtube.
+
+CREATE TABLE universe.media_source_roster (
+    id                      UUID  PRIMARY KEY,
+    source                  TEXT  NOT NULL,                 -- youtube (Go-validated)
+    external_id             TEXT  NOT NULL,                 -- channel id (UC…)
+    handle                  TEXT,                           -- @handle, as entered
+    name                    TEXT  NOT NULL,
+    kind                    TEXT  NOT NULL DEFAULT 'interview',  -- interview | panel | mixed
+    status                  TEXT  NOT NULL DEFAULT 'proposed',   -- proposed | approved | paused | retired
+    known_hosts             JSONB NOT NULL DEFAULT '[]',    -- [{name, linkedin_url?, person_entity_id?}]
+    uploads_playlist_id     TEXT,                           -- UU… (UC → UU), or contentDetails.relatedPlaylists.uploads
+    backfill_state          TEXT  NOT NULL DEFAULT 'pending',    -- pending | running | done
+    last_polled_at          TIMESTAMPTZ,
+    last_seen_published_at  TIMESTAMPTZ,                    -- incremental high-water mark
+    proposed_by             TEXT,
+    approved_by             TEXT,
+    approved_at             TIMESTAMPTZ,
+    notes                   TEXT,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT media_source_roster_uniq UNIQUE (source, external_id)
+);
+
+CREATE TABLE universe.media_video_queue (
+    id              UUID  PRIMARY KEY,
+    roster_id       UUID  NOT NULL REFERENCES universe.media_source_roster(id) ON DELETE CASCADE,
+    video_id        TEXT  NOT NULL,
+    published_at    TIMESTAMPTZ,
+    priority_tier   INT   NOT NULL DEFAULT 4,
+    mode            TEXT  NOT NULL DEFAULT 'backfill',    -- backfill | incremental
+    count           INT   NOT NULL DEFAULT 1,
+    locked_at       TIMESTAMPTZ,
+    locked_by       TEXT,
+    attempts        INT   NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    next_attempt_at TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT media_video_queue_video_uniq UNIQUE (video_id)
+);
+CREATE INDEX media_video_queue_pick
+    ON universe.media_video_queue (priority_tier, published_at DESC, id) WHERE locked_at IS NULL;
+
+CREATE TABLE universe.media_appearance (
+    id                   UUID  PRIMARY KEY,
+    source               TEXT  NOT NULL,                  -- youtube | podcast (podcast rows arrive later, via mediapub)
+    appearance_key       TEXT  NOT NULL,                  -- "youtube::<video_id>" — the proposed graph MERGE key
+    video_id             TEXT,                            -- YouTube anchor
+    episode_ref          TEXT,                            -- podcast anchor; NULL in Phase 1 (simulcast slot)
+    roster_id            UUID  REFERENCES universe.media_source_roster(id) ON DELETE SET NULL,
+    channel_external_id  TEXT,
+    channel_name         TEXT,
+    title                TEXT  NOT NULL,
+    description_excerpt  TEXT,                            -- first 500 chars, for reviewers
+    published_at         TIMESTAMPTZ,
+    duration_seconds     INT,
+    url                  TEXT  NOT NULL,
+    raw                  JSONB NOT NULL,                  -- verbatim videos.list item
+    raw_storage_key      TEXT,                            -- GCS copy of the same
+    extraction           JSONB,                           -- the strict-JSON participants payload
+    extraction_model     TEXT,
+    extracted_at         TIMESTAMPTZ,
+    participant_count    INT   NOT NULL DEFAULT 0,
+    graph_node_uuid      UUID,
+    graph_written_at     TIMESTAMPTZ,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT media_appearance_key_uniq UNIQUE (appearance_key)
+);
+CREATE UNIQUE INDEX media_appearance_video_uniq
+    ON universe.media_appearance (video_id) WHERE video_id IS NOT NULL;
+CREATE INDEX media_appearance_node_pending
+    ON universe.media_appearance (id) WHERE graph_written_at IS NULL;
+
+CREATE TABLE universe.media_appearance_mention (
+    id                     UUID  PRIMARY KEY,
+    appearance_id          UUID  NOT NULL REFERENCES universe.media_appearance(id) ON DELETE CASCADE,
+    ordinal                INT   NOT NULL,
+    name_as_extracted      TEXT  NOT NULL,
+    name_normalized        TEXT  NOT NULL,                -- entitiespub.NormalizeKey("name", …)
+    role                   TEXT  NOT NULL,                -- host | guest | panelist | unknown
+    identity_points        JSONB NOT NULL DEFAULT '{}',   -- {title, employer, linkedin_url, twitter_handle, other}
+    evidence_quote         TEXT,
+    extraction_confidence  TEXT,                          -- high | medium | low
+    resolution_state       TEXT  NOT NULL DEFAULT 'unresolved',
+                                 -- unresolved | auto_linked | needs_review | rejected | excluded
+    person_entity_id       UUID  REFERENCES universe.entities(id) ON DELETE SET NULL,
+    resolution_method      TEXT,   -- roster_host | linkedin_strong | prior_channel | affiliation | adjudicated
+    resolution_confidence  NUMERIC(4,3),
+    review_item_id         UUID,
+    resolved_at            TIMESTAMPTZ,
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT media_appearance_mention_uniq UNIQUE (appearance_id, ordinal)
+);
+CREATE INDEX media_appearance_mention_unresolved
+    ON universe.media_appearance_mention (name_normalized) WHERE resolution_state = 'unresolved';
+
+CREATE TABLE universe.media_resolution_attempt (
+    id          UUID  PRIMARY KEY,
+    mention_id  UUID  NOT NULL REFERENCES universe.media_appearance_mention(id) ON DELETE CASCADE,
+    method      TEXT  NOT NULL,
+    candidates  JSONB NOT NULL DEFAULT '[]',
+    model       TEXT,
+    confidence  NUMERIC(4,3),
+    outcome     TEXT  NOT NULL,      -- auto_linked | needs_review | rejected | no_candidates | error | cap_deferred
+    detail      JSONB,
+    cost_usd    NUMERIC(10,6),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE universe.media_appearance_edge (
+    id                UUID  PRIMARY KEY,
+    person_entity_id  UUID  NOT NULL REFERENCES universe.entities(id) ON DELETE CASCADE,
+    appearance_id     UUID  NOT NULL REFERENCES universe.media_appearance(id) ON DELETE CASCADE,
+    mention_id        UUID  REFERENCES universe.media_appearance_mention(id) ON DELETE SET NULL,
+    role              TEXT  NOT NULL,      -- host | guest | panelist
+    weight            INT   NOT NULL,      -- 15 | 20
+    graph_edge_uuid   UUID,
+    graph_written_at  TIMESTAMPTZ,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT media_appearance_edge_uniq UNIQUE (person_entity_id, appearance_id)
+);
+CREATE INDEX media_appearance_edge_pending
+    ON universe.media_appearance_edge (id) WHERE graph_written_at IS NULL;
+
+-- Daily unit ledger. One row per Pacific-time day; CAS updates like music_rate_limit.
+CREATE TABLE universe.media_youtube_quota (
+    day             DATE PRIMARY KEY,
+    units_used      INT  NOT NULL DEFAULT 0,
+    units_search    INT  NOT NULL DEFAULT 0,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- +goose Down
+DROP TABLE universe.media_youtube_quota;
+DROP TABLE universe.media_appearance_edge;
+DROP TABLE universe.media_resolution_attempt;
+DROP TABLE universe.media_appearance_mention;
+DROP TABLE universe.media_appearance;
+DROP TABLE universe.media_video_queue;
+DROP TABLE universe.media_source_roster;
+```
+
+<Note>
+  **The MERGE key needs Mark's call before the first write** (`CLAUDE.md`: always ask before choosing CREATE vs MERGE for a new node type). Proposal: `MediaAppearance:Entity {appearance_key}` with `appearance_key = "<source>::<anchor>"` — `youtube::<video_id>` here, `podcast::<episode_url>` when the Deep Bio rows arrive. Composite, lowercased, `::`-joined, the house idiom (`region_key`, `city_key`). The node uuid is the row id (the 2026-08-12 rule: a created node's uuid is its owning row's id). Rejected alternative: keying on `video_id` alone, which leaves no room for a podcast episode that later gains a video.
+</Note>
+
+### Graph contracts
+
+**Node** `MediaAppearance:Entity` (new, `platform/graph/media.go`, `MergeMediaAppearance`): `uuid` (= row id), `appearance_key`, `entity_type: 'MediaAppearance'`, `source`, `title`, `valid_from` (publish date, `YYYY-MM-DD`), `video_id`, `episode_ref` (omitted when null), `via_roster` (channel name), `channel_external_id`, `url`, `source_urls`, `confidence`, `description` = `"Episode of {channel}: {title}"` with `description_generated_at`, `created_at` / `updated_at`, and `embeddings` of `"{title} — {channel}"` with `embedding_model` + `embedding_dimensions` (mandatory beside any vector). ON MATCH: `updated_at` only.
+
+**Edge** `(Person:Entity {uuid})-[:APPEARED_IN]->(MediaAppearance:Entity {uuid})` (new, `platform/graph/media_edges.go`, `MergeAppearedIn`): MATCH both endpoints (never create a stub), `edgeIdentitySet` (v7 uuid from Go, stable `created_at`), `role`, `weight` set ON CREATE only (15 host/guest, 20 panelist), `mention_ref` = `media_appearance_mention:<id>`, `source: youtube`, `source_urls`, `confidence`, `description` = `"{Person} appeared in {title} as {role} on {channel}."`. Keyed on the endpoint pair.
+
+## Pipeline
+
+```text
+roster (approved)  ──hourly poll──►  uploads playlist pages  ──►  media_video_queue (upsert on video_id)
+                                                                          │  every 5 min: media.queue_drain_requested
+                                                                          ▼
+   ┌──── Stage A: fetch + extract ─────────────────────────────────────────────────────────────┐
+   │ videos.list (≤50 ids / call) → media_appearance.raw + GCS                                 │
+   │ deterministic pre-pass: LinkedIn URLs, @handles, "with X" / "ft. X" / "| X" patterns      │
+   │ LLM tier-1 extraction (metadata only) → participants[] → media_appearance_mention rows    │
+   └────────────────────────────────────────────────────────────────────────────────────────────┘
+                                                                          ▼
+   ┌──── Stage B: resolution (per mention) ──────────────────────────────────────────────────────┐
+   │ roster_host → linkedin_strong → prior_channel → affiliation → adjudication → unresolved      │
+   └────────────────────────────────────────────────────────────────────────────────────────────┘
+                                                                          ▼
+   ┌──── Stage C: node + ledger + gated edge ───────────────────────────────────────────────────┐
+   │ MergeMediaAppearance (always) · media_appearance_edge upsert · MEDIA_EDGE_WRITES_ENABLED    │
+   │ → MergeAppearedIn → ledger stamp                                                            │
+   └────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Roster and polling
+
+- The roster is **config seeded from a file**, not hand-inserted: `gcpseed/data/media_source_roster.json` loaded by a `media-source-roster` seeder (`make seed ONLY=media-source-roster`), upsert on `(source, external_id)`. Phase 0 fills it with ~5 interview channels resolved through `channels.list?forHandle=<handle>` (1 unit each) so the file carries the `UC…` id and the uploads playlist id. Candidate handles to verify in Phase 0: `@20VC`, `@LennysPodcast`, `@AllInPodcast` (co-host panel shape, so `panelist` gets exercised), plus one entertainment-only channel as the negative control.
+- Only `status = approved` rows are polled. Proposals (`proposed`) come in through `POST /v1/admin/media/roster` and are approved by a human — the founder-approval rule from the parent page.
+- **Backfill** (`backfill_state = pending`): enumerate the uploads playlist oldest → newest, 50 per page (`playlistItems.list`, 1 unit/page), upserting `media_video_queue` rows keyed on `video_id` (re-enumeration is a no-op). Mark `done` and set `last_seen_published_at`.
+- **Incremental** (hourly): first page only; stop at the first `publishedAt <= last_seen_published_at`.
+- **Quota ledger**: before every API call `UPDATE media_youtube_quota SET units_used = units_used + $cost WHERE day = $today AND units_used + $cost <= $budget RETURNING units_used` (insert the day row first, `ON CONFLICT DO NOTHING`). A zero-row update means the budget is spent: the handler releases its rows with `next_attempt_at = next Pacific midnight` and returns cleanly. A `403 quotaExceeded` from the API forces the ledger to the budget for the day. `search.list` charges against `units_search` and `YOUTUBE_SEARCH_UNIT_BUDGET` (0 → the call is refused before it is made).
+
+### Stage A: fetch and extract
+
+1. **Fetch** — drain claims ≤ `MEDIA_YOUTUBE_QUEUE_DRAIN_MAX_ROWS` queue rows, batches ids into `videos.list?part=snippet,contentDetails,statistics&id=<≤50 ids>` (1 unit per call regardless of id count). Store each item verbatim in `media_appearance.raw` and GCS; `title`, `description_excerpt`, `published_at`, `duration_seconds` (ISO-8601 duration parsed), `url = https://www.youtube.com/watch?v=<id>`. Skip and mark `excluded` when `snippet.liveBroadcastContent = upcoming` or the item is missing (private/deleted → `attempts` capped, `last_error = video_unavailable`).
+2. **Deterministic pre-pass** on title + description: LinkedIn profile URLs (`linkedin.com/in/…`, normalized with `entitiespub.NormalizeKey("linkedin", …)`), X/Twitter handles, and the name patterns `with <Name>`, `ft. <Name>`, `feat. <Name>`, `<Name> | <Channel>`, `<Name> on <topic>`, `Ep. N: <Name>`. These seed `identity_points` and are handed to the LLM as hints, never as truth.
+3. **LLM extraction** — `MEDIA_EXTRACT_MODEL`, reasoning off, strict JSON, validated by `platform/llm.Caller.CompleteJSON`; the parent page's v0.1 prompt verbatim (channel, known hosts, title, description → `participants[]` with `name`, `role`, `identity_points`, `evidence_quote`, `confidence`). Rules the validator enforces: every participant has a non-empty `evidence_quote` that is a substring of the input; known hosts default to `host`; ≥ 3 non-host participants → all non-hosts become `panelist`; a response with zero participants is valid and cheap (the negative-control path). Store the payload in `media_appearance.extraction`.
+4. **Mentions** — one row per participant, `ordinal` in response order, `name_normalized` via `NormalizeKey("name")`. A participant whose name equals a known host → `role = host`.
+
+### Stage B: resolution (stop at the first hit; every step appends an attempt row)
+
+1. **`roster_host`** — the mention matches a `known_hosts[]` entry that carries `person_entity_id` → `auto_linked` at 1.0. A known host with only a `linkedin_url` resolves through step 2 once and the roster row is back-filled with the entity id.
+2. **`linkedin_strong`** — `identity_points.linkedin_url` present → `ResolveStrong("linkedin", url, "person")` find-or-create → `auto_linked` at 0.98. A **created** entity is a leaf: `graph.MergePerson` (name + embedding), `AttachIdentifier` soft `name`, then `fanoutlimit.Bound.Offer` → `enrichment_queue` at **tier 4**, depth 1, `source_function = media.youtube`, `seed_entity_id` = nil (no cascade root — the appearance is not an entity). Counted against `MEDIA_MAX_NEW_PERSONS_PER_RUN` and the person cap.
+3. **`prior_channel`** — the same `name_normalized` was `auto_linked` on an earlier appearance of the **same channel** → inherit (repeat guests, co-hosts).
+4. **`affiliation`** — `MatchIdentifiers("person", [name])` soft candidates; a candidate whose chosen `current_title` / `current_company` facts agree with `identity_points.title` / `employer` is corroboration #1; a second independent point (X handle on a `master_links` row, or a prior appearance) is #2. Two → `auto_linked` at 0.90; one → adjudicate.
+5. **`adjudication`** — `MEDIA_ADJUDICATE_MODEL`, temperature 0.1, the #12677 v5 shape (`match: yes|no|none`, `candidate`, `confidence`, `reasoning`, `same_name_different_person`) over the full mention context (title, description excerpt, channel, evidence quote, identity points) plus each candidate's summary. `≥ MEDIA_AUTO_LINK_THRESHOLD` with two corroborations → `auto_linked`; name-only capped at 0.59 (#13168); `[0.60, 0.85)` → `needs_review` via `ReviewFiler.FileReviewItem` (`ambiguous_soft_match`, evidence kind `name`); else `unresolved`.
+6. **Exa** is used only when steps 1–4 produced **no** candidate and the mention carries at least one identity point besides the name: `clients/exa.Search` with `"<name>" <employer> <title> linkedin`, domain filter `linkedin.com`, surname-in-slug guard → adjudicate → on success `ResolveStrong("linkedin")` as in step 2. A bare name with no identity points is **not** searched (it would only ever produce name-only matches).
+7. **No candidate** → `unresolved`, name-anchored, retried weekly by `media.resolution_sweep_requested` (steps 3–4 free; 5–6 monthly).
+
+### Stage C: node, ledger, gated edge
+
+1. `MergeMediaAppearance` for every appearance row with `graph_written_at IS NULL` — **regardless of the gate**: the node is the anchor other lanes (Deep Bio podcast rows, later conference sessions) attach to. Stamp `graph_node_uuid` (= row id) and `graph_written_at`.
+2. For every `auto_linked` mention, upsert `media_appearance_edge` on `(person, appearance)` with `role` and `weight` (15 host/guest, 20 panelist).
+3. When `MEDIA_EDGE_WRITES_ENABLED`: `MergeAppearedIn` for ledger rows with `graph_written_at IS NULL`; stamp `graph_edge_uuid` + `graph_written_at`. The partial index is the sweep queue when the gate opens later (`media.edge_sweep_requested`).
+
+### Events and endpoints
+
+| Event | Payload | Handler |
+| --- | --- | --- |
+| `media.roster_poll_requested` | `{}` | For each approved roster row: backfill if pending, else incremental page; upserts `media_video_queue` |
+| `media.queue_drain_requested` | `{}` | Claim rows, Stage A→C, delete on success; `attempts++` / `last_error` / linear backoff on failure; lock reaper |
+| `media.resolution_sweep_requested` | `{}` | Re-resolve `unresolved` mentions per the cadence |
+| `media.edge_sweep_requested` | `{}` | Pending nodes and, if the gate is open, pending edges |
+
+Management plane (`RequireUser` + `RequireAdminRole`, `/v1/`, `pmw.OK` envelope, struct-tag validation):
+
+- `GET /v1/admin/media/roster` · `POST /v1/admin/media/roster` `{ "source":"youtube", "handle":"@20VC", "kind":"interview", "known_hosts":[{"name":"Harry Stebbings","linkedin_url":"…"}] }` (resolves the channel id via `channels.list forHandle`, 1 unit) · `POST /v1/admin/media/roster/{id}/approve` · `POST /v1/admin/media/roster/{id}/backfill` (re-arms `backfill_state`).
+- `GET /v1/admin/media/appearances?channel=&state=` — appearance and mention census.
+- `POST /v1/admin/media/drain` `{ "max_rows": 5 }` — one synchronous drain pass (sandbox stepping).
+- `GET /v1/admin/media/quota` — today's ledger.
+
+OpenAPI fragment `api/media.openapi.yaml`; lint before merge.
+
+## Package layout
+
+```text
+internal/features/media/
+├─ module.go  types.go  http_types.go  http_mappers.go  handler.go  service.go  repo.go  worker.go  events.go
+├─ youtube_gate.go        seam adapters (entities / enrichment / graph) — never in module.go
+├─ youtube_roster.go      roster poll, backfill/incremental, high-water mark
+├─ youtube_quota.go       the CAS ledger (pure SQL through repo)
+├─ youtube_extract.go     pre-pass + LLM extraction + validator      (+ _test.go, golden fixtures)
+├─ youtube_resolve.go     the ladder                                  youtube_edges.go   ledger + gate + writers
+├─ queries/media.sql      sqlc bucket → db/
+└─ testdata/youtube/<channel_id>/{channel.json, playlist_page_*.json, videos_*.json, golden/*.json}
+internal/features/media/mediapub/     AppearanceWriter — the seam the Deep Bio podcast writer will call
+internal/clients/youtube/             channels.list, playlistItems.list, videos.list, search.list; httpx.RetryPolicy with
+                                       RetryStatus (403 quotaExceeded terminal, 429/5xx retry), BeforeAttempt = quota reservation
+internal/platform/graph/media.go + media_edges.go   MergeMediaAppearance, MergeAppearedIn
+```
+
+Plus: `cross-feature-media` depguard block; `Media`/`YouTube` config structs; `.env.example`; `gcpseed/data/media_source_roster.json` + seeder; universe-schema skill entries + decision-log line; new `.claude/skills/media-enrichment/SKILL.md` with the D-numbered decisions; `internal/features/media/TODO.md`.
+
+## Build plan for the agent
+
+Read first: repo `CLAUDE.md`; `.claude/skills/universe-schema/SKILL.md`; `.claude/skills/music-enrichment/SKILL.md` (support rows + support edges, the shape this lane copies); [Go Developer Notes](/guides/enrichment/waterfall/go-developer-notes); the [parent lane page](/guides/open-work/roadmap/media-co-occurrence) for invariants; [Edges → APPEARED_IN](/guides/ontology/edges#appeared_in). Fake adapters first, daily merges.
+
+<Steps>
+  <Step title="1. Fixtures before code (Phase 0)">
+    With a real key, resolve the candidate handles (`channels.list forHandle`), record channel ids + uploads playlist ids in `gcpseed/data/media_source_roster.json`, and capture for **one** interview channel: the channel item, every uploads playlist page, and the `videos.list` items (raw JSON under `testdata/youtube/<channel_id>/`). Capture 20 items from the negative-control channel. Note units spent in the manifest. **Done when:** the recorded corpus replays through a fake server; per-channel unit cost is ≤ 50 for a 1,000-video channel; the extraction prompt is run once over 30 recorded videos in the LLM Test Harness and the metadata-only guest yield is written into `TODO.md` (the Phase 0 measurement the parent page asks for).
+  </Step>
+  <Step title="2. Migration, sqlc, config, docs">
+    `make migration name=media_youtube_init` with the DDL above; sqlc bucket; config + `.env.example`; depguard; skill docs; roster seeder. **Done when:** `make lint` / `make test` green and the migration is surfaced for a human to apply.
+  </Step>
+  <Step title="3. YouTube client + quota ledger">
+    `clients/youtube` behind `httpx.Do`; `BeforeAttempt` reserves units through the ledger; `RetryStatus` treats 403 `quotaExceeded` as terminal for the day. **Done when:** unit tests cover budget exhaustion mid-batch (rows released with `next_attempt_at` = Pacific midnight), 429-then-200, and an unavailable video.
+  </Step>
+  <Step title="4. Roster poll + queue">
+    Backfill and incremental enumeration with the high-water mark; queue upsert. **Done when:** a recorded 40-page channel lands every video once, a second poll is a no-op, and an incremental poll stops at the first seen video.
+  </Step>
+  <Step title="5. Stage A with fake LLM">
+    Fetch, raw + GCS, pre-pass, extraction, mentions. **Done when:** golden mention rows match for 30 fixture videos; the negative control yields zero mentions for all 20; re-processing a video is a no-op.
+  </Step>
+  <Step title="6. Stage B with fake Exa + fake adjudicator">
+    The ladder, attempts, review filing, caps, tier-4 leaves through `fanoutlimit`. **Done when:** ST-3's controls pass and every mention carries a complete attempt chain.
+  </Step>
+  <Step title="7. Graph writers + ledger + gate">
+    `MergeMediaAppearance` (after Mark confirms the MERGE key), `MergeAppearedIn`, ledger, sweep. **Done when:** gate closed → nodes exist, zero edges; gate open → one edge per pair, `created_at` stable across two runs, weights are 15 or 20; acceptance queries zero twice.
+  </Step>
+  <Step title="8. Wire, deploy to dev, run for real">
+    Events, scheduler jobs (disabled), secret, OpenAPI. Run ST-1 → ST-3 against the real API with the gate closed and `MEDIA_YOUTUBE_MAX_VIDEOS_FIRST_RUN = 500`; open the gate for the fixture channel; acceptance twice; register QA checks; then lift the cap. **Done when:** the parent page's Phase 1 definition of done holds: roster full-history mentions landed, the duplicate-appearance assertion green, edges behind the gate.
+  </Step>
+</Steps>
+
+## Smoke tests
+
+### ST-1 — Roster channel, full history (parent ST-1 without the podcast dedup)
+
+**Input:** `POST /v1/admin/media/roster` for the fixture channel → approve → backfill → drain until the queue is empty.
+
+```json
+{
+  "enumeration": { "videos_found": "<count from manifest>", "quota_units_spent_max": 60 },
+  "appearances": { "rows": "== videos_found", "nodes_written": "== videos_found", "duplicate_video_ids": 0 },
+  "mentions": { "videos_with_participants_ratio_range": [0.5, 1.0], "host_defaulted": true },
+  "resolution": { "auto_linked_via_linkedin_strong_gte": 1, "persons_created_from_bare_name": 0 },
+  "edges_with_gate_closed": 0,
+  "enrich_events_published": 0
+}
+```
+
+**Pass criteria:** zero `media_appearance` rows share a `video_id`; every appearance has `graph_node_uuid` and a node with `appearance_key`; known-host defaulting holds on every video; total units for the fixture stay in double digits; re-running backfill + drain changes nothing.
+
+### ST-2 — One video with a LinkedIn URL in the description
+
+**Input:** enqueue a single fixture `video_id` whose description carries the guest's LinkedIn URL.
+
+**Expected:** the guest mention resolves `linkedin_strong`; if the profile was unknown, exactly one `person` entity is created with a strong `linkedin` identifier, one `Person:Entity` node, one `enrichment_queue` row at tier 4 with `source_function = media.youtube`, and **zero** `entity.enrich_requested` events; the host resolves `roster_host`; with the gate open, two `APPEARED_IN` edges (host 15, guest 15) whose `mention_ref` points at the right rows.
+
+### ST-3 — Negative controls (fixture harness, fakes)
+
+| Control | Assert |
+| --- | --- |
+| Entertainment-only channel, 20 videos | 20 appearances, 0 mentions, 0 entities, extraction cost recorded per video |
+| Common name, no identity points | not searched, `unresolved`, 0 entities |
+| Common name with employer, three candidates, one corroboration | `needs_review`, one open review row (stable across re-runs) |
+| Name mentioned as a topic ("discussing Elon Musk's…") | excluded by the extractor (evidence-quote rule), no mention |
+| Four named participants on one video | non-hosts stored as `panelist`, weight 20 in the ledger |
+| Budget = 5 units, batch needs 6 | rows released with `next_attempt_at` at Pacific midnight, no API call beyond budget |
+| Gate closed | nodes written, ledger populated, zero `MergeAppearedIn` calls |
+| Same channel drained twice | zero new rows, edge `created_at` unchanged |
+| `MEDIA_MAX_NEW_PERSONS_PER_RUN = 1`, two creatable mentions | second attempt outcome `cap_deferred` |
+
+### Acceptance queries (zero rows required, run twice)
+
+```sql
+SELECT id FROM universe.media_appearance_edge WHERE role NOT IN ('host','guest','panelist');
+SELECT id FROM universe.media_appearance_edge
+ WHERE (role IN ('host','guest') AND weight <> 15) OR (role = 'panelist' AND weight <> 20);
+SELECT video_id FROM universe.media_appearance WHERE video_id IS NOT NULL GROUP BY video_id HAVING count(*) > 1;
+SELECT e.id FROM universe.media_appearance_edge e
+ JOIN universe.media_appearance a ON a.id = e.appearance_id
+ WHERE e.graph_written_at IS NOT NULL AND a.graph_node_uuid IS NULL;
+SELECT en.id FROM universe.entities en
+ JOIN universe.enrichment_queue q ON q.entity_id = en.id AND q.source_function = 'media.youtube'
+ WHERE NOT EXISTS (SELECT 1 FROM universe.entity_identifiers i WHERE i.entity_id = en.id AND i.is_strong_identity);
+SELECT day FROM universe.media_youtube_quota WHERE units_used > 9000 OR units_search > 0;
+```
+
+```cypher
+MATCH (p:Person)-[r:APPEARED_IN]->(m:MediaAppearance)
+WHERE r.role IS NULL OR r.mention_ref IS NULL OR r.uuid IS NULL OR r.created_at IS NULL
+RETURN r.uuid
+MATCH (m:MediaAppearance) WITH m.appearance_key AS k, count(*) AS n WHERE n > 1 RETURN k, n
+MATCH ()-[r:CO_APPEARED_WITH|CO_PANELISTS]->() RETURN count(r)
+```
+
+A repo test also greps `internal/clients/youtube` for `captions` and fails if the string appears: invariant 4 (no caption or transcript path in v1) enforced by CI, not by review.
+
+### QA registration
+
+Extend the `qa-the-sandbox` registry with: queue quiescence (no lock older than TTL, no row at max attempts); appearance/mention census with denominators (`vacuous` on zero); node ledger vs graph parity (`graph_written_at` rows ↔ `MATCH (m:MediaAppearance)` count); edge ledger vs graph parity; the six SQL queries; the daily unit ledger vs `YOUTUBE_DAILY_UNIT_BUDGET`; zero `entity.enrich_requested` from `media.youtube`.
+
+## Cost and volume
+
+YouTube Data API is free inside quota; the Phase 1 roster fits in a single day. First run of 500 videos: extraction ≈ \$0.50 on `gemini-3.1-flash-lite`, a few hundred adjudications ≈ \$3–8, Exa on identity-pointed mentions only ≈ \$2–5. GCS negligible. No vendor person-enrichment spend: leaves sit at tier 4.
+
+## Decisions to record
+
+| # | Decision | Default on this page | Why it needs a signature |
+| --- | --- | --- | --- |
+| D1 | `MediaAppearance` is a **support row owning a node**, not an entity; person→appearance is an edge-ledger row, not a relationship fact | as above | Fixes the node kind's place in the four-layer model |
+| D2 | Graph MERGE key `appearance_key = "<source>::<anchor>"` | `youtube::<video_id>` | The mandatory CREATE-vs-MERGE ask |
+| D3 | No person entity from a bare name; strong key or adjudicated match only; Exa only with identity points | as above | Same deviation as the 990 lane's D4 |
+| D4 | Strong-key leaves get a tier-4 `enrichment_queue` row and no dispatch; no `seed_entity_id` | tier 4 | Uses the person drain's tier ≤ 1 pickup as the guarantee |
+| D5 | Podcast reconciliation is a nullable `episode_ref` filled by a future writer; this lane owns `MediaAppearance` and exposes `mediapub.AppearanceWriter` | as above | Replaces the parent page's non-existent podcast spine |
+| D6 | Person-side `search.list` is compiled but budget-locked at 0 in Phase 1 | off | Quota economics; the parent page's entry points #2/#3 move to Phase 1.5 with a quota-increase request |
+| D7 | Nodes are written regardless of the gate; only edges wait | as above | Other lanes anchor to the node |
+
+## Open questions
+
+1. **MERGE key** — confirm D2, or name a different anchor rule.
+2. **Roster v1** — confirm the five channels once the handles resolve in Phase 0.
+3. **Podcast writer ownership** — when Deep Bio's `works[].type = podcast` writer lands, it calls `mediapub.AppearanceWriter` with `podcast::<episode_url>`; confirm that is the seam rather than a second `MediaAppearance` writer.
+4. **Quota increase** — request it before Phase 1.5 (person-side search), not mid-backfill.
+
+## References
+
+- [Speaking & Media Co-Occurrence](/guides/open-work/roadmap/media-co-occurrence) (parent lane) · [Edges → APPEARED_IN](/guides/ontology/edges#appeared_in) · [Edge Weights](/guides/ontology/edge-weights)
+- [YouTube Data API v3](https://developers.google.com/youtube/v3) · [quota](https://developers.google.com/youtube/v3/getting-started#quota) · [playlistItems.list](https://developers.google.com/youtube/v3/docs/playlistItems/list)
+- [Universe Lookup Tables](/guides/open-work/orbiter-univers-standalone/universe-lookup-tables) · [Go Developer Notes](/guides/enrichment/waterfall/go-developer-notes)

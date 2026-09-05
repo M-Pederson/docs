@@ -16,7 +16,10 @@ tags:
       Data-plane enrichment triggers: the company get-or-create entry gate (scope enrich:company) and the person one (enrich:person). The two scopes are independent.
   - name: Projections
     description: |
-      Versioned packages consumers read and upsert from. Row-derived projections carry an entity's attributes; the graph-derived subgraph projection carries its relationships, including edge types that have no backing row.
+      Versioned packages consumers read and upsert from. Row-derived projections carry an entity's attributes; the graph-derived subgraph projection carries its relationships, including edge types that have no backing row. Graph search finds ids a consumer does not yet hold; graph paths says how two entities connect.
+  - name: Persona
+    description: |
+      The persona build trigger (scope persona:build). Asks for a person's nine-dimension profile; the work runs in a worker, so the call reports what it set in motion rather than the persona itself.
   - name: Graph
     description: |
       Operator-only graph seeding (scope graph:seed). Not part of the consumer contract — self-hosted clients never call these.
@@ -157,6 +160,83 @@ paths:
           $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/Internal'
+  /v1/graph/search:
+    post:
+      operationId: searchGraph
+      tags:
+        - Projections
+      summary: Find graph nodes by meaning
+      description: |
+        Returns the nodes nearest the query, each with its one-hop edges, in the same node/edge shape as the subgraph projection.
+        The counterpart to the subgraph read: that one needs an id you already hold, this one is how you find an id you do not. The query is embedded server-side with the same model that wrote the node vectors — vectors from two models are not comparable, so a consumer cannot supply its own vector.
+        score is a DISTANCE: lower is closer, and 0 would be identical. Matched nodes carry it and sort first; a node pulled in by expansion has score null and is_match false. Relevance is cut both absolutely and relative to the best hit, so a query with one good answer returns one node no matter what limit says — limit is an upper bound, not a page size, and there is no pagination.
+        Geography, expertise and tombstoned nodes are excluded, as in the subgraph read: both are hubs that connect everyone to everyone.
+        A client with entity-type entitlements is narrowed to those types automatically; asking only for types it may not read is a 403, not an empty result. Neighbours are not filtered by entity type — a match's surroundings describe it, and cutting them would misdescribe it.
+        Requires scope `graph:search`.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GraphSearchRequest'
+      responses:
+        '200':
+          description: |
+            The matched nodes and their one-hop edges. An empty nodes array means nothing was close enough, which is a normal answer.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphSearchEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /v1/graph/paths:
+    post:
+      operationId: findGraphPaths
+      tags:
+        - Projections
+      summary: Find how source entities reach a target entity
+      description: |
+        Returns the best route from each source entity to the target, one path per source that can reach it.
+        Ids are entity ids, not graph node uuids: an entity id is what a consumer stores, and it resolves through the merge chain. Every path echoes both the canonical and the requested source id so a stored reference can be healed.
+        Fewest hops wins per source; ties and ordering across sources go by total_weight, where LOWER is stronger — the weight scale is a distance, so paths come back strongest first.
+        Geography and expertise are excluded from every route: both are hubs that connect everyone to everyone, so a path through one is not a connection anybody can act on. This is policy, not an option.
+        A source with no route within max_hops is listed in unreachable_source_entity_ids. One that could not be traversed at all — unknown to Universe, or not yet written to the graph — is listed in skipped_source_entity_ids instead, and never silently dropped. 404 means the TARGET is not in the graph yet.
+        Entitlements are checked on the target only. An interior node is part of how two entities connect, not something the response hands over: it carries a name and type, never a property bag.
+        Requires scope `graph:paths`.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GraphPathsRequest'
+      responses:
+        '200':
+          description: |
+            One path per reachable source, strongest first, plus what could not be reached or traversed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphPathsEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
   /v1/enrichment/companies/get-add:
     post:
       operationId: getAddCompany
@@ -211,6 +291,51 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PersonShellEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /v1/persona/persons/{id}:
+    post:
+      operationId: buildPersona
+      tags:
+        - Persona
+      summary: Ask for a person's persona
+      description: |
+        Asks for the nine-dimension persona of one person: nine narratives, each embedded as its own vector, so people are matched dimension against the same dimension rather than as one averaged profile. Nothing is built by the time this returns. A synthesis runs for tens of seconds, so the work happens in a worker and this call only ever decides what to set in motion. Read `status` to know which: `exists` (200) means a persona built inside the freshness window already covers this person and nothing was started; `building` (202) means the evidence is present and a worker has the job; `queued` (202) means evidence is missing, whatever was absent has been started, and the person waits for it. A persona needs a deep bio and social insights, both of which take minutes to produce. When either is absent this call launches it and parks the person, and `started` names what it launched. Asking again while they wait is safe and cheap: it bumps a counter rather than queueing them twice, and starts nothing that is already running. Requires scope `persona:build`, which is independent of `enrich:person` — a client may be entitled to enrich a person without paying for their persona.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The canonical universe entity id of the person.
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BuildPersonaRequest'
+      responses:
+        '200':
+          description: A persona inside the freshness window already exists.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PersonaBuildEnvelope'
+        '202':
+          description: A build was started, or the person was queued for one.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PersonaBuildEnvelope'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -298,6 +423,52 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PersonSocialInsightsEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /v1/enrichment/persons/{id}/deep-research:
+    post:
+      operationId: personDeepResearch
+      tags:
+        - Enrichment
+      summary: Return a person's Deep Bio, or research one (plus social insights) without the full pipeline
+      description: |
+        For people enriched WITHOUT deep research: returns the stored Deep Bio when a successful run is younger than the freshness window (`DEEP_BIO_FRESHNESS_DAYS`, 90 by default), else launches one under every pipeline guard — confirmed name, something on file to research beyond the name, the daily spend cap, and single-flight (a live job is joined, never duplicated). Social insights chain automatically when the bio lands; a fresh hit that has no insights yet asks for them and reports `social_insights_requested: true`. Requires scope `deep_research:person` — the most expensive call this system makes, sold apart from `enrich:person`. `status` is `fresh` (200, `deep_bio` filled), `skipped` (200, see `skip_reason`, nothing spent), `created` or `already_running` (202). Poll by calling again: the same call returns `fresh` once the bio has landed and distilled. `force: true` re-researches inside the window; the daily cap still applies.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeepResearchRequest'
+      responses:
+        '200':
+          description: A fresh bio, or a typed skip.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeepResearchEnvelope'
+        '202':
+          description: A job was created or is already running; poll by calling again.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeepResearchEnvelope'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -424,6 +595,58 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '500':
           $ref: '#/components/responses/Internal'
+  /v1/backfill/graph/indexes/ensure:
+    post:
+      operationId: ensureGraphVectorIndexes
+      tags:
+        - Graph
+      summary: Create the graph's vector indexes when absent
+      description: |
+        Operator-only, idempotent. Creates the Entity vector indexes (`embeddings` for consumer search, `expert_embeddings` for the SPECIALIZES_IN rebuild) at the embedder's width with cosine similarity. An index the graph already holds is left alone, never dropped and rebuilt.
+        Needed because FalkorDB errors rather than falling back to a scan when a queried vector index is missing, so a graph without them fails every vector read. The API also runs this at boot; this route is how a graph created later, or one whose index was dropped, is repaired without a redeploy.
+        Requires an authenticated admin user (role `admin`); consumer API keys are rejected.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: One entry per index, with created=false when it was already there.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - data
+                  - error
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      required:
+                        - label
+                        - property
+                        - dimensions
+                        - created
+                      properties:
+                        label:
+                          type: string
+                          example: Entity
+                        property:
+                          type: string
+                          example: embeddings
+                        dimensions:
+                          type: integer
+                          example: 1536
+                        created:
+                          type: boolean
+                  error:
+                    type: 'null'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
   /v1/backfill/graph/wipe:
     post:
       operationId: wipeGraph
@@ -431,7 +654,7 @@ paths:
         - Graph
       summary: Wipe enrichment-created graph nodes and/or table rows
       description: |
-        Operator-only, DESTRUCTIVE. `target` selects what dies — `nodes` (default): one bounded batch of nodes whose labels are outside the reference keep-set (Country, Region, City, DomainExpertise, SubDomainExpertise) — or, with `entity_type`, only that scope's labels (company = Company + Funding_Round; person = Person + its credential nodes Work, Certification, Honor; film_tv = Film_TV + Film_TV_Award; music = Music_Group, Release_Group, Recording, Music_Work, Event plus the Release and Place support nodes) — plus the write-back ledgers nulled (entities graph_node_uuid / graph_written_at, entity_addresses graph_written_at, funding_rounds graph_node_uuid / raised_edge_uuid) so replay rebuilds them; round caveat: with rows kept, cleared round uuids require a table-side reset before deals reprocess or duplicates land. `tables`: one-transaction delete of enrichment-written ROWS — theses, typed caches, entities and every ON DELETE CASCADE dependent (identifiers, facts, payloads, attempts, queue, satellites, dates, rounds, profiles) — plus fundables.deals.processed_at reset so the fanout re-materializes rounds (mirror data itself untouched); no graph calls. `all`: tables first, then a node batch. Seeded reference rows and nodes always survive. Do not run while enrichment/queue drain is active. Requires `confirm: true`; re-run while `has_more` is true (node batches; table wipes are one-shot). Requires an authenticated admin user (role `admin`); consumer API keys are rejected.
+        Operator-only, DESTRUCTIVE. `target` selects what dies — `nodes` (default): one bounded batch of nodes whose labels are outside the reference keep-set (Country, Region, City, DomainExpertise, SubDomainExpertise) — or, with `entity_type`, only that scope's labels (company = Company + Funding_Round; person = Person + its credential nodes Work, Certification, Honor; film_tv = Film_TV + Film_TV_Award; music = Music_Group, Release_Group, Recording, Music_Work, Event plus the Release and Place support nodes; company and person also take the InvestmentThesis nodes their investors own, selected through the HAS_INVESTMENT_THESIS edge because the thesis label is shared) — plus the write-back ledgers nulled (entities graph_node_uuid / graph_written_at, entity_addresses graph_written_at, funding_rounds graph_node_uuid / raised_edge_uuid) so replay rebuilds them; round caveat: with rows kept, cleared round uuids require a table-side reset before deals reprocess or duplicates land. `tables`: one-transaction delete of enrichment-written ROWS — theses, typed caches, entities and every ON DELETE CASCADE dependent (identifiers, facts, payloads, attempts, queue, satellites, dates, rounds, profiles) — plus fundables.deals.processed_at reset so the fanout re-materializes rounds (mirror data itself untouched); no graph calls. `all`: tables first, then a node batch. Seeded reference rows and nodes always survive. Do not run while enrichment/queue drain is active. Requires `confirm: true`; re-run while `has_more` is true (node batches; table wipes are one-shot). Requires an authenticated admin user (role `admin`); consumer API keys are rejected.
       security:
         - bearerAuth: []
       requestBody:
@@ -443,21 +666,29 @@ paths:
               properties:
                 confirm:
                   type: boolean
+                  const: true
                   description: Must be true — guards against stray POSTs.
                 limit:
                   type: integer
-                  description: Nodes per batch (default 1000, max 10000).
+                  description: |
+                    Nodes per batch (default 1000, max 10000). CLAMPED, not rejected: a value at or below zero becomes the default and one above the max becomes the max, so no limit is ever a validation failure.
                 entity_type:
                   type: string
+                  enum:
+                    - company
+                    - person
+                    - film_tv
+                    - music
                   description: |
-                    Optional scope; omit to wipe every non-reference node. Known scopes: company, person, film_tv, music. `music` is the one umbrella — it covers all five music entity types (music_group, music_release_group, music_recording, music_work, music_event) plus the music_release / music_place support rows and the artist / label satellite profiles, because they are one pipeline.
+                    Optional scope; omit to wipe every non-reference node. `music` is the one umbrella — it covers all five music entity types (music_group, music_release_group, music_recording, music_work, music_event) plus the music_release / music_place support rows and the artist / label satellite profiles, because they are one pipeline.
                 target:
                   type: string
                   enum:
                     - nodes
                     - tables
                     - all
-                  description: What dies; omitted = nodes.
+                  description: |
+                    What dies; OPTIONAL, and omitted means `nodes`. Unlike `/graph/purge-entity`, where a target is required: that call names one live row, this one is scoped and batched.
               required:
                 - confirm
       responses:
@@ -468,7 +699,24 @@ paths:
               schema:
                 $ref: '#/components/schemas/WipeResultEnvelope'
         '400':
-          $ref: '#/components/responses/BadRequest'
+          description: |
+            The body failed validation. `error.details` lists EVERY failing field in one response, keyed by the JSON name you sent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                data: null
+                error:
+                  code: VALIDATION_FAILED
+                  message: validation failed
+                  details:
+                    - field: confirm
+                      issue: required
+                    - field: entity_type
+                      issue: oneof
+                meta:
+                  requestId: 6f1c2f7e-2b21-4a0b-9c3a-9a1f2d3e4b55
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -602,7 +850,7 @@ paths:
                   items:
                     type: string
                   description: |
-                    Entitlement scopes — data plane only (read:entity, read:person, read:company, read:film_tv, projections:pull, subgraph:read, investor_narrative:read, corrections:propose, enrich:company, enrich:person, enrich:film_tv, social_media_insights:company, social_media_insights:person). Unknown scopes are rejected; management actions are role-guarded and have no scope.
+                    Entitlement scopes — data plane only (read:entity, read:person, read:company, read:film_tv, projections:pull, subgraph:read, graph:search, graph:paths, investor_narrative:read, corrections:propose, enrich:company, enrich:person, enrich:film_tv, social_media_insights:company, social_media_insights:person, deep_research:person). Unknown scopes are rejected; management actions are role-guarded and have no scope.
                 entitlements:
                   type: object
                   description: |
@@ -718,6 +966,81 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /v1/admin/enrichment/persons/social-insights/backfill:
+    post:
+      operationId: backfillPersonSocialInsights
+      tags:
+        - Enrichment
+      summary: Request social insights for persons whose Deep Bio never chained one (management plane)
+      description: |
+        A Deep Bio landing now chains a forced social-insights rebuild. Persons researched before that chain existed hold a distilled Deep Bio and no insights; this publishes one forced request per such person. **Management plane, staff only** — a WorkOS session with role `admin`, never a consumer API key, because each request is a paid LLM build (~90s) plus two web searches. One bounded batch per call. Requests are asynchronous, so a person leaves the backlog only once the build lands; calling again inside that window asks for the same people again. A person whose build failed in the last day is skipped so one bad subject is not re-bought on every call. `remaining` is true when the batch filled — call again until it is false.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: |
+            Persons to request in this batch. Omitted uses the server default (25); values above the server ceiling (200) are clamped.
+          schema:
+            type: integer
+            minimum: 1
+        - name: dry_run
+          in: query
+          required: false
+          description: When `true`, counts the backlog and publishes nothing.
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: The batch result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SocialInsightsBackfillEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /v1/admin/enrichment/persons/social-insights/persist:
+    post:
+      operationId: persistPersonSocialInsights
+      tags:
+        - Enrichment
+      summary: Decode stored social-insights payloads into the person_social_insights rows (management plane)
+      description: |
+        Closes the gap for insights runs that landed before the satellite table existed: for every person whose latest `social_insights` payload has no row, the payload is decoded into one. No LLM call and no provider spend; `model` stays null because the envelope never carried it. **Management plane, staff only** — a WorkOS session with role `admin`. One bounded batch per call; `remaining` is true when the batch filled.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: |
+            Persons to persist in this batch. Omitted uses the server default (25); values above the server ceiling (200) are clamped.
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        '200':
+          description: The batch result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SocialInsightsPersistEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '500':
           $ref: '#/components/responses/Internal'
   /v1/admin/agents/deep-bio/sweep:
@@ -915,6 +1238,18 @@ components:
           type:
             - string
             - 'null'
+        logo_storage_key:
+          type:
+            - string
+            - 'null'
+          description: The object key behind `logo`, when Universe re-hosts it.
+        logo_url_expires_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: |
+            When `logo` stops working. Null means permanent; set means a short-lived lease that must not be stored long term.
         domain:
           type:
             - string
@@ -988,6 +1323,8 @@ components:
         - aliases
         - legal_name
         - logo
+        - logo_storage_key
+        - logo_url_expires_at
         - domain
         - alternative_domains
         - linkedin_url
@@ -1183,6 +1520,19 @@ components:
       properties:
         url:
           type: string
+        storage_key:
+          type:
+            - string
+            - 'null'
+          description: |
+            The object key behind `url`, present only for media Universe re-hosts. Stable across signatures: re-request the projection by it once `url_expires_at` passes.
+        url_expires_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: |
+            When `url` stops working. Null means a permanent url — a provider url, or a serving host that carries its own auth. Set means the url is a short-lived lease and must not be stored long term.
         source_url:
           type:
             - string
@@ -1197,6 +1547,8 @@ components:
             - 'null'
       required:
         - url
+        - storage_key
+        - url_expires_at
         - source_url
         - is_main
         - is_placeholder
@@ -1824,6 +2176,18 @@ components:
           type:
             - string
             - 'null'
+        avatar_storage_key:
+          type:
+            - string
+            - 'null'
+          description: The object key behind `avatar`, when Universe re-hosts it.
+        avatar_url_expires_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: |
+            When `avatar` stops working. Null means permanent; set means a short-lived lease that must not be stored long term.
         current_title:
           type:
             - string
@@ -1863,6 +2227,24 @@ components:
             - string
             - 'null'
           format: date-time
+        social_profile_urls:
+          type: array
+          description: Verified social profiles the insights run bound to the person, with the evidence.
+          items:
+            type: object
+            properties:
+              url:
+                type: string
+              confidence:
+                type: string
+              evidence:
+                type: array
+                items:
+                  type: string
+            required:
+              - url
+              - confidence
+              - evidence
         visibility:
           type: boolean
         is_angel:
@@ -1916,6 +2298,8 @@ components:
         - full_name
         - sex
         - avatar
+        - avatar_storage_key
+        - avatar_url_expires_at
         - current_title
         - current_company_id
         - primary_location
@@ -1925,6 +2309,7 @@ components:
         - social_insights
         - social_media_influence
         - social_insights_updated_at
+        - social_profile_urls
         - visibility
         - is_angel
         - is_c_suite
@@ -2002,6 +2387,19 @@ components:
       properties:
         url:
           type: string
+        storage_key:
+          type:
+            - string
+            - 'null'
+          description: |
+            The object key behind `url`, present only for media Universe re-hosts. Stable across signatures: re-request the projection by it once `url_expires_at` passes.
+        url_expires_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: |
+            When `url` stops working. Null means a permanent url — a provider url, or a serving host that carries its own auth. Set means the url is a short-lived lease and must not be stored long term.
         original_source_url:
           type:
             - string
@@ -2016,6 +2414,8 @@ components:
             - 'null'
       required:
         - url
+        - storage_key
+        - url_expires_at
         - original_source_url
         - is_main
         - is_placeholder
@@ -2554,6 +2954,294 @@ components:
           $ref: '#/components/schemas/Subgraph'
         error:
           type: 'null'
+    GraphSearchRequest:
+      type: object
+      required:
+        - query
+      properties:
+        query:
+          type: string
+          minLength: 1
+          maxLength: 2000
+          description: |
+            Natural-language text, embedded server-side. A description of what you are looking for beats a bare keyword.
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 10
+          description: |
+            Upper bound on matches fetched from the vector index, not a page size: relevance cuts run after it, so fewer nodes may come back.
+        include_embeddings:
+          type: boolean
+          default: true
+          description: |
+            Vectors dominate the payload at roughly 107KB per node. Turn them off for structure only; keep them if the consumer intends to search its own copy, since they are never regenerated downstream.
+        entity_types:
+          type: array
+          items:
+            type: string
+          example:
+            - person
+            - company
+          description: |
+            Narrows MATCHES to these entity_type values; neighbours are unaffected. Omit for every type the client is entitled to.
+    GraphSearchNode:
+      type: object
+      required:
+        - id
+        - uuid
+        - labels
+        - is_match
+        - score
+        - properties
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: |
+            Identifies the node within this response only. It means nothing in another graph; consumers merge on uuid.
+        uuid:
+          type: string
+          format: uuid
+          description: |
+            The node's identity, and what a consumer must merge on. For an enrichable entity this is also its Universe entity id, so it is what you pass to the entity, projection and paths endpoints.
+        labels:
+          type: array
+          items:
+            type: string
+          example:
+            - Entity
+            - Person
+        is_match:
+          type: boolean
+          description: |
+            True for a node the query matched, false for one pulled in by one-hop expansion.
+        score:
+          type:
+            - number
+            - 'null'
+          description: |
+            Vector DISTANCE on a match — lower is closer. Null on a neighbour, which was never scored against the query.
+        properties:
+          type: object
+          additionalProperties: true
+          description: |
+            Verbatim node properties, untyped for the same reason as the subgraph projection: one field name carries two types across labels. embeddings arrives as an array and must be re-wrapped as a vector on write.
+    GraphSearch:
+      type: object
+      required:
+        - schema_version
+        - nodes
+        - edges
+        - truncated
+      properties:
+        schema_version:
+          type: string
+          description: Wire contract version. A breaking change gets a new version, not an edit.
+          example: graph_search.v1
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphSearchNode'
+        edges:
+          type: array
+          items:
+            $ref: '#/components/schemas/SubgraphEdge'
+          description: |
+            Edges incident to a matched node, in the same shape as the subgraph projection. direction is relative to the matched node.
+        truncated:
+          type: boolean
+          description: |
+            True when the neighbour cap dropped nodes. Matched nodes are never dropped, and edges to a dropped node are omitted.
+    GraphSearchEnvelope:
+      type: object
+      required:
+        - data
+        - error
+      properties:
+        data:
+          $ref: '#/components/schemas/GraphSearch'
+        error:
+          type: 'null'
+    GraphPathsRequest:
+      type: object
+      required:
+        - source_entity_ids
+        - target_entity_id
+      properties:
+        source_entity_ids:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items:
+            type: string
+            format: uuid
+          description: |
+            Universe entity ids to search from. Each runs its own traversal, which is why the list is capped. The target itself is ignored if included.
+        target_entity_id:
+          type: string
+          format: uuid
+          description: Universe entity id to reach. Resolved through the merge chain.
+        max_hops:
+          type: integer
+          minimum: 1
+          maximum: 6
+          default: 4
+          description: |
+            Route length ceiling. Past four, a traversal reaches most of the graph through some chain, which is not a connection anyone can act on; cost also grows with depth.
+    GraphPathNode:
+      type: object
+      required:
+        - uuid
+        - name
+        - entity_type
+        - labels
+      properties:
+        uuid:
+          type: string
+          format: uuid
+        name:
+          type: string
+        entity_type:
+          type: string
+          example: company
+        labels:
+          type: array
+          items:
+            type: string
+          example:
+            - Entity
+            - Company
+    GraphPathHop:
+      type: object
+      required:
+        - type
+        - source
+        - target
+        - weight
+        - description
+      properties:
+        type:
+          type: string
+          example: WORKS_AT
+        source:
+          type: string
+          format: uuid
+          description: |
+            The edge's true start node, which may be the node travelled TO when the route runs against the arrow. Never flip it.
+        target:
+          type: string
+          format: uuid
+          description: The edge's true end node.
+        weight:
+          type: integer
+          format: int64
+          description: |
+            Traversal cost, lower being stronger. 0 when the edge carries no weight.
+        description:
+          type: string
+          description: |
+            The edge's description, or its fact when it has no description. Empty when it has neither.
+    GraphPath:
+      type: object
+      required:
+        - source_entity_id
+        - requested_source_entity_id
+        - source_node_uuid
+        - hops_count
+        - total_weight
+        - nodes
+        - hops
+      properties:
+        source_entity_id:
+          type: string
+          format: uuid
+          description: The canonical source id after merge resolution.
+        requested_source_entity_id:
+          type: string
+          format: uuid
+          description: |
+            The source id asked for, so a consumer can heal a stored reference when a merge has moved it.
+        source_node_uuid:
+          type: string
+          format: uuid
+          description: The source's graph node uuid, which the path starts from.
+        hops_count:
+          type: integer
+          description: Number of edges traversed. One less than nodes.
+        total_weight:
+          type: integer
+          format: int64
+          description: |
+            Sum of the hop weights, where LOWER is stronger: the weight scale is a distance, so paths are ordered ascending.
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphPathNode'
+          description: |
+            The route in order, source first and target last. Named only — full properties come from the subgraph endpoint.
+        hops:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphPathHop'
+          description: The edges in order, aligned with consecutive nodes.
+    GraphPaths:
+      type: object
+      required:
+        - schema_version
+        - target_entity_id
+        - requested_target_id
+        - max_hops
+        - paths
+        - unreachable_source_entity_ids
+        - skipped_source_entity_ids
+      properties:
+        schema_version:
+          type: string
+          description: Wire contract version. A breaking change gets a new version, not an edit.
+          example: graph_paths.v1
+        target_entity_id:
+          type: string
+          format: uuid
+          description: The canonical target id after merge resolution.
+        requested_target_id:
+          type: string
+          format: uuid
+          description: |
+            The target id asked for. Differs from target_entity_id when a merge has moved the entity, so a consumer can heal a stored reference.
+        max_hops:
+          type: integer
+          description: The bound actually applied, after defaulting.
+        paths:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphPath'
+          description: One path per reachable source, lowest total_weight first.
+        unreachable_source_entity_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: |
+            Sources that were searched and have no route within max_hops, in request order.
+        skipped_source_entity_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: |
+            Sources that could not be searched at all: unknown to Universe, not yet written to the graph, or the target itself. Held apart from unreachable, which means searched and not found.
+    GraphPathsEnvelope:
+      type: object
+      required:
+        - data
+        - error
+      properties:
+        data:
+          $ref: '#/components/schemas/GraphPaths'
+        error:
+          type: 'null'
     GetAddCompanyRequest:
       type: object
       description: |
@@ -2640,12 +3328,15 @@ components:
         Whether the consumer package rode along on this get-add and, when it did not, which gate stopped it. Always present, including when `projection` is null.
         The response status is always 200 — a resolved entity is not an error. `class` is an HTTP-SHAPED CLASS for the projection field alone, so a client can branch without knowing every slug: 200 you have it, 202 it is coming, 4xx this call will not give it to you.
         `poll` is DERIVED from `code`; a client that reads only `poll` is never wrong about whether to come back.
+        A repeat get-add of an already enriched person answers `200:available` from what we hold and dispatches no run inside the server's re-run window (24h by default) unless `force` is sent. While a run IS still settling the code is `202:enriching`; `409:unsatisfied` is reserved for a run that settled with a failed clause.
+        The two `disputed` codes are the pair to handle deliberately. They mean a provider resolved an IDENTITY that contradicts the name we hold, so we no longer know for certain who the record describes. `200:disputed` still carries the package — most of it is likely correct, only the identity is in doubt, so hold the record rather than discard it and do not act on its identity; `409:disputed` means there is no package to send. Both are `poll: false`: the record is frozen on our side and no further run will revisit it until a human reconciles it, so re-reading never changes the answer. Tell us instead.
       properties:
         code:
           type: string
           enum:
             - 200:available
             - 200:stale
+            - 200:disputed
             - 202:created
             - 202:queued
             - 202:enriching
@@ -2656,6 +3347,7 @@ components:
             - 404:never_enriched
             - 409:not_distilled
             - 409:unsatisfied
+            - 409:disputed
             - 422:unsupported_entity_type
         class:
           type: integer
@@ -2893,6 +3585,18 @@ components:
             - 'null'
           description: |
             The canonical IMDb name page, when the person carries an imdb key. Canonical, not the URL you sent — that is how you learn two variants are one person. Null when they have no imdb key.
+        emails:
+          type: array
+          items:
+            type: string
+          description: |
+            The contact emails the person NOW HOLDS — lowercased, deduped, and including any a provider contributed. NOT an echo of what you sent: the same contract as `linkedin_url` and `imdb_url`, so sending one address and getting three back tells you the person already held two. `[]` when we hold none.
+        phone_numbers:
+          type: array
+          items:
+            type: string
+          description: |
+            The stored phone numbers in E.164, on the same terms as `emails`. `[]` when we hold none.
         projection:
           oneOf:
             - $ref: '#/components/schemas/PersonProjection'
@@ -2907,6 +3611,8 @@ components:
         - master_person_id
         - node_uuid
         - full_name
+        - emails
+        - phone_numbers
         - linkedin_url
         - match_via
         - fiber_deferred
@@ -2918,6 +3624,75 @@ components:
       properties:
         data:
           $ref: '#/components/schemas/PersonShell'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+      required:
+        - data
+        - error
+        - meta
+    BuildPersonaRequest:
+      type: object
+      description: |
+        Optional. An empty body is the normal call: the id in the path is enough to ask for a persona.
+      properties:
+        force:
+          type: boolean
+          default: false
+          description: |
+            Rebuild even when a persona is still inside the freshness window. The evidence requirement still applies: forcing a build on missing evidence yields a worse persona, not a fresher one.
+        reason:
+          type: string
+          description: |
+            Why the rebuild was asked for, recorded on the row. Ignored unless `force` is set, and an unrecognised value falls back to `manual`.
+          enum:
+            - initial
+            - expertise_updated
+            - work_history_changed
+            - manual
+      additionalProperties: false
+    PersonaBuildResult:
+      type: object
+      required:
+        - entity_id
+        - status
+        - persona_id
+        - started
+      properties:
+        entity_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          description: |
+            `exists` — a fresh persona already covers this person, nothing was started. `building` — a worker has the job. `queued` — evidence is missing and the person waits for it.
+          enum:
+            - exists
+            - queued
+            - building
+        persona_id:
+          type:
+            - string
+            - 'null'
+          format: uuid
+          description: |
+            Set only when `status` is `exists`. A build in flight has no id to report yet.
+        started:
+          type: array
+          description: |
+            The prerequisites this call launched. Empty when both were already present, or when something else had already started them.
+          items:
+            type: string
+            enum:
+              - deep_bio
+              - social_insights
+      additionalProperties: false
+    PersonaBuildEnvelope:
+      type: object
+      properties:
+        data:
+          $ref: '#/components/schemas/PersonaBuildResult'
         error:
           type: 'null'
         meta:
@@ -3092,6 +3867,69 @@ components:
       properties:
         data:
           $ref: '#/components/schemas/PersonSocialInsights'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+    DeepResearchRequest:
+      type: object
+      properties:
+        force:
+          type: boolean
+          default: false
+          description: Re-research inside the freshness window. The daily cap still applies.
+    DeepResearch:
+      type: object
+      properties:
+        entity_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum:
+            - fresh
+            - created
+            - already_running
+            - skipped
+        skip_reason:
+          type:
+            - string
+            - 'null'
+        job_id:
+          type:
+            - string
+            - 'null'
+          format: uuid
+        deep_bio:
+          type: array
+          items:
+            type: string
+          description: The stored narrative paragraphs; empty until a job lands and distills.
+        deep_bio_generated_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        social_insights_requested:
+          type: boolean
+          description: True when this call asked for the insights build (a fresh bio with no insights row).
+      required:
+        - entity_id
+        - status
+        - skip_reason
+        - job_id
+        - deep_bio
+        - deep_bio_generated_at
+        - social_insights_requested
+    DeepResearchEnvelope:
+      type: object
+      required:
+        - data
+        - error
+        - meta
+      properties:
+        data:
+          $ref: '#/components/schemas/DeepResearch'
         error:
           type: 'null'
         meta:
@@ -3362,6 +4200,73 @@ components:
       properties:
         data:
           $ref: '#/components/schemas/IssuedKey'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+      required:
+        - data
+        - error
+        - meta
+    SocialInsightsBackfill:
+      type: object
+      properties:
+        found:
+          type: integer
+          description: Persons in this batch's backlog.
+        requested:
+          type: integer
+          description: Forced insights requests published.
+        failed:
+          type: integer
+          description: Requests that could not be published; the persons stay in the backlog.
+        dry_run:
+          type: boolean
+        remaining:
+          type: boolean
+          description: |
+            The batch filled to the limit, so more may be waiting. False is the only signal that the backlog is clear.
+      required:
+        - found
+        - requested
+        - failed
+        - dry_run
+        - remaining
+    SocialInsightsBackfillEnvelope:
+      type: object
+      properties:
+        data:
+          $ref: '#/components/schemas/SocialInsightsBackfill'
+        error:
+          type: 'null'
+        meta:
+          $ref: '#/components/schemas/Meta'
+      required:
+        - data
+        - error
+        - meta
+    SocialInsightsPersist:
+      type: object
+      properties:
+        found:
+          type: integer
+        persisted:
+          type: integer
+        failed:
+          type: integer
+          description: Payloads that could not be decoded; they stay in the backlog.
+        remaining:
+          type: boolean
+      required:
+        - found
+        - persisted
+        - failed
+        - remaining
+    SocialInsightsPersistEnvelope:
+      type: object
+      properties:
+        data:
+          $ref: '#/components/schemas/SocialInsightsPersist'
         error:
           type: 'null'
         meta:

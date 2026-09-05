@@ -118,7 +118,8 @@ Once markdown is available, the worker runs the **classifier** — a short LLM
 call that reads the document and assigns it a type. The current options
 include:
 
-- `fundraising_deck`
+- `fundraising_deck` — a company raising a round
+- `fund_fundraising_deck` — a GP raising a fund from limited partners
 - `financial_document`
 - `legal`
 - a few others, plus an `unknown` fallback
@@ -126,23 +127,33 @@ include:
 The classification result is written to the `classification` column on the
 file row.
 
+The two deck labels matter because they fork the pipeline. A company deck
+and a fund deck share almost no structured fields (a fund has fee, carry and
+prior-fund track record; a company has ARR, customers and GTM), so each gets
+its own profile pipeline, prompt and tables. See
+[Fund vs Company Pitch Profiles](/guides/open-work/fund-vs-company-pitch-profiles)
+for the comparison.
+
 This step is intentionally **best-effort**. If the classifier fails for any
 reason, the failure is logged but the pipeline continues — the file is fine,
 the classification is just metadata. We'd rather have a usable file with no
 type than no file at all.
 
 The classification is what decides whether the next two stages run. Files that
-are *not* fundraising decks transition straight to `completed` at this point.
-Decks continue on to the profile and embedding stages.
+are *not* decks transition straight to `completed` at this point. Decks
+continue on to the profile and embedding stages: `fundraising_deck` publishes
+`pitch_profile.requested`, `fund_fundraising_deck` publishes
+`fund_profile.requested`.
 
 ---
 
-## Stage 4: Profiled (fundraising decks only)
+## Stage 4: Profiled (decks only)
 
 When a file classifies as a `fundraising_deck`, the worker transitions the
 status from `extracting` to `embedding` and begins building the **pitch
 profile** — the structured representation of the deck that downstream matching
-systems will use.
+systems will use. A `fund_fundraising_deck` follows the same shape through the
+sibling **fund profile** pipeline, described at the end of this stage.
 
 The profile is produced by a single LLM call against a strong reasoning model
 (deepseek-v3.2 by default). The model receives the deck's markdown and is
@@ -175,9 +186,28 @@ profile failure marks the file row `failed` and lets Pub/Sub retry the whole
 pipeline. By the time a file reaches `completed`, its profile is guaranteed
 to exist.
 
+### Fund decks
+
+A `fund_fundraising_deck` runs the same steps through the `fundprofile`
+package instead. The LLM call uses `assets/prompts/fund-profile-extractor.md`
+and returns fund-native fields — fund name and number, target size and hard
+cap, management fee, carry, GP commitment, fund life, minimum LP commitment,
+check size and target ownership into companies, prior funds with MOIC / DPI /
+TVPI, anchor LPs, service providers — plus six fund-native narratives:
+
+- **GP track record** — who the GPs are, prior exits, prior funds, advisers.
+- **Fund thesis** — sectors, stages, geographies, why now.
+- **Sourcing edge** — how the fund sees and wins deals first.
+- **Performance & momentum** — prior fund returns, exits, capital committed.
+- **Fund economics** — the terms offered to LPs.
+- **Portfolio strategy** — how capital deploys into companies.
+
+The row lands in `fund_profiles`, with the same status column as
+`pitch_profiles`.
+
 ---
 
-## Stage 5: Embedded (fundraising decks only)
+## Stage 5: Embedded (decks only)
 
 The six narratives are turned into six 768-dimensional vectors in a single
 request to Perplexity's contextualized embedding endpoint. "Contextualized"
@@ -198,6 +228,11 @@ are populated by other features that run on top of the pitch profile.
 The pitch profile pipeline ends by publishing a **`pitch_profile.completed`**
 event with the file's id, the profile id, the company name, and the Xano
 routing keys.
+
+Fund decks embed the same way with the same model and width, so a fund
+vector and a pitch vector live in one comparable space. The six vectors land
+in `fund_profile_narratives` and the pipeline ends with
+**`fund_profile.completed`**.
 
 ---
 
@@ -222,14 +257,16 @@ update a CRM — is the job of the webhook fanout.
 
 ## Webhooks: how downstream systems hear about all this
 
-Two events fired during a successful pipeline can trigger webhooks:
+Three events fired during a successful pipeline can trigger webhooks:
 
 - `files.completed` — fires for every file that finishes the pipeline,
   regardless of classification.
 - `pitch_profile.completed` — fires only for files that produced a pitch
-  profile (i.e. fundraising decks).
+  profile (company fundraising decks).
+- `fund_profile.completed` — fires only for files that produced a fund
+  profile (fund fundraising decks).
 
-A third event, `theses.completed`, fires from a different feature (investment
+A fourth event, `theses.completed`, fires from a different feature (investment
 thesis builder) but uses the exact same webhook delivery machinery, so it's
 included here for completeness.
 
@@ -253,8 +290,9 @@ create three subscriptions and the system fans out to all three in parallel.
 
 ### Fan-out
 
-When a `files.completed` (or `pitch_profile.completed`, or
-`theses.completed`) event arrives at the worker, the **fan-out handler**:
+When a `files.completed` (or `pitch_profile.completed`,
+`fund_profile.completed`, or `theses.completed`) event arrives at the worker,
+the **fan-out handler**:
 
 1. Looks up every enabled subscription for that event type.
 2. Inserts one row into the `webhook_deliveries` table per subscription. The
@@ -374,11 +412,16 @@ POST /v1/ingestion/files
   │                                                       ▼
   │                                                  webhook fan-out → Xano (etc.)
   │
-  └──(fundraising_deck)──▶
-       [pitch profile: structured fields + 6 narratives]
-                                                     ─── (no event yet)
+  ├──(fundraising_deck)──▶                          ─── pitch_profile.requested
+  │    [pitch profile: company fields + 6 narratives]
+  │    [6 narratives embedded → 6 vectors]
+  │                                                  ─── pitch_profile.completed
+  │
+  └──(fund_fundraising_deck)──▶                     ─── fund_profile.requested
+       [fund profile: fund fields + 6 narratives]
        [6 narratives embedded → 6 vectors]
-                                                     ─── pitch_profile.completed
+                                                     ─── fund_profile.completed
+
        [files row: completed]                        ─── files.completed
                                                           │
                                                           ▼
